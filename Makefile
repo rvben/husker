@@ -226,10 +226,12 @@ deny:
 	cargo deny check advisories bans sources
 
 # Update dependencies (requires: cargo install upd)
-# Applies patch + minor bumps only; major bumps are surfaced by check-deps
-# and handled manually so the automated PR stays buildable.
+# Applies patch + minor Rust crate bumps only. Major bumps and non-Rust
+# ecosystems (GitHub Actions, etc.) are surfaced by check-deps and handled
+# manually: the workflow's GITHUB_TOKEN cannot push .github/workflows
+# changes, and major bumps would break the automated PR's build.
 update-deps:
-	upd --apply --max-bump minor
+	upd --apply --max-bump minor --lang rust
 
 # Check for outdated dependencies
 check-deps:
