@@ -226,8 +226,10 @@ deny:
 	cargo deny check advisories bans sources
 
 # Update dependencies (requires: cargo install upd)
+# Applies patch + minor bumps only; major bumps are surfaced by check-deps
+# and handled manually so the automated PR stays buildable.
 update-deps:
-	upd
+	upd --apply --max-bump minor
 
 # Check for outdated dependencies
 check-deps:
