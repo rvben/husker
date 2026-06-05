@@ -1,9 +1,11 @@
 fn main() {
-    eprintln!("husker is not yet available on crates.io.");
+    eprintln!("husker is distributed as a prebuilt binary, not via crates.io.");
     eprintln!();
-    eprintln!("This is a placeholder publication reserving the crate name while the");
-    eprintln!("project works toward its first release. Track progress at:");
+    eprintln!("Install it with one of:");
+    eprintln!("    pip install husker");
+    eprintln!("    brew install rvben/tap/husker");
+    eprintln!("    download from https://github.com/rvben/husker/releases");
     eprintln!();
-    eprintln!("    https://github.com/rvben/husker");
+    eprintln!("This crate only reserves the name. Docs: https://github.com/rvben/husker");
     std::process::exit(1);
 }
