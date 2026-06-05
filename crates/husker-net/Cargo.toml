@@ -1,0 +1,15 @@
+[package]
+name = "husker-net"
+description = "Network management for husker microVMs (TAP devices, IP allocation, nftables)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

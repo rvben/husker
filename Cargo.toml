@@ -1,14 +1,14 @@
 [workspace]
 members = [
-    "crates/shuck",
-    "crates/shuck-core",
-    "crates/shuck-vmm",
-    "crates/shuck-net",
-    "crates/shuck-storage",
-    "crates/shuck-agent",
-    "crates/shuck-agent-proto",
-    "crates/shuck-api",
-    "crates/shuck-state",
+    "crates/husker",
+    "crates/husker-core",
+    "crates/husker-vmm",
+    "crates/husker-net",
+    "crates/husker-storage",
+    "crates/husker-agent",
+    "crates/husker-agent-proto",
+    "crates/husker-api",
+    "crates/husker-state",
 ]
 resolver = "3"
 
@@ -16,7 +16,7 @@ resolver = "3"
 version = "0.1.4"
 edition = "2024"
 rust-version = "1.90"
-repository = "https://github.com/rvben/shuck"
+repository = "https://github.com/rvben/husker"
 license = "MIT"
 authors = ["Ruben Jongejan <ruben.jongejan@gmail.com>"]
 description = "An open-source microVM manager built on Firecracker"
@@ -80,13 +80,13 @@ utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 # Internal crates
-shuck-core = { path = "crates/shuck-core", default-features = false }
-shuck-vmm = { path = "crates/shuck-vmm" }
-shuck-net = { path = "crates/shuck-net" }
-shuck-storage = { path = "crates/shuck-storage" }
-shuck-agent-proto = { path = "crates/shuck-agent-proto" }
-shuck-api = { path = "crates/shuck-api", default-features = false }
-shuck-state = { path = "crates/shuck-state" }
+husker-core = { path = "crates/husker-core", default-features = false }
+husker-vmm = { path = "crates/husker-vmm" }
+husker-net = { path = "crates/husker-net" }
+husker-storage = { path = "crates/husker-storage" }
+husker-agent-proto = { path = "crates/husker-agent-proto" }
+husker-api = { path = "crates/husker-api", default-features = false }
+husker-state = { path = "crates/husker-state" }
 
 [profile.release]
 lto = true

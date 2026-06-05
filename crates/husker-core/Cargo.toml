@@ -1,0 +1,32 @@
+[package]
+name = "husker-core"
+description = "Core orchestration for husker microVM lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["linux-net"]
+linux-net = ["husker-net", "dep:tempfile"]
+utoipa = ["dep:utoipa"]
+
+[dependencies]
+husker-vmm = { workspace = true }
+husker-net = { workspace = true, optional = true }
+husker-storage = { workspace = true }
+husker-state = { workspace = true }
+husker-agent-proto = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
+ring = "0.17"
+
+[dev-dependencies]
+husker-agent = { path = "../husker-agent" }
+tempfile = "3"

@@ -1,0 +1,49 @@
+[package]
+name = "husker"
+description = "An open source microVM manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "husker"
+path = "src/main.rs"
+
+[lib]
+name = "husker"
+path = "src/lib.rs"
+
+[features]
+default = ["linux-net"]
+linux-net = ["husker-core/linux-net", "husker-api/linux-net", "husker-net"]
+
+[dependencies]
+husker-api = { workspace = true }
+husker-core = { workspace = true }
+husker-vmm = { workspace = true }
+husker-net = { workspace = true, optional = true }
+husker-storage = { workspace = true }
+husker-state = { workspace = true }
+husker-agent-proto = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+crossterm = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

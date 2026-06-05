@@ -1,0 +1,36 @@
+[package]
+name = "husker-api"
+description = "REST API server for husker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["linux-net"]
+linux-net = ["husker-core/linux-net"]
+
+[dependencies]
+husker-core = { workspace = true, features = ["utoipa"] }
+husker-vmm = { workspace = true }
+husker-agent-proto = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+[dev-dependencies]
+husker-vmm = { workspace = true }
+husker-state = { workspace = true }
+husker-net = { workspace = true }
+husker-storage = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tempfile = "3"
