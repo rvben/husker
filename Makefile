@@ -24,12 +24,12 @@ AARCH64_MUSL_LINKER ?= aarch64-linux-musl-gcc
 # Build only the guest agent (optimized for size, x86_64)
 build-agent:
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$(X86_64_MUSL_LINKER) \
-	cargo build --package shuck-agent --profile agent --target x86_64-unknown-linux-musl
+	cargo build --package husker-agent --profile agent --target x86_64-unknown-linux-musl
 
 # Build guest agent for ARM64 (for macOS/VZ guests)
 build-agent-aarch64:
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$(AARCH64_MUSL_LINKER) \
-	cargo build --package shuck-agent --profile agent --target aarch64-unknown-linux-musl
+	cargo build --package husker-agent --profile agent --target aarch64-unknown-linux-musl
 
 # Build release for macOS (no linux-net, with entitlement signing)
 build-release-macos:
@@ -38,16 +38,16 @@ build-release-macos:
 
 # Sign macOS binary with virtualization entitlement
 sign-macos:
-	codesign --entitlements shuck.entitlements --force --sign - target/release/shuck
+	codesign --entitlements husker.entitlements --force --sign - target/release/husker
 
 # Check compilation without linux-net (macOS path)
 check-macos:
 	cargo check --workspace --no-default-features
 
 # Run tests on macOS (without linux-net feature)
-# Excludes shuck-api whose integration tests require linux-net
+# Excludes husker-api whose integration tests require linux-net
 test-macos:
-	cargo nextest run --workspace --no-default-features --exclude shuck-api 2>/dev/null || cargo test --workspace --no-default-features --exclude shuck-api
+	cargo nextest run --workspace --no-default-features --exclude husker-api 2>/dev/null || cargo test --workspace --no-default-features --exclude husker-api
 
 # Run all tests
 test:
@@ -80,62 +80,62 @@ check:
 clean:
 	cargo clean
 
-# Install shuck binary (auto-detects macOS to disable linux-net and sign)
+# Install husker binary (auto-detects macOS to disable linux-net and sign)
 install:
 ifeq ($(shell uname -s),Darwin)
-	cargo install --path crates/shuck --no-default-features
-	codesign --entitlements shuck.entitlements --force --sign - "$$(which shuck)"
+	cargo install --path crates/husker --no-default-features
+	codesign --entitlements husker.entitlements --force --sign - "$$(which husker)"
 else
-	cargo install --path crates/shuck
+	cargo install --path crates/husker
 endif
 
 # Install and restart daemon (development workflow)
 install-restart: install
-	@pkill -f "shuck daemon" 2>/dev/null || true
+	@pkill -f "husker daemon" 2>/dev/null || true
 	@sleep 1
-	@nohup shuck daemon > /tmp/shuck-daemon.log 2>&1 &
-	@echo "Daemon restarted (log: /tmp/shuck-daemon.log)"
+	@nohup husker daemon > /tmp/husker-daemon.log 2>&1 &
+	@echo "Daemon restarted (log: /tmp/husker-daemon.log)"
 
 # Run E2E tests (requires running daemon and a booted VM)
 test-e2e:
-	cargo nextest run --package shuck --test e2e -- --ignored 2>/dev/null || cargo test --package shuck --test e2e -- --ignored
+	cargo nextest run --package husker --test e2e -- --ignored 2>/dev/null || cargo test --package husker --test e2e -- --ignored
 
-# Run ignored shuck e2e tests only when explicitly enabled.
+# Run ignored husker e2e tests only when explicitly enabled.
 test-e2e-gated:
-	@if [ "$${SHUCK_RUN_IGNORED_E2E:-0}" = "1" ]; then \
-		cargo test --package shuck --test e2e -- --ignored; \
+	@if [ "$${HUSKER_RUN_IGNORED_E2E:-0}" = "1" ]; then \
+		cargo test --package husker --test e2e -- --ignored; \
 	else \
-		echo "Skipping shuck ignored e2e tests (set SHUCK_RUN_IGNORED_E2E=1 to enable)"; \
+		echo "Skipping husker ignored e2e tests (set HUSKER_RUN_IGNORED_E2E=1 to enable)"; \
 	fi
 
-# Run ignored shuck-net e2e tests only when explicitly enabled.
+# Run ignored husker-net e2e tests only when explicitly enabled.
 test-net-e2e-gated:
-	@if [ "$${SHUCK_RUN_NET_E2E:-0}" = "1" ]; then \
-		cargo test --package shuck-net --test e2e_bridge -- --ignored; \
+	@if [ "$${HUSKER_RUN_NET_E2E:-0}" = "1" ]; then \
+		cargo test --package husker-net --test e2e_bridge -- --ignored; \
 	else \
-		echo "Skipping shuck-net ignored e2e tests (set SHUCK_RUN_NET_E2E=1 to enable)"; \
+		echo "Skipping husker-net ignored e2e tests (set HUSKER_RUN_NET_E2E=1 to enable)"; \
 	fi
 
 # API/CLI contract tests (OpenAPI + CLI output schema stability)
 test-contracts:
-	cargo test -p shuck-api --test openapi_contract
-	cargo test -p shuck --no-default-features -- --nocapture
+	cargo test -p husker-api --test openapi_contract
+	cargo test -p husker --no-default-features -- --nocapture
 
 # Core failure-injection tests
 test-failure-injection:
-	cargo test -p shuck-core --test failure_injection
+	cargo test -p husker-core --test failure_injection
 
 # Lightweight performance baseline and regression gate
 test-perf-baseline:
-	cargo test -p shuck-api --test perf_baseline -- --nocapture
+	cargo test -p husker-api --test perf_baseline -- --nocapture
 
 # Coverage gate (line + branch) for workspace quality floor.
 coverage-ci:
-	cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/shuck/src/main.rs|crates/shuck-agent/src/main.rs|crates/shuck-vmm/src/apple_vz.rs' --fail-under-lines 77 --lcov --output-path target/llvm-cov.info
+	cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/husker/src/main.rs|crates/husker-agent/src/main.rs|crates/husker-vmm/src/apple_vz.rs' --fail-under-lines 77 --lcov --output-path target/llvm-cov.info
 
 # Mutation-testing smoke gate (tooling + target discoverability).
 mutation-gate:
-	cargo mutants --list --package shuck-agent-proto > /dev/null
+	cargo mutants --list --package husker-agent-proto > /dev/null
 
 # Graceful shutdown drill (SIGTERM path)
 graceful-shutdown-drill:
@@ -150,9 +150,9 @@ nightly-quality: test-perf-baseline test-failure-injection mutation-gate gracefu
 
 # Update guest rootfs image with latest agent binary and inittab.
 # Requires: aarch64-linux-musl-gcc cross-compiler, e2fsprogs (brew install e2fsprogs)
-ROOTFS_IMAGE ?= $(HOME)/.local/share/shuck/images/alpine-aarch64.ext4
+ROOTFS_IMAGE ?= $(HOME)/.local/share/husker/images/alpine-aarch64.ext4
 DEBUGFS ?= $(shell find /opt/homebrew/Cellar/e2fsprogs -name debugfs -type f 2>/dev/null | head -1)
-AGENT_BIN = target/aarch64-unknown-linux-musl/agent/shuck-agent
+AGENT_BIN = target/aarch64-unknown-linux-musl/agent/husker-agent
 GUEST_INITTAB = guest/inittab
 
 update-rootfs: build-agent-aarch64
@@ -160,21 +160,21 @@ update-rootfs: build-agent-aarch64
 	@test -n "$(DEBUGFS)" || { echo "Error: debugfs not found. Install e2fsprogs: brew install e2fsprogs"; exit 1; }
 	@echo "Injecting agent binary into $(ROOTFS_IMAGE)..."
 	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "rm /usr/local/bin/shuck-agent" 2>/dev/null; true
+		-R "rm /usr/local/bin/husker-agent" 2>/dev/null; true
 	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "write $(AGENT_BIN) /usr/local/bin/shuck-agent"
+		-R "write $(AGENT_BIN) /usr/local/bin/husker-agent"
 	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "set_inode_field /usr/local/bin/shuck-agent mode 0100755"
+		-R "set_inode_field /usr/local/bin/husker-agent mode 0100755"
 	@echo "Injecting inittab into $(ROOTFS_IMAGE)..."
 	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
 		-R "rm /etc/inittab" 2>/dev/null; true
 	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
 		-R "write $(GUEST_INITTAB) /etc/inittab"
 	@echo "Rootfs updated. Verify with:"
-	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/shuck-agent' $(ROOTFS_IMAGE)"
+	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/husker-agent' $(ROOTFS_IMAGE)"
 	@echo "  $(DEBUGFS) -R 'cat /etc/inittab' $(ROOTFS_IMAGE)"
 
-# Build initramfs for Alpine-based shuck VMs.
+# Build initramfs for Alpine-based husker VMs.
 # ARCH defaults to aarch64; pass ARCH=x86_64 for Firecracker.
 build-initramfs:
 	guest/build-initramfs.sh $(ALPINE_VERSION) $(ARCH)
@@ -184,7 +184,7 @@ build-initramfs:
 build-kernel-image:
 	guest/build-kernel-image.sh $(ARCH)
 
-# Build baseline Alpine rootfs with shuck-agent and inittab baked in.
+# Build baseline Alpine rootfs with husker-agent and inittab baked in.
 # ARCH=aarch64 builds for macOS VZ; ARCH=x86_64 for Firecracker.
 build-rootfs:
 ifeq ($(ARCH),x86_64)
@@ -204,7 +204,7 @@ build-k3s-rootfs: build-agent
 	sudo guest/build-k3s-rootfs.sh $(K3S_ROOTFS)
 
 # Build k3s-compatible kernel (requires root, build-essential, flex, bison, libelf-dev)
-K3S_KERNEL ?= /mnt/shuck/vmlinux-k3s
+K3S_KERNEL ?= /mnt/husker/vmlinux-k3s
 build-k3s-kernel:
 	sudo guest/build-k3s-kernel.sh $(K3S_KERNEL)
 
@@ -215,7 +215,7 @@ test-k3s:
 
 # Run the daemon (development)
 run-daemon:
-	cargo run --package shuck -- daemon --listen 127.0.0.1:7777
+	cargo run --package husker -- daemon --listen 127.0.0.1:7777
 
 # Security audit
 audit:
