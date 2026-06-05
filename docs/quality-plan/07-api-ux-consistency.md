@@ -33,8 +33,8 @@
 ## Notes
 
 - Source hotspots:
-  - `/Users/ruben/Projects/shuck/crates/shuck-api/src/lib.rs`
-  - `/Users/ruben/Projects/shuck/crates/shuck/src/main.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-api/src/lib.rs`
+  - `/Users/ruben/Projects/husker/crates/husker/src/main.rs`
 
 ## Progress log
 

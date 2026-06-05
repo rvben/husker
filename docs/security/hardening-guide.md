@@ -3,7 +3,7 @@
 ## 1. API exposure
 
 - Keep daemon on loopback whenever possible:
-  - `shuck daemon --listen 127.0.0.1:7777`
+  - `husker daemon --listen 127.0.0.1:7777`
 - If remote bind is required:
   - use `--allow-remote` explicitly
   - set `api_token` in config
@@ -43,7 +43,7 @@
 ## 6. Network topology recommendations
 
 - Preferred: local daemon behind SSH tunnel or private service mesh.
-- Remote control plane: terminate TLS at reverse proxy, enforce authn/authz before forwarding to shuck.
+- Remote control plane: terminate TLS at reverse proxy, enforce authn/authz before forwarding to husker.
 - Avoid exposing daemon directly on public interfaces.
 
 ## 7. Logging and monitoring

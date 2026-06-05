@@ -32,9 +32,9 @@
 ## Notes
 
 - Source hotspots:
-  - `/Users/ruben/Projects/shuck/crates/shuck-core/src/agent_client.rs`
-  - `/Users/ruben/Projects/shuck/crates/shuck-api/src/lib.rs`
-  - `/Users/ruben/Projects/shuck/crates/shuck-vmm/src/firecracker.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-core/src/agent_client.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-api/src/lib.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-vmm/src/firecracker.rs`
 
 ## Progress log
 

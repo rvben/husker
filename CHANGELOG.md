@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- Renamed the project from `shuck` to `husker` (the old name collided with an
+  existing shell linter). The binary, crates, Python package, env vars, and
+  data directories all change. There is no automatic migration.
+
+  One-time migration for existing installs:
+
+      mv ~/.local/share/shuck ~/.local/share/husker
+      mv ~/.config/shuck      ~/.config/husker
+      sudo mv /var/lib/shuck  /var/lib/husker      # if used
+      sudo mv /etc/shuck      /etc/husker          # if used
+      # Linux host networking: drop stale kernel state
+      sudo nft delete table ip shuck   # recreated on next run
+      sudo ip link del shuck0          # old default bridge, if present
+      # systemd: replace contrib/shuck.service with contrib/husker.service
+
+  All `SHUCK_*` environment variables are now `HUSKER_*`.
+
 ## [0.1.4] - 2026-04-21
 
 ### Added

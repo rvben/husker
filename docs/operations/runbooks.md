@@ -4,7 +4,7 @@
 
 - Symptom: CLI returns `cannot connect to daemon`.
 - Checks:
-  - `shuck version` (daemon section absent)
+  - `husker version` (daemon section absent)
   - process/service status
 - Actions:
   - restart daemon
@@ -39,21 +39,21 @@
   - guest boot completion
 - Actions:
   - retry after boot delay
-  - inspect guest serial logs (`shuck logs <vm>`)
+  - inspect guest serial logs (`husker logs <vm>`)
 
 ## 5. Port-forward drift after restart
 
 - Symptom: state has forwards but packets do not route.
 - Checks:
   - daemon startup logs mention reconciliation count
-  - `shuck pf <vm> list`
+  - `husker pf <vm> list`
 - Actions:
   - restart daemon to trigger reconciliation
   - verify nftables table health on host
 
 ## 6. Serial log stream appears stalled
 
-- Symptom: `shuck logs -f` stops unexpectedly.
+- Symptom: `husker logs -f` stops unexpectedly.
 - Checks:
   - VM still running
   - serial log rotation/truncation notices
@@ -73,7 +73,7 @@
 
 ## 8. High API error rate
 
-- Symptom: `shuck_api_errors_total` spike.
+- Symptom: `husker_api_errors_total` spike.
 - Checks:
   - `/v1/metrics` counters
   - recent deploy/config changes

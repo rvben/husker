@@ -2,7 +2,7 @@
 
 ## Baseline test
 
-- Test: `cargo test -p shuck-api --test perf_baseline -- --nocapture`
+- Test: `cargo test -p husker-api --test perf_baseline -- --nocapture`
 - Current sample (microseconds):
   - health p95: 89
   - health p99: 121

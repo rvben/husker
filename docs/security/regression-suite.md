@@ -10,13 +10,13 @@
 ## Automated checks
 
 - API auth and protected-route tests:
-  - `cargo test -p shuck-api auth_enabled_`
+  - `cargo test -p husker-api auth_enabled_`
 - Rate limiting and policy checks:
-  - `cargo test -p shuck-api rate_limiter_blocks_when_limit_reached`
-  - `cargo test -p shuck-api allowlist_path_enforcement`
-  - `cargo test -p shuck-api exec_policy_allow_deny_and_env`
+  - `cargo test -p husker-api rate_limiter_blocks_when_limit_reached`
+  - `cargo test -p husker-api allowlist_path_enforcement`
+  - `cargo test -p husker-api exec_policy_allow_deny_and_env`
 - CLI unsafe default guard:
-  - `cargo test -p shuck daemon_bind_non_loopback_requires_allow_remote`
+  - `cargo test -p husker daemon_bind_non_loopback_requires_allow_remote`
 
 ## CI enforcement
 

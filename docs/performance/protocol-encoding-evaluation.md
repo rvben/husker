@@ -4,7 +4,7 @@ Date: 2026-02-16
 
 ## Question
 
-Should shuck switch from the current base64 helpers to a different base64 crate for protocol payload performance?
+Should husker switch from the current base64 helpers to a different base64 crate for protocol payload performance?
 
 ## Findings
 

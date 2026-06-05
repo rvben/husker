@@ -11,7 +11,7 @@ Host/guest communication requires a portable framing format over vsock and WebSo
 
 - Use length-prefixed JSON messages.
 - Use base64 for binary payload fields.
-- Keep protocol crate (`shuck-agent-proto`) shared by daemon/client/agent.
+- Keep protocol crate (`husker-agent-proto`) shared by daemon/client/agent.
 - Validate with roundtrip, integration, and property tests.
 
 ## Consequences

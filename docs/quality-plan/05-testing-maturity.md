@@ -16,7 +16,7 @@
 | TEST-002 | Add regression tests for known defects (initrd, pf atomicity, 503 mapping) | P1 | Done | Commits `5efa1b3`, `1fd8f61`, `b44f38c` + integration suites |
 | TEST-003 | Add protocol fuzzing for message framing and base64 payload handling | P2 | Done | Commit `8efb119`, protocol property/fuzz-style roundtrip tests |
 | TEST-004 | Add property tests for IP and CID allocators and lifecycle transitions | P2 | Done | Commits `ded9179` + current allocator/lifecycle property suites |
-| TEST-005 | Add failure-injection tests across core operations | P1 | Done | Commit `762f3dc`, `crates/shuck-core/tests/failure_injection.rs` |
+| TEST-005 | Add failure-injection tests across core operations | P1 | Done | Commit `762f3dc`, `crates/husker-core/tests/failure_injection.rs` |
 | TEST-006 | Define and enforce minimum line coverage target and mutation quality gate | P2 | Done | Commits `762f3dc`, `ec097fb`, `make coverage-ci` + `make mutation-gate` |
 | TEST-007 | Add snapshot/contract tests for OpenAPI and CLI output stability | P3 | Done | Commits `078d7d7`, `762f3dc` |
 | TEST-008 | Add nightly long-run suite for soak, chaos, and performance checks | P2 | Done | Commit `762f3dc`, `.github/workflows/nightly-quality.yml` |
@@ -33,9 +33,9 @@
 ## Notes
 
 - Source hotspots:
-  - `/Users/ruben/Projects/shuck/crates/shuck/tests/e2e.rs`
-  - `/Users/ruben/Projects/shuck/crates/shuck-net/tests/e2e_bridge.rs`
-  - `/Users/ruben/Projects/shuck/crates/shuck-api/tests/api_integration.rs`
+  - `/Users/ruben/Projects/husker/crates/husker/tests/e2e.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-net/tests/e2e_bridge.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-api/tests/api_integration.rs`
 
 ## Progress log
 

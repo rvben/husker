@@ -4,10 +4,10 @@ Last updated: 2026-02-16
 
 ## Scope
 
-- Daemon API (`crates/shuck-api`)
-- Core lifecycle/state engine (`crates/shuck-core`, `crates/shuck-state`)
-- Guest agent channel (`crates/shuck-agent`, `crates/shuck-agent-proto`)
-- Host networking and port-forward path (`crates/shuck-net`, Linux only)
+- Daemon API (`crates/husker-api`)
+- Core lifecycle/state engine (`crates/husker-core`, `crates/husker-state`)
+- Guest agent channel (`crates/husker-agent`, `crates/husker-agent-proto`)
+- Host networking and port-forward path (`crates/husker-net`, Linux only)
 
 ## Assets
 
@@ -21,7 +21,7 @@ Last updated: 2026-02-16
 
 | Category | Threat | Current control(s) | Validation |
 |---|---|---|---|
-| Spoofing | Unauthorized API caller invokes mutating endpoints | Bearer token auth on protected routes; local-only default bind unless `--allow-remote` | `cargo test -p shuck-api` auth middleware tests |
+| Spoofing | Unauthorized API caller invokes mutating endpoints | Bearer token auth on protected routes; local-only default bind unless `--allow-remote` | `cargo test -p husker-api` auth middleware tests |
 | Tampering | Guest file operations target unsafe paths | Path normalization + optional read/write allowlists | API integration tests for policy denial |
 | Repudiation | Sensitive actions not attributable | Structured audit logs for `exec`, file read/write, shell start/exit; request ID propagation | API unit/integration tests + log schema checks |
 | Information Disclosure | Excessive file read payload leaks data | Read-size policy limits; explicit policy error code | API integration tests |

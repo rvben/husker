@@ -10,14 +10,14 @@
 - Failure-injection lifecycle tests
 - Perf baseline regression test
 - Coverage threshold gate (`cargo llvm-cov`)
-- Mutation smoke gate (`cargo mutants --list --package shuck-agent-proto`)
+- Mutation smoke gate (`cargo mutants --list --package husker-agent-proto`)
 - Dependency security/policy (`cargo audit`, `cargo deny`)
 
 ## Gated suites
 
 - Ignored end-to-end suites are executed only when explicitly enabled:
-  - `SHUCK_RUN_IGNORED_E2E=1`
-  - `SHUCK_RUN_NET_E2E=1`
+  - `HUSKER_RUN_IGNORED_E2E=1`
+  - `HUSKER_RUN_NET_E2E=1`
 - These lanes run in CI and nightly with environment gates.
 
 ## Nightly lane
@@ -35,9 +35,9 @@
 - Workspace coverage floor (enforced by `make coverage-ci`):
   - line >= 77%
 - Coverage scope exclusions:
-  - `crates/shuck/src/main.rs` (CLI binary entrypoint orchestration)
-  - `crates/shuck-agent/src/main.rs` (agent binary entrypoint bootstrap)
-  - `crates/shuck-vmm/src/apple_vz.rs` (platform-specific Virtualization.framework FFI shim)
+  - `crates/husker/src/main.rs` (CLI binary entrypoint orchestration)
+  - `crates/husker-agent/src/main.rs` (agent binary entrypoint bootstrap)
+  - `crates/husker-vmm/src/apple_vz.rs` (platform-specific Virtualization.framework FFI shim)
 - Last validated:
   - 2026-02-17 (`make coverage-ci` passed with 77.15% line coverage in enforced scope)
 

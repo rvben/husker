@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | PERF-001 | Rework `logs?follow=true` to stream without full-file preload | P1 | Done | Commit `ded9179`, bounded preload + streaming follow |
 | PERF-002 | Add payload size limits and streaming patterns for read/write file endpoints | P1 | Done | Commit `ded9179`, policy-enforced file size limits |
-| PERF-003 | Add benchmark harness for VM create, exec, shell latency, log throughput | P2 | Done | Commit `762f3dc`, `crates/shuck-api/tests/perf_baseline.rs` |
+| PERF-003 | Add benchmark harness for VM create, exec, shell latency, log throughput | P2 | Done | Commit `762f3dc`, `crates/husker-api/tests/perf_baseline.rs` |
 | PERF-004 | Add p95 and p99 latency SLOs and fail CI on major regression | P2 | Done | Commit `762f3dc`, perf baseline CI lane |
 | PERF-005 | Profile protocol encoding and evaluate switching to optimized base64 crate | P3 | Done | Commit `ec097fb`, `docs/performance/protocol-encoding-evaluation.md` |
 | PERF-006 | Optimize hot allocation paths in shell relay loops | P3 | Done | Commit `ded9179`, shell/log relay hot paths tightened and bounded |
@@ -31,9 +31,9 @@
 ## Notes
 
 - Source hotspots:
-  - `/Users/ruben/Projects/shuck/crates/shuck-api/src/lib.rs`
-  - `/Users/ruben/Projects/shuck/crates/shuck-agent/src/lib.rs`
-  - `/Users/ruben/Projects/shuck/crates/shuck-agent-proto/src/lib.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-api/src/lib.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-agent/src/lib.rs`
+  - `/Users/ruben/Projects/husker/crates/husker-agent-proto/src/lib.rs`
 
 ## Progress log
 
