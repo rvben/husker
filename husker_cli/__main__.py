@@ -1,4 +1,4 @@
-"""Shim that locates the native shuck binary installed by maturin and execs it."""
+"""Shim that locates the native husker binary installed by maturin and execs it."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from pathlib import Path
 
 
 def _find_native_binary() -> str:
-    """Return the path to the native shuck binary shipped in the wheel."""
-    bin_name = "shuck.exe" if sys.platform == "win32" else "shuck"
+    """Return the path to the native husker binary shipped in the wheel."""
+    bin_name = "husker.exe" if sys.platform == "win32" else "husker"
 
     # maturin installs the binary into the environment's Scripts/bin dir,
     # which is already on PATH for an activated venv or system install.
@@ -20,14 +20,14 @@ def _find_native_binary() -> str:
         return on_path
 
     # Fallback: look next to the sys.executable (common on Windows, useful
-    # when the shim is invoked via an explicit python -m shuck_cli).
+    # when the shim is invoked via an explicit python -m husker_cli).
     candidate = Path(sys.executable).parent / bin_name
     if candidate.exists():
         return str(candidate)
 
     raise FileNotFoundError(
-        "Could not find the native shuck binary. Reinstall the package with "
-        "'pip install --force-reinstall shuck' or build from source."
+        "Could not find the native husker binary. Reinstall the package with "
+        "'pip install --force-reinstall husker' or build from source."
     )
 
 
