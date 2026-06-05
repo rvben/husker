@@ -1,9 +1,9 @@
 [package]
-name = "shuck"
-version = "0.0.2"
+name = "husker"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.90"
-description = "Deprecated: shuck was renamed to husker. See https://github.com/rvben/husker"
+description = "Placeholder for the husker microVM manager. The first real release is not yet on crates.io."
 license = "MIT"
 repository = "https://github.com/rvben/husker"
 homepage = "https://github.com/rvben/husker"
@@ -13,7 +13,7 @@ keywords = ["microvm", "firecracker", "virtualization"]
 categories = ["command-line-utilities", "virtualization"]
 
 [[bin]]
-name = "shuck"
+name = "husker"
 path = "src/main.rs"
 
 # Declared as its own workspace root so the outer husker workspace does not

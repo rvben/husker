@@ -1,9 +1,8 @@
 fn main() {
-    eprintln!("shuck is not yet available on crates.io.");
+    eprintln!("shuck has been renamed to husker.");
     eprintln!();
-    eprintln!("This is a placeholder publication reserving the crate name while the");
-    eprintln!("project works toward its first release. Track progress at:");
+    eprintln!("Install the current tool from:");
     eprintln!();
-    eprintln!("    https://github.com/rvben/shuck");
+    eprintln!("    https://github.com/rvben/husker");
     std::process::exit(1);
 }

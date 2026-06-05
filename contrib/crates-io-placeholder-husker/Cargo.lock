@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "shuck"
-version = "0.0.2"
+name = "husker"
+version = "0.0.1"
