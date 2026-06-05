@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test for a multi-node k3s cluster on Shuck microVMs.
+# End-to-end test for a multi-node k3s cluster on Husker microVMs.
 #
 # Boots a k3s server and 2 agent nodes, waits for all nodes to become Ready,
 # deploys workloads, validates networking, and tears everything down.
@@ -7,14 +7,14 @@
 # Usage:  sudo ./guest/test-k3s-cluster.sh [rootfs]
 #
 # Requires:
-#   - Running shuck daemon (shuck daemon --listen 127.0.0.1:7777)
+#   - Running husker daemon (husker daemon --listen 127.0.0.1:7777)
 #   - k3s-rootfs.ext4 built via guest/build-k3s-rootfs.sh
 #   - Sufficient memory (~3 GB for the cluster)
 
 set -uo pipefail
 
-ROOTFS="${1:-/mnt/shuck/k3s-rootfs.ext4}"
-KERNEL="${K3S_KERNEL:-/mnt/shuck/vmlinux-k3s}"
+ROOTFS="${1:-/mnt/husker/k3s-rootfs.ext4}"
+KERNEL="${K3S_KERNEL:-/mnt/husker/vmlinux-k3s}"
 SERVER_NAME="k3s-server"
 AGENT_NAMES=("k3s-agent-1" "k3s-agent-2")
 SERVER_CPUS=2
@@ -34,7 +34,7 @@ pass() { PASS=$((PASS + 1)); TESTS_RUN=$((TESTS_RUN + 1)); echo "  [PASS] $*"; }
 fail() { FAIL=$((FAIL + 1)); TESTS_RUN=$((TESTS_RUN + 1)); echo "  [FAIL] $*"; }
 
 kubectl_server() {
-    shuck exec "$SERVER_NAME" -- k3s kubectl "$@"
+    husker exec "$SERVER_NAME" -- k3s kubectl "$@"
 }
 
 # Apply a YAML manifest inside the server VM.
@@ -42,7 +42,7 @@ kubectl_server() {
 kubectl_apply() {
     local yaml
     yaml=$(cat)
-    shuck exec "$SERVER_NAME" -- sh -c "k3s kubectl apply -f - <<'K3SEOF'
+    husker exec "$SERVER_NAME" -- sh -c "k3s kubectl apply -f - <<'K3SEOF'
 ${yaml}
 K3SEOF"
 }
@@ -68,9 +68,9 @@ wait_for() {
 cleanup() {
     log "Tearing down cluster..."
     for agent in "${AGENT_NAMES[@]}"; do
-        shuck destroy "$agent" 2>/dev/null && log "Destroyed VM: $agent" || true
+        husker destroy "$agent" 2>/dev/null && log "Destroyed VM: $agent" || true
     done
-    shuck destroy "$SERVER_NAME" 2>/dev/null && log "Destroyed VM: $SERVER_NAME" || true
+    husker destroy "$SERVER_NAME" 2>/dev/null && log "Destroyed VM: $SERVER_NAME" || true
     log "Cluster torn down"
 }
 trap cleanup EXIT
@@ -100,15 +100,15 @@ log ""
 log "=== Phase 1: Boot cluster ==="
 
 log "Starting k3s server..."
-shuck run --name "$SERVER_NAME" --kernel "$KERNEL" --cpus "$SERVER_CPUS" --memory "$SERVER_MEM" \
+husker run --name "$SERVER_NAME" --kernel "$KERNEL" --cpus "$SERVER_CPUS" --memory "$SERVER_MEM" \
     --userdata guest/k3s-server.sh "$ROOTFS" || { fail "Failed to create k3s server VM"; exit 1; }
 
 # Wait for k3s API to be reachable
-wait_for "k3s server API" 300 shuck exec "$SERVER_NAME" -- k3s kubectl get node || exit 1
+wait_for "k3s server API" 300 husker exec "$SERVER_NAME" -- k3s kubectl get node || exit 1
 
 # Get join token
 log "Retrieving join token..."
-K3S_TOKEN=$(shuck exec "$SERVER_NAME" -- cat /var/lib/rancher/k3s/server/node-token)
+K3S_TOKEN=$(husker exec "$SERVER_NAME" -- cat /var/lib/rancher/k3s/server/node-token)
 if [ -z "$K3S_TOKEN" ]; then
     fail "Failed to retrieve join token"
     exit 1
@@ -118,7 +118,7 @@ log "Token acquired"
 # Start agents
 for agent in "${AGENT_NAMES[@]}"; do
     log "Starting $agent..."
-    shuck run --name "$agent" --kernel "$KERNEL" --cpus "$AGENT_CPUS" --memory "$AGENT_MEM" \
+    husker run --name "$agent" --kernel "$KERNEL" --cpus "$AGENT_CPUS" --memory "$AGENT_MEM" \
         --userdata guest/k3s-agent.sh \
         -e "K3S_URL=$K3S_URL" \
         -e "K3S_TOKEN=$K3S_TOKEN" \
@@ -128,7 +128,7 @@ done
 # Wait for all nodes to join
 EXPECTED_NODES=$(( 1 + ${#AGENT_NAMES[@]} ))
 wait_for "all $EXPECTED_NODES nodes Ready" 300 \
-    sh -c "shuck exec $SERVER_NAME -- k3s kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready' | grep -q '^${EXPECTED_NODES}$'" || exit 1
+    sh -c "husker exec $SERVER_NAME -- k3s kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready' | grep -q '^${EXPECTED_NODES}$'" || exit 1
 
 log ""
 log "=== Cluster status ==="
@@ -150,7 +150,7 @@ fi
 
 # Test: CoreDNS running
 wait_for "CoreDNS ready" 300 \
-    sh -c "shuck exec $SERVER_NAME -- k3s kubectl -n kube-system get pods -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -q '1/1.*Running'"
+    sh -c "husker exec $SERVER_NAME -- k3s kubectl -n kube-system get pods -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -q '1/1.*Running'"
 
 COREDNS_STATUS=$(kubectl_server -n kube-system get pods -l k8s-app=kube-dns --no-headers 2>/dev/null | head -1)
 if echo "$COREDNS_STATUS" | grep -q "1/1.*Running"; then
@@ -206,7 +206,7 @@ YAML
 
 # Wait for deployment rollout
 wait_for "nginx deployment ready" 180 \
-    sh -c "shuck exec $SERVER_NAME -- k3s kubectl get deployment nginx-test --no-headers 2>/dev/null | grep -q '3/3'"
+    sh -c "husker exec $SERVER_NAME -- k3s kubectl get deployment nginx-test --no-headers 2>/dev/null | grep -q '3/3'"
 
 # Test: all 3 replicas running
 READY_REPLICAS=$(kubectl_server get deployment nginx-test -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
@@ -270,7 +270,7 @@ sleep 5
 CLUSTER_IP=$(kubectl_server get svc nginx-clusterip -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
 log "ClusterIP: $CLUSTER_IP"
 
-CLUSTERIP_RESULT=$(shuck exec "$SERVER_NAME" -- \
+CLUSTERIP_RESULT=$(husker exec "$SERVER_NAME" -- \
     sh -c "curl -sf --max-time 10 http://${CLUSTER_IP} 2>/dev/null || wget -qO- --timeout=10 http://${CLUSTER_IP} 2>/dev/null" || true)
 if echo "$CLUSTERIP_RESULT" | grep -qi "nginx\|welcome"; then
     pass "ClusterIP service reachable at $CLUSTER_IP"
@@ -279,7 +279,7 @@ else
 fi
 
 # Test: NodePort service reachable from server node
-NODEPORT_RESULT=$(shuck exec "$SERVER_NAME" -- \
+NODEPORT_RESULT=$(husker exec "$SERVER_NAME" -- \
     sh -c "curl -sf --max-time 10 http://127.0.0.1:30080 2>/dev/null || wget -qO- --timeout=10 http://127.0.0.1:30080 2>/dev/null" || true)
 if echo "$NODEPORT_RESULT" | grep -qi "nginx\|welcome"; then
     pass "NodePort service reachable on port 30080"
@@ -297,7 +297,7 @@ COREDNS_IP=$(kubectl_server get svc -n kube-system kube-dns -o jsonpath='{.spec.
 log "CoreDNS ClusterIP: $COREDNS_IP"
 
 # Use dig/nslookup from the server node (host has access to ClusterIPs via kube-proxy)
-DNS_RESULT=$(shuck exec "$SERVER_NAME" -- \
+DNS_RESULT=$(husker exec "$SERVER_NAME" -- \
     sh -c "nslookup nginx-clusterip.default.svc.cluster.local $COREDNS_IP 2>&1" || true)
 if echo "$DNS_RESULT" | grep -qi "address.*10\.\|name:.*nginx"; then
     pass "CoreDNS resolves service name (from server node)"
@@ -325,7 +325,7 @@ if [ -n "$NGINX_POD" ]; then
     K8S_DNS=$(kubectl_server exec "$NGINX_POD" -- \
         sh -c "nslookup kubernetes.default.svc.cluster.local 2>&1" 2>/dev/null || true)
 else
-    K8S_DNS=$(shuck exec "$SERVER_NAME" -- \
+    K8S_DNS=$(husker exec "$SERVER_NAME" -- \
         sh -c "nslookup kubernetes.default.svc.cluster.local $COREDNS_IP 2>&1" || true)
 fi
 if echo "$K8S_DNS" | grep -qi "address.*10\.43\.\|name:.*kubernetes"; then
@@ -352,7 +352,7 @@ done
 FIRST_POD_IP=$(kubectl_server get pods -l app=nginx-test -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
 SECOND_POD_IP=$(kubectl_server get pods -l app=nginx-test -o jsonpath='{.items[1].status.podIP}' 2>/dev/null)
 if [ -n "$FIRST_POD_IP" ]; then
-    CROSS_RESULT=$(shuck exec "$SERVER_NAME" -- \
+    CROSS_RESULT=$(husker exec "$SERVER_NAME" -- \
         sh -c "curl -sf --max-time 10 http://${FIRST_POD_IP} 2>/dev/null || wget -qO- --timeout=10 http://${FIRST_POD_IP} 2>/dev/null" || true)
     if echo "$CROSS_RESULT" | grep -qi "nginx\|welcome"; then
         pass "Pod-to-pod communication works (via pod IP $FIRST_POD_IP)"
@@ -365,7 +365,7 @@ fi
 
 # Also test second pod IP (may be on a different node)
 if [ -n "$SECOND_POD_IP" ] && [ "$SECOND_POD_IP" != "$FIRST_POD_IP" ]; then
-    CROSS_RESULT2=$(shuck exec "$SERVER_NAME" -- \
+    CROSS_RESULT2=$(husker exec "$SERVER_NAME" -- \
         sh -c "curl -sf --max-time 10 http://${SECOND_POD_IP} 2>/dev/null || wget -qO- --timeout=10 http://${SECOND_POD_IP} 2>/dev/null" || true)
     if echo "$CROSS_RESULT2" | grep -qi "nginx\|welcome"; then
         pass "Second pod reachable (via pod IP $SECOND_POD_IP)"
@@ -402,7 +402,7 @@ spec:
   containers:
   - name: writer
     image: busybox:1.36
-    command: ["sh", "-c", "echo 'shuck-k3s-storage-ok' > /data/test.txt && sleep 3600"]
+    command: ["sh", "-c", "echo 'husker-k3s-storage-ok' > /data/test.txt && sleep 3600"]
     volumeMounts:
     - name: data
       mountPath: /data
@@ -414,15 +414,15 @@ spec:
 YAML
 
 wait_for "storage-test pod Running" 120 \
-    sh -c "shuck exec $SERVER_NAME -- k3s kubectl get pod storage-test --no-headers 2>/dev/null | grep -q Running"
+    sh -c "husker exec $SERVER_NAME -- k3s kubectl get pod storage-test --no-headers 2>/dev/null | grep -q Running"
 
 # Verify data was written
-STORAGE_DATA=$(shuck exec "$SERVER_NAME" -- \
+STORAGE_DATA=$(husker exec "$SERVER_NAME" -- \
     k3s kubectl exec storage-test -- cat /data/test.txt 2>/dev/null || true)
-if [ "$STORAGE_DATA" = "shuck-k3s-storage-ok" ]; then
+if [ "$STORAGE_DATA" = "husker-k3s-storage-ok" ]; then
     pass "Persistent volume: data written and read back"
 else
-    fail "Persistent volume: expected 'shuck-k3s-storage-ok', got '$STORAGE_DATA'"
+    fail "Persistent volume: expected 'husker-k3s-storage-ok', got '$STORAGE_DATA'"
 fi
 
 # Test PVC is bound

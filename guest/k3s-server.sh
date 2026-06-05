@@ -5,15 +5,15 @@
 # Uses host-gw flannel backend (no VXLAN kernel support needed).
 #
 # Usage:
-#   shuck run --name k3s-server --cpus 2 --memory 2048 \
+#   husker run --name k3s-server --cpus 2 --memory 2048 \
 #       --userdata guest/k3s-server.sh k3s-rootfs.ext4
 #
 # After boot, retrieve the join token:
-#   shuck exec k3s-server -- cat /var/lib/rancher/k3s/server/node-token
+#   husker exec k3s-server -- cat /var/lib/rancher/k3s/server/node-token
 
 set -e
 
-echo "[shuck] Installing k3s server systemd service..."
+echo "[husker] Installing k3s server systemd service..."
 
 cat > /etc/systemd/system/k3s-server.service << 'EOF'
 [Unit]
@@ -39,12 +39,12 @@ EOF
 systemctl daemon-reload
 systemctl enable --now k3s-server.service
 
-echo "[shuck] Waiting for node to become Ready..."
+echo "[husker] Waiting for node to become Ready..."
 timeout 180 sh -c '
     until k3s kubectl get node 2>/dev/null | grep -q " Ready"; do
         sleep 3
     done
 '
 
-echo "[shuck] k3s server is ready."
+echo "[husker] k3s server is ready."
 k3s kubectl get node

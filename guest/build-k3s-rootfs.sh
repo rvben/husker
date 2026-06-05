@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build a k3s-ready ext4 rootfs for Firecracker microVMs.
 #
-# Creates an Ubuntu 22.04 (Jammy) rootfs with k3s, systemd, and the shuck
+# Creates an Ubuntu 22.04 (Jammy) rootfs with k3s, systemd, and the husker
 # guest agent pre-installed. The image boots via systemd, starts the agent
 # on vsock, and has all k3s dependencies (iptables, conntrack, etc.).
 #
@@ -23,20 +23,20 @@ case "$ARCH" in
     *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# Locate the shuck-agent binary
+# Locate the husker-agent binary
 AGENT_BIN=""
 for candidate in \
-    "target/x86_64-unknown-linux-musl/agent/shuck-agent" \
-    "target/aarch64-unknown-linux-musl/agent/shuck-agent" \
-    "target/release/shuck-agent" \
-    "target/debug/shuck-agent"; do
+    "target/x86_64-unknown-linux-musl/agent/husker-agent" \
+    "target/aarch64-unknown-linux-musl/agent/husker-agent" \
+    "target/release/husker-agent" \
+    "target/debug/husker-agent"; do
     if [[ -f "$candidate" ]]; then
         AGENT_BIN="$candidate"
         break
     fi
 done
 if [[ -z "$AGENT_BIN" ]]; then
-    echo "Error: shuck-agent binary not found. Run 'make build-agent' first."
+    echo "Error: husker-agent binary not found. Run 'make build-agent' first."
     exit 1
 fi
 
@@ -93,20 +93,20 @@ for cmd in kubectl crictl ctr; do
     ln -sf k3s "$MOUNT_DIR/usr/local/bin/$cmd"
 done
 
-echo "==> Installing shuck-agent"
-cp "$AGENT_BIN" "$MOUNT_DIR/usr/local/bin/shuck-agent"
-chmod 755 "$MOUNT_DIR/usr/local/bin/shuck-agent"
+echo "==> Installing husker-agent"
+cp "$AGENT_BIN" "$MOUNT_DIR/usr/local/bin/husker-agent"
+chmod 755 "$MOUNT_DIR/usr/local/bin/husker-agent"
 
-echo "==> Creating shuck-agent systemd service"
-cat > "$MOUNT_DIR/etc/systemd/system/shuck-agent.service" << 'EOF'
+echo "==> Creating husker-agent systemd service"
+cat > "$MOUNT_DIR/etc/systemd/system/husker-agent.service" << 'EOF'
 [Unit]
-Description=Shuck Guest Agent
+Description=Husker Guest Agent
 After=network.target
 ConditionVirtualization=vm
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/shuck-agent
+ExecStart=/usr/local/bin/husker-agent
 Restart=always
 RestartSec=1
 
@@ -114,7 +114,7 @@ RestartSec=1
 WantedBy=multi-user.target
 EOF
 
-chroot "$MOUNT_DIR" systemctl enable shuck-agent.service
+chroot "$MOUNT_DIR" systemctl enable husker-agent.service
 
 echo "==> Configuring serial console (ttyS0)"
 chroot "$MOUNT_DIR" systemctl enable serial-getty@ttyS0.service
@@ -129,7 +129,7 @@ EOF
 echo "==> Setting empty root password"
 chroot "$MOUNT_DIR" passwd -d root
 
-echo "==> Disabling systemd-resolved (shuck injects /etc/resolv.conf directly)"
+echo "==> Disabling systemd-resolved (husker injects /etc/resolv.conf directly)"
 chroot "$MOUNT_DIR" systemctl disable systemd-resolved.service 2>/dev/null || true
 chroot "$MOUNT_DIR" systemctl mask systemd-resolved.service
 rm -f "$MOUNT_DIR/etc/resolv.conf"
@@ -139,7 +139,7 @@ nameserver 1.1.1.1
 EOF
 
 echo "==> Configuring hostname"
-echo "shuck-k3s" > "$MOUNT_DIR/etc/hostname"
+echo "husker-k3s" > "$MOUNT_DIR/etc/hostname"
 
 echo "==> Cleaning up image"
 rm -rf "$MOUNT_DIR/tmp/"* "$MOUNT_DIR/var/tmp/"*

@@ -7,14 +7,14 @@
 #
 # Defaults: ARCH=aarch64  ALPINE_VERSION=3.21
 #
-# Output (aarch64):  ~/.local/share/shuck/kernels/Image-virt
-# Output (x86_64):   ~/.local/share/shuck/kernels/vmlinux
+# Output (aarch64):  ~/.local/share/husker/kernels/Image-virt
+# Output (x86_64):   ~/.local/share/husker/kernels/vmlinux
 
 set -euo pipefail
 
 ARCH="${1:-aarch64}"
 ALPINE_VERSION="${2:-3.21}"
-OUTPUT_DIR="${SHUCK_KERNEL_OUT:-${HOME}/.local/share/shuck/kernels}"
+OUTPUT_DIR="${HUSKER_KERNEL_OUT:-${HOME}/.local/share/husker/kernels}"
 WORK_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT

@@ -23,8 +23,8 @@
 ::sysinit:/sbin/ip link set eth0 up 2>/dev/null
 ::sysinit:/sbin/udhcpc -b -i eth0
 
-# Start shuck guest agent
-::respawn:/usr/local/bin/shuck-agent
+# Start husker guest agent
+::respawn:/usr/local/bin/husker-agent
 
 # Virtio console for Apple VZ — guarded because Firecracker guests have no
 # /dev/hvc0 and respawn would otherwise flood the serial log with open errors.

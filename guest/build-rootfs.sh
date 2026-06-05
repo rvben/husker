@@ -1,19 +1,19 @@
 #!/bin/bash
-# Build a baseline Alpine ext4 rootfs with shuck-agent and inittab baked in.
+# Build a baseline Alpine ext4 rootfs with husker-agent and inittab baked in.
 #
 # Usage:
 #   ./guest/build-rootfs.sh [ARCH] [ALPINE_VERSION]
 #
 # Requires: debugfs (e2fsprogs), agent binary already built for $ARCH at
-#   target/${ARCH}-unknown-linux-musl/agent/shuck-agent
+#   target/${ARCH}-unknown-linux-musl/agent/husker-agent
 #
-# Output: ~/.local/share/shuck/images/alpine-${ARCH}.ext4 (256 MiB)
+# Output: ~/.local/share/husker/images/alpine-${ARCH}.ext4 (256 MiB)
 
 set -euo pipefail
 
 ARCH="${1:-aarch64}"
 ALPINE_VERSION="${2:-3.21}"
-OUTPUT_DIR="${SHUCK_IMAGE_OUT:-${HOME}/.local/share/shuck/images}"
+OUTPUT_DIR="${HUSKER_IMAGE_OUT:-${HOME}/.local/share/husker/images}"
 WORK_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
@@ -31,7 +31,7 @@ MKFS_EXT4="${MKFS_EXT4:-$(command -v mkfs.ext4 2>/dev/null || find /opt/homebrew
 [ -x "$DEBUGFS" ]   || { echo "ERROR: debugfs not found (brew install e2fsprogs)" >&2; exit 1; }
 [ -x "$MKFS_EXT4" ] || { echo "ERROR: mkfs.ext4 not found (brew install e2fsprogs)" >&2; exit 1; }
 
-AGENT_BIN="$SCRIPT_DIR/target/${ARCH}-unknown-linux-musl/agent/shuck-agent"
+AGENT_BIN="$SCRIPT_DIR/target/${ARCH}-unknown-linux-musl/agent/husker-agent"
 [ -f "$AGENT_BIN" ] || { echo "ERROR: agent binary missing at $AGENT_BIN (run make build-agent-aarch64 / build-agent)" >&2; exit 1; }
 
 # ── Fetch Alpine minirootfs tarball ──────────────────────────────────
@@ -44,7 +44,7 @@ curl -sL "${MINI_URL}${MINI_NAME}" -o "$WORK_DIR/minirootfs.tar.gz"
 # ── Populate an ext4 image via debugfs -f (no loop mount needed) ─────
 IMG="$WORK_DIR/rootfs.ext4"
 truncate -s 256M "$IMG"
-"$MKFS_EXT4" -q -F -L shuck-root "$IMG"
+"$MKFS_EXT4" -q -F -L husker-root "$IMG"
 
 # Extract and layer the minirootfs, agent, and inittab before injecting.
 TAR_DIR="$WORK_DIR/extract"
@@ -52,8 +52,8 @@ mkdir -p "$TAR_DIR"
 tar xzf "$WORK_DIR/minirootfs.tar.gz" -C "$TAR_DIR"
 
 mkdir -p "$TAR_DIR/usr/local/bin"
-cp "$AGENT_BIN" "$TAR_DIR/usr/local/bin/shuck-agent"
-chmod 0755 "$TAR_DIR/usr/local/bin/shuck-agent"
+cp "$AGENT_BIN" "$TAR_DIR/usr/local/bin/husker-agent"
+chmod 0755 "$TAR_DIR/usr/local/bin/husker-agent"
 mkdir -p "$TAR_DIR/etc"
 cp "$SCRIPT_DIR/guest/inittab" "$TAR_DIR/etc/inittab"
 chmod 0644 "$TAR_DIR/etc/inittab"
@@ -100,8 +100,8 @@ done ) >> "$DBG_CMDS"
 
 # debugfs exits 0 even when individual commands in the command file fail.
 # Probe the populated image for the agent binary before declaring success.
-if ! "$DEBUGFS" -R "stat /usr/local/bin/shuck-agent" "$IMG" 2>/dev/null | grep -q "Type: regular"; then
-    echo "ERROR: shuck-agent was not written to the image (debugfs populate may have failed)" >&2
+if ! "$DEBUGFS" -R "stat /usr/local/bin/husker-agent" "$IMG" 2>/dev/null | grep -q "Type: regular"; then
+    echo "ERROR: husker-agent was not written to the image (debugfs populate may have failed)" >&2
     exit 1
 fi
 

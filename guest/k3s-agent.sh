@@ -5,22 +5,22 @@
 # Sets the hostname to the VM name for unique node identity in the cluster.
 #
 # Requires K3S_URL and K3S_TOKEN environment variables, passed via:
-#   shuck run --name k3s-agent-1 --cpus 2 --memory 2048 \
+#   husker run --name k3s-agent-1 --cpus 2 --memory 2048 \
 #       --userdata guest/k3s-agent.sh \
 #       -e "K3S_URL=https://172.20.0.2:6443" \
-#       -e "K3S_TOKEN=$(shuck exec k3s-server -- cat /var/lib/rancher/k3s/server/node-token)" \
+#       -e "K3S_TOKEN=$(husker exec k3s-server -- cat /var/lib/rancher/k3s/server/node-token)" \
 #       k3s-rootfs.ext4
 
 set -e
 
 if [ -z "$K3S_URL" ] || [ -z "$K3S_TOKEN" ]; then
-    echo "[shuck] Error: K3S_URL and K3S_TOKEN must be set"
-    echo "  Pass via: shuck run -e K3S_URL=... -e K3S_TOKEN=..."
+    echo "[husker] Error: K3S_URL and K3S_TOKEN must be set"
+    echo "  Pass via: husker run -e K3S_URL=... -e K3S_TOKEN=..."
     exit 1
 fi
 
-echo "[shuck] Installing k3s agent systemd service..."
-echo "[shuck] Joining cluster at $K3S_URL"
+echo "[husker] Installing k3s agent systemd service..."
+echo "[husker] Joining cluster at $K3S_URL"
 
 cat > /etc/systemd/system/k3s-agent.service << EOF
 [Unit]
@@ -46,4 +46,4 @@ EOF
 systemctl daemon-reload
 systemctl enable --now k3s-agent.service
 
-echo "[shuck] k3s agent started (joining cluster via systemd)."
+echo "[husker] k3s agent started (joining cluster via systemd)."

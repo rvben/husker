@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INITTAB="$SCRIPT_DIR/inittab"
 BUILD_SCRIPT="$SCRIPT_DIR/build-initramfs.sh"
-INITRAMFS_PATH="${HOME}/.local/share/shuck/kernels/initramfs-virt.gz"
+INITRAMFS_PATH="${HOME}/.local/share/husker/kernels/initramfs-virt.gz"
 
 ERRORS=0
 TESTS=0
