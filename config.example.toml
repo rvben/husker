@@ -1,43 +1,43 @@
-# Shuck configuration file
+# Husker configuration file
 #
 # Config file discovery order:
 #   1. --config flag (explicit path)
-#   2. ~/.config/shuck/config.toml (user config)
-#   3. /etc/shuck/config.toml (system config)
+#   2. ~/.config/husker/config.toml (user config)
+#   3. /etc/husker/config.toml (system config)
 #
 # All fields are optional and have sensible defaults.
 
 # ── Storage ──────────────────────────────────────────────────────────
 
 # Base directory for VM images, state database, and runtime files.
-#   macOS default: ~/.local/share/shuck
-#   Linux default: /var/lib/shuck when writable, otherwise ~/.local/share/shuck
-#                  (honors $XDG_DATA_HOME). Setting SHUCK_DATA_DIR also
+#   macOS default: ~/.local/share/husker
+#   Linux default: /var/lib/husker when writable, otherwise ~/.local/share/husker
+#                  (honors $XDG_DATA_HOME). Setting HUSKER_DATA_DIR also
 #                  cascades to default_kernel/default_rootfs/default_initrd
 #                  unless those are set explicitly.
-# data_dir = "/var/lib/shuck"
+# data_dir = "/var/lib/husker"
 
 # ── Kernel ───────────────────────────────────────────────────────────
 
-# Default kernel used when --kernel is not passed to `shuck run`.
+# Default kernel used when --kernel is not passed to `husker run`.
 #   macOS default: <data_dir>/kernels/Image-virt   (uncompressed ARM64 Image)
 #   Linux default: <data_dir>/kernels/vmlinux       (uncompressed x86_64 ELF)
-# default_kernel = "/var/lib/shuck/kernels/vmlinux"
+# default_kernel = "/var/lib/husker/kernels/vmlinux"
 
-# Path to the default rootfs image. Used when `shuck run` is invoked
+# Path to the default rootfs image. Used when `husker run` is invoked
 # without an explicit rootfs argument.
 #   aarch64 default: <data_dir>/images/alpine-aarch64.ext4
 #   x86_64 default:  <data_dir>/images/alpine-x86_64.ext4
-# default_rootfs = "/var/lib/shuck/images/alpine-x86_64.ext4"
+# default_rootfs = "/var/lib/husker/images/alpine-x86_64.ext4"
 
 # Optional initrd/initramfs path used alongside the default kernel.
 # Apple VZ requires one for Alpine linux-virt (virtio_blk is a module,
 # not built-in) — build with `make build-initramfs`.
-# default_initrd = "/var/lib/shuck/kernels/initramfs-virt.gz"
+# default_initrd = "/var/lib/husker/kernels/initramfs-virt.gz"
 
-# Base URL for `shuck images pull`. Must host kernel-<arch>,
+# Base URL for `husker images pull`. Must host kernel-<arch>,
 # initramfs-<arch>.gz, rootfs-<arch>.ext4, and SHA256SUMS at the root.
-# images_base_url = "https://github.com/rvben/shuck/releases/latest/download"
+# images_base_url = "https://github.com/rvben/husker/releases/latest/download"
 
 # ── API Security and Limits ─────────────────────────────────────────
 
@@ -83,7 +83,7 @@
 # host_interface = "eth0"
 
 # Bridge device created by the daemon for guest networking.
-# bridge_name = "shuck0"
+# bridge_name = "husker0"
 
 # Subnet from which /30 blocks are allocated to each VM.
 # The gateway (.1 of the subnet) is assigned to the bridge.
@@ -97,16 +97,16 @@
 # All configuration values can be overridden via environment variables.
 # Environment variables take precedence over file-based config.
 #
-#   SHUCK_DATA_DIR         →  data_dir
-#   SHUCK_DEFAULT_KERNEL   →  default_kernel
-#   SHUCK_DEFAULT_ROOTFS   →  default_rootfs
-#   SHUCK_DEFAULT_INITRD   →  default_initrd
-#   SHUCK_IMAGES_BASE_URL  →  images_base_url
-#   SHUCK_FIRECRACKER_BIN  →  firecracker_bin    (Linux only)
-#   SHUCK_HOST_INTERFACE   →  host_interface     (Linux only)
-#   SHUCK_BRIDGE_NAME      →  bridge_name        (Linux only)
-#   SHUCK_BRIDGE_SUBNET    →  bridge_subnet      (Linux only)
-#   SHUCK_DNS_SERVERS      →  dns_servers        (Linux only, comma-separated)
+#   HUSKER_DATA_DIR         →  data_dir
+#   HUSKER_DEFAULT_KERNEL   →  default_kernel
+#   HUSKER_DEFAULT_ROOTFS   →  default_rootfs
+#   HUSKER_DEFAULT_INITRD   →  default_initrd
+#   HUSKER_IMAGES_BASE_URL  →  images_base_url
+#   HUSKER_FIRECRACKER_BIN  →  firecracker_bin    (Linux only)
+#   HUSKER_HOST_INTERFACE   →  host_interface     (Linux only)
+#   HUSKER_BRIDGE_NAME      →  bridge_name        (Linux only)
+#   HUSKER_BRIDGE_SUBNET    →  bridge_subnet      (Linux only)
+#   HUSKER_DNS_SERVERS      →  dns_servers        (Linux only, comma-separated)
 #
 # Example:
-#   SHUCK_DATA_DIR=/tmp/shuck shuck daemon
+#   HUSKER_DATA_DIR=/tmp/husker husker daemon

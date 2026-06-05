@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${SHUCK_DRILL_PORT:-17877}"
+PORT="${HUSKER_DRILL_PORT:-17877}"
 BASE_URL="http://127.0.0.1:${PORT}"
 DATA_DIR="$(mktemp -d)"
 LOG_FILE="$(mktemp)"
@@ -18,18 +18,18 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[graceful-shutdown] building daemon"
-cargo build --quiet --package shuck --no-default-features
+cargo build --quiet --package husker --no-default-features
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-BIN="${TARGET_DIR}/debug/shuck"
+BIN="${TARGET_DIR}/debug/husker"
 if [[ ! -x "${BIN}" ]]; then
   echo "[graceful-shutdown] expected ${BIN} to exist after build" >&2
   exit 1
 fi
 
 echo "[graceful-shutdown] starting daemon on ${BASE_URL}"
-SHUCK_DATA_DIR="${DATA_DIR}" \
-  RUST_LOG="${RUST_LOG:-shuck=info,shuck_api=info}" \
+HUSKER_DATA_DIR="${DATA_DIR}" \
+  RUST_LOG="${RUST_LOG:-husker=info,husker_api=info}" \
   "${BIN}" daemon --listen "127.0.0.1:${PORT}" \
   >"${LOG_FILE}" 2>&1 &
 PID=$!

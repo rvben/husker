@@ -1,21 +1,21 @@
 #!/bin/sh
-# shuck installer
+# husker installer
 #
 # Usage:
-#   curl -sSfL https://raw.githubusercontent.com/rvben/shuck/main/install.sh | sh
-#   curl -sSfL https://raw.githubusercontent.com/rvben/shuck/main/install.sh | sh -s -- --prefix /usr/local
+#   curl -sSfL https://raw.githubusercontent.com/rvben/husker/main/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/rvben/husker/main/install.sh | sh -s -- --prefix /usr/local
 #
 # Options:
 #   --prefix <dir>   Install prefix. Default: $HOME/.local
 #   --version <tag>  Pin a release tag (e.g. v0.1.2). Default: latest release.
 #
-# Env equivalents: SHUCK_PREFIX, SHUCK_VERSION
+# Env equivalents: HUSKER_PREFIX, HUSKER_VERSION
 
 set -eu
 
-REPO="rvben/shuck"
-PREFIX="${SHUCK_PREFIX:-$HOME/.local}"
-VERSION="${SHUCK_VERSION:-}"
+REPO="rvben/husker"
+PREFIX="${HUSKER_PREFIX:-$HOME/.local}"
+VERSION="${HUSKER_VERSION:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,17 +25,17 @@ while [ $# -gt 0 ]; do
     --version=*) VERSION="${1#--version=}"; shift ;;
     -h|--help)
       cat <<'USAGE'
-shuck installer
+husker installer
 
 Usage:
-  curl -sSfL https://raw.githubusercontent.com/rvben/shuck/main/install.sh | sh
-  curl -sSfL https://raw.githubusercontent.com/rvben/shuck/main/install.sh | sh -s -- --prefix /usr/local
+  curl -sSfL https://raw.githubusercontent.com/rvben/husker/main/install.sh | sh
+  curl -sSfL https://raw.githubusercontent.com/rvben/husker/main/install.sh | sh -s -- --prefix /usr/local
 
 Options:
   --prefix <dir>   Install prefix. Default: $HOME/.local
   --version <tag>  Pin a release tag (e.g. v0.1.2). Default: latest release.
 
-Env equivalents: SHUCK_PREFIX, SHUCK_VERSION
+Env equivalents: HUSKER_PREFIX, HUSKER_VERSION
 USAGE
       exit 0
       ;;
@@ -100,7 +100,7 @@ case "$VERSION" in
   *) VERSION="v$VERSION" ;;
 esac
 
-archive="shuck-${VERSION}-${target}.tar.gz"
+archive="husker-${VERSION}-${target}.tar.gz"
 url="https://github.com/${REPO}/releases/download/${VERSION}/${archive}"
 sha_url="${url}.sha256"
 
@@ -123,11 +123,11 @@ echo "Checksum OK."
 
 mkdir -p "${tmp}/extract" "${PREFIX}/bin"
 tar -xzf "${tmp}/${archive}" -C "${tmp}/extract"
-mv "${tmp}/extract/shuck" "${PREFIX}/bin/shuck"
-chmod +x "${PREFIX}/bin/shuck"
+mv "${tmp}/extract/husker" "${PREFIX}/bin/husker"
+chmod +x "${PREFIX}/bin/husker"
 
 echo
-echo "Installed shuck ${VERSION} to ${PREFIX}/bin/shuck"
+echo "Installed husker ${VERSION} to ${PREFIX}/bin/husker"
 
 case ":$PATH:" in
   *":${PREFIX}/bin:"*)
@@ -141,6 +141,6 @@ esac
 
 echo
 echo "Next steps:"
-echo "  shuck images pull        # fetch the default kernel + rootfs"
-echo "  shuck daemon &           # start the daemon"
-echo "  shuck run --name hello   # boot a VM"
+echo "  husker images pull        # fetch the default kernel + rootfs"
+echo "  husker daemon &           # start the daemon"
+echo "  husker run --name hello   # boot a VM"

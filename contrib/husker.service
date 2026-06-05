@@ -1,0 +1,19 @@
+[Unit]
+Description=Husker microVM manager daemon
+After=network.target
+Documentation=https://github.com/rvben/husker
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/husker daemon
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ReadWritePaths=/var/lib/husker
+RuntimeDirectory=husker
+
+[Install]
+WantedBy=multi-user.target

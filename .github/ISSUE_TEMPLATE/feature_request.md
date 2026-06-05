@@ -6,7 +6,7 @@ labels: enhancement
 
 ## Problem
 
-<!-- What are you trying to do that shuck doesn't support today? -->
+<!-- What are you trying to do that husker doesn't support today? -->
 
 ## Proposed solution
 

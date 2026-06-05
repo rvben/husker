@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${SHUCK_CHAOS_PORT:-17878}"
+PORT="${HUSKER_CHAOS_PORT:-17878}"
 BASE_URL="http://127.0.0.1:${PORT}"
 DATA_DIR="$(mktemp -d)"
 LOG1="$(mktemp)"
@@ -26,8 +26,8 @@ trap cleanup EXIT
 
 start_daemon() {
   local log_file="$1"
-  SHUCK_DATA_DIR="${DATA_DIR}" \
-    cargo run --quiet --package shuck --no-default-features -- daemon --listen "127.0.0.1:${PORT}" \
+  HUSKER_DATA_DIR="${DATA_DIR}" \
+    cargo run --quiet --package husker --no-default-features -- daemon --listen "127.0.0.1:${PORT}" \
     >"${log_file}" 2>&1 &
   LAST_PID="$!"
 }

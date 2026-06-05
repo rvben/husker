@@ -20,7 +20,7 @@ labels: bug
 
 ## Environment
 
-- `shuck --version`:
+- `husker --version`:
 - OS / arch: <!-- e.g. Ubuntu 22.04 x86_64, macOS 14 arm64 -->
 - Install method: <!-- pip, brew, installer script, release archive, from source -->
 - Backend: <!-- Firecracker / Apple VZ -->
@@ -32,7 +32,7 @@ labels: bug
 <summary>Daemon logs</summary>
 
 ```
-paste output from `shuck daemon` or `journalctl -u shuck --no-pager -n 200`
+paste output from `husker daemon` or `journalctl -u husker --no-pager -n 200`
 ```
 
 </details>

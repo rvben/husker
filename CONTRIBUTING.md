@@ -1,6 +1,6 @@
-# Contributing to shuck
+# Contributing to husker
 
-Thanks for your interest. shuck is pre-1.0 and moves quickly — please open an issue before starting non-trivial work so we can agree on scope.
+Thanks for your interest. husker is pre-1.0 and moves quickly — please open an issue before starting non-trivial work so we can agree on scope.
 
 ## Development setup
 

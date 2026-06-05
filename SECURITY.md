@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report security vulnerabilities privately via GitHub Security Advisories:
-<https://github.com/rvben/shuck/security/advisories/new>
+<https://github.com/rvben/husker/security/advisories/new>
 
 Do not open public issues for security reports. Expect an initial response within 72 hours.
 
@@ -15,9 +15,9 @@ Only the latest `0.x` release receives security fixes. Pre-1.0 releases do not g
 
 In scope:
 
-- `shuck` daemon and CLI (`crates/shuck`, `crates/shuck-api`, `crates/shuck-core`)
-- Guest agent protocol and host-guest channel (`crates/shuck-agent`, `crates/shuck-agent-proto`)
-- Host networking and port-forward path (`crates/shuck-net`, Linux)
+- `husker` daemon and CLI (`crates/husker`, `crates/husker-api`, `crates/husker-core`)
+- Guest agent protocol and host-guest channel (`crates/husker-agent`, `crates/husker-agent-proto`)
+- Host networking and port-forward path (`crates/husker-net`, Linux)
 - Default image build pipeline (`.github/workflows/build-images.yml`, `guest/`)
 
 Out of scope:

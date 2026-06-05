@@ -8,5 +8,5 @@ memory: "8GiB"
 disk: "30GiB"
 mountType: virtiofs
 mounts:
-  - location: "~/Projects/shuck"
+  - location: "~/Projects/husker"
     writable: true
