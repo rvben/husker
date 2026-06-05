@@ -68,10 +68,10 @@ jobs:
         run: |
           mkdir -p stage
           KERNEL_SRC=$( [ "${{ matrix.arch }}" = "aarch64" ] && echo Image-virt || echo vmlinux )
-          cp "$HOME/.local/share/shuck/kernels/$KERNEL_SRC" "stage/kernel-${{ matrix.arch }}"
+          cp "$HOME/.local/share/husker/kernels/$KERNEL_SRC" "stage/kernel-${{ matrix.arch }}"
           INITRAMFS_SRC=$( [ "${{ matrix.arch }}" = "aarch64" ] && echo initramfs-virt.gz || echo initramfs-x86_64-virt.gz )
-          cp "$HOME/.local/share/shuck/kernels/$INITRAMFS_SRC" "stage/initramfs-${{ matrix.arch }}.gz"
-          cp "$HOME/.local/share/shuck/images/alpine-${{ matrix.arch }}.ext4" \
+          cp "$HOME/.local/share/husker/kernels/$INITRAMFS_SRC" "stage/initramfs-${{ matrix.arch }}.gz"
+          cp "$HOME/.local/share/husker/images/alpine-${{ matrix.arch }}.ext4" \
              "stage/rootfs-${{ matrix.arch }}.ext4"
           ( cd stage && sha256sum kernel-* initramfs-* rootfs-* > "SHA256SUMS-${{ matrix.arch }}" )
 
@@ -115,13 +115,13 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Default images ${{ steps.tag.outputs.tag }}
           body: |
-            Default kernel, initramfs, and rootfs images for shuck. Built from Alpine 3.21
+            Default kernel, initramfs, and rootfs images for husker. Built from Alpine 3.21
             minirootfs + linux-virt apk. Verify downloads against SHA256SUMS.
 
             File naming:
               kernel-<arch>            (uncompressed Linux Image / vmlinux)
               initramfs-<arch>.gz      (gzipped cpio, loads virtio_blk before root mount)
-              rootfs-<arch>.ext4       (Alpine + shuck-agent baked in)
+              rootfs-<arch>.ext4       (Alpine + husker-agent baked in)
           files: release/*
 
       # Only runs on workflow_dispatch with dry_run=true (default).

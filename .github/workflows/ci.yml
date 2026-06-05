@@ -102,8 +102,8 @@ jobs:
     name: Ignored E2E (Gated)
     runs-on: ubuntu-latest
     env:
-      SHUCK_RUN_IGNORED_E2E: ${{ vars.SHUCK_RUN_IGNORED_E2E }}
-      SHUCK_RUN_NET_E2E: ${{ vars.SHUCK_RUN_NET_E2E }}
+      HUSKER_RUN_IGNORED_E2E: ${{ vars.HUSKER_RUN_IGNORED_E2E }}
+      HUSKER_RUN_NET_E2E: ${{ vars.HUSKER_RUN_NET_E2E }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

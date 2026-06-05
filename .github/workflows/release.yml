@@ -90,7 +90,7 @@ jobs:
 
       - name: Build binary (Linux, cross via zigbuild for manylinux_2_28)
         if: runner.os == 'Linux'
-        run: cargo zigbuild --release --target ${{ matrix.target }}.2.28 --package shuck
+        run: cargo zigbuild --release --target ${{ matrix.target }}.2.28 --package husker
 
       - name: Build wheel (Linux, maturin + zig for manylinux_2_28)
         if: runner.os == 'Linux'
@@ -99,10 +99,10 @@ jobs:
       - name: Build binary (macOS, no-default-features + codesign)
         if: runner.os == 'macOS'
         run: |
-          cargo build --release --no-default-features --target ${{ matrix.target }} --package shuck
-          codesign --entitlements shuck.entitlements --force --sign - \
-            target/${{ matrix.target }}/release/shuck
-          codesign -d --entitlements :- target/${{ matrix.target }}/release/shuck
+          cargo build --release --no-default-features --target ${{ matrix.target }} --package husker
+          codesign --entitlements husker.entitlements --force --sign - \
+            target/${{ matrix.target }}/release/husker
+          codesign -d --entitlements :- target/${{ matrix.target }}/release/husker
 
       - name: Build wheel (macOS, no-default-features)
         if: runner.os == 'macOS'
@@ -115,12 +115,12 @@ jobs:
           mkdir -p wheel-extract
           WHEEL=$(ls dist/*.whl)
           wheel unpack "$WHEEL" -d wheel-extract
-          BIN=$(find wheel-extract -type f -name shuck | head -1)
+          BIN=$(find wheel-extract -type f -name husker | head -1)
           if [[ -z "$BIN" ]]; then
-            echo "error: shuck binary not found in wheel" >&2
+            echo "error: husker binary not found in wheel" >&2
             exit 1
           fi
-          codesign --entitlements shuck.entitlements --force --sign - "$BIN"
+          codesign --entitlements husker.entitlements --force --sign - "$BIN"
           EXTRACT_DIR=$(find wheel-extract -maxdepth 1 -mindepth 1 -type d | head -1)
           rm "$WHEEL"
           wheel pack "$EXTRACT_DIR" --dest-dir dist/
@@ -128,7 +128,7 @@ jobs:
 
       - name: Verify native binary (host-runnable targets)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
-        run: ./target/${{ matrix.target }}/release/shuck --version
+        run: ./target/${{ matrix.target }}/release/husker --version
 
       - name: Create release archive
         shell: bash
@@ -137,12 +137,12 @@ jobs:
           if [[ -z "${VERSION}" || "${VERSION}" == "${GITHUB_REF}" ]]; then
             VERSION="v0.0.0-dev"
           fi
-          ARCHIVE_NAME="shuck-${VERSION}-${{ matrix.target }}"
+          ARCHIVE_NAME="husker-${VERSION}-${{ matrix.target }}"
 
           mkdir -p release-package
-          cp target/${{ matrix.target }}/release/shuck release-package/shuck
+          cp target/${{ matrix.target }}/release/husker release-package/husker
           if [[ "${{ runner.os }}" == "macOS" ]]; then
-            cp shuck.entitlements release-package/
+            cp husker.entitlements release-package/
           fi
 
           tar -czf "${ARCHIVE_NAME}.tar.gz" -C release-package .
@@ -165,8 +165,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           path: |
-            shuck-*-${{ matrix.target }}.tar.gz
-            shuck-*-${{ matrix.target }}.tar.gz.sha256
+            husker-*-${{ matrix.target }}.tar.gz
+            husker-*-${{ matrix.target }}.tar.gz.sha256
           name: release-${{ matrix.target }}
 
   sdist:
@@ -237,8 +237,8 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            artifacts/release-*/shuck-*.tar.gz
-            artifacts/release-*/shuck-*.tar.gz.sha256
+            artifacts/release-*/husker-*.tar.gz
+            artifacts/release-*/husker-*.tar.gz.sha256
 
       - name: Dry Run Summary
         if: ${{ inputs.dry_run == true }}
@@ -261,7 +261,7 @@ jobs:
         id: hashes
         run: |
           for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-            sha=$(cat /tmp/artifacts/release-${target}/shuck-${{ github.ref_name }}-${target}.tar.gz.sha256 | awk '{print $1}')
+            sha=$(cat /tmp/artifacts/release-${target}/husker-${{ github.ref_name }}-${target}.tar.gz.sha256 | awk '{print $1}')
             key=$(echo "${target}" | tr '-' '_')
             echo "${key}=${sha}" >> "$GITHUB_OUTPUT"
           done
@@ -273,56 +273,56 @@ jobs:
           VERSION="${{ github.ref_name }}"
           VERSION_NUM="${VERSION#v}"
 
-          cat > /tmp/shuck.rb << 'FORMULA'
-          class Shuck < Formula
+          cat > /tmp/husker.rb << 'FORMULA'
+          class Husker < Formula
             desc "MicroVM manager built on Firecracker (Linux) and Apple Virtualization.framework (macOS)"
-            homepage "https://github.com/rvben/shuck"
+            homepage "https://github.com/rvben/husker"
             version "VERSION_NUM"
             license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/rvben/husker/releases/download/VERSION/husker-VERSION-aarch64-apple-darwin.tar.gz"
                 sha256 "SHA_AARCH64_APPLE_DARWIN"
               else
-                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/rvben/husker/releases/download/VERSION/husker-VERSION-x86_64-apple-darwin.tar.gz"
                 sha256 "SHA_X86_64_APPLE_DARWIN"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-aarch64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/rvben/husker/releases/download/VERSION/husker-VERSION-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "SHA_AARCH64_UNKNOWN_LINUX_GNU"
               else
-                url "https://github.com/rvben/shuck/releases/download/VERSION/shuck-VERSION-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/rvben/husker/releases/download/VERSION/husker-VERSION-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "SHA_X86_64_UNKNOWN_LINUX_GNU"
               end
             end
 
             def install
-              bin.install "shuck"
+              bin.install "husker"
             end
 
             test do
-              system "#{bin}/shuck", "--version"
+              system "#{bin}/husker", "--version"
             end
           end
           FORMULA
 
-          sed -i "s/VERSION_NUM/${VERSION_NUM}/g" /tmp/shuck.rb
-          sed -i "s/VERSION/${VERSION}/g" /tmp/shuck.rb
-          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${{ steps.hashes.outputs.aarch64_apple_darwin }}/g" /tmp/shuck.rb
-          sed -i "s/SHA_X86_64_APPLE_DARWIN/${{ steps.hashes.outputs.x86_64_apple_darwin }}/g" /tmp/shuck.rb
-          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${{ steps.hashes.outputs.aarch64_unknown_linux_gnu }}/g" /tmp/shuck.rb
-          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${{ steps.hashes.outputs.x86_64_unknown_linux_gnu }}/g" /tmp/shuck.rb
+          sed -i "s/VERSION_NUM/${VERSION_NUM}/g" /tmp/husker.rb
+          sed -i "s/VERSION/${VERSION}/g" /tmp/husker.rb
+          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${{ steps.hashes.outputs.aarch64_apple_darwin }}/g" /tmp/husker.rb
+          sed -i "s/SHA_X86_64_APPLE_DARWIN/${{ steps.hashes.outputs.x86_64_apple_darwin }}/g" /tmp/husker.rb
+          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${{ steps.hashes.outputs.aarch64_unknown_linux_gnu }}/g" /tmp/husker.rb
+          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${{ steps.hashes.outputs.x86_64_unknown_linux_gnu }}/g" /tmp/husker.rb
 
           git clone https://x-access-token:${GH_TOKEN}@github.com/rvben/homebrew-tap.git /tmp/tap
           mkdir -p /tmp/tap/Formula
-          cp /tmp/shuck.rb /tmp/tap/Formula/shuck.rb
+          cp /tmp/husker.rb /tmp/tap/Formula/husker.rb
           cd /tmp/tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/shuck.rb
-          git diff --cached --quiet || git commit -m "Update shuck to ${VERSION}"
+          git add Formula/husker.rb
+          git diff --cached --quiet || git commit -m "Update husker to ${VERSION}"
           git push

@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      SHUCK_RUN_IGNORED_E2E: ${{ vars.SHUCK_RUN_IGNORED_E2E_NIGHTLY }}
-      SHUCK_RUN_NET_E2E: ${{ vars.SHUCK_RUN_NET_E2E_NIGHTLY }}
+      HUSKER_RUN_IGNORED_E2E: ${{ vars.HUSKER_RUN_IGNORED_E2E_NIGHTLY }}
+      HUSKER_RUN_NET_E2E: ${{ vars.HUSKER_RUN_NET_E2E_NIGHTLY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
