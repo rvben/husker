@@ -4,8 +4,10 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -105,12 +107,44 @@ async fn clone_rootfs_impl(source: &Path, dest: &Path) -> Result<(), StorageErro
 
     let src = source.to_owned();
     let dst = dest.to_owned();
-    tokio::task::spawn_blocking(move || reflink_copy::reflink_or_copy(&src, &dst))
+    // `reflink_or_copy` returns `None` when the reflink (copy-on-write) clone
+    // succeeded and `Some(bytes)` when it had to fall back to a full byte copy
+    // because the filesystem lacks reflink support (e.g. ext4).
+    let copied = tokio::task::spawn_blocking(move || reflink_copy::reflink_or_copy(&src, &dst))
         .await
         .map_err(|e| StorageError::CommandFailed(format!("spawn_blocking join: {e}")))?
         .map_err(StorageError::Io)?;
 
+    if should_warn_reflink_fallback(copied, &REFLINK_FALLBACK_WARNED) {
+        warn!(
+            dest = %dest.display(),
+            bytes = copied.unwrap_or(0),
+            "rootfs clone fell back to a full byte copy: the data directory's filesystem \
+             does not support reflink (copy-on-write), so every microVM pays a full copy of \
+             the rootfs image. Host the data directory on XFS or btrfs for instant clones."
+        );
+    }
+
     Ok(())
+}
+
+/// Static guard so the reflink-fallback warning is emitted at most once per
+/// process rather than on every clone.
+static REFLINK_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Decide whether to emit the reflink-fallback warning.
+///
+/// Returns `true` at most once for a given `warned` flag, and only when the
+/// clone fell back to a full copy (`copied` is `Some`). A reflink success
+/// (`None`) never warns.
+fn should_warn_reflink_fallback(copied: Option<u64>, warned: &AtomicBool) -> bool {
+    if copied.is_none() {
+        return false;
+    }
+    // The first caller to flip false -> true wins the single warning.
+    warned
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 /// Validate that a kernel file exists and looks reasonable.
@@ -203,6 +237,26 @@ mod tests {
     fn validate_rootfs_existing_file_ok() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         assert!(validate_rootfs(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn reflink_fallback_warns_once_only_on_full_copy() {
+        let warned = AtomicBool::new(false);
+
+        // A reflink success (None) must never warn and must not consume the flag.
+        assert!(!should_warn_reflink_fallback(None, &warned));
+        assert!(!warned.load(Ordering::SeqCst));
+
+        // The first full-copy fallback warns and latches the flag.
+        assert!(should_warn_reflink_fallback(Some(8_589_934_592), &warned));
+        assert!(warned.load(Ordering::SeqCst));
+
+        // Subsequent fallbacks do not warn again (no log spam per clone).
+        assert!(!should_warn_reflink_fallback(Some(1024), &warned));
+        assert!(!should_warn_reflink_fallback(Some(0), &warned));
+
+        // A later reflink success still never warns.
+        assert!(!should_warn_reflink_fallback(None, &warned));
     }
 
     #[cfg(target_os = "macos")]

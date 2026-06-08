@@ -9,6 +9,7 @@ rust-version.workspace = true
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 reflink-copy = "0.1"
 
 [dev-dependencies]
