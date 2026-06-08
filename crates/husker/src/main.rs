@@ -137,6 +137,14 @@ enum Commands {
         #[arg(long, short = 'w')]
         workdir: Option<String>,
 
+        /// Environment variables for the command (KEY=VALUE), repeatable
+        #[arg(long, short = 'e')]
+        env: Vec<String>,
+
+        /// Seconds to wait for the guest agent to become reachable before failing
+        #[arg(long)]
+        connect_timeout: Option<u64>,
+
         /// Command and arguments (after --)
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -221,6 +229,9 @@ enum Commands {
         /// Show last N lines
         #[arg(long, short = 'n')]
         tail: Option<u64>,
+        /// Show the captured userdata script output instead of the serial console
+        #[arg(long)]
+        userdata: bool,
     },
 
     /// Print version information (client and daemon)
@@ -724,7 +735,7 @@ async fn main() -> Result<()> {
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
 
             let rootfs = match rootfs {
-                Some(path) => path,
+                Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
                 None => {
                     let default = config.default_rootfs.clone();
                     if !default.exists() {
@@ -1051,6 +1062,8 @@ async fn main() -> Result<()> {
         Commands::Exec {
             name,
             workdir,
+            env,
+            connect_timeout,
             command,
         } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -1062,6 +1075,17 @@ async fn main() -> Result<()> {
             });
             if let Some(ref wd) = workdir {
                 body["working_dir"] = serde_json::json!(wd);
+            }
+            let env_map: serde_json::Map<String, serde_json::Value> = env
+                .iter()
+                .filter_map(|s| s.split_once('='))
+                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                .collect();
+            if !env_map.is_empty() {
+                body["env"] = serde_json::Value::Object(env_map);
+            }
+            if let Some(secs) = connect_timeout {
+                body["connect_timeout_secs"] = serde_json::json!(secs);
             }
 
             let client = reqwest::Client::new();
@@ -1227,10 +1251,21 @@ async fn main() -> Result<()> {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             secret_command(api_url, api_token, action, output).await
         }
-        Commands::Logs { name, follow, tail } => {
+        Commands::Logs {
+            name,
+            follow,
+            tail,
+            userdata,
+        } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            // The userdata log is a static, already-captured file, so following
+            // it is meaningless; ignore --follow when --userdata is set.
+            let follow = follow && !userdata;
             let mut url = format!("{api_url}/v1/vms/{name}/logs");
             let mut params = Vec::new();
+            if userdata {
+                params.push("userdata=true".to_string());
+            }
             if follow {
                 params.push("follow=true".to_string());
             }

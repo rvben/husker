@@ -710,6 +710,66 @@ async fn run_userdata_marks_completed_on_success() {
 }
 
 #[tokio::test]
+async fn run_userdata_captures_output_to_log() {
+    let _serial = userdata_test_lock().lock().await;
+    let (_dir, socket_path) = spawn_agent().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    mock.set_agent_socket(Some(socket_path)).await;
+
+    let vm_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            vm_id,
+            "vm-userdata-log",
+            "running",
+            Some("echo husker-marker-9f3 >&2; echo on-stdout".into()),
+            Some("pending".into()),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "vm-userdata-log".into(),
+        state: VmState::Running,
+        pid: Some(5),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 11,
+    })
+    .await;
+
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+    core.run_userdata("vm-userdata-log").await.unwrap();
+
+    // The script's stdout and stderr are captured to the userdata log so they
+    // can be inspected via `husker logs <name> --userdata`.
+    let log_path = core.userdata_log_path("vm-userdata-log").unwrap();
+    let captured = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        captured.contains("on-stdout"),
+        "stdout captured: {captured}"
+    );
+    assert!(
+        captured.contains("husker-marker-9f3"),
+        "stderr captured: {captured}"
+    );
+    assert!(
+        captured.contains("[stderr]"),
+        "stderr section labeled: {captured}"
+    );
+}
+
+#[tokio::test]
 async fn run_userdata_marks_failed_on_nonzero_exit() {
     let _serial = userdata_test_lock().lock().await;
     let (_dir, socket_path) = spawn_agent().await;

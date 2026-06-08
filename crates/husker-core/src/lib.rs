@@ -726,6 +726,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             warn!(%name, path = %serial_log.display(), error = %e, "failed to remove serial log during destroy");
         }
 
+        // The userdata log is optional (only VMs with userdata have one), so
+        // its absence is not worth a warning.
+        let userdata_log = self.runtime_dir.join(format!("{}.userdata.log", record.id));
+        let _ = remove_file_best_effort(&userdata_log).await;
+
         self.state.delete_vm(record.id)?;
         info!(%name, "VM destroyed");
         Ok(())
@@ -1207,6 +1212,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(self.runtime_dir.join(format!("{}.serial.log", record.id)))
     }
 
+    /// Path to the captured userdata stdout/stderr log for a VM. Written by
+    /// `run_userdata` so the output of the userdata script is inspectable via
+    /// `husker logs <name> --userdata` instead of being discarded.
+    pub fn userdata_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        let record = self.lookup_vm(name)?;
+        Ok(self.runtime_dir.join(format!("{}.userdata.log", record.id)))
+    }
+
     /// Stop all running and paused VMs during daemon shutdown.
     ///
     /// Returns the number of VMs that were drained. Errors on individual VMs
@@ -1379,6 +1392,23 @@ impl<B: VmmBackend> HuskerCore<B> {
             let exec_result = conn
                 .exec("sh", &["/tmp/husker-userdata.sh"], None, &env_refs)
                 .await?;
+
+            // Persist the script's output so it is inspectable after the fact
+            // via `husker logs <name> --userdata`, rather than being discarded.
+            let log_path = self
+                .runtime_dir
+                .join(format!("{}.userdata.log", record.id));
+            let mut log = exec_result.stdout.clone();
+            if !exec_result.stderr.is_empty() {
+                if !log.is_empty() && !log.ends_with('\n') {
+                    log.push('\n');
+                }
+                log.push_str("[stderr]\n");
+                log.push_str(&exec_result.stderr);
+            }
+            if let Err(e) = tokio::fs::write(&log_path, log).await {
+                warn!(%name, path = %log_path.display(), error = %e, "failed to write userdata log");
+            }
 
             if exec_result.exit_code == 0 {
                 self.state.update_userdata_status(record.id, "completed")?;

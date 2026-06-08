@@ -100,6 +100,24 @@ pub fn default_rootfs_path_for(data_dir: &Path) -> PathBuf {
     data_dir.join("images").join(name)
 }
 
+/// Resolve a `husker run <rootfs>` argument against the images directory.
+///
+/// If the argument exists as given it is used unchanged. Otherwise, when a file
+/// of that name exists under `<data_dir>/images`, that path is used, so a bare
+/// image name from `husker images pull` (e.g. `alpine-x86_64.ext4`) is runnable
+/// without spelling out the full path. When neither exists the original
+/// argument is returned so the caller surfaces a clear "rootfs not found" error.
+pub fn resolve_rootfs_arg(arg: PathBuf, data_dir: &Path) -> PathBuf {
+    if arg.exists() {
+        return arg;
+    }
+    let in_images = data_dir.join("images").join(&arg);
+    if in_images.exists() {
+        return in_images;
+    }
+    arg
+}
+
 pub fn default_initrd_path() -> PathBuf {
     default_initrd_path_for(&default_data_dir())
 }
@@ -122,4 +140,41 @@ pub fn default_images_base_url() -> String {
 /// None. Users can explicitly set it to `null` in config to opt out.
 pub fn default_initrd_some() -> Option<PathBuf> {
     Some(default_initrd_path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_rootfs_arg_resolves_bare_name_from_images_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let images = data_dir.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join("alpine-x86_64.ext4"), b"img").unwrap();
+
+        // A bare image name resolves to the images directory.
+        let resolved = resolve_rootfs_arg(PathBuf::from("alpine-x86_64.ext4"), data_dir.path());
+        assert_eq!(resolved, images.join("alpine-x86_64.ext4"));
+    }
+
+    #[test]
+    fn resolve_rootfs_arg_prefers_an_existing_path_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("custom.ext4");
+        std::fs::write(&explicit, b"img").unwrap();
+
+        // An existing path is used unchanged, even if a same-named image exists.
+        let resolved = resolve_rootfs_arg(explicit.clone(), dir.path());
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn resolve_rootfs_arg_returns_input_when_unresolvable() {
+        let data_dir = tempfile::tempdir().unwrap();
+        // Neither the path nor an image of that name exists: return the input so
+        // the caller can surface a clear "rootfs not found" error.
+        let arg = PathBuf::from("does-not-exist.ext4");
+        assert_eq!(resolve_rootfs_arg(arg.clone(), data_dir.path()), arg);
+    }
 }

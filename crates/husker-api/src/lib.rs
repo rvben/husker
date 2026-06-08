@@ -239,6 +239,23 @@ pub struct ExecRequest {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Seconds to wait for the guest agent to become reachable. Defaults to
+    /// `DEFAULT_EXEC_CONNECT_TIMEOUT_SECS` and is clamped to a sane range.
+    pub connect_timeout_secs: Option<u64>,
+}
+
+/// Default agent-readiness wait for exec when the caller does not specify one.
+const DEFAULT_EXEC_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Upper bound so a caller cannot pin an exec connection open indefinitely.
+const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
+
+/// Resolve the exec agent-connect timeout: default when unset, clamped to
+/// `[1, MAX_EXEC_CONNECT_TIMEOUT_SECS]` otherwise.
+fn resolve_exec_connect_timeout(requested: Option<u64>) -> Duration {
+    let secs = requested
+        .unwrap_or(DEFAULT_EXEC_CONNECT_TIMEOUT_SECS)
+        .clamp(1, MAX_EXEC_CONNECT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -328,6 +345,9 @@ pub struct LogsQuery {
     #[serde(default)]
     pub follow: bool,
     pub tail: Option<u64>,
+    /// Serve the captured userdata script output instead of the serial console.
+    #[serde(default)]
+    pub userdata: bool,
 }
 
 /// Messages sent by the server to the client over the shell WebSocket.
@@ -1646,7 +1666,10 @@ async fn exec_vm<B: VmmBackend + 'static>(
     // or two of VM boot, before the guest has bound vsock port 52. A short
     // retry window eliminates the need for client-side polling.
     let mut conn = core
-        .agent_connect_ready(&name, Duration::from_secs(30))
+        .agent_connect_ready(
+            &name,
+            resolve_exec_connect_timeout(req.connect_timeout_secs),
+        )
         .await
         .map_err(map_agent_connect_error)?;
     let args: Vec<&str> = req.args.iter().map(String::as_str).collect();
@@ -2042,21 +2065,28 @@ async fn get_logs<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Query(params): Query<LogsQuery>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
-    let log_path = core.serial_log_path(&name).map_err(map_error)?;
+    let (log_path, log_label) = if params.userdata {
+        (
+            core.userdata_log_path(&name).map_err(map_error)?,
+            "userdata",
+        )
+    } else {
+        (core.serial_log_path(&name).map_err(map_error)?, "serial")
+    };
 
     let metadata = tokio::fs::metadata(&log_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             (
                 StatusCode::NOT_FOUND,
                 error_response(
-                    "serial_log_not_found",
-                    format!("no serial log for VM '{name}'"),
+                    "log_not_found",
+                    format!("no {log_label} log for VM '{name}'"),
                 ),
             )
         } else {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                error_response("log_read_failed", format!("reading {log_label} log: {e}")),
             )
         }
     })?;
@@ -3467,6 +3497,30 @@ mod tests {
         let no_allowlist: Vec<String> = Vec::new();
         assert!(is_allowed_guest_path("/etc/passwd", &no_allowlist));
         assert!(!is_allowed_guest_path("etc/passwd", &no_allowlist));
+    }
+
+    #[test]
+    fn exec_connect_timeout_defaults_and_clamps() {
+        // Unset -> the default.
+        assert_eq!(
+            resolve_exec_connect_timeout(None),
+            Duration::from_secs(DEFAULT_EXEC_CONNECT_TIMEOUT_SECS)
+        );
+        // In-range values pass through.
+        assert_eq!(
+            resolve_exec_connect_timeout(Some(5)),
+            Duration::from_secs(5)
+        );
+        // Zero is clamped up to the 1s floor (never an instant-fail connect).
+        assert_eq!(
+            resolve_exec_connect_timeout(Some(0)),
+            Duration::from_secs(1)
+        );
+        // Absurd values are clamped to the ceiling.
+        assert_eq!(
+            resolve_exec_connect_timeout(Some(u64::MAX)),
+            Duration::from_secs(MAX_EXEC_CONNECT_TIMEOUT_SECS)
+        );
     }
 
     #[test]
