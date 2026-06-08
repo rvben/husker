@@ -3671,6 +3671,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     let runtime_dir = config.data_dir.join("run");
     let db_path = config.data_dir.join("husker.db");
     let api_token = config.api_token.clone();
+    let service_reconcile_enabled = config.service_reconcile_enabled;
+    let service_reconcile_interval = config.service_reconcile_interval_secs;
     let api_policy = husker_api::ApiPolicy {
         max_request_bytes: config.api_max_request_bytes,
         max_file_read_bytes: config.api_max_file_read_bytes,
@@ -3734,11 +3736,18 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             runtime_dir.clone(),
         ));
 
+        run_initial_service_reconcile(&core).await;
+
         let restored = core.reconcile_port_forwards_from_state().await;
         if restored > 0 {
             tracing::info!(restored, "restored persisted port-forward nftables rules");
         }
 
+        spawn_service_reconcile_loop(
+            Arc::clone(&core),
+            service_reconcile_enabled,
+            service_reconcile_interval,
+        );
         spawn_log_rotation(Arc::clone(&core));
         husker_api::serve_with_auth(Arc::clone(&core), listen, api_token.clone()).await?;
         drain_vms_on_shutdown(&core).await;
@@ -3762,6 +3771,12 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             runtime_dir.clone(),
         ));
 
+        run_initial_service_reconcile(&core).await;
+        spawn_service_reconcile_loop(
+            Arc::clone(&core),
+            service_reconcile_enabled,
+            service_reconcile_interval,
+        );
         spawn_log_rotation(Arc::clone(&core));
         husker_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
         drain_vms_on_shutdown(&core).await;
@@ -3785,11 +3800,82 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             runtime_dir.clone(),
         ));
 
+        run_initial_service_reconcile(&core).await;
+        spawn_service_reconcile_loop(
+            Arc::clone(&core),
+            service_reconcile_enabled,
+            service_reconcile_interval,
+        );
         spawn_log_rotation(Arc::clone(&core));
         husker_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
         drain_vms_on_shutdown(&core).await;
         Ok(())
     }
+}
+
+/// Run an initial service reconcile for all services, then create the ordinal index.
+/// Always run on daemon startup (independent of the periodic-loop setting).
+async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
+    core: &Arc<husker_core::HuskerCore<B>>,
+) {
+    match core.list_services() {
+        Ok(services) => {
+            for svc in &services {
+                let o = core.reconcile_service(svc).await;
+                if !o.created.is_empty() || !o.destroyed.is_empty() || !o.failed.is_empty() {
+                    tracing::info!(
+                        service = %svc.name,
+                        created = o.created.len(),
+                        destroyed = o.destroyed.len(),
+                        failed = o.failed.len(),
+                        "startup service reconcile"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to list services for startup reconcile"),
+    }
+    if let Err(e) = core.create_service_ordinal_index() {
+        tracing::warn!(error = %e, "failed to create service ordinal index");
+    }
+}
+
+/// Spawn the periodic self-healing reconcile loop (only when enabled).
+fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
+    core: Arc<husker_core::HuskerCore<B>>,
+    enabled: bool,
+    interval_secs: u64,
+) {
+    if !enabled {
+        return;
+    }
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // consume the immediate first tick
+        loop {
+            ticker.tick().await;
+            let services = match core.list_services() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "reconcile loop: list_services failed");
+                    continue;
+                }
+            };
+            for svc in &services {
+                let o = core.reconcile_service(svc).await;
+                if !o.created.is_empty() || !o.destroyed.is_empty() || !o.failed.is_empty() {
+                    tracing::info!(
+                        service = %svc.name,
+                        created = o.created.len(),
+                        destroyed = o.destroyed.len(),
+                        failed = o.failed.len(),
+                        "reconcile loop"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Spawn a background task that rotates oversized serial logs every hour.
