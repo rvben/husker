@@ -2073,26 +2073,36 @@ async fn get_logs<B: VmmBackend + 'static>(
     } else {
         (core.serial_log_path(&name).map_err(map_error)?, "serial")
     };
+    // The userdata log is a static, already-captured file, so following it is
+    // meaningless; ignore follow for it (the CLI does too, but enforce it here
+    // so a direct API caller cannot stream-follow it down the serial path).
+    let follow = params.follow && !params.userdata;
 
+    // Error `code`s are part of the stable API contract, so the serial path
+    // keeps its original `serial_log_*` codes while the userdata path gets its
+    // own `userdata_log_*` codes.
     let metadata = tokio::fs::metadata(&log_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             (
                 StatusCode::NOT_FOUND,
                 error_response(
-                    "log_not_found",
+                    &format!("{log_label}_log_not_found"),
                     format!("no {log_label} log for VM '{name}'"),
                 ),
             )
         } else {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                error_response("log_read_failed", format!("reading {log_label} log: {e}")),
+                error_response(
+                    &format!("{log_label}_log_read_failed"),
+                    format!("reading {log_label} log: {e}"),
+                ),
             )
         }
     })?;
 
     let file_size = metadata.len();
-    if params.follow {
+    if follow {
         // Bounded preload: for follow mode never load more than 1 MiB.
         let mut initial_content = if file_size > LOG_MAX_READ_BYTES {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -2204,7 +2214,10 @@ async fn get_logs<B: VmmBackend + 'static>(
             let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                    error_response(
+                        &format!("{log_label}_log_read_failed"),
+                        format!("reading {log_label} log: {e}"),
+                    ),
                 )
             })?;
             file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
@@ -2213,8 +2226,8 @@ async fn get_logs<B: VmmBackend + 'static>(
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         error_response(
-                            "serial_log_seek_failed",
-                            format!("seeking serial log: {e}"),
+                            &format!("{log_label}_log_seek_failed"),
+                            format!("seeking {log_label} log: {e}"),
                         ),
                     )
                 })?;
@@ -2222,7 +2235,10 @@ async fn get_logs<B: VmmBackend + 'static>(
             file.read_to_string(&mut buf).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                    error_response(
+                        &format!("{log_label}_log_read_failed"),
+                        format!("reading {log_label} log: {e}"),
+                    ),
                 )
             })?;
             format!("[... truncated, showing last 1 MiB ...]\n{buf}")
@@ -2230,7 +2246,10 @@ async fn get_logs<B: VmmBackend + 'static>(
             tokio::fs::read_to_string(&log_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                    error_response(
+                        &format!("{log_label}_log_read_failed"),
+                        format!("reading {log_label} log: {e}"),
+                    ),
                 )
             })?
         };
@@ -3166,6 +3185,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn logs_missing_use_kind_specific_error_codes() {
+        // The VM exists but has no log files, so each request reaches the
+        // log-not-found path. The structured `code` is part of the API contract:
+        // the serial path must keep `serial_log_not_found`, and the userdata path
+        // gets its own distinct code rather than reusing the serial one.
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let runtime_dir = temp.path().join("run");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let now = chrono::Utc::now();
+        state
+            .insert_vm(&husker_state::VmRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "logvm".into(),
+                state: "running".into(),
+                pid: Some(1234),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 7,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "/tmp/vmlinux".into(),
+                rootfs_path: "/tmp/rootfs.ext4".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+            })
+            .unwrap();
+
+        let core = make_core(
+            state,
+            husker_storage::StorageConfig { data_dir },
+            runtime_dir,
+        );
+        let app = router(core);
+
+        let serial = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/vms/logvm/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serial.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_json(serial).await["code"], "serial_log_not_found");
+
+        let userdata = app
+            .oneshot(
+                Request::get("/v1/vms/logvm/logs?userdata=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(userdata.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(userdata).await["code"],
+            "userdata_log_not_found"
+        );
     }
 
     #[tokio::test]
