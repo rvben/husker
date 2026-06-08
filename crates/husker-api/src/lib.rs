@@ -1510,15 +1510,7 @@ async fn create_vm<B: VmmBackend + 'static>(
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
     let record = core.create_vm(req).await.map_err(map_error)?;
 
-    if record.userdata.is_some() {
-        let core = Arc::clone(&core);
-        let vm_name = record.name.clone();
-        tokio::spawn(async move {
-            if let Err(e) = core.run_userdata(&vm_name).await {
-                warn!(%vm_name, error = %e, "userdata execution failed");
-            }
-        });
-    }
+    core.spawn_userdata(&record);
 
     Ok((StatusCode::CREATED, Json(record_to_response(record))))
 }

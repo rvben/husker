@@ -1809,3 +1809,59 @@ async fn concurrent_create_same_name_one_winner() {
     // Exactly one VM persisted.
     assert_eq!(core.list_vms().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn run_userdata_spawn_userdata_drives_to_completed() {
+    let _serial = userdata_test_lock().lock().await;
+    let (_dir, socket_path) = spawn_agent().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    mock.set_agent_socket(Some(socket_path)).await;
+
+    let vm_id = Uuid::new_v4();
+    let record = vm_record(
+        vm_id,
+        "vm-spawn-userdata",
+        "running",
+        Some("exit 0".into()),
+        Some("pending".into()),
+        None,
+        None,
+        None,
+    );
+    state.insert_vm(&record).unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "vm-spawn-userdata".into(),
+        state: VmState::Running,
+        pid: Some(5),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 11,
+    })
+    .await;
+
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+    core.spawn_userdata(&record);
+
+    let mut status = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        status = core.get_vm(&record.name).unwrap().userdata_status;
+        if status.as_deref() == Some("completed") {
+            break;
+        }
+    }
+    assert_eq!(
+        status.as_deref(),
+        Some("completed"),
+        "spawn_userdata should drive userdata_status to completed"
+    );
+}

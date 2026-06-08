@@ -1498,6 +1498,24 @@ impl<B: VmmBackend> HuskerCore<B> {
         result
     }
 
+    /// Spawn background userdata execution for a freshly created VM, if it has any.
+    /// Fire-and-forget: returns immediately; `run_userdata` updates `userdata_status`.
+    pub fn spawn_userdata(self: &Arc<Self>, record: &VmRecord)
+    where
+        B: 'static,
+    {
+        if record.userdata.is_none() {
+            return;
+        }
+        let core = Arc::clone(self);
+        let name = record.name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = core.run_userdata(&name).await {
+                warn!(%name, error = %e, "userdata execution failed");
+            }
+        });
+    }
+
     /// Add a port forward from a host port to a guest port on a VM.
     #[cfg(feature = "linux-net")]
     pub async fn add_port_forward(
