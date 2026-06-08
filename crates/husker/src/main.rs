@@ -495,6 +495,10 @@ struct Config {
     exec_denylist: Vec<String>,
     #[serde(default)]
     exec_env_allowlist: Vec<String>,
+    #[serde(default = "default_service_reconcile_interval")]
+    service_reconcile_interval_secs: u64,
+    #[serde(default = "default_true")]
+    service_reconcile_enabled: bool,
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_host_interface")]
     host_interface: String,
@@ -532,6 +536,14 @@ fn default_api_sensitive_rate_limit_per_minute() -> u32 {
 
 fn default_exec_timeout_secs() -> u64 {
     30
+}
+
+fn default_service_reconcile_interval() -> u64 {
+    15
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(feature = "linux-net")]
@@ -924,6 +936,8 @@ impl Default for Config {
             exec_allowlist: Vec::new(),
             exec_denylist: Vec::new(),
             exec_env_allowlist: Vec::new(),
+            service_reconcile_interval_secs: default_service_reconcile_interval(),
+            service_reconcile_enabled: default_true(),
             #[cfg(feature = "linux-net")]
             host_interface: default_host_interface(),
             #[cfg(feature = "linux-net")]
@@ -3202,6 +3216,14 @@ fn apply_env_overrides(config: &mut Config) {
             .filter(|s| !s.is_empty())
             .collect();
     }
+    if let Ok(val) = std::env::var("HUSKER_SERVICE_RECONCILE_INTERVAL")
+        && let Ok(parsed) = val.parse::<u64>()
+    {
+        config.service_reconcile_interval_secs = parsed;
+    }
+    if let Ok(val) = std::env::var("HUSKER_SERVICE_RECONCILE_ENABLED") {
+        config.service_reconcile_enabled = matches!(val.as_str(), "1" | "true" | "TRUE" | "yes");
+    }
     #[cfg(feature = "linux-net")]
     {
         if let Ok(val) = std::env::var("HUSKER_FIRECRACKER_BIN") {
@@ -4522,6 +4544,54 @@ mod tests {
         apply_env_overrides(&mut config);
         assert_eq!(config.api_max_request_bytes, expected_req);
         assert_eq!(config.exec_timeout_secs, expected_timeout);
+    }
+
+    #[test]
+    fn service_config_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.service_reconcile_interval_secs, 15);
+        assert!(cfg.service_reconcile_enabled);
+    }
+
+    #[test]
+    fn env_override_service_reconcile_interval() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSKER_SERVICE_RECONCILE_INTERVAL", "60");
+        let mut config = Config::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(config.service_reconcile_interval_secs, 60);
+    }
+
+    #[test]
+    fn env_override_service_reconcile_enabled_false() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSKER_SERVICE_RECONCILE_ENABLED", "0");
+        let mut config = Config::default();
+        apply_env_overrides(&mut config);
+        assert!(!config.service_reconcile_enabled);
+    }
+
+    #[test]
+    fn env_override_service_reconcile_enabled_true_variants() {
+        let _guard = env_mutex().lock().unwrap();
+        for val in &["1", "true", "TRUE", "yes"] {
+            let _env = EnvVarGuard::set("HUSKER_SERVICE_RECONCILE_ENABLED", val);
+            let mut config = Config::default();
+            apply_env_overrides(&mut config);
+            assert!(
+                config.service_reconcile_enabled,
+                "expected enabled=true for HUSKER_SERVICE_RECONCILE_ENABLED={val}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_override_service_reconcile_interval_ignores_invalid() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSKER_SERVICE_RECONCILE_INTERVAL", "not-a-number");
+        let mut config = Config::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(config.service_reconcile_interval_secs, 15);
     }
 
     #[tokio::test]

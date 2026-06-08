@@ -92,21 +92,29 @@
 # DNS servers injected into guest /etc/resolv.conf via the agent.
 # dns_servers = ["8.8.8.8", "1.1.1.1"]
 
+# ── Service Reconciler ───────────────────────────────────────────────
+
+# Background reconciler for service workloads.
+# reconcile_interval_secs = 15   # how often the self-healing loop runs
+# enabled = true                 # master switch for the periodic reconcile loop
+
 # ── Environment Variable Overrides ─────────────────────────────────
 #
 # All configuration values can be overridden via environment variables.
 # Environment variables take precedence over file-based config.
 #
-#   HUSKER_DATA_DIR         →  data_dir
-#   HUSKER_DEFAULT_KERNEL   →  default_kernel
-#   HUSKER_DEFAULT_ROOTFS   →  default_rootfs
-#   HUSKER_DEFAULT_INITRD   →  default_initrd
-#   HUSKER_IMAGES_BASE_URL  →  images_base_url
-#   HUSKER_FIRECRACKER_BIN  →  firecracker_bin    (Linux only)
-#   HUSKER_HOST_INTERFACE   →  host_interface     (Linux only)
-#   HUSKER_BRIDGE_NAME      →  bridge_name        (Linux only)
-#   HUSKER_BRIDGE_SUBNET    →  bridge_subnet      (Linux only)
-#   HUSKER_DNS_SERVERS      →  dns_servers        (Linux only, comma-separated)
+#   HUSKER_DATA_DIR                          →  data_dir
+#   HUSKER_DEFAULT_KERNEL                    →  default_kernel
+#   HUSKER_DEFAULT_ROOTFS                    →  default_rootfs
+#   HUSKER_DEFAULT_INITRD                    →  default_initrd
+#   HUSKER_IMAGES_BASE_URL                   →  images_base_url
+#   HUSKER_SERVICE_RECONCILE_INTERVAL        →  service_reconcile_interval_secs
+#   HUSKER_SERVICE_RECONCILE_ENABLED         →  service_reconcile_enabled (1/true/TRUE/yes)
+#   HUSKER_FIRECRACKER_BIN                   →  firecracker_bin    (Linux only)
+#   HUSKER_HOST_INTERFACE                    →  host_interface     (Linux only)
+#   HUSKER_BRIDGE_NAME                       →  bridge_name        (Linux only)
+#   HUSKER_BRIDGE_SUBNET                     →  bridge_subnet      (Linux only)
+#   HUSKER_DNS_SERVERS                       →  dns_servers        (Linux only, comma-separated)
 #
 # Example:
 #   HUSKER_DATA_DIR=/tmp/husker husker daemon
