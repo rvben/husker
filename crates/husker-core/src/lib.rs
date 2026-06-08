@@ -240,6 +240,35 @@ fn validate_resource_name(kind: &str, name: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Build the canonical instance name for a service ordinal.
+fn instance_name(service: &str, ordinal: u32) -> String {
+    format!("{service}-{ordinal}")
+}
+
+/// Validate the worst-case generated instance name `<service>-<desired-1>` fits the
+/// resource-name limit. No-op when `desired_instances == 0` (no instances created).
+fn validate_service_instance_names(name: &str, desired_instances: u32) -> Result<(), CoreError> {
+    if desired_instances > 0 {
+        validate_resource_name("service instance", &instance_name(name, desired_instances - 1))?;
+    }
+    Ok(())
+}
+
+/// True if `candidate` is a better survivor than `current` for the same ordinal:
+/// prefer `running`, then oldest `created_at`, then lowest `id`.
+fn better_survivor(candidate: &VmRecord, current: &VmRecord) -> bool {
+    let rank = |s: &str| if s == "running" { 0 } else { 1 };
+    match rank(&candidate.state).cmp(&rank(&current.state)) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => match candidate.created_at.cmp(&current.created_at) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => candidate.id < current.id,
+        },
+    }
+}
+
 /// Validate a user-supplied host filesystem path before the daemon opens it.
 ///
 /// Rejects relative paths, `..` components, and paths whose final component is
@@ -286,9 +315,18 @@ struct AllocatedResources {
 
 /// Service ownership stamped onto an instance VM at creation time.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ServiceTag {
+pub struct ServiceTag {
     pub service_id: Uuid,
     pub ordinal: u32,
+}
+
+/// Result of one reconcile pass over a single service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReconcileOutcome {
+    pub created: Vec<String>,
+    pub destroyed: Vec<String>,
+    /// (instance_name, error_message) for instances that could not be created/destroyed.
+    pub failed: Vec<(String, String)>,
 }
 
 /// Core orchestrator that ties together all subsystems.
@@ -306,6 +344,8 @@ pub struct HuskerCore<B: VmmBackend> {
     runtime_dir: PathBuf,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-service reconcile locks; serialize concurrent reconciles of the same service.
+    reconcile_locks: std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<B: VmmBackend> HuskerCore<B> {
@@ -330,6 +370,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             dns_servers,
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -351,12 +392,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage_driver: husker_storage::default_storage_driver(),
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.vm_name_locks.lock().expect("vm_name_locks poisoned");
         map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn reconcile_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.reconcile_locks.lock().expect("reconcile_locks poisoned");
+        map.entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -370,13 +419,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.create_vm_record(req, None, true).await
     }
 
-    /// Internal create path used by both the public API and the service reconciler.
+    /// Internal/advanced: prefer `create_vm`. Used by the reconciler to stamp service ownership.
     ///
     /// `tags` stamps service ownership atomically onto the new VM record.
     /// `replace_existing_stopped` controls whether an existing stopped/failed
     /// same-named VM is auto-replaced (public API: true; reconciler: false to
     /// avoid clobbering a foreign stopped VM).
-    pub(crate) async fn create_vm_record(
+    pub async fn create_vm_record(
         &self,
         req: CreateVmRequest,
         tags: Option<ServiceTag>,
@@ -863,6 +912,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "desired_instances must be >= 1".into(),
             ));
         }
+        validate_service_instance_names(&req.name, desired_instances)?;
 
         let host_group_id = match req.host_group.as_deref() {
             Some(group_name) => {
@@ -931,6 +981,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "desired_instances must be >= 1".into(),
             ));
         }
+        validate_service_instance_names(name, desired_instances)?;
 
         let record = self.get_service(name)?;
         self.state
@@ -1671,6 +1722,159 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
         restored
+    }
+
+    /// List VMs owned by a service (core wrapper over state).
+    pub fn list_vms_for_service(&self, service_id: Uuid) -> Result<Vec<VmRecord>, CoreError> {
+        Ok(self.state.list_vms_for_service(service_id)?)
+    }
+
+    /// Create the partial unique index for service ordinals (core wrapper over state).
+    pub fn create_service_ordinal_index(&self) -> Result<(), CoreError> {
+        Ok(self.state.create_service_ordinal_index()?)
+    }
+
+    /// Converge a service's running instances to `desired_instances`.
+    /// Target: ordinals 0..desired-1 each backed by exactly one `running` VM.
+    pub async fn reconcile_service(self: &Arc<Self>, svc: &ServiceRecord) -> ReconcileOutcome
+    where
+        B: 'static,
+    {
+        let _guard = self.reconcile_lock(svc.id).lock_owned().await;
+        let mut outcome = ReconcileOutcome::default();
+
+        if svc.rootfs_path.is_empty() {
+            outcome
+                .failed
+                .push((svc.name.clone(), "service has no rootfs template".into()));
+            return outcome;
+        }
+
+        let instances = match self.state.list_vms_for_service(svc.id) {
+            Ok(v) => v,
+            Err(e) => {
+                outcome.failed.push((svc.name.clone(), e.to_string()));
+                return outcome;
+            }
+        };
+
+        // Dedupe: one survivor per ordinal (BTreeMap = deterministic ascending order),
+        // destroy the rest + any NULL-ordinal orphans.
+        let mut by_ordinal: std::collections::BTreeMap<u32, VmRecord> =
+            std::collections::BTreeMap::new();
+        for vm in instances {
+            let Some(ord) = vm.service_ordinal else {
+                let _ = self.destroy_instance(&vm, &mut outcome).await; // orphan
+                continue;
+            };
+            match by_ordinal.get(&ord) {
+                None => {
+                    by_ordinal.insert(ord, vm);
+                }
+                Some(existing) => {
+                    if better_survivor(&vm, existing) {
+                        let loser = by_ordinal.insert(ord, vm).expect("ordinal present");
+                        let _ = self.destroy_instance(&loser, &mut outcome).await;
+                    } else {
+                        let _ = self.destroy_instance(&vm, &mut outcome).await;
+                    }
+                }
+            }
+        }
+
+        // Ordinals 0..desired-1: ensure each is a single running instance.
+        for ordinal in 0..svc.desired_instances {
+            match by_ordinal.get(&ordinal) {
+                Some(vm) if vm.state == "running" => {}
+                Some(vm) => {
+                    let vm = vm.clone();
+                    if self.destroy_instance(&vm, &mut outcome).await {
+                        self.create_instance(svc, ordinal, &mut outcome).await;
+                    }
+                }
+                None => self.create_instance(svc, ordinal, &mut outcome).await,
+            }
+        }
+
+        // Scale-down: destroy survivors with ordinal >= desired (ascending, deterministic).
+        let excess: Vec<VmRecord> = by_ordinal
+            .into_iter()
+            .filter(|(ord, _)| *ord >= svc.desired_instances)
+            .map(|(_, vm)| vm)
+            .collect();
+        for vm in excess {
+            let _ = self.destroy_instance(&vm, &mut outcome).await;
+        }
+
+        outcome
+    }
+
+    async fn create_instance(
+        self: &Arc<Self>,
+        svc: &ServiceRecord,
+        ordinal: u32,
+        outcome: &mut ReconcileOutcome,
+    ) where
+        B: 'static,
+    {
+        let name = instance_name(&svc.name, ordinal);
+
+        // Ownership preflight: never clobber a VM not owned by this service.
+        if let Ok(existing) = self.state.get_vm_by_name(&name) {
+            if existing.service_id != Some(svc.id) {
+                outcome
+                    .failed
+                    .push((name, "name owned by a non-service VM".into()));
+                return;
+            }
+        }
+
+        let env: Vec<(String, String)> = svc
+            .userdata_env
+            .as_deref()
+            .map(|s| serde_json::from_str(s).unwrap_or_default())
+            .unwrap_or_default();
+        let req = CreateVmRequest {
+            name: name.clone(),
+            kernel_path: svc.kernel_path.clone().into(),
+            rootfs_path: svc.rootfs_path.clone().into(),
+            vcpu_count: svc.vcpu_count,
+            mem_size_mib: svc.mem_size_mib,
+            initrd_path: svc.initrd_path.clone().map(Into::into),
+            userdata: svc.userdata.clone(),
+            env,
+        };
+        match self
+            .create_vm_record(
+                req,
+                Some(ServiceTag {
+                    service_id: svc.id,
+                    ordinal,
+                }),
+                false,
+            )
+            .await
+        {
+            Ok(record) => {
+                self.spawn_userdata(&record);
+                outcome.created.push(name);
+            }
+            Err(e) => outcome.failed.push((name, e.to_string())),
+        }
+    }
+
+    async fn destroy_instance(&self, vm: &VmRecord, outcome: &mut ReconcileOutcome) -> bool {
+        let _name_guard = self.vm_name_lock(&vm.name).lock_owned().await;
+        match self.destroy_vm_inner(vm).await {
+            Ok(()) => {
+                outcome.destroyed.push(vm.name.clone());
+                true
+            }
+            Err(e) => {
+                outcome.failed.push((vm.name.clone(), e.to_string()));
+                false
+            }
+        }
     }
 
     fn lookup_vm(&self, name: &str) -> Result<VmRecord, CoreError> {

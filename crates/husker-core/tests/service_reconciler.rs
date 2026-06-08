@@ -1,0 +1,482 @@
+#![cfg(not(feature = "linux-net"))]
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use husker_core::{CoreError, CreateVmRequest, HuskerCore, ServiceTag};
+use husker_state::{ServiceRecord, StateStore};
+use husker_storage::StorageConfig;
+use husker_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// MockVmm - copied from orchestration_paths.rs
+// ---------------------------------------------------------------------------
+
+struct MockInner {
+    vms: Mutex<HashMap<Uuid, VmInfo>>,
+}
+
+#[derive(Clone)]
+struct MockVmm {
+    inner: Arc<MockInner>,
+}
+
+impl MockVmm {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(MockInner {
+                vms: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+}
+
+impl VmmBackend for MockVmm {
+    type VsockStream = tokio::net::UnixStream;
+
+    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        let id = Uuid::new_v4();
+        let info = VmInfo {
+            id,
+            name: config.name,
+            state: VmState::Running,
+            pid: Some(9999),
+            vcpu_count: config.vcpu_count,
+            mem_size_mib: config.mem_size_mib,
+            vsock_cid: config.vsock_cid,
+        };
+        self.inner.vms.lock().await.insert(id, info.clone());
+        Ok(info)
+    }
+
+    async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        let mut vms = self.inner.vms.lock().await;
+        match vms.get_mut(&id) {
+            Some(vm) => {
+                vm.state = VmState::Stopped;
+                Ok(())
+            }
+            None => Err(VmmError::VmNotFound(id)),
+        }
+    }
+
+    async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        self.inner.vms.lock().await.remove(&id);
+        Ok(())
+    }
+
+    async fn vm_info(&self, id: Uuid) -> Result<VmInfo, VmmError> {
+        self.inner
+            .vms
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or(VmmError::VmNotFound(id))
+    }
+
+    async fn pause_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        let mut vms = self.inner.vms.lock().await;
+        match vms.get_mut(&id) {
+            Some(vm) => {
+                vm.state = VmState::Paused;
+                Ok(())
+            }
+            None => Err(VmmError::VmNotFound(id)),
+        }
+    }
+
+    async fn resume_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        let mut vms = self.inner.vms.lock().await;
+        match vms.get_mut(&id) {
+            Some(vm) => {
+                vm.state = VmState::Running;
+                Ok(())
+            }
+            None => Err(VmmError::VmNotFound(id)),
+        }
+    }
+
+    async fn vsock_connect(&self, _id: Uuid, _port: u32) -> Result<Self::VsockStream, VmmError> {
+        Err(VmmError::ProcessError("not configured".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn build_core(mock: MockVmm, state: StateStore, data_dir: &Path, runtime_dir: &Path) -> Arc<HuskerCore<MockVmm>> {
+    let storage = StorageConfig {
+        data_dir: data_dir.to_path_buf(),
+    };
+    Arc::new(HuskerCore::new(mock, state, storage, runtime_dir.to_path_buf()))
+}
+
+// Kernel fixture valid on macOS too (ARM64 Image magic 0x644d5241 at offset 56).
+fn write_fixtures(dir: &Path) -> (PathBuf, PathBuf) {
+    let kernel = dir.join("vmlinux");
+    let mut kbytes = vec![0u8; 64];
+    kbytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, &kbytes).unwrap();
+    let rootfs = dir.join("rootfs.ext4");
+    std::fs::write(&rootfs, b"rootfs").unwrap();
+    (kernel, rootfs)
+}
+
+fn make_service_record(
+    id: Uuid,
+    name: &str,
+    desired: u32,
+    kernel: &Path,
+    rootfs: &Path,
+) -> ServiceRecord {
+    let now = chrono::Utc::now();
+    ServiceRecord {
+        id,
+        name: name.into(),
+        host_group_id: None,
+        desired_instances: desired,
+        image: None,
+        kernel_path: kernel.to_string_lossy().into_owned(),
+        rootfs_path: rootfs.to_string_lossy().into_owned(),
+        initrd_path: None,
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        userdata: None,
+        userdata_env: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn make_core_with_fixtures(tmp: &tempfile::TempDir) -> (Arc<HuskerCore<MockVmm>>, PathBuf, PathBuf) {
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let (kernel, rootfs) = write_fixtures(tmp.path());
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+    (core, kernel, rootfs)
+}
+
+fn sorted_names(names: &[String]) -> Vec<String> {
+    let mut v = names.to_vec();
+    v.sort();
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// 1. Scale up from zero: svc desired=3, empty -> reconcile -> 3 instances all running.
+#[tokio::test]
+async fn reconcile_scales_up_from_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+    let id = Uuid::new_v4();
+    let svc = make_service_record(id, "web", 3, &kernel, &rootfs);
+
+    let outcome = core.reconcile_service(&svc).await;
+
+    assert!(outcome.failed.is_empty(), "failed: {:?}", outcome.failed);
+    assert!(outcome.destroyed.is_empty());
+    let mut created = outcome.created.clone();
+    created.sort();
+    assert_eq!(created, vec!["web-0", "web-1", "web-2"]);
+
+    for name in &["web-0", "web-1", "web-2"] {
+        let vm = core.get_vm(name).unwrap();
+        assert_eq!(vm.state, "running", "{name} should be running");
+        assert_eq!(vm.service_id, Some(id));
+    }
+    let owned = core.list_vms_for_service(id).unwrap();
+    assert_eq!(owned.len(), 3);
+}
+
+// 2. Idempotent no-op: after scaling to 3, reconcile again -> empty outcome.
+#[tokio::test]
+async fn reconcile_idempotent_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+    let id = Uuid::new_v4();
+    let svc = make_service_record(id, "web", 3, &kernel, &rootfs);
+
+    core.reconcile_service(&svc).await;
+
+    let outcome = core.reconcile_service(&svc).await;
+    assert!(outcome.created.is_empty(), "created: {:?}", outcome.created);
+    assert!(outcome.destroyed.is_empty());
+    assert!(outcome.failed.is_empty());
+}
+
+// 3. Self-heal: stop web-1 -> reconcile -> web-1 replaced, ends running, new id.
+#[tokio::test]
+async fn reconcile_self_heals_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+    let id = Uuid::new_v4();
+    let svc = make_service_record(id, "web", 2, &kernel, &rootfs);
+
+    core.reconcile_service(&svc).await;
+
+    let old_id = core.get_vm("web-1").unwrap().id;
+    core.stop_vm("web-1").await.unwrap();
+    assert_eq!(core.get_vm("web-1").unwrap().state, "stopped");
+
+    let outcome = core.reconcile_service(&svc).await;
+
+    assert!(outcome.failed.is_empty(), "failed: {:?}", outcome.failed);
+    assert!(outcome.destroyed.contains(&"web-1".to_string()), "expected web-1 in destroyed: {:?}", outcome.destroyed);
+    assert!(outcome.created.contains(&"web-1".to_string()), "expected web-1 in created: {:?}", outcome.created);
+
+    let new_vm = core.get_vm("web-1").unwrap();
+    assert_eq!(new_vm.state, "running");
+    assert_ne!(new_vm.id, old_id, "replaced VM should have a new id");
+    // web-0 untouched
+    assert_eq!(core.get_vm("web-0").unwrap().state, "running");
+}
+
+// 4. Scale down: svc desired=3 -> reconcile; then desired=1 -> reconcile -> only web-0 remains.
+#[tokio::test]
+async fn reconcile_scales_down_destroys_highest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+    let id = Uuid::new_v4();
+    let svc3 = make_service_record(id, "web", 3, &kernel, &rootfs);
+    core.reconcile_service(&svc3).await;
+
+    let svc1 = make_service_record(id, "web", 1, &kernel, &rootfs);
+    let outcome = core.reconcile_service(&svc1).await;
+
+    assert!(outcome.failed.is_empty(), "failed: {:?}", outcome.failed);
+    let mut destroyed = outcome.destroyed.clone();
+    destroyed.sort();
+    assert_eq!(destroyed, vec!["web-1", "web-2"]);
+
+    assert_eq!(core.get_vm("web-0").unwrap().state, "running");
+    assert!(matches!(core.get_vm("web-1"), Err(CoreError::VmNotFound(_))));
+    assert!(matches!(core.get_vm("web-2"), Err(CoreError::VmNotFound(_))));
+    let owned = core.list_vms_for_service(id).unwrap();
+    assert_eq!(owned.len(), 1);
+}
+
+// 5. Foreign running collision: standalone "web-1" -> reconcile -> web-1 in failed; web-0/web-2 created.
+#[tokio::test]
+async fn reconcile_foreign_running_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    // Create a foreign running VM named "web-1"
+    core.create_vm(CreateVmRequest {
+        name: "web-1".into(),
+        kernel_path: kernel.clone(),
+        rootfs_path: rootfs.clone(),
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        initrd_path: None,
+        userdata: None,
+        env: vec![],
+    })
+    .await
+    .unwrap();
+    let foreign_id = core.get_vm("web-1").unwrap().id;
+    assert_eq!(core.get_vm("web-1").unwrap().service_id, None);
+
+    let id = Uuid::new_v4();
+    let svc = make_service_record(id, "web", 3, &kernel, &rootfs);
+    let outcome = core.reconcile_service(&svc).await;
+
+    // web-1 should be in failed
+    let failed_names: Vec<&str> = outcome.failed.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(failed_names.contains(&"web-1"), "expected web-1 in failed: {:?}", outcome.failed);
+
+    // web-0 and web-2 should be created
+    let created = sorted_names(&outcome.created);
+    assert_eq!(created, vec!["web-0", "web-2"]);
+
+    // Foreign web-1 is untouched
+    let foreign = core.get_vm("web-1").unwrap();
+    assert_eq!(foreign.id, foreign_id);
+    assert_eq!(foreign.service_id, None);
+    assert_eq!(foreign.state, "running");
+}
+
+// 6. Foreign stopped collision: standalone stopped "web-1" -> reconcile -> foreign NOT destroyed.
+#[tokio::test]
+async fn reconcile_foreign_stopped_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    // Create and stop a foreign VM named "web-1"
+    core.create_vm(CreateVmRequest {
+        name: "web-1".into(),
+        kernel_path: kernel.clone(),
+        rootfs_path: rootfs.clone(),
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        initrd_path: None,
+        userdata: None,
+        env: vec![],
+    })
+    .await
+    .unwrap();
+    core.stop_vm("web-1").await.unwrap();
+    let foreign_id = core.get_vm("web-1").unwrap().id;
+
+    let id = Uuid::new_v4();
+    let svc = make_service_record(id, "web", 3, &kernel, &rootfs);
+    let outcome = core.reconcile_service(&svc).await;
+
+    // web-1 should be in failed (not destroyed or created)
+    let failed_names: Vec<&str> = outcome.failed.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(failed_names.contains(&"web-1"), "expected web-1 in failed: {:?}", outcome.failed);
+
+    // Foreign web-1 still exists with same id and service_id == None
+    let foreign = core.get_vm("web-1").unwrap();
+    assert_eq!(foreign.id, foreign_id, "foreign VM should not have been replaced");
+    assert_eq!(foreign.service_id, None, "foreign VM service_id should still be None");
+
+    // web-0 and web-2 should be created
+    let created = sorted_names(&outcome.created);
+    assert_eq!(created, vec!["web-0", "web-2"]);
+}
+
+// 7. Dedupe: two VMs with same (service_id, ordinal) -> reconciler keeps best, destroys other.
+#[tokio::test]
+async fn reconcile_dedupes_duplicate_ordinal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    let id = Uuid::new_v4();
+    let svc = make_service_record(id, "web", 1, &kernel, &rootfs);
+
+    // Create "web-0" tagged as ordinal 0
+    let rec0 = core
+        .create_vm_record(
+            CreateVmRequest {
+                name: "web-0".into(),
+                kernel_path: kernel.clone(),
+                rootfs_path: rootfs.clone(),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                initrd_path: None,
+                userdata: None,
+                env: vec![],
+            },
+            Some(ServiceTag { service_id: id, ordinal: 0 }),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Create "dup-0" also tagged as ordinal 0 (bypasses unique index - index not yet created)
+    let _rec_dup = core
+        .create_vm_record(
+            CreateVmRequest {
+                name: "dup-0".into(),
+                kernel_path: kernel.clone(),
+                rootfs_path: rootfs.clone(),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                initrd_path: None,
+                userdata: None,
+                env: vec![],
+            },
+            Some(ServiceTag { service_id: id, ordinal: 0 }),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let pre_count = core.list_vms_for_service(id).unwrap().len();
+    assert_eq!(pre_count, 2, "should have 2 VMs before reconcile");
+
+    let outcome = core.reconcile_service(&svc).await;
+
+    assert!(outcome.failed.is_empty(), "failed: {:?}", outcome.failed);
+    // One should be destroyed (the duplicate)
+    assert!(!outcome.destroyed.is_empty(), "expected a destroyed instance: {:?}", outcome.destroyed);
+
+    let post = core.list_vms_for_service(id).unwrap();
+    assert_eq!(post.len(), 1, "should have exactly 1 VM after dedup");
+    assert_eq!(post[0].state, "running");
+
+    // The survivor (web-0) is running - verify rec0 survived (it was created first/running)
+    // Both were running so tie-break by created_at then id. Doesn't matter which survives as
+    // long as exactly one remains.
+    let _ = rec0; // suppress unused warning
+}
+
+// 8. Replace paused: svc desired=1; reconcile; pause web-0; reconcile -> web-0 running.
+#[tokio::test]
+async fn reconcile_replaces_paused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+    let id = Uuid::new_v4();
+    let svc = make_service_record(id, "web", 1, &kernel, &rootfs);
+
+    core.reconcile_service(&svc).await;
+    assert_eq!(core.get_vm("web-0").unwrap().state, "running");
+
+    core.pause_vm("web-0").await.unwrap();
+    assert_eq!(core.get_vm("web-0").unwrap().state, "paused");
+
+    let outcome = core.reconcile_service(&svc).await;
+
+    assert!(outcome.failed.is_empty(), "failed: {:?}", outcome.failed);
+    assert!(outcome.destroyed.contains(&"web-0".to_string()));
+    assert!(outcome.created.contains(&"web-0".to_string()));
+
+    let vm = core.get_vm("web-0").unwrap();
+    assert_eq!(vm.state, "running", "web-0 should be running after replace");
+}
+
+// Additional: empty rootfs path returns failed outcome without panicking.
+#[tokio::test]
+async fn reconcile_empty_rootfs_returns_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    let now = chrono::Utc::now();
+    let svc = ServiceRecord {
+        id: Uuid::new_v4(),
+        name: "empty-svc".into(),
+        host_group_id: None,
+        desired_instances: 1,
+        image: None,
+        kernel_path: "/some/kernel".into(),
+        rootfs_path: "".into(), // empty!
+        initrd_path: None,
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        userdata: None,
+        userdata_env: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let outcome = core.reconcile_service(&svc).await;
+    assert!(!outcome.failed.is_empty(), "should have a failure for empty rootfs");
+    assert!(outcome.created.is_empty());
+    assert!(outcome.destroyed.is_empty());
+}
