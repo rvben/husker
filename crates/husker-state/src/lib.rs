@@ -339,8 +339,9 @@ impl StateStore {
             ],
         )
         .map_err(|e| match &e {
-            rusqlite::Error::SqliteFailure(err, _)
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            rusqlite::Error::SqliteFailure(err, Some(msg))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && msg.contains("vms.name") =>
             {
                 StateError::VmAlreadyExists(record.name.clone())
             }
@@ -1075,6 +1076,20 @@ impl StateStore {
             params![now],
         )?;
         Ok(count)
+    }
+
+    /// Create the partial unique index that prevents two VMs from claiming the
+    /// same (service_id, service_ordinal). Idempotent. Must be called only after
+    /// a core-level dedupe pass has removed any existing duplicates, since the
+    /// index creation fails if duplicates already exist.
+    pub fn create_service_ordinal_index(&self) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_vms_service_ordinal
+               ON vms(service_id, service_ordinal)
+               WHERE service_id IS NOT NULL AND service_ordinal IS NOT NULL;",
+        )?;
+        Ok(())
     }
 
     /// Delete all port forwards for a VM.
@@ -2118,6 +2133,35 @@ mod tests {
         assert_eq!(got.vcpu_count, Some(2));
         assert_eq!(got.mem_size_mib, Some(512));
         assert_eq!(got.userdata.as_deref(), Some("echo hi"));
+    }
+
+    // ── Service Ordinal Index ─────────────────────────────────────────
+
+    #[test]
+    fn create_service_ordinal_index_rejects_duplicate_ordinal() {
+        let store = StateStore::open_memory().unwrap();
+        store.create_service_ordinal_index().unwrap();
+        let sid = Uuid::new_v4();
+        let mut a = make_record("web-0");
+        a.service_id = Some(sid);
+        a.service_ordinal = Some(0);
+        store.insert_vm(&a).unwrap();
+
+        let mut dup = make_record("web-0-dup");
+        dup.service_id = Some(sid);
+        dup.service_ordinal = Some(0); // same (service_id, ordinal)
+        let err = store.insert_vm(&dup).unwrap_err();
+        assert!(matches!(err, StateError::Database(_)));
+    }
+
+    #[test]
+    fn create_service_ordinal_index_allows_null_ordinals() {
+        let store = StateStore::open_memory().unwrap();
+        store.create_service_ordinal_index().unwrap();
+        // Two standalone VMs (NULL service_id/ordinal) must not collide under the partial index.
+        store.insert_vm(&make_record("a")).unwrap();
+        store.insert_vm(&make_record("b")).unwrap();
+        assert_eq!(store.list_vms().unwrap().len(), 2);
     }
 
     // ── Service ownership tags ────────────────────────────────────────
