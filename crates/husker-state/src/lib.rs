@@ -84,6 +84,10 @@ pub struct VmRecord {
     pub userdata_status: Option<String>,
     /// JSON-serialized environment variables for userdata script.
     pub userdata_env: Option<String>,
+    /// UUID of the owning service, or None for a standalone VM.
+    pub service_id: Option<Uuid>,
+    /// Stable instance ordinal within the owning service (0..desired-1).
+    pub service_ordinal: Option<u32>,
 }
 
 /// Persistent port forward record.
@@ -274,6 +278,10 @@ impl StateStore {
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata_status TEXT", []);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata_env TEXT", []);
 
+        // Migration: tag VMs with their owning service (idempotent).
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_ordinal INTEGER", []);
+
         Ok(())
     }
 
@@ -285,8 +293,9 @@ impl StateStore {
         conn.execute(
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                              created_at, updated_at, userdata, userdata_status, userdata_env)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                              created_at, updated_at, userdata, userdata_status, userdata_env,
+                              service_id, service_ordinal)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -305,6 +314,8 @@ impl StateStore {
                 record.userdata,
                 record.userdata_status,
                 record.userdata_env,
+                record.service_id.map(|id| id.to_string()),
+                record.service_ordinal,
             ],
         )
         .map_err(|e| match &e {
@@ -324,7 +335,8 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at, userdata, userdata_status, userdata_env
+                    created_at, updated_at, userdata, userdata_status, userdata_env,
+                    service_id, service_ordinal
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -341,7 +353,8 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at, userdata, userdata_status, userdata_env
+                    created_at, updated_at, userdata, userdata_status, userdata_env,
+                    service_id, service_ordinal
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -358,7 +371,8 @@ impl StateStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                    created_at, updated_at, userdata, userdata_status, userdata_env
+                    created_at, updated_at, userdata, userdata_status, userdata_env,
+                    service_id, service_ordinal
              FROM vms ORDER BY created_at",
         )?;
 
@@ -366,6 +380,22 @@ impl StateStore {
             .query_map([], row_to_vm_record)?
             .collect::<Result<Vec<_>, _>>()?;
 
+        Ok(records)
+    }
+
+    /// List all VMs owned by a given service, ordered by ordinal.
+    pub fn list_vms_for_service(&self, service_id: Uuid) -> Result<Vec<VmRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                    tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                    created_at, updated_at, userdata, userdata_status, userdata_env,
+                    service_id, service_ordinal
+             FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
+        )?;
+        let records = stmt
+            .query_map(params![service_id.to_string()], row_to_vm_record)?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
 
@@ -1058,6 +1088,23 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
         userdata: row.get(14)?,
         userdata_status: row.get(15)?,
         userdata_env: row.get(16)?,
+        service_id: {
+            let s: Option<String> = row.get(17)?;
+            s.as_deref().map(parse_uuid).transpose()?
+        },
+        service_ordinal: {
+            let raw: Option<i64> = row.get(18)?;
+            match raw {
+                None => None,
+                Some(v) => Some(u32::try_from(v).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        18,
+                        rusqlite::types::Type::Integer,
+                        format!("service_ordinal {v} out of u32 range").into(),
+                    )
+                })?),
+            }
+        },
     })
 }
 
@@ -1161,6 +1208,8 @@ mod tests {
             userdata: None,
             userdata_status: None,
             userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
         }
     }
 
@@ -1999,5 +2048,43 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let err = store.delete_secret(Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, StateError::SecretNotFound(_)));
+    }
+
+    // ── Service ownership tags ────────────────────────────────────────
+
+    #[test]
+    fn vm_service_tags_roundtrip() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("svc-inst");
+        let sid = Uuid::new_v4();
+        rec.service_id = Some(sid);
+        rec.service_ordinal = Some(0);
+        store.insert_vm(&rec).unwrap();
+
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(fetched.service_id, Some(sid));
+        assert_eq!(fetched.service_ordinal, Some(0));
+    }
+
+    #[test]
+    fn list_vms_for_service_filters_by_owner() {
+        let store = StateStore::open_memory().unwrap();
+        let sid = Uuid::new_v4();
+        let mut a = make_record("web-0");
+        a.service_id = Some(sid);
+        a.service_ordinal = Some(0);
+        let mut b = make_record("web-1");
+        b.service_id = Some(sid);
+        b.service_ordinal = Some(1);
+        let standalone = make_record("other"); // no service_id
+        store.insert_vm(&a).unwrap();
+        store.insert_vm(&b).unwrap();
+        store.insert_vm(&standalone).unwrap();
+
+        let owned = store.list_vms_for_service(sid).unwrap();
+        assert_eq!(owned.len(), 2);
+        assert!(owned.iter().all(|v| v.service_id == Some(sid)));
+        assert_eq!(owned[0].service_ordinal, Some(0));
+        assert_eq!(owned[1].service_ordinal, Some(1));
     }
 }

@@ -2856,6 +2856,8 @@ mod tests {
                 userdata: None,
                 userdata_status: None,
                 userdata_env: None,
+                service_id: None,
+                service_ordinal: None,
             })
             .unwrap();
 
@@ -3219,6 +3221,8 @@ mod tests {
                 userdata: None,
                 userdata_status: None,
                 userdata_env: None,
+                service_id: None,
+                service_ordinal: None,
             })
             .unwrap();
 

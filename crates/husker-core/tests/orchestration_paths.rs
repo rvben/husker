@@ -186,6 +186,8 @@ fn vm_record(
         userdata,
         userdata_status,
         userdata_env,
+        service_id: None,
+        service_ordinal: None,
     }
 }
 

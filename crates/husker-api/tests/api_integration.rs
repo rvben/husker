@@ -113,6 +113,8 @@ async fn health_counts_vms_correctly() {
             userdata: None,
             userdata_status: None,
             userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -311,6 +313,8 @@ async fn snapshot_endpoints_roundtrip() {
             userdata: None,
             userdata_status: None,
             userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
         })
         .unwrap();
 
@@ -816,6 +820,8 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -964,6 +970,8 @@ async fn vm_response_json_structure() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1034,6 +1042,8 @@ async fn list_vms_returns_all_records() {
             userdata: None,
             userdata_status: None,
             userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -1265,6 +1275,8 @@ async fn list_port_forwards_empty_for_existing_vm() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1313,6 +1325,8 @@ async fn vm_response_with_null_optional_fields() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1381,6 +1395,8 @@ async fn logs_returns_serial_output() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1433,6 +1449,8 @@ async fn logs_tail_returns_last_n_lines() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1485,6 +1503,8 @@ async fn logs_no_serial_file_returns_404() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1539,6 +1559,8 @@ fn logs_test_core(
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1774,6 +1796,8 @@ async fn logs_large_file_is_truncated() {
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state.insert_vm(&record).unwrap();
 

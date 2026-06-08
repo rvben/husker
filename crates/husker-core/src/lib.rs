@@ -465,6 +465,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
             },
+            service_id: None,
+            service_ordinal: None,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -548,6 +550,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
             },
+            service_id: None,
+            service_ordinal: None,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {

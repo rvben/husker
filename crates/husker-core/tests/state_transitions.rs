@@ -127,6 +127,8 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
         userdata: None,
         userdata_status: None,
         userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
     };
     state_store.insert_vm(&record).unwrap();
 
