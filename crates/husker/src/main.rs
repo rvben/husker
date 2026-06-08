@@ -242,6 +242,10 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Emit a machine-readable contract of the CLI (commands, args, output
+    /// fields, exit codes) for agent introspection
+    Schema,
 }
 
 #[derive(Subcommand)]
@@ -554,28 +558,92 @@ fn default_dns_servers() -> Vec<String> {
 ///
 /// Handles JSON error bodies, plain text, and empty responses gracefully
 /// so the CLI never dumps raw stack traces at the user.
-async fn api_error(resp: reqwest::Response, subject: &str) -> String {
+/// Exit codes husker returns for its own failures. `exec` and `shell` instead
+/// pass through the guest command's exit code. Documented in `husker schema`.
+mod exit_code {
+    pub const GENERAL: i32 = 1;
+    pub const NOT_FOUND: i32 = 2;
+    pub const CONFLICT: i32 = 3;
+    pub const DENIED: i32 = 4;
+    pub const DAEMON_UNREACHABLE: i32 = 5;
+}
+
+/// A failure to surface to the user: a human-readable `message`, an optional
+/// machine-readable `code` (the daemon's stable error code), and the process
+/// exit code to return. `String`/`&str` convert in as a generic error.
+struct ApiFailure {
+    message: String,
+    code: Option<String>,
+    exit_code: i32,
+}
+
+impl From<String> for ApiFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: None,
+            exit_code: exit_code::GENERAL,
+        }
+    }
+}
+
+impl From<&str> for ApiFailure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+/// Marker attached to connection failures so the top-level handler can map them
+/// to `exit_code::DAEMON_UNREACHABLE`.
+#[derive(Debug)]
+struct DaemonUnreachable;
+
+impl std::fmt::Display for DaemonUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "daemon unreachable")
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {}
+
+/// Build an `ApiFailure` from a non-success API response: derive the exit code
+/// from the HTTP status, capture the daemon's stable `code`, and the message.
+async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFailure {
     let status = resp.status();
-    match resp.text().await {
-        Ok(body) if !body.is_empty() => {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+    let exit_code = match status.as_u16() {
+        404 => exit_code::NOT_FOUND,
+        409 => exit_code::CONFLICT,
+        401 | 403 => exit_code::DENIED,
+        _ => exit_code::GENERAL,
+    };
+    let mut code = None;
+    let message = match resp.text().await {
+        Ok(body) if !body.is_empty() => match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(json) => {
+                code = json["code"].as_str().map(String::from);
                 if let Some(msg) = json["message"].as_str() {
-                    if let Some(hint) = json["hint"].as_str() {
-                        return format!("{msg} (hint: {hint})");
+                    match json["hint"].as_str() {
+                        Some(hint) => format!("{msg} (hint: {hint})"),
+                        None => msg.to_string(),
                     }
-                    return msg.to_string();
-                }
-                if let Some(msg) = json["error"].as_str() {
-                    return msg.to_string();
+                } else if let Some(msg) = json["error"].as_str() {
+                    msg.to_string()
+                } else {
+                    body
                 }
             }
-            body
-        }
+            Err(_) => body,
+        },
         _ => match status.as_u16() {
             404 => format!("{subject} not found"),
             409 => format!("{subject} already exists"),
             _ => format!("{subject}: {status}"),
         },
+    };
+    ApiFailure {
+        message,
+        code,
+        exit_code,
     }
 }
 
@@ -597,10 +665,10 @@ async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Respon
     request.send().await.map_err(|e| {
         if e.is_connect() {
             let url = DAEMON_URL.get().map(String::as_str).unwrap_or("the daemon");
-            anyhow::anyhow!(
+            anyhow::Error::new(DaemonUnreachable).context(format!(
                 "cannot connect to daemon at {url}\n\
                  hint: start it with `husker daemon`, or point at a running daemon via --api-url / HUSKER_API_URL"
-            )
+            ))
         } else {
             anyhow::anyhow!("{e}")
         }
@@ -630,14 +698,15 @@ fn render_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef
     }
 }
 
-fn render_error_output(format: OutputFormat, message: impl Into<String>) -> String {
-    let message = message.into();
+fn render_error_output(format: OutputFormat, message: &str, code: Option<&str>) -> String {
     if format == OutputFormat::Json {
-        serde_json::json!({
-            "error": message,
-            "status": "error"
-        })
-        .to_string()
+        let mut obj = serde_json::Map::new();
+        obj.insert("status".into(), serde_json::Value::from("error"));
+        obj.insert("error".into(), serde_json::Value::from(message));
+        if let Some(c) = code {
+            obj.insert("code".into(), serde_json::Value::from(c));
+        }
+        serde_json::Value::Object(obj).to_string()
     } else {
         format!("Error: {message}")
     }
@@ -647,14 +716,191 @@ fn print_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<
     println!("{}", render_output(format, value, text));
 }
 
-fn exit_with_error(format: OutputFormat, message: impl Into<String>) -> ! {
-    let rendered = render_error_output(format, message);
+fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
+    let err = error.into();
+    let rendered = render_error_output(format, &err.message, err.code.as_deref());
     if format == OutputFormat::Json {
         println!("{rendered}");
     } else {
         eprintln!("{rendered}");
     }
-    std::process::exit(1);
+    std::process::exit(err.exit_code);
+}
+
+/// Build the machine-readable CLI contract emitted by `husker schema`, in the
+/// clispec shape used across the rest of the CLI fleet. Command names and args
+/// are derived from clap so they cannot drift; mutating flags and output fields
+/// are annotated here.
+fn build_cli_schema() -> serde_json::Value {
+    use clap::CommandFactory;
+    let root = Cli::command();
+    let mut commands = serde_json::Map::new();
+    for sub in root.get_subcommands() {
+        collect_schema_command(sub, "", &[], &mut commands);
+    }
+    serde_json::json!({
+        "name": "husker",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": root.get_about().map(|s| s.to_string()).unwrap_or_default(),
+        "global_flags": schema_global_flags(&root),
+        "exit_codes": {
+            "0": "success",
+            "1": "general error",
+            "2": "not found (VM, image, snapshot, secret, ...)",
+            "3": "conflict or invalid state (already exists, or wrong state for the operation)",
+            "4": "permission denied (token auth or exec policy)",
+            "5": "daemon unreachable",
+        },
+        "notes": [
+            "exec and shell pass through the guest command's exit code instead of the codes above.",
+            "Pass --output json for machine-readable output; --output text is the default.",
+            "JSON errors carry a stable `code` field when the daemon provides one.",
+        ],
+        "commands": serde_json::Value::Object(commands),
+    })
+}
+
+/// Recursively flatten a clap command into clispec entries keyed by the full
+/// command path ("image pull"). Groups (commands that only hold subcommands)
+/// are not emitted; their leaves are.
+fn collect_schema_command(
+    cmd: &clap::Command,
+    prefix: &str,
+    parent_args: &[serde_json::Value],
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let name = cmd.get_name();
+    if name == "help" {
+        return;
+    }
+    let path = if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix} {name}")
+    };
+
+    // This command's own arguments. A group (e.g. `port-forward`) can define
+    // arguments (a required VM `name`) that its leaves also require, so groups
+    // pass theirs down and leaves combine inherited + own.
+    let own_args: Vec<serde_json::Value> = cmd
+        .get_arguments()
+        .filter(|a| a.get_id() != "help" && !a.is_global_set())
+        .map(|a| {
+            let mut o = serde_json::Map::new();
+            o.insert("name".into(), serde_json::Value::from(a.get_id().as_str()));
+            if let Some(help) = a.get_help() {
+                o.insert(
+                    "description".into(),
+                    serde_json::Value::from(help.to_string()),
+                );
+            }
+            o.insert(
+                "required".into(),
+                serde_json::Value::from(a.is_required_set()),
+            );
+            if let Some(long) = a.get_long() {
+                o.insert("flag".into(), serde_json::Value::from(format!("--{long}")));
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+
+    let subs: Vec<&clap::Command> = cmd
+        .get_subcommands()
+        .filter(|s| s.get_name() != "help")
+        .collect();
+
+    if subs.is_empty() {
+        let mut args = parent_args.to_vec();
+        args.extend(own_args);
+        let (mutating, output_fields) = schema_command_annotations(&path);
+        out.insert(
+            path,
+            serde_json::json!({
+                "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
+                "args": args,
+                "mutating": mutating,
+                "output_fields": output_fields,
+            }),
+        );
+    } else {
+        let mut child_args = parent_args.to_vec();
+        child_args.extend(own_args);
+        for sub in subs {
+            collect_schema_command(sub, &path, &child_args, out);
+        }
+    }
+}
+
+/// Top-level (global) flags for the schema, derived from the root command.
+fn schema_global_flags(root: &clap::Command) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for a in root.get_arguments() {
+        let id = a.get_id().as_str();
+        if id == "help" || id == "version" {
+            continue;
+        }
+        if let Some(long) = a.get_long() {
+            let key = if matches!(
+                a.get_action(),
+                clap::ArgAction::Set | clap::ArgAction::Append
+            ) {
+                format!("--{long} <{}>", id.to_uppercase())
+            } else {
+                format!("--{long}")
+            };
+            let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+            m.insert(key, serde_json::Value::from(help));
+        }
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Manual annotations clap cannot derive: whether a command mutates state, and
+/// the fields its JSON output emits. Read-only commands are listed explicitly;
+/// everything else is treated as mutating. `output_fields` are provided for the
+/// core commands and left empty for the rest.
+fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
+    let read_only = matches!(
+        path,
+        "list"
+            | "info"
+            | "logs"
+            | "version"
+            | "schema"
+            | "config check"
+            | "port-forward list"
+            | "host-group list"
+            | "host-group get"
+            | "service list"
+            | "service get"
+            | "snapshot list"
+            | "snapshot get"
+            | "image list"
+            | "image get"
+            | "secret list"
+            | "secret get"
+            | "secret reveal"
+    );
+    let output_fields: Vec<&'static str> = match path {
+        "run" => vec!["status", "action", "vm", "userdata_queued"],
+        "list" => vec!["name", "state", "vcpu_count", "mem_size_mib", "guest_ip"],
+        "info" => vec![
+            "name",
+            "state",
+            "vcpu_count",
+            "mem_size_mib",
+            "guest_ip",
+            "host_ip",
+            "userdata_status",
+            "id",
+        ],
+        "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
+        "exec" => vec!["exit_code", "stdout", "stderr"],
+        "version" => vec!["client_version", "server_version"],
+        _ => vec![],
+    };
+    (!read_only, output_fields)
 }
 
 impl Default for Config {
@@ -691,7 +937,7 @@ impl Default for Config {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -700,6 +946,28 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let output = cli.output;
+    if let Err(e) = run(cli).await {
+        // A connection failure carries the DaemonUnreachable marker; everything
+        // else is a generic client error. API errors (not-found/conflict/denied)
+        // exit earlier via exit_with_error with their own codes. Rendered in the
+        // requested format so `--output json` callers always get parseable errors.
+        let (code, error_code) = if e.chain().any(|cause| cause.is::<DaemonUnreachable>()) {
+            (exit_code::DAEMON_UNREACHABLE, Some("daemon_unreachable"))
+        } else {
+            (exit_code::GENERAL, None)
+        };
+        let rendered = render_error_output(output, &format!("{e:#}"), error_code);
+        if output == OutputFormat::Json {
+            println!("{rendered}");
+        } else {
+            eprintln!("{rendered}");
+        }
+        std::process::exit(code);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let Cli {
         config: config_path,
         api_url,
@@ -824,10 +1092,9 @@ async fn main() -> Result<()> {
             .await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
-                let mut full = msg.clone();
-                if msg.contains("already exists") {
-                    full.push_str(&format!(
+                let mut full = api_error(resp, &format!("VM '{name}'")).await;
+                if full.message.contains("already exists") {
+                    full.message.push_str(&format!(
                         " (hint: stop or destroy it first with `husker destroy {name}`)"
                     ));
                 }
@@ -969,8 +1236,8 @@ async fn main() -> Result<()> {
                 );
             } else {
                 let mut msg = api_error(resp, &format!("VM '{name}'")).await;
-                if msg.contains("stopped") {
-                    msg.push_str(" (hint: VM is already stopped)");
+                if msg.message.contains("stopped") {
+                    msg.message.push_str(" (hint: VM is already stopped)");
                 }
                 exit_with_error(output, msg);
             }
@@ -997,8 +1264,9 @@ async fn main() -> Result<()> {
                 );
             } else {
                 let mut msg = api_error(resp, &format!("VM '{name}'")).await;
-                if msg.contains("stopped") {
-                    msg.push_str(" (hint: start the VM first with `husker run`)");
+                if msg.message.contains("stopped") {
+                    msg.message
+                        .push_str(" (hint: start the VM first with `husker run`)");
                 }
                 exit_with_error(output, msg);
             }
@@ -1025,10 +1293,12 @@ async fn main() -> Result<()> {
                 );
             } else {
                 let mut msg = api_error(resp, &format!("VM '{name}'")).await;
-                if msg.contains("stopped") {
-                    msg.push_str(" (hint: start the VM first with `husker run`)");
-                } else if msg.contains("running") {
-                    msg.push_str(" (hint: VM is already running, nothing to resume)");
+                if msg.message.contains("stopped") {
+                    msg.message
+                        .push_str(" (hint: start the VM first with `husker run`)");
+                } else if msg.message.contains("running") {
+                    msg.message
+                        .push_str(" (hint: VM is already running, nothing to resume)");
                 }
                 exit_with_error(output, msg);
             }
@@ -1330,7 +1600,15 @@ async fn main() -> Result<()> {
         }
         Commands::Shell { name, command } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            run_shell(api_url, config_path, name, command, api_token.as_deref()).await
+            run_shell(
+                api_url,
+                config_path,
+                name,
+                command,
+                api_token.as_deref(),
+                output,
+            )
+            .await
         }
         Commands::Version => {
             let mut daemon_info: Option<serde_json::Value> = None;
@@ -1387,6 +1665,13 @@ async fn main() -> Result<()> {
                 check_config(config_path.as_deref())
             }
         },
+        Commands::Schema => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&build_cli_schema()).expect("schema serializes")
+            );
+            Ok(())
+        }
     }
 }
 
@@ -2478,6 +2763,7 @@ async fn run_shell(
     name: String,
     command: Option<String>,
     api_token: Option<&str>,
+    output: OutputFormat,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let resp = api_request(with_api_auth(
@@ -2487,8 +2773,8 @@ async fn run_shell(
     .await?;
 
     if !resp.status().is_success() {
-        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-        std::process::exit(1);
+        let err = api_error(resp, &format!("VM '{name}'")).await;
+        exit_with_error(output, err);
     }
 
     let vm: serde_json::Value = resp.json().await?;
@@ -2533,7 +2819,7 @@ async fn run_shell(
     }
 
     // Direct vsock unavailable — use WebSocket through daemon.
-    run_shell_ws(&api_url, &name, command.as_deref(), api_token).await
+    run_shell_ws(&api_url, &name, command.as_deref(), api_token, output).await
 }
 
 #[cfg(not(feature = "linux-net"))]
@@ -2543,8 +2829,9 @@ async fn run_shell(
     name: String,
     command: Option<String>,
     api_token: Option<&str>,
+    output: OutputFormat,
 ) -> Result<()> {
-    run_shell_ws(&api_url, &name, command.as_deref(), api_token).await
+    run_shell_ws(&api_url, &name, command.as_deref(), api_token, output).await
 }
 
 /// WebSocket-based interactive shell, works on both Linux and macOS.
@@ -2553,6 +2840,7 @@ async fn run_shell_ws(
     name: &str,
     command: Option<&str>,
     api_token: Option<&str>,
+    output: OutputFormat,
 ) -> Result<()> {
     // Pre-check: verify VM is running before opening the WebSocket.
     let client = reqwest::Client::new();
@@ -2562,19 +2850,28 @@ async fn run_shell_ws(
     ))
     .await?;
     if !resp.status().is_success() {
-        eprintln!("Error: {}", api_error(resp, &format!("VM '{name}'")).await);
-        std::process::exit(1);
+        let err = api_error(resp, &format!("VM '{name}'")).await;
+        exit_with_error(output, err);
     }
     let vm: serde_json::Value = resp.json().await?;
     let state = vm["state"].as_str().unwrap_or("unknown");
     if state != "running" {
-        eprintln!("Error: VM '{name}' is {state}, expected running");
+        let mut message = format!("VM '{name}' is {state}, expected running");
         if state == "stopped" {
-            eprintln!("Hint: start the VM first with `husker run`");
+            message.push_str(" (hint: start the VM first with `husker run`)");
         } else if state == "paused" {
-            eprintln!("Hint: resume the VM first with `husker resume {name}`");
+            message.push_str(&format!(
+                " (hint: resume the VM first with `husker resume {name}`)"
+            ));
         }
-        std::process::exit(1);
+        exit_with_error(
+            output,
+            ApiFailure {
+                message,
+                code: Some("vm_not_running".into()),
+                exit_code: exit_code::CONFLICT,
+            },
+        );
     }
 
     let ws_url = api_url
@@ -3925,16 +4222,69 @@ mod tests {
 
     #[test]
     fn render_error_output_json_has_stable_fields() {
-        let rendered = render_error_output(OutputFormat::Json, "boom");
+        let rendered = render_error_output(OutputFormat::Json, "boom", None);
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(parsed["status"], "error");
         assert_eq!(parsed["error"], "boom");
+        assert!(parsed.get("code").is_none());
+    }
+
+    #[test]
+    fn render_error_output_json_includes_code_when_present() {
+        let rendered = render_error_output(OutputFormat::Json, "boom", Some("vm_not_found"));
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["error"], "boom");
+        assert_eq!(parsed["code"], "vm_not_found");
     }
 
     #[test]
     fn render_error_output_text_is_prefixed() {
-        let rendered = render_error_output(OutputFormat::Text, "boom");
+        let rendered = render_error_output(OutputFormat::Text, "boom", None);
         assert_eq!(rendered, "Error: boom");
+    }
+
+    #[test]
+    fn cli_schema_is_well_formed() {
+        let schema = build_cli_schema();
+        assert_eq!(schema["name"], "husker");
+        assert!(schema["version"].as_str().is_some());
+        assert!(
+            schema["exit_codes"]["2"]
+                .as_str()
+                .unwrap()
+                .contains("not found")
+        );
+
+        let cmds = &schema["commands"];
+        // Leaf commands and nested subcommands are derived from clap.
+        assert!(cmds["run"].is_object());
+        assert!(cmds["image pull"].is_object());
+        assert!(cmds["schema"].is_object());
+        // Groups themselves are not emitted, only their leaves.
+        assert!(cmds.get("image").is_none());
+
+        // Mutating annotations: writes are mutating, getters/lists are not.
+        assert_eq!(cmds["run"]["mutating"], true);
+        assert_eq!(cmds["image pull"]["mutating"], true);
+        assert_eq!(cmds["list"]["mutating"], false);
+        assert_eq!(cmds["schema"]["mutating"], false);
+        assert_eq!(cmds["secret get"]["mutating"], false);
+        assert_eq!(cmds["snapshot get"]["mutating"], false);
+
+        // Args are derived from clap (run takes a positional rootfs).
+        let run_args = cmds["run"]["args"].as_array().unwrap();
+        assert!(run_args.iter().any(|a| a["name"] == "rootfs"));
+
+        // Nested commands inherit their parent's arguments: `port-forward add`
+        // requires the parent VM `name` as well as its own ports.
+        let pf_args = cmds["port-forward add"]["args"].as_array().unwrap();
+        assert!(pf_args.iter().any(|a| a["name"] == "name"));
+        assert!(pf_args.iter().any(|a| a["name"] == "host_port"));
+
+        // Output fields annotated for core commands.
+        let list_fields = cmds["list"]["output_fields"].as_array().unwrap();
+        assert!(list_fields.contains(&serde_json::json!("guest_ip")));
     }
 
     #[test]
@@ -4200,7 +4550,7 @@ mod tests {
             r#"{"message":"nope","hint":"try again"}"#,
         )
         .await;
-        let message = api_error(response, "running VM").await;
+        let message = api_error(response, "running VM").await.message;
         assert_eq!(message, "nope (hint: try again)");
     }
 
@@ -4212,7 +4562,7 @@ mod tests {
             r#"{"error":"backend exploded"}"#,
         )
         .await;
-        let message = api_error(response, "running VM").await;
+        let message = api_error(response, "running VM").await.message;
         assert_eq!(message, "backend exploded");
     }
 
@@ -4220,28 +4570,52 @@ mod tests {
     async fn api_error_uses_plain_text_body_when_available() {
         let response =
             request_single_response("502 Bad Gateway", "text/plain", "gateway timeout").await;
-        let message = api_error(response, "running VM").await;
+        let message = api_error(response, "running VM").await.message;
         assert_eq!(message, "gateway timeout");
     }
 
     #[tokio::test]
     async fn api_error_uses_subject_for_empty_404() {
         let response = request_single_response("404 Not Found", "text/plain", "").await;
-        let message = api_error(response, "VM 'demo'").await;
-        assert_eq!(message, "VM 'demo' not found");
+        let failure = api_error(response, "VM 'demo'").await;
+        assert_eq!(failure.message, "VM 'demo' not found");
+        assert_eq!(failure.exit_code, exit_code::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_error_maps_status_and_code_to_exit_code() {
+        let conflict = api_error(
+            request_single_response(
+                "409 Conflict",
+                "application/json",
+                r#"{"code":"vm_exists"}"#,
+            )
+            .await,
+            "vm",
+        )
+        .await;
+        assert_eq!(conflict.exit_code, exit_code::CONFLICT);
+        assert_eq!(conflict.code.as_deref(), Some("vm_exists"));
+
+        let denied = api_error(
+            request_single_response("403 Forbidden", "text/plain", "").await,
+            "vm",
+        )
+        .await;
+        assert_eq!(denied.exit_code, exit_code::DENIED);
     }
 
     #[tokio::test]
     async fn api_error_uses_subject_for_empty_409() {
         let response = request_single_response("409 Conflict", "text/plain", "").await;
-        let message = api_error(response, "VM 'demo'").await;
+        let message = api_error(response, "VM 'demo'").await.message;
         assert_eq!(message, "VM 'demo' already exists");
     }
 
     #[tokio::test]
     async fn api_error_uses_status_for_other_empty_errors() {
         let response = request_single_response("500 Internal Server Error", "text/plain", "").await;
-        let message = api_error(response, "creating VM").await;
+        let message = api_error(response, "creating VM").await.message;
         assert_eq!(message, "creating VM: 500 Internal Server Error");
     }
 
