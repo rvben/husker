@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.1] - 2026-06-08
+
+### Fixed
+
+- Destroying a VM that produced no serial output no longer logs a spurious
+  "failed to remove serial log" warning during cleanup.
+
+### Internal
+
+- Stabilized the `run_userdata` integration tests under parallel (nextest)
+  execution by serializing them across processes, so they no longer
+  intermittently clobber a shared host path.
+
 ## [0.2.0] - 2026-06-05
 
 ### Changed (BREAKING)
