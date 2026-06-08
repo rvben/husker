@@ -36,6 +36,25 @@ async fn listen_unix(path: &str) -> Result<()> {
     }
 }
 
+/// Build an actionable error for a failed vsock bind. The common cause in a
+/// custom guest rootfs is that the vsock kernel modules are not loaded, which
+/// surfaces as `EAFNOSUPPORT`. Call that out explicitly so the serial console
+/// shows the fix instead of an opaque "Address family not supported", which
+/// otherwise just looks like a silent agent crash loop.
+#[cfg(target_os = "linux")]
+fn vsock_bind_error(port: u32, err: std::io::Error) -> anyhow::Error {
+    if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+        anyhow::anyhow!(
+            "failed to bind guest agent to vsock port {port}: AF_VSOCK is not supported \
+             ({err}). The vsock kernel modules are not loaded; load vsock, \
+             vmw_vsock_virtio_transport_common and vmw_vsock_virtio_transport in the guest \
+             before starting the agent (see docs/custom-rootfs.md)."
+        )
+    } else {
+        anyhow::anyhow!("failed to bind guest agent to vsock port {port}: {err}")
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn listen_vsock() -> Result<()> {
     use tokio_vsock::VsockListener;
@@ -44,7 +63,7 @@ async fn listen_vsock() -> Result<()> {
     info!("listening on vsock port {port}");
 
     let addr = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, port);
-    let mut listener = VsockListener::bind(addr).context("binding vsock listener")?;
+    let mut listener = VsockListener::bind(addr).map_err(|e| vsock_bind_error(port, e))?;
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -60,4 +79,32 @@ async fn listen_vsock() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 async fn listen_vsock() -> Result<()> {
     anyhow::bail!("vsock is only available on Linux; set HUSKER_AGENT_SOCKET for dev use")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vsock_bind_error_explains_missing_modules() {
+        let err = std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+        let msg = format!("{:#}", vsock_bind_error(52, err));
+        assert!(msg.contains("port 52"), "names the port: {msg}");
+        assert!(
+            msg.to_lowercase().contains("module"),
+            "points at the kernel modules: {msg}"
+        );
+        assert!(msg.contains("vsock"), "names the vsock modules: {msg}");
+    }
+
+    #[test]
+    fn vsock_bind_error_passes_through_unrelated_errors() {
+        let err = std::io::Error::from_raw_os_error(libc::EADDRINUSE);
+        let msg = format!("{:#}", vsock_bind_error(52, err));
+        assert!(msg.contains("port 52"), "names the port: {msg}");
+        assert!(
+            !msg.to_lowercase().contains("module"),
+            "no misleading module hint for unrelated errors: {msg}"
+        );
+    }
 }
