@@ -933,7 +933,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "version" => vec!["client_version", "server_version"],
         "service create" | "service scale" => vec!["status", "action", "service", "outcome"],
         "service delete" => vec!["status", "action", "name", "outcome"],
-        "service get" => vec!["status", "action", "service"],
+        "service get" => vec!["status", "action", "service", "instances"],
         "service list" => vec!["status", "action", "services"],
         _ => vec![],
     };
@@ -2008,19 +2008,27 @@ async fn service_command(
             userdata,
             env,
         } => {
+            // Rootfs resolution precedence:
+            //   1. --rootfs given: resolve through catalog (same as `husker run`)
+            //   2. --image given: treat the value as a rootfs reference (path or
+            //      bare image name) and resolve through the same catalog lookup
+            //   3. neither: fall back to the configured default_rootfs
             let rootfs = match rootfs {
                 Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
-                None => {
-                    let default = config.default_rootfs.clone();
-                    if !default.exists() {
-                        eprintln!(
-                            "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass --rootfs explicitly.",
-                            default.display()
-                        );
-                        exit_with_error(output, "default rootfs not available".to_string());
+                None => match image.as_ref().map(PathBuf::from) {
+                    Some(image_path) => husker::resolve_rootfs_arg(image_path, &config.data_dir),
+                    None => {
+                        let default = config.default_rootfs.clone();
+                        if !default.exists() {
+                            eprintln!(
+                                "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass --rootfs or --image explicitly.",
+                                default.display()
+                            );
+                            exit_with_error(output, "default rootfs not available".to_string());
+                        }
+                        default
                     }
-                    default
-                }
+                },
             };
 
             let kernel = match kernel {
@@ -2220,6 +2228,20 @@ async fn service_command(
                 println!("ID:                {}", s("id"));
                 println!("Created:           {}", s("created_at"));
                 println!("Updated:           {}", s("updated_at"));
+                if let Some(instances) = service["instances"].as_array()
+                    && !instances.is_empty()
+                {
+                    println!("Instances:");
+                    println!("  {:<24} {:>7}  STATE", "NAME", "ORDINAL");
+                    for inst in instances {
+                        println!(
+                            "  {:<24} {:>7}  {}",
+                            inst["name"].as_str().unwrap_or("-"),
+                            inst["ordinal"],
+                            inst["state"].as_str().unwrap_or("-"),
+                        );
+                    }
+                }
             }
         }
         ServiceAction::Scale {
@@ -4043,6 +4065,13 @@ fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
                         "reconcile loop"
                     );
                 }
+            }
+            // Attempt to create the unique ordinal index after reconciling all
+            // services. It is idempotent (CREATE UNIQUE INDEX IF NOT EXISTS) and
+            // only fails while a duplicate ordinal still exists. Each tick's
+            // reconcile removes duplicates, so a later tick will succeed.
+            if let Err(e) = core.create_service_ordinal_index() {
+                tracing::warn!(error = %e, "reconcile loop: failed to create ordinal index");
             }
         }
     });

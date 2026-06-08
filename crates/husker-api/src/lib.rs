@@ -77,6 +77,20 @@ pub struct ServiceResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceInstance {
+    pub name: String,
+    pub ordinal: u32,
+    pub state: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceDetailResponse {
+    #[serde(flatten)]
+    pub service: ServiceResponse,
+    pub instances: Vec<ServiceInstance>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReconcileFailure {
     pub instance: String,
     pub error: String,
@@ -443,6 +457,8 @@ pub enum WsShellOutput {
         VmResponse,
         HostGroupResponse,
         ServiceResponse,
+        ServiceInstance,
+        ServiceDetailResponse,
         ServiceMutationResponse,
         ServiceDeleteResponse,
         ReconcileOutcomeResponse,
@@ -1146,16 +1162,34 @@ async fn create_service<B: VmmBackend + 'static>(
     tag = "services",
     params(("name" = String, Path, description = "Service name")),
     responses(
-        (status = 200, description = "Service details", body = ServiceResponse),
+        (status = 200, description = "Service details", body = ServiceDetailResponse),
         (status = 404, description = "Service not found", body = ErrorResponse)
     )
 )]
 async fn get_service<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
-) -> Result<Json<ServiceResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ServiceDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
     let service = core.get_service(&name).map_err(map_error)?;
-    Ok(Json(service_to_response(&core, service)))
+    let id = service.id;
+    let service_resp = service_to_response(&core, service);
+    let mut instances: Vec<ServiceInstance> = core
+        .list_vms_for_service(id)
+        .map_err(map_error)?
+        .into_iter()
+        .filter_map(|v| {
+            v.service_ordinal.map(|ord| ServiceInstance {
+                name: v.name,
+                ordinal: ord,
+                state: v.state,
+            })
+        })
+        .collect();
+    instances.sort_by_key(|i| i.ordinal);
+    Ok(Json(ServiceDetailResponse {
+        service: service_resp,
+        instances,
+    }))
 }
 
 #[utoipa::path(
@@ -2427,7 +2461,7 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             (StatusCode::BAD_REQUEST, "invalid_argument", err.to_string())
         }
         CoreError::ServiceOperationFailed(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             "service_operation_failed",
             err.to_string(),
         ),
@@ -2765,6 +2799,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let get_json = response_json(response).await;
+        assert_eq!(get_json["name"], "api");
+        assert_eq!(get_json["desired_instances"], 0);
+        assert_eq!(get_json["instances"], serde_json::json!([]));
 
         let response = app
             .clone()
