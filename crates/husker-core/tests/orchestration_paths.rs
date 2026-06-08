@@ -1757,3 +1757,55 @@ async fn create_vm_accepts_safe_names() {
         );
     }
 }
+
+// The concurrent-create test drives the full create path to completion (VMM
+// create + state insert). The linux-net path requires real TAP device operations
+// that cannot run in a unit test environment, so this test is restricted to the
+// macOS/no-linux-net build where the VMM backend mock covers the full path.
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn concurrent_create_same_name_one_winner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+
+    // Fixtures valid on both Linux and macOS (ARM64 Image magic at offset 56).
+    let kernel = tmp.path().join("vmlinux");
+    let mut kbytes = vec![0u8; 64];
+    kbytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, &kbytes).unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"rootfs").unwrap();
+
+    let mk = |c: Arc<HuskerCore<MockVmm>>| {
+        let kernel = kernel.clone();
+        let rootfs = rootfs.clone();
+        tokio::spawn(async move {
+            c.create_vm(CreateVmRequest {
+                name: "racer".into(),
+                kernel_path: kernel,
+                rootfs_path: rootfs,
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                initrd_path: None,
+                userdata: None,
+                env: Vec::new(),
+            })
+            .await
+        })
+    };
+    let (a, b) = tokio::join!(mk(Arc::clone(&core)), mk(Arc::clone(&core)));
+    let results = [a.unwrap(), b.unwrap()];
+    let oks = results.iter().filter(|r| r.is_ok()).count();
+    let already = results
+        .iter()
+        .filter(|r| matches!(r, Err(CoreError::VmAlreadyExists(_))))
+        .count();
+    assert_eq!(oks, 1, "exactly one create should win");
+    assert_eq!(
+        already,
+        1,
+        "the loser must get VmAlreadyExists, not a partial/corrupt failure"
+    );
+    // Exactly one VM persisted.
+    assert_eq!(core.list_vms().unwrap().len(), 1);
+}

@@ -284,6 +284,13 @@ struct AllocatedResources {
     vm_id: Option<Uuid>,
 }
 
+/// Service ownership stamped onto an instance VM at creation time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServiceTag {
+    pub service_id: Uuid,
+    pub ordinal: u32,
+}
+
 /// Core orchestrator that ties together all subsystems.
 pub struct HuskerCore<B: VmmBackend> {
     vmm: B,
@@ -297,6 +304,8 @@ pub struct HuskerCore<B: VmmBackend> {
     #[cfg(feature = "linux-net")]
     dns_servers: Vec<String>,
     runtime_dir: PathBuf,
+    /// Per-VM-name locks guarding the create/destroy critical section.
+    vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<B: VmmBackend> HuskerCore<B> {
@@ -320,6 +329,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             bridge_name,
             dns_servers,
             runtime_dir,
+            vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -340,23 +350,52 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             runtime_dir,
+            vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.vm_name_locks.lock().expect("vm_name_locks poisoned");
+        map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Create and boot a new VM.
     ///
     /// Allocates network, storage, and VMM resources. On failure, all
-    /// partially allocated resources are rolled back.
+    /// partially allocated resources are rolled back. A stopped or failed VM
+    /// with the same name is automatically replaced.
     pub async fn create_vm(&self, req: CreateVmRequest) -> Result<VmRecord, CoreError> {
+        self.create_vm_record(req, None, true).await
+    }
+
+    /// Internal create path used by both the public API and the service reconciler.
+    ///
+    /// `tags` stamps service ownership atomically onto the new VM record.
+    /// `replace_existing_stopped` controls whether an existing stopped/failed
+    /// same-named VM is auto-replaced (public API: true; reconciler: false to
+    /// avoid clobbering a foreign stopped VM).
+    pub(crate) async fn create_vm_record(
+        &self,
+        req: CreateVmRequest,
+        tags: Option<ServiceTag>,
+        replace_existing_stopped: bool,
+    ) -> Result<VmRecord, CoreError> {
         validate_resource_name("vm", &req.name)?;
         info!(name = %req.name, "creating VM");
 
-        // If a stopped VM with this name exists, replace it automatically.
-        // Running or paused VMs must be explicitly destroyed first.
+        let _name_guard = self.vm_name_lock(&req.name).lock_owned().await;
+
+        // If a stopped VM with this name exists, replace it automatically when
+        // the caller allows it. Running or paused VMs must be explicitly
+        // destroyed first.
         if let Ok(existing) = self.state.get_vm_by_name(&req.name) {
-            if existing.state == "stopped" || existing.state == "failed" {
+            if replace_existing_stopped
+                && (existing.state == "stopped" || existing.state == "failed")
+            {
                 info!(name = %req.name, "replacing stopped VM");
-                self.destroy_vm(&req.name).await?;
+                self.destroy_vm_inner(&existing).await?;
             } else {
                 return Err(CoreError::VmAlreadyExists(req.name));
             }
@@ -366,7 +405,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         husker_storage::validate_rootfs(&req.rootfs_path)?;
 
         let mut resources = AllocatedResources::default();
-        match self.try_create_vm(req, &mut resources).await {
+        match self.try_create_vm(req, tags, &mut resources).await {
             Ok(record) => {
                 info!(name = %record.name, id = %record.id, "VM created");
                 Ok(record)
@@ -384,6 +423,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     async fn try_create_vm(
         &self,
         req: CreateVmRequest,
+        tags: Option<ServiceTag>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
         let guest_ip = self.ip_allocator.allocate()?;
@@ -465,8 +505,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
             },
-            service_id: None,
-            service_ordinal: None,
+            service_id: tags.map(|t| t.service_id),
+            service_ordinal: tags.map(|t| t.ordinal),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -484,6 +524,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     async fn try_create_vm(
         &self,
         req: CreateVmRequest,
+        tags: Option<ServiceTag>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
         let cid = self.state.allocate_cid()?;
@@ -550,8 +591,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
             },
-            service_id: None,
-            service_ordinal: None,
+            service_id: tags.map(|t| t.service_id),
+            service_ordinal: tags.map(|t| t.ordinal),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -682,8 +723,19 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// (e.g. after a daemon restart), the VMM destroy step is skipped and
     /// only state/storage cleanup is performed.
     pub async fn destroy_vm(&self, name: &str) -> Result<(), CoreError> {
-        info!(%name, "destroying VM");
         let record = self.lookup_vm(name)?;
+        let _name_guard = self.vm_name_lock(name).lock_owned().await;
+        self.destroy_vm_inner(&record).await
+    }
+
+    /// Destroy a VM without acquiring the name lock.
+    ///
+    /// Callers MUST already hold the per-VM-name lock. Used internally by
+    /// `create_vm_record` when replacing a stopped VM atomically within the
+    /// same critical section.
+    async fn destroy_vm_inner(&self, record: &VmRecord) -> Result<(), CoreError> {
+        let name = record.name.as_str();
+        info!(%name, "destroying VM");
 
         match self.vmm.destroy_vm(record.id).await {
             Ok(()) => {}
