@@ -311,6 +311,27 @@ enum ServiceAction {
         /// Optional service image reference
         #[arg(long)]
         image: Option<String>,
+        /// Rootfs image path or catalog reference (defaults to configured default_rootfs)
+        #[arg(long)]
+        rootfs: Option<PathBuf>,
+        /// Kernel path (defaults to configured default_kernel)
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        /// Initrd/initramfs path
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+        /// Number of vCPUs per instance
+        #[arg(long)]
+        vcpus: Option<u32>,
+        /// Memory per instance in MiB
+        #[arg(long)]
+        memory: Option<u32>,
+        /// Path to a userdata script run on each instance
+        #[arg(long)]
+        userdata: Option<PathBuf>,
+        /// Environment variable KEY=VALUE for the userdata script (repeatable)
+        #[arg(long = "env")]
+        env: Vec<String>,
     },
     /// List services
     List,
@@ -1520,8 +1541,9 @@ async fn run(cli: Cli) -> Result<()> {
             host_group_command(api_url, api_token, action, output).await
         }
         Commands::Service { action } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            service_command(api_url, api_token, action, output).await
+            let config = load_config(config_path.as_deref());
+            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
+            service_command(api_url, api_token, action, output, config).await
         }
         Commands::Snapshot { action } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -1965,6 +1987,7 @@ async fn service_command(
     api_token: Option<String>,
     action: ServiceAction,
     output: OutputFormat,
+    config: Config,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     match action {
@@ -1973,16 +1996,84 @@ async fn service_command(
             host_group,
             desired_instances,
             image,
+            rootfs,
+            kernel,
+            initrd,
+            vcpus,
+            memory,
+            userdata,
+            env,
         } => {
+            let rootfs = match rootfs {
+                Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
+                None => {
+                    let default = config.default_rootfs.clone();
+                    if !default.exists() {
+                        eprintln!(
+                            "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass --rootfs explicitly.",
+                            default.display()
+                        );
+                        exit_with_error(output, "default rootfs not available".to_string());
+                    }
+                    default
+                }
+            };
+
+            let kernel = match kernel {
+                Some(path) => path,
+                None => {
+                    let default = config.default_kernel.clone();
+                    if !default.exists() {
+                        eprintln!(
+                            "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
+                            default.display()
+                        );
+                        exit_with_error(output, "default kernel not available".to_string());
+                    }
+                    default
+                }
+            };
+
+            let env_pairs: Vec<(String, String)> = env
+                .iter()
+                .filter_map(|s| {
+                    let (k, v) = s.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect();
+
             let mut body = serde_json::json!({
                 "name": &name,
                 "desired_instances": desired_instances,
+                "rootfs_path": rootfs,
+                "kernel_path": kernel,
+                "env": env_pairs,
             });
             if let Some(group) = host_group.as_deref() {
                 body["host_group"] = serde_json::json!(group);
             }
             if let Some(image_ref) = image.as_deref() {
                 body["image"] = serde_json::json!(image_ref);
+            }
+            if let Some(ref initrd_path) = initrd {
+                body["initrd_path"] = serde_json::json!(initrd_path);
+            } else if let Some(ref default_initrd) = config.default_initrd
+                && default_initrd.exists()
+            {
+                body["initrd_path"] = serde_json::json!(default_initrd);
+            }
+            if let Some(n) = vcpus {
+                body["vcpu_count"] = serde_json::json!(n);
+            }
+            if let Some(m) = memory {
+                body["mem_size_mib"] = serde_json::json!(m);
+            }
+            if let Some(ref userdata_path) = userdata {
+                let script =
+                    std::fs::read_to_string(userdata_path).with_context(|| {
+                        format!("reading userdata script {}", userdata_path.display())
+                    })?;
+                body["userdata"] = serde_json::json!(script);
             }
 
             let resp = api_request(
@@ -1995,19 +2086,45 @@ async fn service_command(
             .await?;
 
             if resp.status().is_success() {
-                let service: serde_json::Value = resp.json().await?;
-                print_output(
-                    output,
-                    &serde_json::json!({
-                        "status": "ok",
-                        "action": "service-create",
-                        "service": service,
-                    }),
-                    format!(
-                        "Created service: {}",
-                        service["name"].as_str().unwrap_or("-")
-                    ),
-                );
+                let body: serde_json::Value = resp.json().await?;
+                let svc = &body["service"];
+                if output == OutputFormat::Text {
+                    println!(
+                        "Created service {} ({}/{})",
+                        svc["name"].as_str().unwrap_or("-"),
+                        svc["current_instances"],
+                        svc["desired_instances"]
+                    );
+                    if let Some(created) = body["outcome"]["created"].as_array()
+                        && !created.is_empty()
+                    {
+                        let names: Vec<&str> =
+                            created.iter().filter_map(|v| v.as_str()).collect();
+                        println!("  created: {}", names.join(", "));
+                    }
+                    if let Some(failed) = body["outcome"]["failed"].as_array()
+                        && !failed.is_empty()
+                    {
+                        for f in failed {
+                            eprintln!(
+                                "  failed {}: {}",
+                                f["instance"].as_str().unwrap_or("?"),
+                                f["error"].as_str().unwrap_or("unknown error")
+                            );
+                        }
+                    }
+                } else {
+                    print_output(
+                        output,
+                        &serde_json::json!({
+                            "status": "ok",
+                            "action": "service-create",
+                            "service": svc,
+                            "outcome": body["outcome"],
+                        }),
+                        "",
+                    );
+                }
             } else {
                 let msg = api_error(resp, &format!("service '{name}'")).await;
                 exit_with_error(output, msg);
@@ -2040,14 +2157,22 @@ async fn service_command(
                 println!("No services found");
             } else {
                 println!(
-                    "{:<20} {:>7}   {:<30} {:<36}",
-                    "NAME", "DESIRED", "IMAGE", "HOST GROUP ID"
+                    "{:<20} {:>14}   {:<30} {:<36}",
+                    "NAME", "RUNNING/DESIRED", "IMAGE", "HOST GROUP ID"
                 );
                 for service in &services {
+                    let current = service["current_instances"]
+                        .as_u64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let desired = service["desired_instances"]
+                        .as_u64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "{:<20} {:>7}   {:<30} {:<36}",
+                        "{:<20} {:>14}   {:<30} {:<36}",
                         service["name"].as_str().unwrap_or("-"),
-                        service["desired_instances"],
+                        format!("{current}/{desired}"),
                         service["image"].as_str().unwrap_or("-"),
                         service["host_group_id"].as_str().unwrap_or("-"),
                     );
@@ -2081,6 +2206,7 @@ async fn service_command(
                 let s = |key: &str| service[key].as_str().unwrap_or("-");
                 println!("Name:              {}", s("name"));
                 println!("Desired instances: {}", service["desired_instances"]);
+                println!("Current instances: {}", service["current_instances"]);
                 println!(
                     "Image:             {}",
                     service["image"].as_str().unwrap_or("-")
@@ -2110,20 +2236,49 @@ async fn service_command(
             .await?;
 
             if resp.status().is_success() {
-                let service: serde_json::Value = resp.json().await?;
-                print_output(
-                    output,
-                    &serde_json::json!({
-                        "status": "ok",
-                        "action": "service-scale",
-                        "service": service,
-                    }),
-                    format!(
-                        "Scaled service {} to {}",
-                        service["name"].as_str().unwrap_or("-"),
-                        service["desired_instances"]
-                    ),
-                );
+                let body: serde_json::Value = resp.json().await?;
+                let svc = &body["service"];
+                if output == OutputFormat::Text {
+                    println!(
+                        "Scaled service {} to {} (current {})",
+                        svc["name"].as_str().unwrap_or("-"),
+                        svc["desired_instances"],
+                        svc["current_instances"]
+                    );
+                    let created_count = body["outcome"]["created"]
+                        .as_array()
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let destroyed_count = body["outcome"]["destroyed"]
+                        .as_array()
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if created_count > 0 || destroyed_count > 0 {
+                        println!("  +{created_count} created, -{destroyed_count} destroyed");
+                    }
+                    if let Some(failed) = body["outcome"]["failed"].as_array()
+                        && !failed.is_empty()
+                    {
+                        for f in failed {
+                            eprintln!(
+                                "  failed {}: {}",
+                                f["instance"].as_str().unwrap_or("?"),
+                                f["error"].as_str().unwrap_or("unknown error")
+                            );
+                        }
+                    }
+                } else {
+                    print_output(
+                        output,
+                        &serde_json::json!({
+                            "status": "ok",
+                            "action": "service-scale",
+                            "service": svc,
+                            "outcome": body["outcome"],
+                        }),
+                        "",
+                    );
+                }
             } else {
                 let msg = api_error(resp, &format!("service '{name}'")).await;
                 exit_with_error(output, msg);
@@ -2137,15 +2292,28 @@ async fn service_command(
             .await?;
 
             if resp.status().is_success() {
-                print_output(
-                    output,
-                    &serde_json::json!({
-                        "status": "ok",
-                        "action": "service-delete",
-                        "service": &name,
-                    }),
-                    format!("Deleted service: {name}"),
-                );
+                let body: serde_json::Value = resp.json().await?;
+                if output == OutputFormat::Text {
+                    println!("Deleted service {name}");
+                    if let Some(destroyed) = body["outcome"]["destroyed"].as_array()
+                        && !destroyed.is_empty()
+                    {
+                        let names: Vec<&str> =
+                            destroyed.iter().filter_map(|v| v.as_str()).collect();
+                        println!("  destroyed: {}", names.join(", "));
+                    }
+                } else {
+                    print_output(
+                        output,
+                        &serde_json::json!({
+                            "status": "ok",
+                            "action": "service-delete",
+                            "name": &name,
+                            "outcome": body["outcome"],
+                        }),
+                        "",
+                    );
+                }
             } else {
                 let msg = api_error(resp, &format!("service '{name}'")).await;
                 exit_with_error(output, msg);
@@ -4098,12 +4266,26 @@ mod tests {
                         host_group,
                         desired_instances,
                         image,
+                        rootfs,
+                        kernel,
+                        initrd,
+                        vcpus,
+                        memory,
+                        userdata,
+                        env,
                     },
             } => {
                 assert_eq!(name, "api");
                 assert!(host_group.is_none());
                 assert_eq!(desired_instances, 1);
                 assert!(image.is_none());
+                assert!(rootfs.is_none());
+                assert!(kernel.is_none());
+                assert!(initrd.is_none());
+                assert!(vcpus.is_none());
+                assert!(memory.is_none());
+                assert!(userdata.is_none());
+                assert!(env.is_empty());
             }
             _ => panic!("expected service create command"),
         }
@@ -4132,12 +4314,26 @@ mod tests {
                         host_group,
                         desired_instances,
                         image,
+                        rootfs,
+                        kernel,
+                        initrd,
+                        vcpus,
+                        memory,
+                        userdata,
+                        env,
                     },
             } => {
                 assert_eq!(name, "api");
                 assert_eq!(host_group.as_deref(), Some("default"));
                 assert_eq!(desired_instances, 3);
                 assert_eq!(image.as_deref(), Some("ghcr.io/acme/api:1.2.3"));
+                assert!(rootfs.is_none());
+                assert!(kernel.is_none());
+                assert!(initrd.is_none());
+                assert!(vcpus.is_none());
+                assert!(memory.is_none());
+                assert!(userdata.is_none());
+                assert!(env.is_empty());
             }
             _ => panic!("expected service create command"),
         }
