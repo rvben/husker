@@ -1098,7 +1098,7 @@ async fn create_service<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<(StatusCode, Json<ServiceResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let service = core.create_service(req).map_err(map_error)?;
+    let (service, _outcome) = core.create_service(req).await.map_err(map_error)?;
     Ok((StatusCode::CREATED, Json(service_to_response(service))))
 }
 
@@ -1134,7 +1134,7 @@ async fn delete_service<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    core.delete_service(&name).map_err(map_error)?;
+    let _outcome = core.delete_service(&name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1155,8 +1155,9 @@ async fn scale_service<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<ScaleServiceRequest>,
 ) -> Result<Json<ServiceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let service = core
+    let (service, _outcome) = core
         .scale_service(&name, req.desired_instances)
+        .await
         .map_err(map_error)?;
     Ok(Json(service_to_response(service)))
 }
@@ -2381,6 +2382,11 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::InvalidArgument(_) => {
             (StatusCode::BAD_REQUEST, "invalid_argument", err.to_string())
         }
+        CoreError::ServiceOperationFailed(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "service_operation_failed",
+            err.to_string(),
+        ),
         CoreError::VmAlreadyExists(_) => {
             (StatusCode::CONFLICT, "vm_already_exists", err.to_string())
         }
@@ -2660,8 +2666,10 @@ mod tests {
         let create_service = serde_json::json!({
             "name": "api",
             "host_group": "default",
-            "desired_instances": 2,
-            "image": "ghcr.io/example/api:latest"
+            "desired_instances": 0,
+            "image": "ghcr.io/example/api:latest",
+            "rootfs_path": "/tmp/r",
+            "kernel_path": "/tmp/k"
         });
         let response = app
             .clone()
@@ -2676,7 +2684,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let service = response_json(response).await;
         assert_eq!(service["name"], "api");
-        assert_eq!(service["desired_instances"], 2);
+        assert_eq!(service["desired_instances"], 0);
         assert!(service["host_group_id"].is_string());
 
         let response = app
@@ -2718,7 +2726,9 @@ mod tests {
         let app = router(test_core());
         let body = serde_json::json!({
             "name": "api",
-            "host_group": "missing"
+            "host_group": "missing",
+            "rootfs_path": "/tmp/r",
+            "kernel_path": "/tmp/k"
         });
         let response = app
             .oneshot(
@@ -2735,11 +2745,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_service_invalid_desired_instances_returns_400() {
+    async fn create_service_zero_instances_succeeds() {
+        // Scale-to-zero is now allowed; desired_instances=0 creates a service with no instances.
         let app = router(test_core());
         let body = serde_json::json!({
             "name": "api",
-            "desired_instances": 0
+            "desired_instances": 0,
+            "rootfs_path": "/tmp/r",
+            "kernel_path": "/tmp/k"
         });
         let response = app
             .oneshot(
@@ -2750,15 +2763,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::CREATED);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "invalid_argument");
+        assert_eq!(json["desired_instances"], 0);
     }
 
     #[tokio::test]
     async fn scale_service_updates_desired_instances() {
         let app = router(test_core());
-        let create = serde_json::json!({ "name": "api", "desired_instances": 1 });
+        let create = serde_json::json!({
+            "name": "api",
+            "desired_instances": 0,
+            "rootfs_path": "/tmp/r",
+            "kernel_path": "/tmp/k"
+        });
         let response = app
             .clone()
             .oneshot(
@@ -2788,9 +2806,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scale_service_zero_instances_returns_400() {
+    async fn scale_service_to_zero_succeeds() {
+        // Scale-to-zero is now allowed; desired_instances=0 stops all instances but keeps the service.
         let app = router(test_core());
-        let create = serde_json::json!({ "name": "api", "desired_instances": 1 });
+        let create = serde_json::json!({
+            "name": "api",
+            "desired_instances": 0,
+            "rootfs_path": "/tmp/r",
+            "kernel_path": "/tmp/k"
+        });
         let response = app
             .clone()
             .oneshot(
@@ -2813,9 +2837,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "invalid_argument");
+        assert_eq!(json["desired_instances"], 0);
     }
 
     #[tokio::test]

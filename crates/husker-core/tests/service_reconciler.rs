@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use husker_core::{CoreError, CreateVmRequest, HuskerCore, ServiceTag};
+use husker_core::{CoreError, CreateServiceRequest, CreateVmRequest, HuskerCore, ServiceTag};
 use husker_state::{ServiceRecord, StateStore};
 use husker_storage::StorageConfig;
 use husker_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
@@ -172,6 +172,26 @@ fn sorted_names(names: &[String]) -> Vec<String> {
     let mut v = names.to_vec();
     v.sort();
     v
+}
+
+fn req_with_desired(
+    desired: u32,
+    kernel: &std::path::Path,
+    rootfs: &std::path::Path,
+) -> CreateServiceRequest {
+    CreateServiceRequest {
+        name: "web".into(),
+        host_group: None,
+        desired_instances: Some(desired),
+        image: None,
+        rootfs_path: Some(rootfs.to_path_buf()),
+        kernel_path: Some(kernel.to_path_buf()),
+        initrd_path: None,
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        userdata: None,
+        env: vec![],
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -479,4 +499,107 @@ async fn reconcile_empty_rootfs_returns_failed() {
     assert!(!outcome.failed.is_empty(), "should have a failure for empty rootfs");
     assert!(outcome.created.is_empty());
     assert!(outcome.destroyed.is_empty());
+}
+
+// 10. delete_service destroys all instances then removes the service row.
+#[tokio::test]
+async fn delete_service_destroys_all_instances() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    let (svc, _) = core
+        .create_service(req_with_desired(3, &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    let outcome = core.delete_service("web").await.unwrap();
+    assert_eq!(
+        outcome.destroyed.len(),
+        3,
+        "expected 3 destroyed, got {:?}",
+        outcome.destroyed
+    );
+    assert!(outcome.failed.is_empty(), "unexpected failures: {:?}", outcome.failed);
+    assert!(
+        matches!(core.get_service("web"), Err(CoreError::ServiceNotFound(_))),
+        "service row should be gone after delete"
+    );
+    let remaining = core
+        .list_vms()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.service_id == Some(svc.id))
+        .collect::<Vec<_>>();
+    assert!(
+        remaining.is_empty(),
+        "no VMs should remain for the deleted service, got {:?}",
+        remaining
+    );
+}
+
+// 11. scale to zero keeps the service definition but destroys all instances;
+//     scale back to 1 re-creates exactly one instance.
+#[tokio::test]
+async fn scale_to_zero_then_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    let (_svc, _) = core
+        .create_service(req_with_desired(2, &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    let (svc0, _) = core.scale_service("web", 0).await.unwrap();
+    assert_eq!(svc0.desired_instances, 0);
+    assert!(
+        core.list_vms_for_service(svc0.id).unwrap().is_empty(),
+        "all instances should be destroyed at desired=0"
+    );
+    assert!(
+        core.get_service("web").is_ok(),
+        "service definition must be retained at desired=0"
+    );
+
+    let (_svc1, _) = core.scale_service("web", 1).await.unwrap();
+    let instances = core.list_vms_for_service(svc0.id).unwrap();
+    assert_eq!(
+        instances.len(),
+        1,
+        "expected 1 instance after scale back to 1, got {:?}",
+        instances.iter().map(|v| &v.name).collect::<Vec<_>>()
+    );
+    assert_eq!(instances[0].state, "running");
+}
+
+// 12. concurrent reconcile passes on the same service do not double-create instances.
+#[tokio::test]
+async fn concurrent_reconcile_same_service_no_double_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    let (svc, _) = core
+        .create_service(req_with_desired(3, &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    // Fire two concurrent reconcile passes after the initial create already
+    // produced 3 instances. Each pass should be a no-op under the lock.
+    let a = {
+        let c = std::sync::Arc::clone(&core);
+        let s = svc.clone();
+        tokio::spawn(async move { c.reconcile_service(&s).await })
+    };
+    let b = {
+        let c = std::sync::Arc::clone(&core);
+        let s = svc.clone();
+        tokio::spawn(async move { c.reconcile_service(&s).await })
+    };
+    let _ = tokio::join!(a, b);
+
+    let count = core.list_vms_for_service(svc.id).unwrap().len();
+    assert_eq!(
+        count,
+        3,
+        "exactly 3 instances should exist after concurrent reconciles"
+    );
 }

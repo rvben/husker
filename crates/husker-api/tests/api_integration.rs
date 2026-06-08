@@ -227,8 +227,10 @@ async fn host_group_and_service_endpoints_roundtrip() {
     let service_body = serde_json::json!({
         "name": "api",
         "host_group": "default",
-        "desired_instances": 2,
-        "image": "ghcr.io/example/api:latest"
+        "desired_instances": 0,
+        "image": "ghcr.io/example/api:latest",
+        "rootfs_path": "/tmp/r",
+        "kernel_path": "/tmp/k"
     });
     let response = app
         .clone()
@@ -243,7 +245,7 @@ async fn host_group_and_service_endpoints_roundtrip() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let service = response_json(response).await;
     assert_eq!(service["name"], "api");
-    assert_eq!(service["desired_instances"], 2);
+    assert_eq!(service["desired_instances"], 0);
     assert!(service["host_group_id"].is_string());
 }
 
@@ -253,7 +255,9 @@ async fn scale_service_endpoint_updates_desired_instances() {
 
     let create = serde_json::json!({
         "name": "api",
-        "desired_instances": 1
+        "desired_instances": 0,
+        "rootfs_path": "/tmp/r",
+        "kernel_path": "/tmp/k"
     });
     let response = app
         .clone()
@@ -586,7 +590,9 @@ async fn create_service_with_missing_host_group_returns_404() {
     let app = router(test_core());
     let body = serde_json::json!({
         "name": "api",
-        "host_group": "missing-group"
+        "host_group": "missing-group",
+        "rootfs_path": "/tmp/r",
+        "kernel_path": "/tmp/k"
     });
     let response = app
         .oneshot(
@@ -604,11 +610,14 @@ async fn create_service_with_missing_host_group_returns_404() {
 }
 
 #[tokio::test]
-async fn create_service_with_zero_instances_returns_400() {
+async fn create_service_with_zero_instances_succeeds() {
+    // Scale-to-zero is allowed; desired_instances=0 creates a service with no instances.
     let app = router(test_core());
     let body = serde_json::json!({
         "name": "api",
-        "desired_instances": 0
+        "desired_instances": 0,
+        "rootfs_path": "/tmp/r",
+        "kernel_path": "/tmp/k"
     });
     let response = app
         .oneshot(
@@ -620,9 +629,9 @@ async fn create_service_with_zero_instances_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CREATED);
     let json = response_json(response).await;
-    assert_eq!(json["code"], "invalid_argument");
+    assert_eq!(json["desired_instances"], 0);
 }
 
 // ── GET VM Not Found ─────────────────────────────────────────────────

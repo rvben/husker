@@ -1539,7 +1539,15 @@ async fn create_service_rejects_unsafe_names() {
                 host_group: None,
                 desired_instances: Some(1),
                 image: None,
+                rootfs_path: None,
+                kernel_path: None,
+                initrd_path: None,
+                vcpu_count: None,
+                mem_size_mib: None,
+                userdata: None,
+                env: vec![],
             })
+            .await
             .unwrap_err();
         assert!(
             matches!(err, CoreError::InvalidArgument(_)),

@@ -56,6 +56,8 @@ pub enum CoreError {
     SecretCrypto(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("service operation failed: {0}")]
+    ServiceOperationFailed(String),
     #[error("VMM error: {0}")]
     Vmm(#[from] husker_vmm::VmmError),
     #[cfg(feature = "linux-net")]
@@ -112,6 +114,23 @@ pub struct CreateServiceRequest {
     pub desired_instances: Option<u32>,
     #[serde(default)]
     pub image: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub rootfs_path: Option<PathBuf>,
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub kernel_path: Option<PathBuf>,
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub initrd_path: Option<PathBuf>,
+    #[serde(default)]
+    pub vcpu_count: Option<u32>,
+    #[serde(default)]
+    pub mem_size_mib: Option<u32>,
+    #[serde(default)]
+    pub userdata: Option<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 /// Parameters for creating a snapshot.
@@ -903,48 +922,60 @@ impl<B: VmmBackend> HuskerCore<B> {
             })
     }
 
-    /// Create a service.
-    pub fn create_service(&self, req: CreateServiceRequest) -> Result<ServiceRecord, CoreError> {
+    /// Create a service and reconcile it to its desired instance count.
+    pub async fn create_service(
+        self: &std::sync::Arc<Self>,
+        req: CreateServiceRequest,
+    ) -> Result<(ServiceRecord, ReconcileOutcome), CoreError>
+    where
+        B: 'static,
+    {
         validate_resource_name("service", &req.name)?;
         let desired_instances = req.desired_instances.unwrap_or(1);
-        if desired_instances == 0 {
-            return Err(CoreError::InvalidArgument(
-                "desired_instances must be >= 1".into(),
-            ));
-        }
         validate_service_instance_names(&req.name, desired_instances)?;
 
+        let rootfs = req.rootfs_path.ok_or_else(|| {
+            CoreError::InvalidArgument("service requires a rootfs (--image or --rootfs)".into())
+        })?;
+        let kernel = req
+            .kernel_path
+            .ok_or_else(|| CoreError::InvalidArgument("service requires a kernel".into()))?;
+
         let host_group_id = match req.host_group.as_deref() {
-            Some(group_name) => {
-                let group = self
-                    .state
+            Some(group_name) => Some(
+                self.state
                     .get_host_group_by_name(group_name)
                     .map_err(|e| match e {
                         husker_state::StateError::HostGroupNotFoundByName(_) => {
                             CoreError::HostGroupNotFound(group_name.into())
                         }
                         other => CoreError::State(other),
-                    })?;
-                Some(group.id)
-            }
+                    })?
+                    .id,
+            ),
             None => None,
         };
 
+        let now = chrono::Utc::now();
         let record = ServiceRecord {
             id: Uuid::new_v4(),
             name: req.name,
             host_group_id,
             desired_instances,
             image: req.image,
-            kernel_path: String::new(),
-            rootfs_path: String::new(),
-            initrd_path: None,
-            vcpu_count: None,
-            mem_size_mib: None,
-            userdata: None,
-            userdata_env: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            kernel_path: kernel.to_string_lossy().into_owned(),
+            rootfs_path: rootfs.to_string_lossy().into_owned(),
+            initrd_path: req.initrd_path.map(|p| p.to_string_lossy().into_owned()),
+            vcpu_count: req.vcpu_count,
+            mem_size_mib: req.mem_size_mib,
+            userdata: req.userdata,
+            userdata_env: if req.env.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
+            },
+            created_at: now,
+            updated_at: now,
         };
         self.state.insert_service(&record).map_err(|e| match e {
             husker_state::StateError::ServiceAlreadyExists(name) => {
@@ -952,7 +983,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             other => CoreError::State(other),
         })?;
-        Ok(record)
+
+        let outcome = self.reconcile_service(&record).await;
+        Ok((record, outcome))
     }
 
     /// List all services.
@@ -970,20 +1003,17 @@ impl<B: VmmBackend> HuskerCore<B> {
         })
     }
 
-    /// Scale a service to the desired instance count.
-    pub fn scale_service(
-        &self,
+    /// Scale a service to the desired instance count and reconcile.
+    pub async fn scale_service(
+        self: &std::sync::Arc<Self>,
         name: &str,
         desired_instances: u32,
-    ) -> Result<ServiceRecord, CoreError> {
-        if desired_instances == 0 {
-            return Err(CoreError::InvalidArgument(
-                "desired_instances must be >= 1".into(),
-            ));
-        }
-        validate_service_instance_names(name, desired_instances)?;
-
+    ) -> Result<(ServiceRecord, ReconcileOutcome), CoreError>
+    where
+        B: 'static,
+    {
         let record = self.get_service(name)?;
+        validate_service_instance_names(name, desired_instances)?;
         self.state
             .update_service_desired_instances(record.id, desired_instances)
             .map_err(|e| match e {
@@ -992,17 +1022,35 @@ impl<B: VmmBackend> HuskerCore<B> {
                 }
                 other => CoreError::State(other),
             })?;
-
-        self.get_service(name)
+        let record = self.get_service(name)?;
+        let outcome = self.reconcile_service(&record).await;
+        Ok((record, outcome))
     }
 
-    /// Delete a service by name.
-    pub fn delete_service(&self, name: &str) -> Result<(), CoreError> {
-        let record = self.get_service(name)?;
+    /// Destroy all instances, then delete the service row.
+    ///
+    /// If any instance fails to destroy, the row is retained and the error returned.
+    pub async fn delete_service(
+        self: &std::sync::Arc<Self>,
+        name: &str,
+    ) -> Result<ReconcileOutcome, CoreError>
+    where
+        B: 'static,
+    {
+        let mut record = self.get_service(name)?;
+        record.desired_instances = 0;
+        let outcome = self.reconcile_service(&record).await;
+        if !outcome.failed.is_empty() {
+            let (inst, err) = &outcome.failed[0];
+            return Err(CoreError::ServiceOperationFailed(format!(
+                "cannot delete service '{name}': instance {inst} cleanup failed: {err}"
+            )));
+        }
         self.state.delete_service(record.id).map_err(|e| match e {
             husker_state::StateError::ServiceNotFound(_) => CoreError::ServiceNotFound(name.into()),
             other => CoreError::State(other),
-        })
+        })?;
+        Ok(outcome)
     }
 
     /// Create a snapshot from a stopped VM.
