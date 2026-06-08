@@ -68,9 +68,37 @@ pub struct ServiceResponse {
     pub name: String,
     pub host_group_id: Option<String>,
     pub desired_instances: u32,
+    pub current_instances: u32,
     pub image: Option<String>,
+    pub rootfs_path: String,
+    pub kernel_path: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReconcileFailure {
+    pub instance: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReconcileOutcomeResponse {
+    pub created: Vec<String>,
+    pub destroyed: Vec<String>,
+    pub failed: Vec<ReconcileFailure>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceMutationResponse {
+    pub service: ServiceResponse,
+    pub outcome: ReconcileOutcomeResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceDeleteResponse {
+    pub name: String,
+    pub outcome: ReconcileOutcomeResponse,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -415,6 +443,10 @@ pub enum WsShellOutput {
         VmResponse,
         HostGroupResponse,
         ServiceResponse,
+        ServiceMutationResponse,
+        ServiceDeleteResponse,
+        ReconcileOutcomeResponse,
+        ReconcileFailure,
         SnapshotResponse,
         ImageResponse,
         ExportImageResponse,
@@ -1077,7 +1109,7 @@ async fn list_services<B: VmmBackend + 'static>(
     Ok(Json(
         services
             .into_iter()
-            .map(service_to_response)
+            .map(|s| service_to_response(&core, s))
             .collect::<Vec<_>>(),
     ))
 }
@@ -1088,7 +1120,7 @@ async fn list_services<B: VmmBackend + 'static>(
     tag = "services",
     request_body = CreateServiceRequest,
     responses(
-        (status = 201, description = "Service created", body = ServiceResponse),
+        (status = 201, description = "Service created", body = ServiceMutationResponse),
         (status = 404, description = "Referenced host group not found", body = ErrorResponse),
         (status = 409, description = "Service already exists", body = ErrorResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse)
@@ -1097,9 +1129,15 @@ async fn list_services<B: VmmBackend + 'static>(
 async fn create_service<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Json(req): Json<CreateServiceRequest>,
-) -> Result<(StatusCode, Json<ServiceResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let (service, _outcome) = core.create_service(req).await.map_err(map_error)?;
-    Ok((StatusCode::CREATED, Json(service_to_response(service))))
+) -> Result<(StatusCode, Json<ServiceMutationResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let (service, outcome) = core.create_service(req).await.map_err(map_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ServiceMutationResponse {
+            service: service_to_response(&core, service),
+            outcome: outcome_to_response(outcome),
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -1117,7 +1155,7 @@ async fn get_service<B: VmmBackend + 'static>(
     Path(name): Path<String>,
 ) -> Result<Json<ServiceResponse>, (StatusCode, Json<ErrorResponse>)> {
     let service = core.get_service(&name).map_err(map_error)?;
-    Ok(Json(service_to_response(service)))
+    Ok(Json(service_to_response(&core, service)))
 }
 
 #[utoipa::path(
@@ -1126,16 +1164,19 @@ async fn get_service<B: VmmBackend + 'static>(
     tag = "services",
     params(("name" = String, Path, description = "Service name")),
     responses(
-        (status = 204, description = "Service deleted"),
+        (status = 200, description = "Service deleted", body = ServiceDeleteResponse),
         (status = 404, description = "Service not found", body = ErrorResponse)
     )
 )]
 async fn delete_service<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let _outcome = core.delete_service(&name).await.map_err(map_error)?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Json<ServiceDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let outcome = core.delete_service(&name).await.map_err(map_error)?;
+    Ok(Json(ServiceDeleteResponse {
+        name,
+        outcome: outcome_to_response(outcome),
+    }))
 }
 
 #[utoipa::path(
@@ -1145,7 +1186,7 @@ async fn delete_service<B: VmmBackend + 'static>(
     params(("name" = String, Path, description = "Service name")),
     request_body = ScaleServiceRequest,
     responses(
-        (status = 200, description = "Service scaled", body = ServiceResponse),
+        (status = 200, description = "Service scaled", body = ServiceMutationResponse),
         (status = 404, description = "Service not found", body = ErrorResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse)
     )
@@ -1154,12 +1195,15 @@ async fn scale_service<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
     Json(req): Json<ScaleServiceRequest>,
-) -> Result<Json<ServiceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let (service, _outcome) = core
+) -> Result<Json<ServiceMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (service, outcome) = core
         .scale_service(&name, req.desired_instances)
         .await
         .map_err(map_error)?;
-    Ok(Json(service_to_response(service)))
+    Ok(Json(ServiceMutationResponse {
+        service: service_to_response(&core, service),
+        outcome: outcome_to_response(outcome),
+    }))
 }
 
 #[utoipa::path(
@@ -2484,13 +2528,35 @@ fn host_group_to_response(r: HostGroupRecord) -> HostGroupResponse {
     }
 }
 
-fn service_to_response(r: ServiceRecord) -> ServiceResponse {
+fn outcome_to_response(o: husker_core::ReconcileOutcome) -> ReconcileOutcomeResponse {
+    ReconcileOutcomeResponse {
+        created: o.created,
+        destroyed: o.destroyed,
+        failed: o
+            .failed
+            .into_iter()
+            .map(|(instance, error)| ReconcileFailure { instance, error })
+            .collect(),
+    }
+}
+
+fn service_to_response<B: VmmBackend + 'static>(
+    core: &AppState<B>,
+    r: ServiceRecord,
+) -> ServiceResponse {
+    let current_instances = core
+        .list_vms_for_service(r.id)
+        .map(|vs| vs.iter().filter(|v| v.state == "running").count() as u32)
+        .unwrap_or(0);
     ServiceResponse {
         id: r.id.to_string(),
         name: r.name,
         host_group_id: r.host_group_id.map(|id| id.to_string()),
         desired_instances: r.desired_instances,
+        current_instances,
         image: r.image,
+        rootfs_path: r.rootfs_path,
+        kernel_path: r.kernel_path,
         created_at: r.created_at.to_rfc3339(),
         updated_at: r.updated_at.to_rfc3339(),
     }
@@ -2683,9 +2749,11 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         let service = response_json(response).await;
-        assert_eq!(service["name"], "api");
-        assert_eq!(service["desired_instances"], 0);
-        assert!(service["host_group_id"].is_string());
+        assert_eq!(service["service"]["name"], "api");
+        assert_eq!(service["service"]["desired_instances"], 0);
+        assert!(service["service"]["host_group_id"].is_string());
+        assert_eq!(service["service"]["current_instances"], 0);
+        assert_eq!(service["outcome"]["created"], serde_json::json!([]));
 
         let response = app
             .clone()
@@ -2707,7 +2775,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let delete_json = response_json(response).await;
+        assert_eq!(delete_json["name"], "api");
+        assert_eq!(delete_json["outcome"]["created"], serde_json::json!([]));
+        assert_eq!(delete_json["outcome"]["destroyed"], serde_json::json!([]));
 
         let response = app
             .clone()
@@ -2765,7 +2837,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         let json = response_json(response).await;
-        assert_eq!(json["desired_instances"], 0);
+        assert_eq!(json["service"]["desired_instances"], 0);
+        assert_eq!(json["service"]["current_instances"], 0);
+        assert_eq!(json["outcome"]["created"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -2801,8 +2875,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        assert_eq!(json["name"], "api");
-        assert_eq!(json["desired_instances"], 4);
+        assert_eq!(json["service"]["name"], "api");
+        assert_eq!(json["service"]["desired_instances"], 4);
+        assert_eq!(json["service"]["current_instances"], 0);
+        assert_eq!(json["outcome"]["created"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -2839,7 +2915,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        assert_eq!(json["desired_instances"], 0);
+        assert_eq!(json["service"]["desired_instances"], 0);
+        assert_eq!(json["service"]["current_instances"], 0);
+        assert_eq!(json["outcome"]["created"], serde_json::json!([]));
     }
 
     #[tokio::test]

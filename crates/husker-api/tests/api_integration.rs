@@ -244,9 +244,11 @@ async fn host_group_and_service_endpoints_roundtrip() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let service = response_json(response).await;
-    assert_eq!(service["name"], "api");
-    assert_eq!(service["desired_instances"], 0);
-    assert!(service["host_group_id"].is_string());
+    assert_eq!(service["service"]["name"], "api");
+    assert_eq!(service["service"]["desired_instances"], 0);
+    assert!(service["service"]["host_group_id"].is_string());
+    assert_eq!(service["service"]["current_instances"], 0);
+    assert_eq!(service["outcome"]["created"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -283,8 +285,10 @@ async fn scale_service_endpoint_updates_desired_instances() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let service = response_json(response).await;
-    assert_eq!(service["name"], "api");
-    assert_eq!(service["desired_instances"], 3);
+    assert_eq!(service["service"]["name"], "api");
+    assert_eq!(service["service"]["desired_instances"], 3);
+    assert_eq!(service["service"]["current_instances"], 0);
+    assert_eq!(service["outcome"]["created"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -631,7 +635,9 @@ async fn create_service_with_zero_instances_succeeds() {
 
     assert_eq!(response.status(), StatusCode::CREATED);
     let json = response_json(response).await;
-    assert_eq!(json["desired_instances"], 0);
+    assert_eq!(json["service"]["desired_instances"], 0);
+    assert_eq!(json["service"]["current_instances"], 0);
+    assert_eq!(json["outcome"]["created"], serde_json::json!([]));
 }
 
 // ── GET VM Not Found ─────────────────────────────────────────────────
