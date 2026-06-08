@@ -119,6 +119,16 @@ pub struct ServiceRecord {
     pub host_group_id: Option<Uuid>,
     pub desired_instances: u32,
     pub image: Option<String>,
+    /// Concrete kernel path, resolved at create time (empty until set).
+    pub kernel_path: String,
+    /// Concrete rootfs path; authoritative boot source (empty until set).
+    pub rootfs_path: String,
+    pub initrd_path: Option<String>,
+    pub vcpu_count: Option<u32>,
+    pub mem_size_mib: Option<u32>,
+    pub userdata: Option<String>,
+    /// JSON-encoded Vec<(String,String)>.
+    pub userdata_env: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -281,6 +291,16 @@ impl StateStore {
         // Migration: tag VMs with their owning service (idempotent).
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_id TEXT", []);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_ordinal INTEGER", []);
+
+        // Migration: service VM template columns (idempotent).
+        // NOT NULL with DEFAULT '' so ADD COLUMN succeeds on tables with rows.
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN kernel_path TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN rootfs_path TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN initrd_path TEXT", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN vcpu_count INTEGER", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN mem_size_mib INTEGER", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN userdata TEXT", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN userdata_env TEXT", []);
 
         Ok(())
     }
@@ -515,14 +535,23 @@ impl StateStore {
     pub fn insert_service(&self, record: &ServiceRecord) -> Result<(), StateError> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO services (id, name, host_group_id, desired_instances, image, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO services (id, name, host_group_id, desired_instances, image,
+                                   kernel_path, rootfs_path, initrd_path, vcpu_count,
+                                   mem_size_mib, userdata, userdata_env, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 record.id.to_string(),
                 record.name,
                 record.host_group_id.map(|id| id.to_string()),
                 record.desired_instances,
                 record.image,
+                record.kernel_path,
+                record.rootfs_path,
+                record.initrd_path,
+                record.vcpu_count,
+                record.mem_size_mib,
+                record.userdata,
+                record.userdata_env,
                 record.created_at.to_rfc3339(),
                 record.updated_at.to_rfc3339(),
             ],
@@ -542,7 +571,9 @@ impl StateStore {
     pub fn get_service(&self, id: Uuid) -> Result<ServiceRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, host_group_id, desired_instances, image, created_at, updated_at
+            "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
+                    initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
+                    created_at, updated_at
              FROM services WHERE id = ?1",
             params![id.to_string()],
             row_to_service_record,
@@ -557,7 +588,9 @@ impl StateStore {
     pub fn get_service_by_name(&self, name: &str) -> Result<ServiceRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, host_group_id, desired_instances, image, created_at, updated_at
+            "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
+                    initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
+                    created_at, updated_at
              FROM services WHERE name = ?1",
             params![name],
             row_to_service_record,
@@ -572,7 +605,9 @@ impl StateStore {
     pub fn list_services(&self) -> Result<Vec<ServiceRecord>, StateError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, host_group_id, desired_instances, image, created_at, updated_at
+            "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
+                    initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
+                    created_at, updated_at
              FROM services ORDER BY created_at",
         )?;
 
@@ -1125,8 +1160,8 @@ fn row_to_host_group_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostGro
 fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRecord> {
     let id_str: String = row.get(0)?;
     let host_group_id_str: Option<String> = row.get(2)?;
-    let created_str: String = row.get(5)?;
-    let updated_str: String = row.get(6)?;
+    let created_str: String = row.get(12)?;
+    let updated_str: String = row.get(13)?;
 
     Ok(ServiceRecord {
         id: parse_uuid(&id_str)?,
@@ -1134,6 +1169,13 @@ fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRec
         host_group_id: host_group_id_str.as_deref().map(parse_uuid).transpose()?,
         desired_instances: row.get(3)?,
         image: row.get(4)?,
+        kernel_path: row.get(5)?,
+        rootfs_path: row.get(6)?,
+        initrd_path: row.get(7)?,
+        vcpu_count: row.get(8)?,
+        mem_size_mib: row.get(9)?,
+        userdata: row.get(10)?,
+        userdata_env: row.get(11)?,
         created_at: parse_datetime(&created_str)?,
         updated_at: parse_datetime(&updated_str)?,
     })
@@ -1230,6 +1272,13 @@ mod tests {
             host_group_id,
             desired_instances: 1,
             image: Some("ghcr.io/example/service:latest".into()),
+            kernel_path: String::new(),
+            rootfs_path: String::new(),
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            userdata_env: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2048,6 +2097,27 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let err = store.delete_secret(Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, StateError::SecretNotFound(_)));
+    }
+
+    // ── Service VM template ───────────────────────────────────────────
+
+    #[test]
+    fn service_template_roundtrip() {
+        let store = StateStore::open_memory().unwrap();
+        let mut svc = make_service("web", None);
+        svc.kernel_path = "/boot/vmlinux".into();
+        svc.rootfs_path = "/images/web.ext4".into();
+        svc.vcpu_count = Some(2);
+        svc.mem_size_mib = Some(512);
+        svc.userdata = Some("echo hi".into());
+        store.insert_service(&svc).unwrap();
+
+        let got = store.get_service_by_name("web").unwrap();
+        assert_eq!(got.kernel_path, "/boot/vmlinux");
+        assert_eq!(got.rootfs_path, "/images/web.ext4");
+        assert_eq!(got.vcpu_count, Some(2));
+        assert_eq!(got.mem_size_mib, Some(512));
+        assert_eq!(got.userdata.as_deref(), Some("echo hi"));
     }
 
     // ── Service ownership tags ────────────────────────────────────────

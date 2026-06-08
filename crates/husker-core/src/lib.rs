@@ -834,6 +834,13 @@ impl<B: VmmBackend> HuskerCore<B> {
             host_group_id,
             desired_instances,
             image: req.image,
+            kernel_path: String::new(),
+            rootfs_path: String::new(),
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            userdata_env: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
