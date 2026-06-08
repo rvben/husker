@@ -16,6 +16,11 @@ use husker_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// Serializes the `run_userdata` tests, which drive the real guest agent on the
+/// host and so share the host path `/tmp/husker-userdata.sh`. This in-process
+/// mutex only covers `cargo test` (tests as threads in one process). Under
+/// nextest each test runs in its own process, so the `husker-userdata-serial`
+/// test-group in `.config/nextest.toml` provides the cross-process serialization.
 fn userdata_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))

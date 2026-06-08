@@ -1,0 +1,15 @@
+# Tests that exercise `run_userdata` drive the real guest agent
+# (`husker_agent::handle_connection`) directly on the host. The agent writes the
+# userdata script to the path `run_userdata` hardcodes: `/tmp/husker-userdata.sh`.
+# In production that path lives inside an isolated guest, but in the test it lands
+# on the shared host /tmp. nextest runs each test in its own process, so the
+# in-process `userdata_test_lock` in orchestration_paths.rs cannot serialize them;
+# without this group two of these tests clobber that one host file between write
+# and exec and read each other's script (crossed exit codes). This group forces
+# them to run one at a time across processes.
+[test-groups]
+husker-userdata-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(husker-core) and test(run_userdata)'
+test-group = 'husker-userdata-serial'
