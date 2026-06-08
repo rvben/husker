@@ -54,6 +54,9 @@ tar xzf "$WORK_DIR/minirootfs.tar.gz" -C "$TAR_DIR"
 mkdir -p "$TAR_DIR/usr/local/bin"
 cp "$AGENT_BIN" "$TAR_DIR/usr/local/bin/husker-agent"
 chmod 0755 "$TAR_DIR/usr/local/bin/husker-agent"
+mkdir -p "$TAR_DIR/usr/local/sbin"
+cp "$SCRIPT_DIR/guest/husker-net.sh" "$TAR_DIR/usr/local/sbin/husker-net.sh"
+chmod 0755 "$TAR_DIR/usr/local/sbin/husker-net.sh"
 mkdir -p "$TAR_DIR/etc"
 cp "$SCRIPT_DIR/guest/inittab" "$TAR_DIR/etc/inittab"
 chmod 0644 "$TAR_DIR/etc/inittab"
@@ -99,9 +102,13 @@ done ) >> "$DBG_CMDS"
 (cd "$TAR_DIR" && "$DEBUGFS" -w -f "$DBG_CMDS" "$IMG" >/dev/null)
 
 # debugfs exits 0 even when individual commands in the command file fail.
-# Probe the populated image for the agent binary before declaring success.
+# Probe the populated image for key files before declaring success.
 if ! "$DEBUGFS" -R "stat /usr/local/bin/husker-agent" "$IMG" 2>/dev/null | grep -q "Type: regular"; then
     echo "ERROR: husker-agent was not written to the image (debugfs populate may have failed)" >&2
+    exit 1
+fi
+if ! "$DEBUGFS" -R "stat /usr/local/sbin/husker-net.sh" "$IMG" 2>/dev/null | grep -q "Type: regular"; then
+    echo "ERROR: husker-net.sh was not written to the image (debugfs populate may have failed)" >&2
     exit 1
 fi
 

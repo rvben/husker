@@ -5,9 +5,11 @@
 #   1. Every module referenced by insmod in the inittab exists in the
 #      build-initramfs.sh MODULES array.
 #   2. Module load order in inittab respects known dependencies.
-#   3. af_packet.ko is loaded before udhcpc (DHCP needs PF_PACKET).
-#   4. udhcpc invocation does not reference a non-existent script path
-#      or use shell backgrounding (&) alongside -b.
+#   3. af_packet.ko is loaded before husker-net.sh (PF_PACKET needed for
+#      udhcpc, which husker-net.sh may invoke as a fallback).
+#   4. husker-net.sh wiring: inittab invokes /usr/local/sbin/husker-net.sh,
+#      build-rootfs.sh installs it, and the script contains ip= parsing and
+#      a udhcpc fallback.
 #
 # Usage:
 #   ./guest/test-initramfs.sh           # validate scripts only
@@ -83,52 +85,88 @@ check_order "net_failover.ko" "virtio_net.ko" "virtio_net depends on net_failove
 check_order "vsock.ko" "vmw_vsock_virtio_transport_common.ko" "transport_common depends on vsock"
 check_order "vmw_vsock_virtio_transport_common.ko" "vmw_vsock_virtio_transport.ko" "transport depends on transport_common"
 
-# ── 3. af_packet loaded before DHCP ──
+# ── 3. af_packet loaded before husker-net.sh ──
 
 echo ""
-echo "--- DHCP prerequisites ---"
+echo "--- Network prerequisites ---"
 
 AF_PACKET_LINE=$(grep -n "af_packet.ko" "$INITTAB" | head -1 | cut -d: -f1)
-UDHCPC_LINE=$(grep -n "udhcpc" "$INITTAB" | head -1 | cut -d: -f1)
+HUSKER_NET_LINE=$(grep -n "husker-net.sh" "$INITTAB" | head -1 | cut -d: -f1)
 
 if [ -z "$AF_PACKET_LINE" ]; then
-    fail "af_packet.ko not loaded in inittab (required for DHCP raw sockets)"
-elif [ -z "$UDHCPC_LINE" ]; then
-    fail "udhcpc not found in inittab"
-elif [ "$AF_PACKET_LINE" -lt "$UDHCPC_LINE" ]; then
-    pass "af_packet.ko (line $AF_PACKET_LINE) loaded before udhcpc (line $UDHCPC_LINE)"
+    fail "af_packet.ko not loaded in inittab (required for PF_PACKET / udhcpc fallback)"
+elif [ -z "$HUSKER_NET_LINE" ]; then
+    fail "husker-net.sh not found in inittab"
+elif [ "$AF_PACKET_LINE" -lt "$HUSKER_NET_LINE" ]; then
+    pass "af_packet.ko (line $AF_PACKET_LINE) loaded before husker-net.sh (line $HUSKER_NET_LINE)"
 else
-    fail "af_packet.ko (line $AF_PACKET_LINE) must load before udhcpc (line $UDHCPC_LINE)"
+    fail "af_packet.ko (line $AF_PACKET_LINE) must load before husker-net.sh (line $HUSKER_NET_LINE)"
 fi
 
-# ── 4. udhcpc invocation correctness ──
+# ── 4. husker-net.sh wiring ──
 
 echo ""
-echo "--- DHCP invocation ---"
+echo "--- husker-net.sh wiring ---"
 
-UDHCPC_CMD=$(grep "udhcpc" "$INITTAB" | head -1)
+HUSKER_NET_SCRIPT="$SCRIPT_DIR/husker-net.sh"
 
-# Must not reference /etc/udhcpc/default.script (doesn't exist in Alpine)
-if echo "$UDHCPC_CMD" | grep -q '/etc/udhcpc/'; then
-    fail "udhcpc references /etc/udhcpc/default.script which does not exist in Alpine"
+# inittab must invoke husker-net.sh via its installed path
+if grep -q '/usr/local/sbin/husker-net.sh' "$INITTAB"; then
+    pass "inittab invokes /usr/local/sbin/husker-net.sh"
 else
-    pass "udhcpc does not reference non-existent /etc/udhcpc/ script"
+    fail "inittab does not invoke /usr/local/sbin/husker-net.sh"
 fi
 
-# Must not use & with -b (double backgrounding)
-if echo "$UDHCPC_CMD" | grep -q '&'; then
-    if echo "$UDHCPC_CMD" | grep -q '\-b'; then
-        fail "udhcpc uses both -b and & (double backgrounding loses foreground DHCP attempt)"
+# inittab must NOT invoke udhcpc directly (it is now delegated to husker-net.sh).
+# Only check non-comment lines to avoid false positives from descriptive comments.
+if grep -v '^\s*#' "$INITTAB" | grep -q 'udhcpc'; then
+    fail "inittab still invokes udhcpc directly (should be delegated to husker-net.sh)"
+else
+    pass "inittab does not invoke udhcpc directly"
+fi
+
+# husker-net.sh must exist
+if [ -f "$HUSKER_NET_SCRIPT" ]; then
+    pass "husker-net.sh exists at $HUSKER_NET_SCRIPT"
+else
+    fail "husker-net.sh not found at $HUSKER_NET_SCRIPT"
+fi
+
+# husker-net.sh must parse the ip= token
+if grep -q 'ip=' "$HUSKER_NET_SCRIPT" 2>/dev/null; then
+    pass "husker-net.sh contains ip= parsing logic"
+else
+    fail "husker-net.sh does not contain ip= parsing logic"
+fi
+
+# husker-net.sh must have a udhcpc fallback
+if grep -q 'udhcpc' "$HUSKER_NET_SCRIPT" 2>/dev/null; then
+    pass "husker-net.sh contains udhcpc fallback"
+else
+    fail "husker-net.sh does not contain udhcpc fallback"
+fi
+
+# husker-net.sh must use busybox-compatible ip addr add / ip route add
+if grep -q 'ip addr add' "$HUSKER_NET_SCRIPT" 2>/dev/null; then
+    pass "husker-net.sh uses 'ip addr add' (busybox ip compatible)"
+else
+    fail "husker-net.sh does not use 'ip addr add'"
+fi
+
+if grep -q 'ip route add' "$HUSKER_NET_SCRIPT" 2>/dev/null; then
+    pass "husker-net.sh uses 'ip route add' (busybox ip compatible)"
+else
+    fail "husker-net.sh does not use 'ip route add'"
+fi
+
+# build-rootfs.sh must install husker-net.sh
+BUILD_ROOTFS="$SCRIPT_DIR/build-rootfs.sh"
+if [ -f "$BUILD_ROOTFS" ]; then
+    if grep -q 'husker-net.sh' "$BUILD_ROOTFS"; then
+        pass "build-rootfs.sh installs husker-net.sh"
+    else
+        fail "build-rootfs.sh does not install husker-net.sh"
     fi
-else
-    pass "udhcpc does not use shell backgrounding (&)"
-fi
-
-# Must use -b for background retry
-if echo "$UDHCPC_CMD" | grep -q '\-b'; then
-    pass "udhcpc uses -b for background retry on lease failure"
-else
-    fail "udhcpc should use -b flag for background retry"
 fi
 
 # ── 5. Validate built initramfs artifact (optional) ──

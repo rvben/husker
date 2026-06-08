@@ -18,10 +18,12 @@
 ::sysinit:/sbin/insmod /lib/modules/net_failover.ko
 ::sysinit:/sbin/insmod /lib/modules/virtio_net.ko
 
-# Network: bring up loopback and DHCP on eth0
+# Network: bring up loopback, then configure eth0.
+# husker-net.sh reads ip= from /proc/cmdline for static config (husker's
+# standard kernel cmdline format), falling back to udhcpc when absent.
 ::sysinit:/sbin/ip link set lo up
 ::sysinit:/sbin/ip link set eth0 up 2>/dev/null
-::sysinit:/sbin/udhcpc -b -i eth0
+::sysinit:/usr/local/sbin/husker-net.sh
 
 # Start husker guest agent
 ::respawn:/usr/local/bin/husker-agent
