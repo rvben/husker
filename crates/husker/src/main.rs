@@ -931,6 +931,10 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
         "exec" => vec!["exit_code", "stdout", "stderr"],
         "version" => vec!["client_version", "server_version"],
+        "service create" | "service scale" => vec!["status", "action", "service", "outcome"],
+        "service delete" => vec!["status", "action", "name", "outcome"],
+        "service get" => vec!["status", "action", "service"],
+        "service list" => vec!["status", "action", "services"],
         _ => vec![],
     };
     (!read_only, output_fields)
