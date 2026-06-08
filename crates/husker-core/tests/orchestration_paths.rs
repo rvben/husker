@@ -1810,8 +1810,7 @@ async fn concurrent_create_same_name_one_winner() {
         .count();
     assert_eq!(oks, 1, "exactly one create should win");
     assert_eq!(
-        already,
-        1,
+        already, 1,
         "the loser must get VmAlreadyExists, not a partial/corrupt failure"
     );
     // Exactly one VM persisted.

@@ -268,7 +268,10 @@ fn instance_name(service: &str, ordinal: u32) -> String {
 /// resource-name limit. No-op when `desired_instances == 0` (no instances created).
 fn validate_service_instance_names(name: &str, desired_instances: u32) -> Result<(), CoreError> {
     if desired_instances > 0 {
-        validate_resource_name("service instance", &instance_name(name, desired_instances - 1))?;
+        validate_resource_name(
+            "service instance",
+            &instance_name(name, desired_instances - 1),
+        )?;
     }
     Ok(())
 }
@@ -423,7 +426,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     }
 
     fn reconcile_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.reconcile_locks.lock().expect("reconcile_locks poisoned");
+        let mut map = self
+            .reconcile_locks
+            .lock()
+            .expect("reconcile_locks poisoned");
         map.entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -1868,13 +1874,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         let name = instance_name(&svc.name, ordinal);
 
         // Ownership preflight: never clobber a VM not owned by this service.
-        if let Ok(existing) = self.state.get_vm_by_name(&name) {
-            if existing.service_id != Some(svc.id) {
-                outcome
-                    .failed
-                    .push((name, "name owned by a non-service VM".into()));
-                return;
-            }
+        if let Ok(existing) = self.state.get_vm_by_name(&name)
+            && existing.service_id != Some(svc.id)
+        {
+            outcome
+                .failed
+                .push((name, "name owned by a non-service VM".into()));
+            return;
         }
 
         let env: Vec<(String, String)> = svc

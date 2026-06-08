@@ -294,8 +294,14 @@ impl StateStore {
 
         // Migration: service VM template columns (idempotent).
         // NOT NULL with DEFAULT '' so ADD COLUMN succeeds on tables with rows.
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN kernel_path TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN rootfs_path TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute(
+            "ALTER TABLE services ADD COLUMN kernel_path TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE services ADD COLUMN rootfs_path TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE services ADD COLUMN initrd_path TEXT", []);
         let _ = conn.execute("ALTER TABLE services ADD COLUMN vcpu_count INTEGER", []);
         let _ = conn.execute("ALTER TABLE services ADD COLUMN mem_size_mib INTEGER", []);

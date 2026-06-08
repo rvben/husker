@@ -2073,10 +2073,9 @@ async fn service_command(
                 body["mem_size_mib"] = serde_json::json!(m);
             }
             if let Some(ref userdata_path) = userdata {
-                let script =
-                    std::fs::read_to_string(userdata_path).with_context(|| {
-                        format!("reading userdata script {}", userdata_path.display())
-                    })?;
+                let script = std::fs::read_to_string(userdata_path).with_context(|| {
+                    format!("reading userdata script {}", userdata_path.display())
+                })?;
                 body["userdata"] = serde_json::json!(script);
             }
 
@@ -2102,8 +2101,7 @@ async fn service_command(
                     if let Some(created) = body["outcome"]["created"].as_array()
                         && !created.is_empty()
                     {
-                        let names: Vec<&str> =
-                            created.iter().filter_map(|v| v.as_str()).collect();
+                        let names: Vec<&str> = created.iter().filter_map(|v| v.as_str()).collect();
                         println!("  created: {}", names.join(", "));
                     }
                     if let Some(failed) = body["outcome"]["failed"].as_array()

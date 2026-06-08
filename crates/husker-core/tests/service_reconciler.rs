@@ -109,11 +109,21 @@ impl VmmBackend for MockVmm {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_core(mock: MockVmm, state: StateStore, data_dir: &Path, runtime_dir: &Path) -> Arc<HuskerCore<MockVmm>> {
+fn build_core(
+    mock: MockVmm,
+    state: StateStore,
+    data_dir: &Path,
+    runtime_dir: &Path,
+) -> Arc<HuskerCore<MockVmm>> {
     let storage = StorageConfig {
         data_dir: data_dir.to_path_buf(),
     };
-    Arc::new(HuskerCore::new(mock, state, storage, runtime_dir.to_path_buf()))
+    Arc::new(HuskerCore::new(
+        mock,
+        state,
+        storage,
+        runtime_dir.to_path_buf(),
+    ))
 }
 
 // Kernel fixture valid on macOS too (ARM64 Image magic 0x644d5241 at offset 56).
@@ -153,7 +163,9 @@ fn make_service_record(
     }
 }
 
-fn make_core_with_fixtures(tmp: &tempfile::TempDir) -> (Arc<HuskerCore<MockVmm>>, PathBuf, PathBuf) {
+fn make_core_with_fixtures(
+    tmp: &tempfile::TempDir,
+) -> (Arc<HuskerCore<MockVmm>>, PathBuf, PathBuf) {
     let runtime_dir = tmp.path().join("run");
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&runtime_dir).unwrap();
@@ -256,8 +268,16 @@ async fn reconcile_self_heals_stopped() {
     let outcome = core.reconcile_service(&svc).await;
 
     assert!(outcome.failed.is_empty(), "failed: {:?}", outcome.failed);
-    assert!(outcome.destroyed.contains(&"web-1".to_string()), "expected web-1 in destroyed: {:?}", outcome.destroyed);
-    assert!(outcome.created.contains(&"web-1".to_string()), "expected web-1 in created: {:?}", outcome.created);
+    assert!(
+        outcome.destroyed.contains(&"web-1".to_string()),
+        "expected web-1 in destroyed: {:?}",
+        outcome.destroyed
+    );
+    assert!(
+        outcome.created.contains(&"web-1".to_string()),
+        "expected web-1 in created: {:?}",
+        outcome.created
+    );
 
     let new_vm = core.get_vm("web-1").unwrap();
     assert_eq!(new_vm.state, "running");
@@ -284,8 +304,14 @@ async fn reconcile_scales_down_destroys_highest() {
     assert_eq!(destroyed, vec!["web-1", "web-2"]);
 
     assert_eq!(core.get_vm("web-0").unwrap().state, "running");
-    assert!(matches!(core.get_vm("web-1"), Err(CoreError::VmNotFound(_))));
-    assert!(matches!(core.get_vm("web-2"), Err(CoreError::VmNotFound(_))));
+    assert!(matches!(
+        core.get_vm("web-1"),
+        Err(CoreError::VmNotFound(_))
+    ));
+    assert!(matches!(
+        core.get_vm("web-2"),
+        Err(CoreError::VmNotFound(_))
+    ));
     let owned = core.list_vms_for_service(id).unwrap();
     assert_eq!(owned.len(), 1);
 }
@@ -318,7 +344,11 @@ async fn reconcile_foreign_running_collision() {
 
     // web-1 should be in failed
     let failed_names: Vec<&str> = outcome.failed.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(failed_names.contains(&"web-1"), "expected web-1 in failed: {:?}", outcome.failed);
+    assert!(
+        failed_names.contains(&"web-1"),
+        "expected web-1 in failed: {:?}",
+        outcome.failed
+    );
 
     // web-0 and web-2 should be created
     let created = sorted_names(&outcome.created);
@@ -359,12 +389,22 @@ async fn reconcile_foreign_stopped_collision() {
 
     // web-1 should be in failed (not destroyed or created)
     let failed_names: Vec<&str> = outcome.failed.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(failed_names.contains(&"web-1"), "expected web-1 in failed: {:?}", outcome.failed);
+    assert!(
+        failed_names.contains(&"web-1"),
+        "expected web-1 in failed: {:?}",
+        outcome.failed
+    );
 
     // Foreign web-1 still exists with same id and service_id == None
     let foreign = core.get_vm("web-1").unwrap();
-    assert_eq!(foreign.id, foreign_id, "foreign VM should not have been replaced");
-    assert_eq!(foreign.service_id, None, "foreign VM service_id should still be None");
+    assert_eq!(
+        foreign.id, foreign_id,
+        "foreign VM should not have been replaced"
+    );
+    assert_eq!(
+        foreign.service_id, None,
+        "foreign VM service_id should still be None"
+    );
 
     // web-0 and web-2 should be created
     let created = sorted_names(&outcome.created);
@@ -393,7 +433,10 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 userdata: None,
                 env: vec![],
             },
-            Some(ServiceTag { service_id: id, ordinal: 0 }),
+            Some(ServiceTag {
+                service_id: id,
+                ordinal: 0,
+            }),
             false,
         )
         .await
@@ -412,7 +455,10 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 userdata: None,
                 env: vec![],
             },
-            Some(ServiceTag { service_id: id, ordinal: 0 }),
+            Some(ServiceTag {
+                service_id: id,
+                ordinal: 0,
+            }),
             false,
         )
         .await
@@ -425,7 +471,11 @@ async fn reconcile_dedupes_duplicate_ordinal() {
 
     assert!(outcome.failed.is_empty(), "failed: {:?}", outcome.failed);
     // One should be destroyed (the duplicate)
-    assert!(!outcome.destroyed.is_empty(), "expected a destroyed instance: {:?}", outcome.destroyed);
+    assert!(
+        !outcome.destroyed.is_empty(),
+        "expected a destroyed instance: {:?}",
+        outcome.destroyed
+    );
 
     let post = core.list_vms_for_service(id).unwrap();
     assert_eq!(post.len(), 1, "should have exactly 1 VM after dedup");
@@ -496,7 +546,10 @@ async fn reconcile_empty_rootfs_returns_failed() {
     };
 
     let outcome = core.reconcile_service(&svc).await;
-    assert!(!outcome.failed.is_empty(), "should have a failure for empty rootfs");
+    assert!(
+        !outcome.failed.is_empty(),
+        "should have a failure for empty rootfs"
+    );
     assert!(outcome.created.is_empty());
     assert!(outcome.destroyed.is_empty());
 }
@@ -519,7 +572,11 @@ async fn delete_service_destroys_all_instances() {
         "expected 3 destroyed, got {:?}",
         outcome.destroyed
     );
-    assert!(outcome.failed.is_empty(), "unexpected failures: {:?}", outcome.failed);
+    assert!(
+        outcome.failed.is_empty(),
+        "unexpected failures: {:?}",
+        outcome.failed
+    );
     assert!(
         matches!(core.get_service("web"), Err(CoreError::ServiceNotFound(_))),
         "service row should be gone after delete"
@@ -571,6 +628,54 @@ async fn scale_to_zero_then_back() {
     assert_eq!(instances[0].state, "running");
 }
 
+// 13. daemon-restart: all instances stopped -> reconcile recreates workload at same ordinals.
+#[tokio::test]
+async fn restart_recreates_all_instances_at_same_ordinals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    let (svc, _) = core
+        .create_service(req_with_desired(2, &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    let old_ids: std::collections::HashMap<u32, uuid::Uuid> = core
+        .list_vms_for_service(svc.id)
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.service_ordinal.unwrap(), v.id))
+        .collect();
+    assert_eq!(old_ids.len(), 2);
+
+    // Simulate a daemon restart: mark_stale_vms_stopped marks every running instance stopped.
+    core.stop_vm("web-0").await.unwrap();
+    core.stop_vm("web-1").await.unwrap();
+
+    // First reconcile after the restart (the daemon does this on startup).
+    let outcome = core.reconcile_service(&svc).await;
+
+    let after: Vec<_> = core.list_vms_for_service(svc.id).unwrap();
+    assert_eq!(after.len(), 2, "workload restored to 2 instances");
+    let mut ords: Vec<u32> = after.iter().filter_map(|v| v.service_ordinal).collect();
+    ords.sort();
+    assert_eq!(ords, vec![0, 1], "same ordinals 0 and 1");
+    assert!(
+        after.iter().all(|v| v.state == "running"),
+        "all instances running again: {:?}",
+        after
+            .iter()
+            .map(|v| (&v.name, &v.state))
+            .collect::<Vec<_>>()
+    );
+    // Each instance is a fresh VM (new id) since the stale one was destroyed and recreated.
+    for v in &after {
+        let ord = v.service_ordinal.unwrap();
+        assert_ne!(v.id, old_ids[&ord], "ordinal {ord} got a fresh instance");
+    }
+    assert_eq!(outcome.created.len(), 2);
+    assert_eq!(outcome.destroyed.len(), 2);
+}
+
 // 12. concurrent reconcile passes on the same service do not double-create instances.
 #[tokio::test]
 async fn concurrent_reconcile_same_service_no_double_create() {
@@ -598,8 +703,7 @@ async fn concurrent_reconcile_same_service_no_double_create() {
 
     let count = core.list_vms_for_service(svc.id).unwrap().len();
     assert_eq!(
-        count,
-        3,
+        count, 3,
         "exactly 3 instances should exist after concurrent reconciles"
     );
 }
