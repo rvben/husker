@@ -722,7 +722,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         let serial_log = self.runtime_dir.join(format!("{}.serial.log", record.id));
-        if let Err(e) = tokio::fs::remove_file(&serial_log).await {
+        if let Err(e) = remove_file_best_effort(&serial_log).await {
             warn!(%name, path = %serial_log.display(), error = %e, "failed to remove serial log during destroy");
         }
 
@@ -1804,9 +1804,43 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
     }
 }
 
+/// Remove a file, treating a missing file as success. Cleanup paths use this so
+/// a file that was never created (or already gone) does not produce a spurious
+/// warning. Returns `Err` only for real failures (e.g. permission denied).
+async fn remove_file_best_effort(path: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remove_file_best_effort_ignores_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.serial.log");
+        // A file that is already gone is not a cleanup failure.
+        remove_file_best_effort(&missing)
+            .await
+            .expect("missing file should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn remove_file_best_effort_removes_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("present.serial.log");
+        tokio::fs::write(&path, b"log").await.unwrap();
+        assert!(path.exists());
+        remove_file_best_effort(&path)
+            .await
+            .expect("removing an existing file should succeed");
+        assert!(!path.exists(), "file should be gone after removal");
+    }
+
     #[cfg(all(feature = "linux-net", unix))]
     use std::ffi::{OsStr, OsString};
     #[cfg(all(feature = "linux-net", unix))]
