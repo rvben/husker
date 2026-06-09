@@ -349,10 +349,13 @@ pub async fn init_nat(
     // and external interfaces.
     run_cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await?;
 
-    // Delete existing table (ignore error if it doesn't exist)
-    let _ = run_cmd("nft", &["delete", "table", "ip", NFT_TABLE]).await;
+    let table = nft_table_for_bridge(bridge_name);
 
-    run_cmd("nft", &["add", "table", "ip", NFT_TABLE]).await?;
+    // Delete only THIS bridge's table (ignore error if absent), then recreate.
+    // Other daemons' tables are untouched.
+    let _ = run_cmd("nft", &["delete", "table", "ip", &table]).await;
+
+    run_cmd("nft", &["add", "table", "ip", &table]).await?;
 
     // Postrouting chain with masquerade rule
     run_cmd(
@@ -361,7 +364,7 @@ pub async fn init_nat(
             "add",
             "chain",
             "ip",
-            NFT_TABLE,
+            &table,
             "postrouting",
             "{ type nat hook postrouting priority srcnat; policy accept; }",
         ],
@@ -373,7 +376,7 @@ pub async fn init_nat(
             "add",
             "rule",
             "ip",
-            NFT_TABLE,
+            &table,
             "postrouting",
             "ip",
             "saddr",
@@ -394,7 +397,7 @@ pub async fn init_nat(
             "add",
             "chain",
             "ip",
-            NFT_TABLE,
+            &table,
             "forward",
             "{ type filter hook forward priority filter; policy accept; }",
         ],
@@ -406,7 +409,7 @@ pub async fn init_nat(
             "add",
             "rule",
             "ip",
-            NFT_TABLE,
+            &table,
             "forward",
             "iifname",
             bridge_name,
@@ -422,7 +425,7 @@ pub async fn init_nat(
             "add",
             "rule",
             "ip",
-            NFT_TABLE,
+            &table,
             "forward",
             "oifname",
             bridge_name,
@@ -440,7 +443,7 @@ pub async fn init_nat(
             "add",
             "chain",
             "ip",
-            NFT_TABLE,
+            &table,
             "prerouting",
             "{ type nat hook prerouting priority dstnat; policy accept; }",
         ],
@@ -577,12 +580,14 @@ pub async fn remove_all_port_forwards(tap_name: &str) -> Result<(), NetError> {
     Ok(())
 }
 
-/// Remove the entire husker nftables table.
+/// Remove this daemon's per-bridge nftables table.
 ///
-/// Call on daemon shutdown to clean up all rules.
-pub async fn cleanup_nat() -> Result<(), NetError> {
-    info!("removing nftables table");
-    run_cmd("nft", &["delete", "table", "ip", NFT_TABLE]).await?;
+/// Call on daemon shutdown to clean up its own rules. Other daemons' tables
+/// (keyed by their own bridge) are left intact.
+pub async fn cleanup_nat(bridge_name: &str) -> Result<(), NetError> {
+    let table = nft_table_for_bridge(bridge_name);
+    info!(table = %table, "removing nftables table");
+    run_cmd("nft", &["delete", "table", "ip", &table]).await?;
     Ok(())
 }
 
