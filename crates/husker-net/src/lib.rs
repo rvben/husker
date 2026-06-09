@@ -23,8 +23,26 @@ pub enum NetError {
 /// Linux interface name length limit (IFNAMSIZ - 1 for null terminator).
 const IFNAMSIZ_MAX: usize = 15;
 
-/// Name of the nftables table managed by husker.
-const NFT_TABLE: &str = "husker";
+/// Derive the per-bridge nftables table name.
+///
+/// Each daemon owns a table named after its bridge so two husker daemons on one
+/// host never clobber each other's NAT. The encoding is injective: a constant
+/// `husker_` prefix followed by the bridge name, ASCII alphanumerics kept
+/// verbatim and every other byte escaped as `_<hex>`. Within the encoded suffix
+/// the only `_` are escape introducers, so distinct bridges always map to
+/// distinct tables (e.g. `husker-a` and `husker_a` do not collide).
+pub fn nft_table_for_bridge(bridge: &str) -> String {
+    let mut out = String::from("husker_");
+    for &b in bridge.as_bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b as char);
+        } else {
+            out.push('_');
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
+}
 
 // ── IP Allocation ──────────────────────────────────────────────────────
 
@@ -878,6 +896,35 @@ mod tests {
         assert_eq!(generate_mac(0x00FF_FFFF), "AA:FC:00:FF:FF:FF");
         // High byte overflows — only lower 3 bytes are used
         assert_eq!(generate_mac(0x0100_0000), "AA:FC:00:00:00:00");
+    }
+
+    // ── nft table name derivation ──────────────────────────────────────
+
+    #[test]
+    fn nft_table_basic_alphanumeric() {
+        assert_eq!(nft_table_for_bridge("husker0"), "husker_husker0");
+    }
+
+    #[test]
+    fn nft_table_injective_dash_vs_underscore() {
+        // A naive '-' -> '_' substitution would collide these two and let a
+        // second daemon clobber the first's table. The escape encoding must not.
+        assert_ne!(
+            nft_table_for_bridge("husker-a"),
+            nft_table_for_bridge("husker_a")
+        );
+        assert_eq!(nft_table_for_bridge("husker-a"), "husker_husker_2da");
+        assert_eq!(nft_table_for_bridge("husker_a"), "husker_husker_5fa");
+    }
+
+    #[test]
+    fn nft_table_is_valid_identifier() {
+        // Output must contain only [A-Za-z0-9_] (a valid nft identifier).
+        let t = nft_table_for_bridge("br-0_x");
+        assert!(
+            t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "invalid nft identifier: {t}"
+        );
     }
 
     // ── Interface Name Validation ──────────────────────────────────────
