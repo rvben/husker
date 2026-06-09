@@ -3052,6 +3052,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: "firecracker".into(),
+                boot_mode: "direct".into(),
             })
             .unwrap();
 
@@ -3418,6 +3419,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: "firecracker".into(),
+                boot_mode: "direct".into(),
             })
             .unwrap();
 

@@ -633,6 +633,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
             vmm: vmm_kind.map(|k| k.to_string()).unwrap_or_else(|| "firecracker".to_string()),
+            boot_mode: "direct".to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -722,6 +723,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
             vmm: "apple_vz".to_string(),
+            boot_mode: "direct".to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -2597,6 +2599,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             service_id: None,
             service_ordinal: None,
             vmm: vmm.into(),
+            boot_mode: "direct".into(),
         }
     }
 

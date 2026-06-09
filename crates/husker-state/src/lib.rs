@@ -90,6 +90,8 @@ pub struct VmRecord {
     pub service_ordinal: Option<u32>,
     /// VMM backend that created this VM ("firecracker" or "qemu").
     pub vmm: String,
+    /// How the VM boots: "direct" (host kernel) or "uefi" (OVMF + cloud image).
+    pub boot_mode: String,
 }
 
 /// Persistent port forward record.
@@ -300,6 +302,13 @@ impl StateStore {
             [],
         );
 
+        // Migration: record the boot mode (idempotent). NOT NULL DEFAULT keeps
+        // ADD COLUMN working on populated tables and back-fills legacy rows.
+        let _ = conn.execute(
+            "ALTER TABLE vms ADD COLUMN boot_mode TEXT NOT NULL DEFAULT 'direct'",
+            [],
+        );
+
         // Migration: service VM template columns (idempotent).
         // NOT NULL with DEFAULT '' so ADD COLUMN succeeds on tables with rows.
         let _ = conn.execute(
@@ -328,8 +337,8 @@ impl StateStore {
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                               created_at, updated_at, userdata, userdata_status, userdata_env,
-                              service_id, service_ordinal, vmm)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                              service_id, service_ordinal, vmm, boot_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -351,6 +360,7 @@ impl StateStore {
                 record.service_id.map(|id| id.to_string()),
                 record.service_ordinal,
                 record.vmm,
+                record.boot_mode,
             ],
         )
         .map_err(|e| match &e {
@@ -372,7 +382,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm
+                    service_id, service_ordinal, vmm, boot_mode
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -390,7 +400,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm
+                    service_id, service_ordinal, vmm, boot_mode
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -408,7 +418,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm
+                    service_id, service_ordinal, vmm, boot_mode
              FROM vms ORDER BY created_at",
         )?;
 
@@ -426,7 +436,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm
+                    service_id, service_ordinal, vmm, boot_mode
              FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
         )?;
         let records = stmt
@@ -1189,6 +1199,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
             }
         },
         vmm: row.get(19)?,
+        boot_mode: row.get(20)?,
     })
 }
 
@@ -1302,6 +1313,7 @@ mod tests {
             service_id: None,
             service_ordinal: None,
             vmm: "firecracker".into(),
+            boot_mode: "direct".into(),
         }
     }
 
@@ -2294,5 +2306,39 @@ mod tests {
         assert!(owned.iter().all(|v| v.service_id == Some(sid)));
         assert_eq!(owned[0].service_ordinal, Some(0));
         assert_eq!(owned[1].service_ordinal, Some(1));
+    }
+
+    // ── boot_mode field ───────────────────────────────────────────────
+
+    #[test]
+    fn boot_mode_migration_default_applied() {
+        // A row inserted via the raw column set (no boot_mode) must read back "direct".
+        let store = StateStore::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                                  tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                                  created_at, updated_at, userdata, userdata_status, userdata_env,
+                                  service_id, service_ordinal, vmm)
+                 VALUES ('22222222-2222-2222-2222-222222222222', 'legacy', 'stopped',
+                         NULL, 1, 128, 5, NULL, NULL, NULL, '/kernel', '/rootfs',
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                         NULL, NULL, NULL, NULL, NULL, 'qemu')",
+                [],
+            )
+            .unwrap();
+        }
+        let rec = store.get_vm_by_name("legacy").unwrap();
+        assert_eq!(rec.boot_mode, "direct");
+    }
+
+    #[test]
+    fn insert_and_read_uefi_boot_mode() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("uefi-vm");
+        rec.boot_mode = "uefi".to_string();
+        store.insert_vm(&rec).unwrap();
+        assert_eq!(store.get_vm_by_name("uefi-vm").unwrap().boot_mode, "uefi");
     }
 }
