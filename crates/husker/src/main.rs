@@ -232,6 +232,9 @@ enum Commands {
         /// Show the captured userdata script output instead of the serial console
         #[arg(long)]
         userdata: bool,
+        /// Log source: serial (default), boot, or userdata. Overrides --userdata.
+        #[arg(long, value_parser = ["serial", "boot", "userdata"])]
+        source: Option<String>,
     },
 
     /// Print version information (client and daemon)
@@ -1603,16 +1606,22 @@ async fn run(cli: Cli) -> Result<()> {
             follow,
             tail,
             userdata,
+            source,
         } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            // The userdata log is a static, already-captured file, so following
-            // it is meaningless; ignore --follow when --userdata is set.
-            let follow = follow && !userdata;
+            // Effective source: explicit --source wins; else --userdata maps to
+            // "userdata"; else serial. Warn if both --source and --userdata given.
+            if source.is_some() && userdata {
+                eprintln!("warning: --source overrides --userdata");
+            }
+            let effective = source
+                .clone()
+                .unwrap_or_else(|| if userdata { "userdata".into() } else { "serial".into() });
+            // Only the live serial console is followable.
+            let follow = follow && effective == "serial";
             let mut url = format!("{api_url}/v1/vms/{name}/logs");
             let mut params = Vec::new();
-            if userdata {
-                params.push("userdata=true".to_string());
-            }
+            params.push(format!("source={effective}"));
             if follow {
                 params.push("follow=true".to_string());
             }
