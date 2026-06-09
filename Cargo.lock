@@ -825,7 +825,7 @@ dependencies = [
  "libc",
  "tempfile",
  "tokio",
- "tokio-vsock",
+ "tokio-vsock 0.6.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -944,6 +944,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-vsock 0.7.2",
  "tower",
  "uuid",
 ]
@@ -2368,6 +2369,19 @@ name = "tokio-vsock"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad311033c354453d61b537cc239d8d7cc8e3d59c9eda2e8611a8b26e71f0e945"
+dependencies = [
+ "bytes",
+ "futures",
+ "libc",
+ "tokio",
+ "vsock",
+]
+
+[[package]]
+name = "tokio-vsock"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b319ef9394889dab2e1b4f0085b45ba11d0c79dc9d1a9d1afc057d009d0f1c7"
 dependencies = [
  "bytes",
  "futures",

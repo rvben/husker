@@ -6,6 +6,9 @@ pub mod vsock;
 #[cfg(unix)]
 pub mod fd_stream;
 
+#[cfg(unix)]
+pub mod qmp;
+
 #[cfg(target_os = "macos")]
 pub mod apple_vz;
 
