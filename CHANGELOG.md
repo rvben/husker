@@ -2,6 +2,45 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-06-09
+
+### Added
+
+- **Service reconciler.** `husker service` is now a real managed-workload
+  primitive. A service carries a VM template, and the daemon keeps
+  `desired_instances` VMs running, automatically replacing instances that stop or
+  fail. Instances are ordinary VMs named `<service>-<N>` and work with
+  `husker list`/`exec`/`logs`/`cp`.
+  - `husker service create` takes a full instance template: `--image`/`--rootfs`,
+    `--kernel`, `--initrd`, `--vcpus`, `--memory`, `--userdata`, `--env`
+    (plus `--instances`, `--host-group`).
+  - `husker service scale` (including scale-to-zero to pause a workload) and
+    `husker service delete` now create and destroy the underlying VMs.
+  - `husker service get` lists each instance's name, ordinal, and state;
+    `husker service list` shows running/desired counts.
+  - A periodic self-healing reconciler runs in the daemon, configurable via the new
+    `[service]` config (`reconcile_interval_secs`, `enabled`) and the
+    `HUSKER_SERVICE_RECONCILE_INTERVAL` / `HUSKER_SERVICE_RECONCILE_ENABLED`
+    environment variables.
+- **Machine-readable CLI contract.** `husker schema` emits the full
+  command/argument/output-field/exit-code contract for agent introspection, with
+  structured exit codes (1 general, 2 not-found, 3 conflict, 4 denied,
+  5 daemon-unreachable; `exec`/`shell` pass through the guest exit code) and a
+  stable `code` field in `--output json` errors.
+- `husker exec` gains `--env KEY=VALUE` and `--connect-timeout`; `husker run`
+  accepts a bare image name; userdata output is captured and viewable with
+  `husker logs <vm> --userdata`.
+- The guest configures `eth0` from the kernel `ip=` cmdline at boot, and the guest
+  agent now reports a clear message when a vsock bind fails due to missing kernel
+  modules.
+- `husker` warns once when a rootfs clone falls back to a full copy because the
+  filesystem lacks reflink/copy-on-write support.
+
+### Fixed
+
+- Serial-log error codes are preserved; the newly structured userdata error codes
+  no longer overwrite them.
+
 ## [0.2.1] - 2026-06-08
 
 ### Fixed
