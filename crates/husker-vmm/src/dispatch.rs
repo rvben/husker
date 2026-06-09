@@ -113,6 +113,8 @@ impl VmmBackend for LinuxDispatchBackend {
             VmmKind::Firecracker => self.firecracker.destroy_vm(id).await,
             VmmKind::Qemu => self.qemu.destroy_vm(id).await,
         };
+        // Remove the route unconditionally: if the backend destroy fails, a retry
+        // should still clean up state (core handles VmNotFound as "clean state only").
         self.routes.lock().await.remove(&id);
         result
     }
@@ -175,5 +177,22 @@ mod tests {
         let mut buf = [0u8; 4];
         right.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
+    }
+
+    // An id not in the route map must return VmNotFound before touching any backend.
+    #[tokio::test]
+    async fn unknown_id_routes_to_not_found() {
+        use crate::VmmBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let fc = crate::firecracker::FirecrackerBackend::new("firecracker", dir.path());
+        let qemu = crate::qemu::QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let be = LinuxDispatchBackend::new(fc, qemu, crate::VmmKind::Firecracker);
+        let id = uuid::Uuid::new_v4();
+        assert!(matches!(be.stop_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
+        assert!(matches!(be.vm_info(id).await, Err(crate::VmmError::VmNotFound(_))));
+        assert!(matches!(be.destroy_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
+        assert!(matches!(be.pause_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
+        assert!(matches!(be.resume_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
+        assert!(matches!(be.vsock_connect(id, 52).await, Err(crate::VmmError::VmNotFound(_))));
     }
 }

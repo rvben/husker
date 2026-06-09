@@ -597,7 +597,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: req.vmm.clone().unwrap_or_else(|| "firecracker".to_string()),
+            vmm: vmm_kind.map(|k| k.to_string()).unwrap_or_else(|| "firecracker".to_string()),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -685,7 +685,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: "firecracker".to_string(),
+            vmm: "apple_vz".to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
