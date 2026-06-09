@@ -390,6 +390,9 @@ pub struct LogsQuery {
     /// Serve the captured userdata script output instead of the serial console.
     #[serde(default)]
     pub userdata: bool,
+    /// Log source: "serial" (default), "boot", or "userdata". Takes precedence
+    /// over `userdata` when set.
+    pub source: Option<String>,
 }
 
 /// Messages sent by the server to the client over the shell WebSocket.
@@ -2136,22 +2139,32 @@ async fn get_logs<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Query(params): Query<LogsQuery>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
-    let (log_path, log_label) = if params.userdata {
-        (
-            core.userdata_log_path(&name).map_err(map_error)?,
-            "userdata",
-        )
-    } else {
-        (core.serial_log_path(&name).map_err(map_error)?, "serial")
+    let effective = match params.source.as_deref() {
+        Some("boot") => "boot",
+        Some("userdata") => "userdata",
+        Some("serial") => "serial",
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                error_response(
+                    "invalid_log_source",
+                    format!("unknown log source '{other}' (expected serial|boot|userdata)"),
+                ),
+            ));
+        }
+        None if params.userdata => "userdata",
+        None => "serial",
     };
-    // The userdata log is a static, already-captured file, so following it is
-    // meaningless; ignore follow for it (the CLI does too, but enforce it here
-    // so a direct API caller cannot stream-follow it down the serial path).
-    let follow = params.follow && !params.userdata;
+    let (log_path, log_label) = match effective {
+        "boot" => (core.boot_log_path(&name).map_err(map_error)?, "boot"),
+        "userdata" => (core.userdata_log_path(&name).map_err(map_error)?, "userdata"),
+        _ => (core.serial_log_path(&name).map_err(map_error)?, "serial"),
+    };
+    // Only the live serial console is followable; boot/userdata are static files.
+    let follow = params.follow && effective == "serial";
 
-    // Error `code`s are part of the stable API contract, so the serial path
-    // keeps its original `serial_log_*` codes while the userdata path gets its
-    // own `userdata_log_*` codes.
+    // Error `code`s are part of the stable API contract: each source yields
+    // a `{source}_log_*` prefix (e.g. `serial_log_not_found`, `boot_log_not_found`).
     let metadata = tokio::fs::metadata(&log_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             (
@@ -3378,6 +3391,7 @@ mod tests {
         assert_eq!(response_json(serial).await["code"], "serial_log_not_found");
 
         let userdata = app
+            .clone()
             .oneshot(
                 Request::get("/v1/vms/logvm/logs?userdata=true")
                     .body(Body::empty())
@@ -3390,6 +3404,44 @@ mod tests {
             response_json(userdata).await["code"],
             "userdata_log_not_found"
         );
+
+        // source=boot yields boot_log_not_found when the file is absent.
+        let boot = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/vms/logvm/logs?source=boot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(boot.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_json(boot).await["code"], "boot_log_not_found");
+
+        // source=serial via explicit param works like default.
+        let serial2 = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/vms/logvm/logs?source=serial")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serial2.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_json(serial2).await["code"], "serial_log_not_found");
+
+        // Unknown source yields 400 invalid_log_source.
+        let bad = app
+            .oneshot(
+                Request::get("/v1/vms/logvm/logs?source=garbage")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(bad).await["code"], "invalid_log_source");
     }
 
     #[tokio::test]
