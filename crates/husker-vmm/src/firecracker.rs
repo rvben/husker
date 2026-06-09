@@ -17,7 +17,7 @@ struct FcInstance {
     info: VmInfo,
     socket_path: PathBuf,
     vsock_path: PathBuf,
-    log_path: PathBuf,
+    boot_log_path: PathBuf,
     serial_log_path: PathBuf,
     process: tokio::process::Child,
 }
@@ -138,7 +138,7 @@ impl FirecrackerBackend {
         id: Uuid,
         config: VmConfig,
         socket_path: &Path,
-        log_path: &Path,
+        boot_log_path: &Path,
         vsock_path: &Path,
         serial_log_path: &Path,
         serial_file: std::fs::File,
@@ -149,7 +149,7 @@ impl FirecrackerBackend {
             .arg("--api-sock")
             .arg(socket_path)
             .arg("--log-path")
-            .arg(log_path)
+            .arg(boot_log_path)
             .arg("--level")
             .arg("Info")
             .stdout(serial_file)
@@ -270,7 +270,7 @@ impl FirecrackerBackend {
             info: info.clone(),
             socket_path: socket_path.to_owned(),
             vsock_path: vsock_path.to_owned(),
-            log_path: log_path.to_owned(),
+            boot_log_path: boot_log_path.to_owned(),
             serial_log_path: serial_log_path.to_owned(),
             process,
         };
@@ -295,14 +295,14 @@ impl VmmBackend for FirecrackerBackend {
 
         let id = Uuid::new_v4();
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
-        let log_path = self.runtime_dir.join(format!("{id}.log"));
+        let boot_log_path = self.runtime_dir.join(format!("{id}.boot.log"));
         let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
         let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
 
         // Firecracker requires the log file to exist before startup
-        tokio::fs::write(&log_path, b"").await?;
+        tokio::fs::write(&boot_log_path, b"").await?;
 
         // Firecracker writes guest serial console (ttyS0) to stdout.
         // Capture it to a file so `husker logs` can read it.
@@ -313,7 +313,7 @@ impl VmmBackend for FirecrackerBackend {
         let stderr_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path)
+            .open(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
 
         // Spawn, configure, and start — cleaning up the serial log on any failure.
@@ -322,7 +322,7 @@ impl VmmBackend for FirecrackerBackend {
                 id,
                 config,
                 &socket_path,
-                &log_path,
+                &boot_log_path,
                 &vsock_path,
                 &serial_log_path,
                 serial_file,
@@ -332,14 +332,21 @@ impl VmmBackend for FirecrackerBackend {
         {
             Ok(info) => Ok(info),
             Err(e) => {
-                // Remove every runtime artifact that create_vm or Firecracker
-                // may have written before the failure. Each removal is
-                // independent: a missing file is not an error here.
+                // Capture diagnostics before removing the artifacts.
+                let serial_tail = crate::tail_lines(&serial_log_path, 20);
+                let boot_tail = crate::tail_lines(&boot_log_path, 20);
                 let _ = std::fs::remove_file(&serial_log_path);
-                let _ = std::fs::remove_file(&log_path);
+                let _ = std::fs::remove_file(&boot_log_path);
                 let _ = std::fs::remove_file(&socket_path);
                 let _ = std::fs::remove_file(&vsock_path);
-                Err(e)
+                let mut msg = format!("{e}");
+                if let Some(s) = serial_tail {
+                    msg.push_str(&format!("\n--- guest serial (tail) ---\n{s}"));
+                }
+                if let Some(b) = boot_tail {
+                    msg.push_str(&format!("\n--- firecracker boot log (tail) ---\n{b}"));
+                }
+                Err(VmmError::ProcessError(msg))
             }
         }
     }
@@ -374,7 +381,7 @@ impl VmmBackend for FirecrackerBackend {
         let _ = instance.process.kill().await;
         let _ = tokio::fs::remove_file(&instance.socket_path).await;
         let _ = tokio::fs::remove_file(&instance.vsock_path).await;
-        let _ = tokio::fs::remove_file(&instance.log_path).await;
+        let _ = tokio::fs::remove_file(&instance.boot_log_path).await;
         let _ = tokio::fs::remove_file(&instance.serial_log_path).await;
 
         Ok(())
@@ -583,7 +590,7 @@ mod tests {
             },
             socket_path: dir.path().join("fake.sock"),
             vsock_path: dir.path().join("fake.vsock"),
-            log_path: dir.path().join("fake.log"),
+            boot_log_path: dir.path().join("fake.boot.log"),
             serial_log_path: dir.path().join("fake.serial.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
         };
@@ -684,13 +691,13 @@ mod tests {
         let id = Uuid::new_v4();
         let socket_path = dir.path().join("test.sock");
         let vsock_path = dir.path().join("test.vsock");
-        let log_path = dir.path().join("test.log");
+        let boot_log_path = dir.path().join("test.boot.log");
         let serial_log_path = dir.path().join("test.serial.log");
 
         // Create the files
         tokio::fs::write(&socket_path, b"").await.unwrap();
         tokio::fs::write(&vsock_path, b"").await.unwrap();
-        tokio::fs::write(&log_path, b"").await.unwrap();
+        tokio::fs::write(&boot_log_path, b"").await.unwrap();
         tokio::fs::write(&serial_log_path, b"").await.unwrap();
 
         let instance = FcInstance {
@@ -705,7 +712,7 @@ mod tests {
             },
             socket_path: socket_path.clone(),
             vsock_path: vsock_path.clone(),
-            log_path: log_path.clone(),
+            boot_log_path: boot_log_path.clone(),
             serial_log_path: serial_log_path.clone(),
             process: tokio::process::Command::new("true").spawn().unwrap(),
         };
@@ -715,7 +722,7 @@ mod tests {
 
         assert!(!socket_path.exists());
         assert!(!vsock_path.exists());
-        assert!(!log_path.exists());
+        assert!(!boot_log_path.exists());
         assert!(!serial_log_path.exists());
     }
 
@@ -740,7 +747,7 @@ mod tests {
             },
             socket_path: dir.path().join("test.sock"),
             vsock_path: dir.path().join("test.vsock"),
-            log_path: dir.path().join("test.log"),
+            boot_log_path: dir.path().join("test.boot.log"),
             serial_log_path: dir.path().join("test.serial.log"),
             process,
         };

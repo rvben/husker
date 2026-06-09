@@ -317,9 +317,16 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
     };
 
     let err = backend.create_vm(config).await.unwrap_err();
+    // Firecracker API failures are wrapped in ProcessError with the original
+    // API error message as the prefix (followed by any available diagnostic tails).
     assert!(
-        matches!(err, VmmError::ApiError(_)),
-        "expected ApiError, got: {err}"
+        matches!(err, VmmError::ProcessError(_)),
+        "expected ProcessError, got: {err}"
+    );
+    // The original API error detail must appear in the message.
+    assert!(
+        err.to_string().contains("API error"),
+        "ProcessError must contain original API error details, got: {err}"
     );
 
     // No .serial.log files should remain
