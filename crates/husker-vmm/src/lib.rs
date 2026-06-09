@@ -9,6 +9,9 @@ pub mod fd_stream;
 #[cfg(unix)]
 pub mod qmp;
 
+#[cfg(unix)]
+pub mod qemu;
+
 #[cfg(target_os = "macos")]
 pub mod apple_vz;
 
