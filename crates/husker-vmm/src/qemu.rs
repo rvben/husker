@@ -256,6 +256,51 @@ impl QemuKvmBackend {
     }
 }
 
+/// `VmmBackend` impl is Linux-only: it needs `tokio-vsock` (host AF_VSOCK) to
+/// reach the guest agent, and QEMU's `vhost-vsock-pci` device requires
+/// `/dev/vhost-vsock`. The lifecycle methods delegate to the cross-platform
+/// inherent methods above.
+#[cfg(target_os = "linux")]
+impl crate::VmmBackend for QemuKvmBackend {
+    type VsockStream = tokio_vsock::VsockStream;
+
+    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        self.create(config).await
+    }
+
+    async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        self.stop(id).await
+    }
+
+    async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        self.destroy(id).await
+    }
+
+    async fn vm_info(&self, id: Uuid) -> Result<VmInfo, VmmError> {
+        self.info(id).await
+    }
+
+    async fn pause_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        self.pause(id).await
+    }
+
+    async fn resume_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        self.resume(id).await
+    }
+
+    async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
+        let cid = {
+            let instances = self.instances.lock().await;
+            instances.get(&id).ok_or(VmmError::VmNotFound(id))?.vsock_cid
+        };
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port))
+            .await
+            .map_err(|e| {
+                VmmError::ProcessError(format!("vsock connect cid={cid} port={port}: {e}"))
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
