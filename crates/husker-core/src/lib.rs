@@ -861,6 +861,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         let userdata_log = self.runtime_dir.join(format!("{}.userdata.log", record.id));
         let _ = remove_file_best_effort(&userdata_log).await;
 
+        let boot_log = self.runtime_dir.join(format!("{}.boot.log", record.id));
+        if let Err(e) = remove_file_best_effort(&boot_log).await {
+            warn!(%name, path = %boot_log.display(), error = %e, "failed to remove boot log during destroy");
+        }
+
         self.state.delete_vm(record.id)?;
         info!(%name, "VM destroyed");
         Ok(())
@@ -1386,6 +1391,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub fn userdata_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
         let record = self.lookup_vm(name)?;
         Ok(self.runtime_dir.join(format!("{}.userdata.log", record.id)))
+    }
+
+    /// Path to a VM's backend process ("boot") log: QEMU's own stdout/stderr or
+    /// Firecracker's process log, distinct from the guest serial console.
+    pub fn boot_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        let record = self.lookup_vm(name)?;
+        Ok(self.runtime_dir.join(format!("{}.boot.log", record.id)))
     }
 
     /// Stop all running and paused VMs during daemon shutdown.
