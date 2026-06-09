@@ -405,6 +405,10 @@ pub struct HuskerCore<B: VmmBackend> {
     storage: husker_storage::StorageConfig,
     storage_driver: Arc<dyn husker_storage::StorageDriver>,
     #[cfg(feature = "linux-net")]
+    ovmf_code_path: PathBuf,
+    #[cfg(feature = "linux-net")]
+    ovmf_vars_template_path: PathBuf,
+    #[cfg(feature = "linux-net")]
     bridge_name: String,
     #[cfg(feature = "linux-net")]
     dns_servers: Vec<String>,
@@ -436,6 +440,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             ip_allocator,
             storage,
             storage_driver: husker_storage::default_storage_driver(),
+            ovmf_code_path: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
+            ovmf_vars_template_path: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
             bridge_name,
             dns_servers,
             runtime_dir,
@@ -523,8 +529,10 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
 
-        husker_storage::validate_kernel(&req.kernel_path)?;
-        husker_storage::validate_rootfs(&req.rootfs_path)?;
+        if req.cloud_image.is_none() {
+            husker_storage::validate_kernel(&req.kernel_path)?;
+            husker_storage::validate_rootfs(&req.rootfs_path)?;
+        }
 
         let mut resources = AllocatedResources::default();
         match self.try_create_vm(req, tags, &mut resources).await {
@@ -572,22 +580,55 @@ impl<B: VmmBackend> HuskerCore<B> {
                 warn!(dir = %vm_dir.display(), error = %e, "failed to remove stale VM directory");
             }
         }
-        let vm_rootfs = vm_dir.join("rootfs.ext4");
-        self.storage_driver
-            .clone_rootfs(&req.rootfs_path, &vm_rootfs)
-            .await?;
-        resources.vm_dir = Some(vm_dir);
+        // Register the VM directory for rollback before any disk is created, so a
+        // partially-prepared disk (e.g. cloud clone succeeds but resize fails) is
+        // still cleaned up on failure.
+        resources.vm_dir = Some(vm_dir.clone());
 
-        if !self.dns_servers.is_empty() {
-            inject_resolv_conf(&vm_rootfs, &self.dns_servers).await?;
+        // Choose the boot disk + mode. A cloud image boots via UEFI/OVMF from a cloned
+        // qcow2; the default path boots a host kernel from a raw ext4 rootfs.
+        let (disk_path, boot, is_cloud) = if let Some(image) = req.cloud_image.as_ref() {
+            // Cloud-image boot is QEMU-only. Reject an explicit non-QEMU backend request.
+            if let Some(v) = req.vmm.as_deref() {
+                let kind = v.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm)?;
+                if kind != husker_vmm::VmmKind::Qemu {
+                    return Err(CoreError::InvalidArgument(
+                        "cloud-image boot requires the QEMU backend (--vmm qemu)".into(),
+                    ));
+                }
+            }
+            let disk = vm_dir.join("disk.qcow2");
+            let boot = prepare_cloud_disk(
+                self.storage_driver.as_ref(),
+                image,
+                req.disk_size,
+                &disk,
+                &self.ovmf_code_path,
+                &self.ovmf_vars_template_path,
+            )
+            .await?;
+            (disk, boot, true)
+        } else {
+            let vm_rootfs = vm_dir.join("rootfs.ext4");
+            self.storage_driver
+                .clone_rootfs(&req.rootfs_path, &vm_rootfs)
+                .await?;
+            (vm_rootfs, husker_vmm::BootMode::DirectKernel, false)
+        };
+
+        // resolv.conf injection loop-mounts the ext4 rootfs; skip it for qcow2 cloud
+        // images, which are not ext4. Cloud images configure DNS via cloud-init at boot.
+        if !is_cloud && !self.dns_servers.is_empty() {
+            inject_resolv_conf(&disk_path, &self.dns_servers).await?;
         }
 
-        let vmm_kind = match req.vmm.as_deref() {
-            Some(s) => Some(
-                s.parse::<husker_vmm::VmmKind>()
-                    .map_err(CoreError::Vmm)?,
-            ),
-            None => None,
+        let vmm_kind = if is_cloud {
+            Some(husker_vmm::VmmKind::Qemu)
+        } else {
+            match req.vmm.as_deref() {
+                Some(s) => Some(s.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm)?),
+                None => None,
+            }
         };
 
         let vm_config = husker_vmm::VmConfig {
@@ -595,7 +636,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vcpu_count: req.vcpu_count.unwrap_or(1),
             mem_size_mib: req.mem_size_mib.unwrap_or(128),
             kernel_path: req.kernel_path.clone(),
-            rootfs_path: vm_rootfs,
+            rootfs_path: disk_path,
             kernel_args: Some(format!(
                 "console=ttyS0 reboot=k panic=1 pci=off \
                  ip={guest_ip}::{gateway}:{netmask}::eth0:off"
@@ -605,7 +646,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             tap_device: Some(tap_name.clone()),
             guest_mac: Some(mac),
             vmm: vmm_kind,
-            boot: husker_vmm::BootMode::DirectKernel,
+            boot,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -640,7 +681,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
             vmm: vmm_kind.map(|k| k.to_string()).unwrap_or_else(|| "firecracker".to_string()),
-            boot_mode: "direct".to_string(),
+            boot_mode: if is_cloud { "uefi".to_string() } else { "direct".to_string() },
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -661,6 +702,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         tags: Option<ServiceTag>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
+        if req.cloud_image.is_some() {
+            return Err(CoreError::InvalidArgument(
+                "cloud-image boot is only supported on Linux with the QEMU backend".into(),
+            ));
+        }
+
         let cid = self.state.allocate_cid()?;
         resources.cid = Some(cid);
 
@@ -2226,6 +2273,43 @@ async fn rotate_log_file(path: &std::path::Path, keep_bytes: u64) -> std::io::Re
     Ok(())
 }
 
+/// Prepare a cloud-image boot disk: validate the base image and OVMF firmware exist,
+/// clone the base qcow2 into `dest_disk`, optionally grow it, and return the UEFI
+/// BootMode carrying the firmware paths. This is pure file I/O (no networking), so the
+/// full create path's TAP setup is not involved and it is unit-tested directly.
+#[cfg(feature = "linux-net")]
+async fn prepare_cloud_disk(
+    storage_driver: &dyn husker_storage::StorageDriver,
+    image: &str,
+    disk_size: Option<u64>,
+    dest_disk: &Path,
+    ovmf_code: &Path,
+    ovmf_vars_template: &Path,
+) -> Result<husker_vmm::BootMode, CoreError> {
+    let image_path = PathBuf::from(image);
+    if !image_path.exists() {
+        return Err(CoreError::InvalidArgument(format!(
+            "cloud image not found: {}",
+            image_path.display()
+        )));
+    }
+    if !ovmf_code.exists() || !ovmf_vars_template.exists() {
+        return Err(CoreError::InvalidArgument(format!(
+            "OVMF firmware missing (need {} and {}); install the host OVMF package",
+            ovmf_code.display(),
+            ovmf_vars_template.display()
+        )));
+    }
+    storage_driver.clone_rootfs(&image_path, dest_disk).await?;
+    if let Some(size) = disk_size {
+        husker_storage::resize_disk(dest_disk, size).await?;
+    }
+    Ok(husker_vmm::BootMode::Uefi {
+        ovmf_code: ovmf_code.to_path_buf(),
+        ovmf_vars_template: ovmf_vars_template.to_path_buf(),
+    })
+}
+
 /// Mount a rootfs image via loop, write `/etc/resolv.conf`, and unmount.
 #[cfg(feature = "linux-net")]
 async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Result<(), CoreError> {
@@ -2303,6 +2387,82 @@ async fn remove_file_best_effort(path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn prepare_cloud_disk_returns_uefi_and_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("base.qcow2");
+        let code = tmp.path().join("CODE.fd");
+        let vars = tmp.path().join("VARS.fd");
+        for p in [&image, &code, &vars] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let dest = tmp.path().join("vm/disk.qcow2");
+        let driver = husker_storage::default_storage_driver();
+        // disk_size = None so no qemu-img resize is needed (keeps the test hermetic).
+        let boot = super::prepare_cloud_disk(
+            driver.as_ref(),
+            image.to_str().unwrap(),
+            None,
+            &dest,
+            &code,
+            &vars,
+        )
+        .await
+        .unwrap();
+        match boot {
+            husker_vmm::BootMode::Uefi { ovmf_code, ovmf_vars_template } => {
+                assert_eq!(ovmf_code, code);
+                assert_eq!(ovmf_vars_template, vars);
+            }
+            other => panic!("expected Uefi, got {other:?}"),
+        }
+        assert!(dest.exists(), "base image must be cloned to dest");
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn prepare_cloud_disk_errors_on_missing_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("CODE.fd");
+        let vars = tmp.path().join("VARS.fd");
+        for p in [&code, &vars] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let driver = husker_storage::default_storage_driver();
+        let err = super::prepare_cloud_disk(
+            driver.as_ref(),
+            "/no/such/image.qcow2",
+            None,
+            &tmp.path().join("d.qcow2"),
+            &code,
+            &vars,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, super::CoreError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn prepare_cloud_disk_errors_on_missing_ovmf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("base.qcow2");
+        std::fs::write(&image, b"x").unwrap();
+        let driver = husker_storage::default_storage_driver();
+        let err = super::prepare_cloud_disk(
+            driver.as_ref(),
+            image.to_str().unwrap(),
+            None,
+            &tmp.path().join("d.qcow2"),
+            &tmp.path().join("missing-code.fd"),
+            &tmp.path().join("missing-vars.fd"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, super::CoreError::InvalidArgument(_)), "got {err:?}");
+    }
 
     #[tokio::test]
     async fn remove_file_best_effort_ignores_missing_file() {

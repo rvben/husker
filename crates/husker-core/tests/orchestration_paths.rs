@@ -1783,6 +1783,32 @@ async fn create_vm_accepts_safe_names() {
     }
 }
 
+// Cloud-image boot is Linux-only. On the not-linux-net path (macOS / Apple VZ),
+// the request must be rejected before any networking or storage is touched.
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn cloud_image_rejected_on_non_qemu_platform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    let err = core
+        .create_vm(CreateVmRequest {
+            name: "cloudvm".into(),
+            kernel_path: std::path::PathBuf::from("/unused"),
+            rootfs_path: std::path::PathBuf::from("/unused"),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            initrd_path: None,
+            userdata: None,
+            env: Vec::new(),
+            vmm: None,
+            cloud_image: Some("/some/image.qcow2".into()),
+            disk_size: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::InvalidArgument(_)), "got {err:?}");
+}
+
 // The concurrent-create test drives the full create path to completion (VMM
 // create + state insert). The linux-net path requires real TAP device operations
 // that cannot run in a unit test environment, so this test is restricted to the
