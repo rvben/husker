@@ -70,12 +70,17 @@
 # exec_denylist = ["rm", "mkfs", "dd"]
 # exec_env_allowlist = ["PATH", "HOME", "TERM"]
 
-# ── Firecracker (Linux only) ─────────────────────────────────────────
+# ── Firecracker / QEMU (Linux only) ─────────────────────────────────
 
 # Path to the Firecracker binary. Must be on a filesystem that supports
 # execution. On most distros the default of "firecracker" works if it's
 # installed in $PATH.
 # firecracker_bin = "firecracker"
+
+# VMM backend: "firecracker" (default) or "qemu" (Linux only, full QEMU/KVM VMs).
+# vmm = "firecracker"
+# Path to the qemu-system binary when vmm = "qemu" (env: HUSKER_QEMU_BIN).
+# qemu_bin = "qemu-system-x86_64"
 
 # ── Networking (Linux only) ──────────────────────────────────────────
 
@@ -111,6 +116,8 @@
 #   HUSKER_SERVICE_RECONCILE_INTERVAL        →  service_reconcile_interval_secs
 #   HUSKER_SERVICE_RECONCILE_ENABLED         →  service_reconcile_enabled (1/true/TRUE/yes)
 #   HUSKER_FIRECRACKER_BIN                   →  firecracker_bin    (Linux only)
+#   HUSKER_VMM                               →  vmm                (Linux only)
+#   HUSKER_QEMU_BIN                          →  qemu_bin           (Linux only)
 #   HUSKER_HOST_INTERFACE                    →  host_interface     (Linux only)
 #   HUSKER_BRIDGE_NAME                       →  bridge_name        (Linux only)
 #   HUSKER_BRIDGE_SUBNET                     →  bridge_subnet      (Linux only)

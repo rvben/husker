@@ -101,6 +101,15 @@ impl QemuKvmBackend {
             .kernel_args
             .clone()
             .unwrap_or_else(|| default_console.to_string());
+        // QEMU q35 carries every virtio device (vsock/net/rng) on the PCIe bus.
+        // husker-core adds `pci=off` for Firecracker's PCI-less microVM machine;
+        // leaving it in would stop the QEMU guest from enumerating those devices
+        // (no network, no vsock, no agent). Strip it for QEMU.
+        let base_args = base_args
+            .split_whitespace()
+            .filter(|tok| *tok != "pci=off")
+            .collect::<Vec<_>>()
+            .join(" ");
         args.push("-kernel".into());
         args.push(config.kernel_path.display().to_string());
         if let Some(initrd) = &config.initrd_path {
@@ -272,6 +281,11 @@ impl crate::VmmBackend for QemuKvmBackend {
     type VsockStream = tokio_vsock::VsockStream;
 
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            return Err(VmmError::InvalidConfig(
+                "/dev/kvm missing (KVM not available on this host)".into(),
+            ));
+        }
         if !std::path::Path::new("/dev/vhost-vsock").exists() {
             return Err(VmmError::InvalidConfig(
                 "/dev/vhost-vsock missing (load the vhost_vsock kernel module)".into(),
@@ -447,5 +461,17 @@ mod tests {
         assert!(matches!(be.stop(id).await, Err(VmmError::VmNotFound(_))));
         assert!(matches!(be.pause(id).await, Err(VmmError::VmNotFound(_))));
         assert!(matches!(be.resume(id).await, Err(VmmError::VmNotFound(_))));
+    }
+
+    #[test]
+    fn build_args_strips_pci_off_for_qemu() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.kernel_args = Some("console=ttyS0 reboot=k panic=1 pci=off ip=192.0.2.2::192.0.2.1:255.255.255.252::eth0:off".into());
+        let args = be.build_args(Uuid::nil(), &cfg);
+        let append = args.iter().find(|a| a.contains("root=/dev/vda")).expect("append present");
+        assert!(!append.contains("pci=off"), "pci=off must be stripped for QEMU: {append}");
+        assert!(append.contains("console=ttyS0"), "other args preserved: {append}");
+        assert!(append.contains("panic=1"), "other args preserved: {append}");
     }
 }

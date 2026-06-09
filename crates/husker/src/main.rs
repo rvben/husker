@@ -3462,10 +3462,14 @@ fn apply_env_overrides(config: &mut Config) {
         if let Ok(val) = std::env::var("HUSKER_QEMU_BIN") {
             config.qemu_bin = PathBuf::from(val);
         }
-        if let Ok(val) = std::env::var("HUSKER_VMM")
-            && let Some(sel) = VmmSelection::from_env_str(&val)
-        {
-            config.vmm = sel;
+        if let Ok(val) = std::env::var("HUSKER_VMM") {
+            match VmmSelection::from_env_str(&val) {
+                Some(sel) => config.vmm = sel,
+                None => tracing::warn!(
+                    value = %val,
+                    "HUSKER_VMM: unrecognised or unsupported backend on this platform, ignoring (valid: firecracker, qemu)"
+                ),
+            }
         }
         if let Ok(val) = std::env::var("HUSKER_HOST_INTERFACE") {
             config.host_interface = val;

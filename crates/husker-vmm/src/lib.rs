@@ -1,4 +1,4 @@
-//! VMM abstraction and backend-neutral types for Firecracker and Apple VZ.
+//! VMM abstraction and backend-neutral types for Firecracker, Apple VZ, and QEMU/KVM.
 
 pub mod firecracker;
 pub mod vsock;
