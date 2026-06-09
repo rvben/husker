@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.1] - 2026-06-09
+
+### Added
+
+- **QEMU/KVM backend (Linux).** A second `VmmBackend` runs full VMs via
+  `qemu-system` (q35, virtio-over-PCI, vhost-vsock) alongside Firecracker. Raw
+  ext4 rootfs (`format=raw,if=virtio`); the guest kernel must support
+  `CONFIG_VIRTIO_PCI`. `husker config check` verifies `qemu_bin`, `/dev/kvm`, and
+  `/dev/vhost-vsock` when QEMU is selected.
+- **Per-VM backend selection.** One daemon can run Firecracker microVMs and QEMU
+  full VMs side by side. `husker run --vmm <firecracker|qemu>` chooses the backend
+  per VM (default: the daemon's configured `vmm` / `HUSKER_VMM`); the chosen
+  backend is recorded and reported by `husker list` and `husker info`.
+- **`husker wait <name>`** blocks until a VM's guest agent is ready, backed by a
+  fast `GET /v1/vms/{name}/ready` probe. Agent readiness is verified with a real
+  ping/pong round trip and a bounded timeout, so `exec`/`shell` immediately after
+  boot no longer race the agent bind.
+- **`husker logs --source <serial|boot|userdata>`** selects the log stream
+  (default `serial`; `--userdata` retained as an alias).
+
+### Changed
+
+- **nftables tables are namespaced per bridge** (`husker_<bridge>`), so two husker
+  daemons on one host no longer clobber each other's NAT.
+- On a failed VM boot, the error now includes the tail of the guest serial log and
+  the backend boot log (e.g. a kernel panic such as `Cannot open root device`),
+  instead of only a generic startup-timeout message. The backend process log is
+  standardized as `{id}.boot.log`.
+
 ## [0.3.0] - 2026-06-09
 
 ### Added
