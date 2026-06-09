@@ -109,6 +109,13 @@ Current scope is direct-kernel boot (same kernel + rootfs model as the Firecrack
 backend), with the guest agent reachable over vsock. Booting stock cloud images via
 UEFI/OVMF is not yet supported.
 
+**Guest kernel requirement:** the QEMU backend uses the `q35` machine, which puts the
+root disk, NIC, and vsock device on the PCI bus, so the guest kernel must have
+`CONFIG_VIRTIO_PCI` (and an initramfs if `virtio_blk` is a module). The default husker
+images satisfy this. Firecracker's own kernels are built for virtio-MMIO only and will
+panic under QEMU with `Cannot open root device "vda"`. The husker default images and
+most distro kernels work as-is.
+
 ## Alternatives
 
 husker is one of several ways to run microVMs. Rough positioning:
