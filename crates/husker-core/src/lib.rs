@@ -1516,24 +1516,54 @@ impl<B: VmmBackend> HuskerCore<B> {
     ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
         let mut backoff = std::time::Duration::from_millis(200);
         let max_backoff = std::time::Duration::from_secs(2);
+        let attempt_timeout = std::time::Duration::from_secs(2);
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            match self.agent_connect(name).await {
-                Ok(c) => return Ok(c),
-                Err(ref e @ (CoreError::Vmm(_) | CoreError::Agent(_)))
-                    if tokio::time::Instant::now() + backoff < deadline =>
-                {
-                    debug!(
-                        %name,
-                        error = %e,
-                        retry_in = ?backoff,
-                        "agent not ready, retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max_backoff);
+            // Each attempt (connect + ping) is bounded so a guest that accepts
+            // the vsock but never replies cannot exceed the overall deadline.
+            let attempt = tokio::time::timeout(attempt_timeout, async {
+                let mut conn = self.agent_connect(name).await?;
+                conn.ping().await?;
+                Ok::<_, CoreError>(conn)
+            })
+            .await;
+            match attempt {
+                Ok(Ok(conn)) => return Ok(conn),
+                // State errors (VM stopped/destroyed) fail fast.
+                Ok(Err(e)) if !matches!(e, CoreError::Vmm(_) | CoreError::Agent(_)) => {
+                    return Err(e);
                 }
-                Err(e) => return Err(e),
+                // Connection/agent errors are transient.
+                Ok(Err(e)) => debug!(%name, error = %e, "agent not ready, retrying"),
+                // A timed-out attempt is transient.
+                Err(_) => debug!(%name, "agent ping attempt timed out, retrying"),
             }
+            if tokio::time::Instant::now() + backoff >= deadline {
+                return Err(CoreError::Agent(
+                    crate::agent_client::AgentError::NotReady(timeout),
+                ));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+
+    /// Single-attempt readiness probe (for the `/ready` endpoint): connect and
+    /// ping once with a short timeout. `Ok(true)` if the agent ponged, `Ok(false)`
+    /// if not yet reachable (or timed out), and `Err` for state errors (VM
+    /// stopped/destroyed) so callers can distinguish "not up yet" from "gone".
+    pub async fn probe_ready(&self, name: &str) -> Result<bool, CoreError> {
+        let attempt = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut conn = self.agent_connect(name).await?;
+            conn.ping().await?;
+            Ok::<_, CoreError>(())
+        })
+        .await;
+        match attempt {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(CoreError::Vmm(_) | CoreError::Agent(_))) => Ok(false),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(false),
         }
     }
 
