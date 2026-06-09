@@ -129,3 +129,56 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
         "boot-log tail should carry the stand-in's stderr, got: {msg}"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs KVM + qemu + OVMF + a cloud image; gated by HUSKER_RUN_IGNORED_E2E"]
+async fn qemu_uefi_boots_cloud_image() {
+    if std::env::var("HUSKER_RUN_IGNORED_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping qemu_uefi_boots_cloud_image: set HUSKER_RUN_IGNORED_E2E=1");
+        return;
+    }
+    let image = std::env::var("HUSKER_E2E_CLOUD_IMAGE").expect("HUSKER_E2E_CLOUD_IMAGE");
+    let ovmf_code = std::env::var("HUSKER_E2E_OVMF_CODE")
+        .unwrap_or_else(|_| "/usr/share/OVMF/OVMF_CODE_4M.fd".into());
+    let ovmf_vars = std::env::var("HUSKER_E2E_OVMF_VARS")
+        .unwrap_or_else(|_| "/usr/share/OVMF/OVMF_VARS_4M.fd".into());
+    let cid: u32 = std::env::var("HUSKER_E2E_CID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9);
+
+    let dir = tempfile::tempdir().unwrap();
+    // Copy the base image so the test never mutates it.
+    let disk = dir.path().join("disk.qcow2");
+    tokio::fs::copy(&image, &disk).await.unwrap();
+
+    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+    let config = husker_vmm::VmConfig {
+        name: "uefi-e2e".into(),
+        vcpu_count: 2,
+        mem_size_mib: 1024,
+        kernel_path: "/unused".into(),
+        rootfs_path: disk,
+        kernel_args: None,
+        initrd_path: None,
+        vsock_cid: cid,
+        tap_device: None,
+        guest_mac: None,
+        vmm: Some(husker_vmm::VmmKind::Qemu),
+        boot: husker_vmm::BootMode::Uefi {
+            ovmf_code: ovmf_code.into(),
+            ovmf_vars_template: ovmf_vars.into(),
+        },
+    };
+    let info = backend.create(config).await.expect("UEFI VM should boot");
+    // Give OVMF + GRUB time, then assert the serial log shows firmware/boot progress.
+    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    let serial = std::fs::read_to_string(dir.path().join(format!("{}.serial.log", info.id)))
+        .unwrap_or_default();
+    backend.destroy(info.id).await.ok();
+    assert!(
+        serial.contains("UEFI") || serial.to_lowercase().contains("grub")
+            || serial.to_lowercase().contains("login:"),
+        "serial log lacked UEFI/GRUB/login evidence:\n{serial}"
+    );
+}
