@@ -1996,8 +1996,12 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
         .shell_sessions_total
         .fetch_add(1, Ordering::Relaxed);
 
-    // Connect to the guest agent.
-    let mut conn = match core.agent_connect(&name).await {
+    // Connect to the guest agent via bounded readiness wait so an interactive
+    // shell opened immediately after VM creation does not race the agent bind.
+    let mut conn = match core
+        .agent_connect_ready(&name, std::time::Duration::from_secs(30))
+        .await
+    {
         Ok(conn) => conn,
         Err(e) => {
             let _ = send_ws_output(
