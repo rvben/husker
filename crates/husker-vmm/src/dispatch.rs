@@ -57,6 +57,24 @@ impl AsyncWrite for LinuxVsockStream {
             LinuxVsockStream::Qemu(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            LinuxVsockStream::Firecracker(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            LinuxVsockStream::Qemu(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            LinuxVsockStream::Firecracker(s) => s.is_write_vectored(),
+            LinuxVsockStream::Qemu(s) => s.is_write_vectored(),
+        }
+    }
 }
 
 /// Routes each VM to the backend that created it.
