@@ -237,6 +237,15 @@ enum Commands {
         source: Option<String>,
     },
 
+    /// Wait until a VM's guest agent is ready (polls readiness)
+    Wait {
+        /// VM name
+        name: String,
+        /// Maximum seconds to wait
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+
     /// Print version information (client and daemon)
     Version,
 
@@ -935,6 +944,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "list"
             | "info"
             | "logs"
+            | "wait"
             | "version"
             | "schema"
             | "config check"
@@ -964,6 +974,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "userdata_status",
             "id",
         ],
+        "wait" => vec!["status", "action", "vm", "ready"],
         "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
         "exec" => vec!["exit_code", "stdout", "stderr"],
         "version" => vec!["client_version", "server_version"],
@@ -1680,6 +1691,39 @@ async fn run(cli: Cli) -> Result<()> {
                 } else {
                     print!("{body}");
                 }
+            }
+            Ok(())
+        }
+        Commands::Wait { name, timeout } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            let url = format!("{api_url}/v1/vms/{name}/ready");
+            let client = reqwest::Client::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let mut backoff = std::time::Duration::from_millis(200);
+            loop {
+                let resp =
+                    api_request(with_api_auth(client.get(&url), api_token.as_deref())).await?;
+                if !resp.status().is_success() {
+                    let msg = api_error(resp, &format!("VM '{name}'")).await;
+                    exit_with_error(output, msg);
+                }
+                let body: serde_json::Value = resp.json().await?;
+                if body.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
+                    print_output(
+                        output,
+                        &serde_json::json!({"status":"ok","action":"wait","vm":name,"ready":true}),
+                        format!("{name} is ready"),
+                    );
+                    break;
+                }
+                if std::time::Instant::now() + backoff >= deadline {
+                    exit_with_error(
+                        output,
+                        format!("timed out waiting for VM '{name}' to become ready"),
+                    );
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
             }
             Ok(())
         }
