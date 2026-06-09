@@ -332,6 +332,9 @@ async fn reconcile_foreign_running_collision() {
         initrd_path: None,
         userdata: None,
         env: vec![],
+        vmm: None,
+        cloud_image: None,
+        disk_size: None,
     })
     .await
     .unwrap();
@@ -377,6 +380,9 @@ async fn reconcile_foreign_stopped_collision() {
         initrd_path: None,
         userdata: None,
         env: vec![],
+        vmm: None,
+        cloud_image: None,
+        disk_size: None,
     })
     .await
     .unwrap();
@@ -432,6 +438,9 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 initrd_path: None,
                 userdata: None,
                 env: vec![],
+                vmm: None,
+                cloud_image: None,
+                disk_size: None,
             },
             Some(ServiceTag {
                 service_id: id,
@@ -454,6 +463,9 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 initrd_path: None,
                 userdata: None,
                 env: vec![],
+                vmm: None,
+                cloud_image: None,
+                disk_size: None,
             },
             Some(ServiceTag {
                 service_id: id,

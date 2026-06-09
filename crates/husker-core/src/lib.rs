@@ -96,6 +96,13 @@ pub struct CreateVmRequest {
     /// use the daemon's configured default.
     #[serde(default)]
     pub vmm: Option<String>,
+    /// Boot a stock cloud image (qcow2) as a full UEFI VM. Holds the base image
+    /// path on the host. Implies the QEMU backend; `kernel_path`/`rootfs_path` are ignored.
+    #[serde(default)]
+    pub cloud_image: Option<String>,
+    /// Grow the cloud-image disk to this many bytes before boot (cloud-image only).
+    #[serde(default)]
+    pub disk_size: Option<u64>,
 }
 
 /// Parameters for creating a host group.
@@ -1220,6 +1227,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             userdata: req.userdata,
             env: req.env,
             vmm: None,
+            cloud_image: None,
+            disk_size: None,
         })
         .await
     }
@@ -2002,6 +2011,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             userdata: svc.userdata.clone(),
             env,
             vmm: None,
+            cloud_image: None,
+            disk_size: None,
         };
         match self
             .create_vm_record(
@@ -2640,5 +2651,13 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert_eq!(reaped, 0, "stopped VMs and dead/absent pids must not be counted as reaped");
         // We are still alive.
         assert!(std::process::id() > 0);
+    }
+
+    #[test]
+    fn create_vm_request_defaults_cloud_fields_to_none() {
+        let json = r#"{"name":"v","kernel_path":"/k","rootfs_path":"/r"}"#;
+        let req: super::CreateVmRequest = serde_json::from_str(json).unwrap();
+        assert!(req.cloud_image.is_none());
+        assert!(req.disk_size.is_none());
     }
 }

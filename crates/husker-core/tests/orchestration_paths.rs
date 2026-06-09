@@ -520,6 +520,8 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             userdata: None,
             env: Vec::new(),
             vmm: None,
+            cloud_image: None,
+            disk_size: None,
         })
         .await
         .unwrap_err();
@@ -551,6 +553,8 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             userdata: None,
             env: Vec::new(),
             vmm: None,
+            cloud_image: None,
+            disk_size: None,
         })
         .await
         .unwrap_err()
@@ -607,6 +611,8 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             userdata: None,
             env: Vec::new(),
             vmm: None,
+            cloud_image: None,
+            disk_size: None,
         })
         .await
         .unwrap_err()
@@ -1447,6 +1453,8 @@ async fn create_vm_rejects_unsafe_names() {
                 userdata: None,
                 env: Vec::new(),
                 vmm: None,
+                cloud_image: None,
+                disk_size: None,
             })
             .await
             .unwrap_err();
@@ -1763,6 +1771,8 @@ async fn create_vm_accepts_safe_names() {
                 userdata: None,
                 env: Vec::new(),
                 vmm: None,
+                cloud_image: None,
+                disk_size: None,
             })
             .await
             .unwrap_err();
@@ -1805,6 +1815,8 @@ async fn concurrent_create_same_name_one_winner() {
                 userdata: None,
                 env: Vec::new(),
                 vmm: None,
+                cloud_image: None,
+                disk_size: None,
             })
             .await
         })
