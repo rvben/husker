@@ -92,6 +92,10 @@ pub struct CreateVmRequest {
     /// Environment variables to pass to the userdata script.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Backend to run this VM on: "firecracker" (default) or "qemu". Omit to
+    /// use the daemon's configured default.
+    #[serde(default)]
+    pub vmm: Option<String>,
 }
 
 /// Parameters for creating a host group.
@@ -537,6 +541,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             inject_resolv_conf(&vm_rootfs, &self.dns_servers).await?;
         }
 
+        let vmm_kind = match req.vmm.as_deref() {
+            Some(s) => Some(
+                s.parse::<husker_vmm::VmmKind>()
+                    .map_err(CoreError::Vmm)?,
+            ),
+            None => None,
+        };
+
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
@@ -551,6 +563,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vsock_cid: cid,
             tap_device: Some(tap_name.clone()),
             guest_mac: Some(mac),
+            vmm: vmm_kind,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -584,6 +597,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
+            vmm: req.vmm.clone().unwrap_or_else(|| "firecracker".to_string()),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -639,6 +653,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vsock_cid: cid,
             tap_device: None,
             guest_mac: None,
+            vmm: None,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -670,6 +685,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
+            vmm: "firecracker".to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1165,6 +1181,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             initrd_path: req.initrd_path,
             userdata: req.userdata,
             env: req.env,
+            vmm: None,
         })
         .await
     }
@@ -1946,6 +1963,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             initrd_path: svc.initrd_path.clone().map(Into::into),
             userdata: svc.userdata.clone(),
             env,
+            vmm: None,
         };
         match self
             .create_vm_record(

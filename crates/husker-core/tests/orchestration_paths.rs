@@ -188,6 +188,7 @@ fn vm_record(
         userdata_env,
         service_id: None,
         service_ordinal: None,
+        vmm: "firecracker".into(),
     }
 }
 
@@ -517,6 +518,7 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             initrd_path: None,
             userdata: None,
             env: Vec::new(),
+            vmm: None,
         })
         .await
         .unwrap_err();
@@ -547,6 +549,7 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             initrd_path: None,
             userdata: None,
             env: Vec::new(),
+            vmm: None,
         })
         .await
         .unwrap_err()
@@ -602,6 +605,7 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             initrd_path: None,
             userdata: None,
             env: Vec::new(),
+            vmm: None,
         })
         .await
         .unwrap_err()
@@ -1441,6 +1445,7 @@ async fn create_vm_rejects_unsafe_names() {
                 initrd_path: None,
                 userdata: None,
                 env: Vec::new(),
+                vmm: None,
             })
             .await
             .unwrap_err();
@@ -1756,6 +1761,7 @@ async fn create_vm_accepts_safe_names() {
                 initrd_path: None,
                 userdata: None,
                 env: Vec::new(),
+                vmm: None,
             })
             .await
             .unwrap_err();
@@ -1797,6 +1803,7 @@ async fn concurrent_create_same_name_one_winner() {
                 initrd_path: None,
                 userdata: None,
                 env: Vec::new(),
+                vmm: None,
             })
             .await
         })
