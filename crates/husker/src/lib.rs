@@ -135,6 +135,24 @@ pub fn default_images_base_url() -> String {
     DEFAULT_IMAGES_BASE_URL.to_string()
 }
 
+/// Parse a human disk size ("10G", "512M", "1024") into bytes (binary units).
+pub fn parse_disk_size(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    anyhow::ensure!(!s.is_empty(), "disk size must not be empty");
+    let (num, mult): (&str, u64) = match s.chars().last().unwrap() {
+        'G' | 'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        'M' | 'm' => (&s[..s.len() - 1], 1024 * 1024),
+        'K' | 'k' => (&s[..s.len() - 1], 1024),
+        _ => (s, 1),
+    };
+    let value: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid disk size: {s:?}"))?;
+    anyhow::ensure!(value >= 0.0, "disk size must not be negative: {s:?}");
+    Ok((value * mult as f64) as u64)
+}
+
 /// Serde helper: wraps `default_initrd_path` in `Some` so `default_initrd`
 /// in the CLI Config defaults to the computed initramfs path rather than
 /// None. Users can explicitly set it to `null` in config to opt out.
@@ -145,6 +163,19 @@ pub fn default_initrd_some() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_disk_size_units() {
+        assert_eq!(parse_disk_size("1024").unwrap(), 1024);
+        assert_eq!(parse_disk_size("1K").unwrap(), 1024);
+        assert_eq!(parse_disk_size("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_disk_size("10G").unwrap(), 10 * 1024 * 1024 * 1024);
+        assert_eq!(parse_disk_size("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_disk_size("1.5G").unwrap(), 1_610_612_736);
+        assert!(parse_disk_size("").is_err());
+        assert!(parse_disk_size("ten").is_err());
+        assert!(parse_disk_size("-5G").is_err());
+    }
 
     #[test]
     fn resolve_rootfs_arg_resolves_bare_name_from_images_dir() {

@@ -95,6 +95,14 @@ enum Commands {
         /// Backend to run this VM on
         #[arg(long, value_parser = ["firecracker", "qemu"])]
         vmm: Option<String>,
+
+        /// Boot a cloud image (qcow2) as a full UEFI VM via QEMU (Linux only)
+        #[arg(long)]
+        cloud_image: Option<PathBuf>,
+
+        /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
+        #[arg(long)]
+        disk_size: Option<String>,
     },
 
     /// List running VMs
@@ -1108,38 +1116,51 @@ async fn run(cli: Cli) -> Result<()> {
             userdata,
             env,
             vmm,
+            cloud_image,
+            disk_size,
         } => {
             let config = load_config(config_path.as_deref());
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
 
-            let rootfs = match rootfs {
-                Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
-                None => {
-                    let default = config.default_rootfs.clone();
-                    if !default.exists() {
-                        eprintln!(
-                            "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass a rootfs path explicitly.",
-                            default.display()
-                        );
-                        exit_with_error(output, "default rootfs not available".to_string());
-                    }
-                    default
-                }
-            };
+            if disk_size.is_some() && cloud_image.is_none() {
+                exit_with_error(output, "--disk-size requires --cloud-image".to_string());
+            }
 
-            let kernel = match kernel {
-                Some(path) => path,
-                None => {
-                    let default = config.default_kernel.clone();
-                    if !default.exists() {
-                        eprintln!(
-                            "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
-                            default.display()
-                        );
-                        exit_with_error(output, "default kernel not available".to_string());
+            let (rootfs, kernel) = if let Some(ref img) = cloud_image {
+                // Cloud-image boot: kernel/rootfs are unused by the UEFI path. Satisfy
+                // the required request fields with the image path and skip the default
+                // kernel/rootfs lookups (they would hard-fail if the defaults are absent).
+                (img.clone(), img.clone())
+            } else {
+                let rootfs = match rootfs {
+                    Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
+                    None => {
+                        let default = config.default_rootfs.clone();
+                        if !default.exists() {
+                            eprintln!(
+                                "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass a rootfs path explicitly.",
+                                default.display()
+                            );
+                            exit_with_error(output, "default rootfs not available".to_string());
+                        }
+                        default
                     }
-                    default
-                }
+                };
+                let kernel = match kernel {
+                    Some(path) => path,
+                    None => {
+                        let default = config.default_kernel.clone();
+                        if !default.exists() {
+                            eprintln!(
+                                "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
+                                default.display()
+                            );
+                            exit_with_error(output, "default kernel not available".to_string());
+                        }
+                        default
+                    }
+                };
+                (rootfs, kernel)
             };
 
             let name =
@@ -1177,18 +1198,30 @@ async fn run(cli: Cli) -> Result<()> {
                 })?;
                 body["userdata"] = serde_json::json!(script);
             }
+            if let Some(ref img) = cloud_image {
+                body["cloud_image"] = serde_json::json!(img);
+                if let Some(ref size) = disk_size {
+                    let bytes = husker::parse_disk_size(size)
+                        .map_err(|e| anyhow::anyhow!("--disk-size: {e}"))?;
+                    body["disk_size"] = serde_json::json!(bytes);
+                }
+            }
 
             if output == OutputFormat::Text {
-                let initrd_str = body
-                    .get("initrd_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(none)");
-                eprintln!(
-                    "Using: kernel={} rootfs={} initrd={}",
-                    kernel.display(),
-                    rootfs.display(),
-                    initrd_str,
-                );
+                if let Some(ref img) = cloud_image {
+                    eprintln!("Using: cloud-image={}", img.display());
+                } else {
+                    let initrd_str = body
+                        .get("initrd_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(none)");
+                    eprintln!(
+                        "Using: kernel={} rootfs={} initrd={}",
+                        kernel.display(),
+                        rootfs.display(),
+                        initrd_str,
+                    );
+                }
             }
 
             #[cfg(all(target_os = "linux", feature = "linux-net"))]
