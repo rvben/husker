@@ -455,17 +455,14 @@ pub async fn init_nat(
 
 // ── Port Forwarding ───────────────────────────────────────────────────
 
-/// Add a port forward from `host_port` to `guest_ip:guest_port`.
-///
-/// Creates a DNAT rule in the prerouting chain. The bridge-level
-/// forward rules already allow all traffic to/from the bridge, so
-/// no per-port-forward accept rule is needed.
 pub async fn add_port_forward(
     host_port: u16,
     guest_ip: Ipv4Addr,
     guest_port: u16,
     tap_name: &str,
+    bridge: &str,
 ) -> Result<(), NetError> {
+    let table = nft_table_for_bridge(bridge);
     let comment = format!("\"husker-pf:{}:{}\"", tap_name, host_port);
     let dnat_target = format!("{}:{}", guest_ip, guest_port);
 
@@ -475,19 +472,10 @@ pub async fn add_port_forward(
     run_cmd(
         "nft",
         &[
-            "add",
-            "rule",
-            "ip",
-            NFT_TABLE,
-            "prerouting",
-            "tcp",
-            "dport",
-            &host_port.to_string(),
-            "dnat",
-            "to",
-            &dnat_target,
-            "comment",
-            &comment,
+            "add", "rule", "ip", &table, "prerouting",
+            "tcp", "dport", &host_port.to_string(),
+            "dnat", "to", &dnat_target,
+            "comment", &comment,
         ],
     )
     .await?;
@@ -495,14 +483,15 @@ pub async fn add_port_forward(
     Ok(())
 }
 
-/// Remove a specific port forward by host port and TAP name.
-///
-/// Queries the husker nftables table for rules tagged with the port forward
-/// comment and deletes them by handle.
-pub async fn remove_port_forward(host_port: u16, tap_name: &str) -> Result<(), NetError> {
+pub async fn remove_port_forward(
+    host_port: u16,
+    tap_name: &str,
+    bridge: &str,
+) -> Result<(), NetError> {
+    let table = nft_table_for_bridge(bridge);
     info!(host_port, tap = tap_name, "removing port forward");
 
-    let output = match run_cmd("nft", &["-j", "list", "table", "ip", NFT_TABLE]).await {
+    let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
         Err(_) => return Ok(()),
     };
@@ -515,15 +504,7 @@ pub async fn remove_port_forward(host_port: u16, tap_name: &str) -> Result<(), N
         debug!(chain = %chain, handle, "deleting port forward rule");
         if let Err(e) = run_cmd(
             "nft",
-            &[
-                "delete",
-                "rule",
-                "ip",
-                NFT_TABLE,
-                &chain,
-                "handle",
-                &handle.to_string(),
-            ],
+            &["delete", "rule", "ip", &table, &chain, "handle", &handle.to_string()],
         )
         .await
         {
@@ -540,9 +521,9 @@ pub async fn remove_port_forward(host_port: u16, tap_name: &str) -> Result<(), N
     Ok(())
 }
 
-/// Remove all port forwards for a VM identified by its TAP name.
-pub async fn remove_all_port_forwards(tap_name: &str) -> Result<(), NetError> {
-    let output = match run_cmd("nft", &["-j", "list", "table", "ip", NFT_TABLE]).await {
+pub async fn remove_all_port_forwards(tap_name: &str, bridge: &str) -> Result<(), NetError> {
+    let table = nft_table_for_bridge(bridge);
+    let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
         Err(_) => return Ok(()),
     };
@@ -555,15 +536,7 @@ pub async fn remove_all_port_forwards(tap_name: &str) -> Result<(), NetError> {
         debug!(chain = %chain, handle, "deleting port forward rule");
         if let Err(e) = run_cmd(
             "nft",
-            &[
-                "delete",
-                "rule",
-                "ip",
-                NFT_TABLE,
-                &chain,
-                "handle",
-                &handle.to_string(),
-            ],
+            &["delete", "rule", "ip", &table, &chain, "handle", &handle.to_string()],
         )
         .await
         {
