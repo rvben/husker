@@ -2139,7 +2139,8 @@ async fn send_ws_output(ws: &mut WebSocket, msg: &WsShellOutput) -> Result<(), a
     params(("name" = String, Path, description = "VM name")),
     responses(
         (status = 200, description = "Agent readiness", body = ReadyResponse),
-        (status = 404, description = "VM not found", body = ErrorResponse)
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "VM not running", body = ErrorResponse)
     )
 )]
 async fn get_ready<B: VmmBackend + 'static>(

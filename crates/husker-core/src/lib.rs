@@ -370,6 +370,9 @@ pub struct HuskerCore<B: VmmBackend> {
     reconcile_locks: std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+/// Per-attempt timeout for agent connect+ping in readiness loops.
+const AGENT_PING_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl<B: VmmBackend> HuskerCore<B> {
     /// Create a new HuskerCore with Linux networking (bridge + TAP + nftables).
     #[cfg(feature = "linux-net")]
@@ -1506,9 +1509,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// race the agent bind. Use this helper instead of [`Self::agent_connect`]
     /// when the caller can tolerate a bounded wait.
     ///
-    /// Retries only VMM/Agent connection errors (vsock CONNECT rejected,
-    /// agent not responding). State errors (VM destroyed or stopped) fail
-    /// immediately.
+    /// The wait is bounded to approximately `timeout` (the last attempt is
+    /// allowed to finish). Retries only VMM/Agent connection errors (vsock
+    /// CONNECT rejected, agent not responding). State errors (VM destroyed or
+    /// stopped) fail immediately.
     pub async fn agent_connect_ready(
         &self,
         name: &str,
@@ -1516,12 +1520,15 @@ impl<B: VmmBackend> HuskerCore<B> {
     ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
         let mut backoff = std::time::Duration::from_millis(200);
         let max_backoff = std::time::Duration::from_secs(2);
-        let attempt_timeout = std::time::Duration::from_secs(2);
-        let deadline = tokio::time::Instant::now() + timeout;
+        // Shrink the deadline by one attempt window so a final attempt that
+        // starts just under the deadline cannot push total wall-clock beyond
+        // approximately `timeout`.
+        let deadline =
+            tokio::time::Instant::now() + timeout.saturating_sub(AGENT_PING_ATTEMPT_TIMEOUT);
         loop {
             // Each attempt (connect + ping) is bounded so a guest that accepts
             // the vsock but never replies cannot exceed the overall deadline.
-            let attempt = tokio::time::timeout(attempt_timeout, async {
+            let attempt = tokio::time::timeout(AGENT_PING_ATTEMPT_TIMEOUT, async {
                 let mut conn = self.agent_connect(name).await?;
                 conn.ping().await?;
                 Ok::<_, CoreError>(conn)
@@ -1553,7 +1560,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// if not yet reachable (or timed out), and `Err` for state errors (VM
     /// stopped/destroyed) so callers can distinguish "not up yet" from "gone".
     pub async fn probe_ready(&self, name: &str) -> Result<bool, CoreError> {
-        let attempt = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let attempt = tokio::time::timeout(AGENT_PING_ATTEMPT_TIMEOUT, async {
             let mut conn = self.agent_connect(name).await?;
             conn.ping().await?;
             Ok::<_, CoreError>(())
