@@ -4056,7 +4056,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         // Network cleanup after VM drain. If the process is killed
         // (SIGKILL, panic, OOM), the stale bridge cleanup at startup above
         // handles the next launch.
-        let _ = husker_net::cleanup_nat().await;
+        let _ = husker_net::cleanup_nat(&config.bridge_name).await;
         let _ = husker_net::delete_bridge(&config.bridge_name).await;
         Ok(())
     }
