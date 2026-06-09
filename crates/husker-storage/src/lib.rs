@@ -147,6 +147,30 @@ fn should_warn_reflink_fallback(copied: Option<u64>, warned: &AtomicBool) -> boo
         .is_ok()
 }
 
+/// Grow a disk image to `new_size_bytes` using `qemu-img resize`.
+///
+/// Used for cloud-image VMs: clone the base qcow2 (via `clone_rootfs`) then grow it
+/// so cloud-init's growpart/resizefs can expand the guest filesystem on first boot.
+/// `qemu-img resize` only grows by default; pass a size >= the image's virtual size.
+pub async fn resize_disk(path: &Path, new_size_bytes: u64) -> Result<(), StorageError> {
+    let output = tokio::process::Command::new("qemu-img")
+        .arg("resize")
+        .arg(path)
+        // qemu-img interprets a bare integer (no suffix) as a byte count.
+        .arg(new_size_bytes.to_string())
+        .output()
+        .await
+        .map_err(StorageError::Io)?;
+    if !output.status.success() {
+        return Err(StorageError::CommandFailed(format!(
+            "qemu-img resize {} {new_size_bytes} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Validate that a kernel file exists and looks reasonable.
 ///
 /// On macOS (Apple Virtualization.framework), the kernel must be an
@@ -316,5 +340,43 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("too small"), "expected size error, got: {msg}");
         }
+    }
+
+    // These are fast, hermetic tests (tempdir + one qemu-img invocation), so they
+    // run by default rather than being #[ignore]d like the VM-boot e2e tests: when
+    // qemu-img is present (CI) they provide real coverage, and they skip cleanly on
+    // dev hosts that lack it.
+    fn qemu_img_available() -> bool {
+        std::process::Command::new("qemu-img")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn resize_disk_grows_a_raw_file() {
+        if !qemu_img_available() {
+            eprintln!("skipping resize_disk_grows_a_raw_file: qemu-img not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("d.raw");
+        tokio::fs::write(&disk, vec![0u8; 1024 * 1024]).await.unwrap();
+        resize_disk(&disk, 8 * 1024 * 1024).await.unwrap();
+        let len = tokio::fs::metadata(&disk).await.unwrap().len();
+        assert_eq!(len, 8 * 1024 * 1024, "raw disk should grow to the requested size");
+    }
+
+    #[tokio::test]
+    async fn resize_disk_errors_on_missing_file() {
+        if !qemu_img_available() {
+            eprintln!("skipping resize_disk_errors_on_missing_file: qemu-img not installed");
+            return;
+        }
+        let err = resize_disk(std::path::Path::new("/no/such/disk.qcow2"), 1 << 30)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::CommandFailed(_)), "got {err:?}");
     }
 }
