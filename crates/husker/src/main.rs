@@ -3847,6 +3847,46 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
             }
         }
 
+        // QEMU backend prerequisites (only when vmm = "qemu" is selected).
+        #[cfg(target_os = "linux")]
+        if config.vmm == VmmSelection::Qemu {
+            let qemu_env_hint = if std::env::var("HUSKER_QEMU_BIN").is_ok() {
+                " (from HUSKER_QEMU_BIN)"
+            } else {
+                ""
+            };
+            let qb = &config.qemu_bin;
+            match find_in_path(qb) {
+                Some(resolved) => {
+                    if qb.is_absolute() {
+                        println!("  qemu_bin ({}) ... OK{qemu_env_hint}", qb.display());
+                    } else {
+                        println!(
+                            "  qemu_bin ({}) ... OK ({}){qemu_env_hint}",
+                            qb.display(),
+                            resolved.display()
+                        );
+                    }
+                }
+                None => {
+                    println!("  qemu_bin ({}) ... FAIL (not found){qemu_env_hint}", qb.display());
+                    all_ok = false;
+                }
+            }
+            // QEMU needs hardware acceleration and the vsock host device.
+            for (dev, hint) in [
+                ("/dev/kvm", ""),
+                ("/dev/vhost-vsock", " (load the vhost_vsock kernel module)"),
+            ] {
+                if std::path::Path::new(dev).exists() {
+                    println!("  {dev} ... OK");
+                } else {
+                    println!("  {dev} ... FAIL (missing){hint}");
+                    all_ok = false;
+                }
+            }
+        }
+
         // host_interface
         let iface = &config.host_interface;
         let iface_env_hint = if iface_from_env {
