@@ -18,6 +18,12 @@ Uncommitted working notes. What's shipped, what's next, and the sequencing.
 - crates.io: name held by placeholder (`contrib/crates-io-placeholder/`, `0.0.1`).
 - BYO expected: users supplied their own kernel and rootfs.
 
+## In progress / next
+
+- QEMU/KVM backend (Linux, direct-kernel boot): selectable via `vmm = "qemu"` in config
+  or `HUSKER_VMM=qemu`; guest agent reachable over vsock, same model as the Firecracker
+  path. Future phases: OVMF/cloud-image boot, graphical console, VFIO device passthrough.
+
 ## Not blocking v0.1.0 but worth tracking
 
 - Homebrew tap formula for `husker` (unifi-cli workflow has a template to crib).

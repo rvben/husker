@@ -96,6 +96,18 @@ Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` fo
 |----------|---------|------------|--------|
 | Linux x86_64 | Firecracker | TAP + nftables NAT, port forwarding | Usable |
 | macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed) | Experimental |
+| Linux x86_64 | QEMU/KVM | TAP + nftables NAT, port forwarding | Experimental |
+
+### QEMU/KVM backend (Linux)
+
+Besides Firecracker microVMs, husker can run full QEMU/KVM VMs on Linux. Select it
+with `vmm = "qemu"` in the config file or `HUSKER_VMM=qemu`. Requires `/dev/kvm`,
+`/dev/vhost-vsock` (load the `vhost_vsock` kernel module), and `qemu-system-x86_64`
+on `PATH` (override with `HUSKER_QEMU_BIN`).
+
+Current scope is direct-kernel boot (same kernel + rootfs model as the Firecracker
+backend), with the guest agent reachable over vsock. Booting stock cloud images via
+UEFI/OVMF is not yet supported.
 
 ## Alternatives
 

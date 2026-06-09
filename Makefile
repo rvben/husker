@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -115,6 +115,10 @@ test-net-e2e-gated:
 	else \
 		echo "Skipping husker-net ignored e2e tests (set HUSKER_RUN_NET_E2E=1 to enable)"; \
 	fi
+
+# Real QEMU boot + vsock e2e (needs Linux KVM + vhost-vsock + qemu + images)
+test-qemu-e2e-gated: ## Real QEMU boot + vsock e2e (needs Linux KVM + vhost-vsock + qemu + images)
+	HUSKER_RUN_IGNORED_E2E=1 cargo nextest run -p husker-vmm --run-ignored all qemu_boots_and_vsock
 
 # API/CLI contract tests (OpenAPI + CLI output schema stability)
 test-contracts:
