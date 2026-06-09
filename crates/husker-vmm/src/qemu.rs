@@ -20,6 +20,7 @@ pub(crate) struct QemuInstance {
     pub(crate) qmp_path: PathBuf,
     pub(crate) pidfile_path: PathBuf,
     pub(crate) serial_log_path: PathBuf,
+    pub(crate) qemu_log_path: PathBuf,
     pub(crate) process: tokio::process::Child,
 }
 
@@ -47,6 +48,9 @@ impl QemuKvmBackend {
     }
     fn serial_log(&self, id: Uuid) -> PathBuf {
         self.runtime_dir.join(format!("{id}.serial.log"))
+    }
+    fn qemu_log(&self, id: Uuid) -> PathBuf {
+        self.runtime_dir.join(format!("{id}.qemu.log"))
     }
 
     /// Build the full `qemu-system-*` argument vector. Pure function of
@@ -148,8 +152,23 @@ impl QemuKvmBackend {
         let id = Uuid::new_v4();
         let args = self.build_args(id, &config);
 
+        // Detach QEMU's own stdio. `-nographic` otherwise binds the monitor/serial
+        // to the inherited stdio, which hangs whatever launched the daemon (e.g. a
+        // controlling terminal). stdin is null; QEMU's own stdout/stderr (startup
+        // and device errors, distinct from the guest serial console which `-serial
+        // file:` captures) go to a per-VM log for diagnostics.
+        let qemu_log_path = self.qemu_log(id);
+        let log_out = std::fs::File::create(&qemu_log_path)
+            .map_err(|e| VmmError::ProcessError(format!("create qemu log: {e}")))?;
+        let log_err = log_out
+            .try_clone()
+            .map_err(|e| VmmError::ProcessError(format!("clone qemu log handle: {e}")))?;
+
         let process = tokio::process::Command::new(&self.binary)
             .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(log_out)
+            .stderr(log_err)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| VmmError::ProcessError(format!("spawn qemu: {e}")))?;
@@ -169,9 +188,17 @@ impl QemuKvmBackend {
             let _ = std::fs::remove_file(self.qmp_socket(id));
             let _ = std::fs::remove_file(self.pidfile(id));
             let _ = std::fs::remove_file(self.serial_log(id));
-            return Err(VmmError::ProcessError(
-                "QMP socket did not appear within 5s".into(),
-            ));
+            // Surface QEMU's own error output in the message: a failed boot
+            // (bad device, missing accel) writes here before exiting.
+            let detail = std::fs::read_to_string(&qemu_log_path)
+                .ok()
+                .map(|s| s.trim().lines().last().unwrap_or("").to_string())
+                .filter(|s| !s.is_empty());
+            let _ = std::fs::remove_file(&qemu_log_path);
+            return Err(VmmError::ProcessError(match detail {
+                Some(d) => format!("QMP socket did not appear within 5s (qemu: {d})"),
+                None => "QMP socket did not appear within 5s".into(),
+            }));
         }
 
         let info = VmInfo {
@@ -190,6 +217,7 @@ impl QemuKvmBackend {
                 qmp_path,
                 pidfile_path: self.pidfile(id),
                 serial_log_path: self.serial_log(id),
+                qemu_log_path,
                 process,
             },
         );
@@ -221,6 +249,7 @@ impl QemuKvmBackend {
         let _ = tokio::fs::remove_file(&inst.qmp_path).await;
         let _ = tokio::fs::remove_file(&inst.pidfile_path).await;
         let _ = tokio::fs::remove_file(&inst.serial_log_path).await;
+        let _ = tokio::fs::remove_file(&inst.qemu_log_path).await;
         Ok(())
     }
 
@@ -402,6 +431,7 @@ mod tests {
             qmp_path: dir.path().join("x.qmp"),
             pidfile_path: dir.path().join("x.pid"),
             serial_log_path: dir.path().join("x.serial.log"),
+            qemu_log_path: dir.path().join("x.qemu.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
         });
         let mut cfg = sample_config();
@@ -425,6 +455,7 @@ mod tests {
             info: VmInfo { id, name: "x".into(), state: VmState::Running, pid: Some(1),
                            vcpu_count: 1, mem_size_mib: 128, vsock_cid: 3 },
             qmp_path: qmp.clone(), pidfile_path: pid.clone(), serial_log_path: serial.clone(),
+            qemu_log_path: dir.path().join("a.qemu.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
         });
         be.destroy(id).await.unwrap();
@@ -443,6 +474,7 @@ mod tests {
             qmp_path: dir.path().join("d.qmp"),
             pidfile_path: dir.path().join("d.pid"),
             serial_log_path: dir.path().join("d.serial.log"),
+            qemu_log_path: dir.path().join("d.qemu.log"),
             process,
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
