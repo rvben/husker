@@ -487,7 +487,7 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default)]
     vmm: VmmSelection,
-    #[cfg(feature = "linux-net")]
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
     #[serde(default = "default_qemu_bin")]
     qemu_bin: PathBuf,
     #[serde(default = "default_data_dir")]
@@ -551,6 +551,7 @@ fn default_firecracker_bin() -> PathBuf {
 enum VmmSelection {
     #[default]
     Firecracker,
+    #[cfg(target_os = "linux")]
     Qemu,
 }
 
@@ -559,13 +560,14 @@ impl VmmSelection {
     fn from_env_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "firecracker" | "fc" => Some(Self::Firecracker),
+            #[cfg(target_os = "linux")]
             "qemu" | "kvm" => Some(Self::Qemu),
             _ => None,
         }
     }
 }
 
-#[cfg(feature = "linux-net")]
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
 fn default_qemu_bin() -> PathBuf {
     PathBuf::from("qemu-system-x86_64")
 }
@@ -978,7 +980,7 @@ impl Default for Config {
             firecracker_bin: default_firecracker_bin(),
             #[cfg(feature = "linux-net")]
             vmm: VmmSelection::default(),
-            #[cfg(feature = "linux-net")]
+            #[cfg(all(feature = "linux-net", target_os = "linux"))]
             qemu_bin: default_qemu_bin(),
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
@@ -3456,6 +3458,7 @@ fn apply_env_overrides(config: &mut Config) {
         if let Ok(val) = std::env::var("HUSKER_FIRECRACKER_BIN") {
             config.firecracker_bin = PathBuf::from(val);
         }
+        #[cfg(target_os = "linux")]
         if let Ok(val) = std::env::var("HUSKER_QEMU_BIN") {
             config.qemu_bin = PathBuf::from(val);
         }
@@ -3959,6 +3962,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         .context("initializing nftables")?;
 
         match config.vmm {
+            #[cfg(target_os = "linux")]
             VmmSelection::Qemu => {
                 let vmm =
                     husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir);
@@ -5163,7 +5167,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "linux-net")]
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
     #[test]
     fn vmm_selection_parses() {
         assert_eq!(VmmSelection::from_env_str("qemu"), Some(VmmSelection::Qemu));
