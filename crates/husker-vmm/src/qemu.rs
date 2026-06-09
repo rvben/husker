@@ -177,6 +177,19 @@ impl QemuKvmBackend {
         let id = Uuid::new_v4();
         let args = self.build_args(id, &config);
 
+        // UEFI VMs need their own writable OVMF variable store. Copy the firmware
+        // template into the runtime dir; build_args points pflash unit=1 at it.
+        if let crate::BootMode::Uefi { ovmf_vars_template, .. } = &config.boot {
+            let vars_copy = self.ovmf_vars_copy(id);
+            std::fs::copy(ovmf_vars_template, &vars_copy).map_err(|e| {
+                VmmError::ProcessError(format!(
+                    "copy OVMF VARS template {} -> {}: {e}",
+                    ovmf_vars_template.display(),
+                    vars_copy.display()
+                ))
+            })?;
+        }
+
         // Detach QEMU's own stdio. `-nographic` otherwise binds the monitor/serial
         // to the inherited stdio, which hangs whatever launched the daemon (e.g. a
         // controlling terminal). stdin is null; QEMU's own stdout/stderr (startup
@@ -219,6 +232,7 @@ impl QemuKvmBackend {
             let _ = std::fs::remove_file(self.pidfile(id));
             let _ = std::fs::remove_file(self.serial_log(id));
             let _ = std::fs::remove_file(&boot_log_path);
+            let _ = std::fs::remove_file(self.ovmf_vars_copy(id));
             let mut msg = String::from("QMP socket did not appear within 5s");
             crate::append_log_tails(&mut msg, serial_tail, boot_tail, "qemu boot log");
             return Err(VmmError::ProcessError(msg));
@@ -273,6 +287,7 @@ impl QemuKvmBackend {
         let _ = tokio::fs::remove_file(&inst.pidfile_path).await;
         let _ = tokio::fs::remove_file(&inst.serial_log_path).await;
         let _ = tokio::fs::remove_file(&inst.boot_log_path).await;
+        let _ = tokio::fs::remove_file(self.ovmf_vars_copy(id)).await;
         Ok(())
     }
 
@@ -581,5 +596,26 @@ mod tests {
         assert!(args.iter().any(|a| a == "-kernel"), "direct boot must keep -kernel");
         assert!(args.iter().any(|a| a.contains("format=raw") && a.contains("if=virtio")));
         assert!(!args.iter().any(|a| a.contains("if=pflash")), "direct boot must not emit pflash");
+    }
+
+    #[tokio::test]
+    async fn destroy_removes_ovmf_vars_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let id = Uuid::new_v4();
+        // Simulate a booted UEFI VM: a VARS copy exists in the runtime dir.
+        let vars = be.ovmf_vars_copy(id);
+        tokio::fs::write(&vars, b"VARS").await.unwrap();
+        be.instances.lock().await.insert(id, QemuInstance {
+            info: VmInfo { id, name: "u".into(), state: VmState::Running, pid: Some(1),
+                           vcpu_count: 1, mem_size_mib: 128, vsock_cid: 3 },
+            qmp_path: dir.path().join("u.qmp"),
+            pidfile_path: dir.path().join("u.pid"),
+            serial_log_path: dir.path().join("u.serial.log"),
+            boot_log_path: dir.path().join("u.boot.log"),
+            process: tokio::process::Command::new("true").spawn().unwrap(),
+        });
+        be.destroy(id).await.unwrap();
+        assert!(!vars.exists(), "destroy must remove the per-VM OVMF VARS copy");
     }
 }
