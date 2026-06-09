@@ -43,3 +43,4 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 tower = { workspace = true }
 serde_json = { workspace = true }
+husker-agent-proto = { path = "../husker-agent-proto" }

@@ -933,6 +933,7 @@ dependencies = [
  "block2",
  "dispatch2",
  "http-body-util",
+ "husker-agent-proto",
  "hyper",
  "hyper-util",
  "libc",

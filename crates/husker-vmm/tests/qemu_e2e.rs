@@ -58,9 +58,15 @@ async fn qemu_boots_and_vsock() {
     let mut backoff = std::time::Duration::from_millis(200);
     let mut connected = false;
     while tokio::time::Instant::now() < deadline {
-        if backend.vsock_connect(info.id, 52).await.is_ok() {
-            connected = true;
-            break;
+        if let Ok(mut s) = backend.vsock_connect(info.id, 52).await {
+            use husker_agent_proto::{AgentRequest, AgentResponse, read_message, write_message};
+            if write_message(&mut s, &AgentRequest::Ping).await.is_ok() {
+                let resp: Result<Option<AgentResponse>, _> = read_message(&mut s).await;
+                if let Ok(Some(AgentResponse::Pong)) = resp {
+                    connected = true;
+                    break;
+                }
+            }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
