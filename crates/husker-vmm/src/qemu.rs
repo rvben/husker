@@ -195,12 +195,7 @@ impl QemuKvmBackend {
             let _ = std::fs::remove_file(self.serial_log(id));
             let _ = std::fs::remove_file(&boot_log_path);
             let mut msg = String::from("QMP socket did not appear within 5s");
-            if let Some(s) = serial_tail {
-                msg.push_str(&format!("\n--- guest serial (tail) ---\n{s}"));
-            }
-            if let Some(b) = boot_tail {
-                msg.push_str(&format!("\n--- qemu boot log (tail) ---\n{b}"));
-            }
+            crate::append_log_tails(&mut msg, serial_tail, boot_tail, "qemu boot log");
             return Err(VmmError::ProcessError(msg));
         }
 

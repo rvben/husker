@@ -392,6 +392,7 @@ pub struct LogsQuery {
     pub userdata: bool,
     /// Log source: "serial" (default), "boot", or "userdata". Takes precedence
     /// over `userdata` when set.
+    #[schema(example = "serial")]
     pub source: Option<String>,
 }
 
@@ -2193,7 +2194,10 @@ async fn get_logs<B: VmmBackend + 'static>(
             let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                    error_response(
+                        &format!("{log_label}_log_read_failed"),
+                        format!("reading {log_label} log: {e}"),
+                    ),
                 )
             })?;
             file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
@@ -2202,8 +2206,8 @@ async fn get_logs<B: VmmBackend + 'static>(
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         error_response(
-                            "serial_log_seek_failed",
-                            format!("seeking serial log: {e}"),
+                            &format!("{log_label}_log_seek_failed"),
+                            format!("seeking {log_label} log: {e}"),
                         ),
                     )
                 })?;
@@ -2211,7 +2215,10 @@ async fn get_logs<B: VmmBackend + 'static>(
             file.read_to_string(&mut buf).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                    error_response(
+                        &format!("{log_label}_log_read_failed"),
+                        format!("reading {log_label} log: {e}"),
+                    ),
                 )
             })?;
             format!("[... truncated, showing last 1 MiB ...]\n{buf}")
@@ -2219,7 +2226,10 @@ async fn get_logs<B: VmmBackend + 'static>(
             tokio::fs::read_to_string(&log_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response("serial_log_read_failed", format!("reading serial log: {e}")),
+                    error_response(
+                        &format!("{log_label}_log_read_failed"),
+                        format!("reading {log_label} log: {e}"),
+                    ),
                 )
             })?
         };

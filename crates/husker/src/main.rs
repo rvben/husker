@@ -1615,7 +1615,6 @@ async fn run(cli: Cli) -> Result<()> {
                 eprintln!("warning: --source overrides --userdata");
             }
             let effective = source
-                .clone()
                 .unwrap_or_else(|| if userdata { "userdata".into() } else { "serial".into() });
             // Only the live serial console is followable.
             let follow = follow && effective == "serial";

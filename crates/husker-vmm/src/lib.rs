@@ -100,6 +100,21 @@ pub(crate) fn tail_lines(path: &std::path::Path, max_lines: usize) -> Option<Str
     Some(lines[start..].join("\n"))
 }
 
+/// Append guest-serial and backend boot-log tails (if present) to an error message.
+pub(crate) fn append_log_tails(
+    msg: &mut String,
+    serial_tail: Option<String>,
+    boot_tail: Option<String>,
+    boot_label: &str,
+) {
+    if let Some(s) = serial_tail {
+        msg.push_str(&format!("\n--- guest serial (tail) ---\n{s}"));
+    }
+    if let Some(b) = boot_tail {
+        msg.push_str(&format!("\n--- {boot_label} (tail) ---\n{b}"));
+    }
+}
+
 /// Trait abstracting over different VMM implementations.
 ///
 /// Each backend (Firecracker, Apple VZ) implements this trait.
