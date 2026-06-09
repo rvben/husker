@@ -4054,6 +4054,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
     let state = husker_state::StateStore::open(&db_path).context("opening state database")?;
 
+    #[cfg(target_os = "linux")]
+    {
+        let reaped = husker_core::reap_orphaned_vmms(&state);
+        if reaped > 0 {
+            tracing::info!(reaped, "reaped orphaned qemu processes from a prior run");
+        }
+    }
+
     let stale_count = state
         .mark_stale_vms_stopped()
         .context("reconciling stale VM state")?;
@@ -4063,14 +4071,6 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
     #[cfg(feature = "linux-net")]
     state.ensure_cid_base(config.cid_base).context("applying cid_base")?;
-
-    #[cfg(target_os = "linux")]
-    {
-        let reaped = husker_core::reap_orphaned_vmms(&runtime_dir);
-        if reaped > 0 {
-            tracing::info!(reaped, "reaped orphaned qemu processes from a prior run");
-        }
-    }
 
     let storage = husker_storage::StorageConfig {
         data_dir: config.data_dir,

@@ -356,41 +356,35 @@ pub struct ReconcileOutcome {
 }
 
 /// Kill VMM child processes orphaned by a previous daemon that exited without
-/// cleanup (SIGKILL/OOM). Scans `runtime_dir` for `{id}.pid` files (written by
-/// the QEMU backend) and, for each, SIGKILLs the process only if it is still a
-/// live `qemu-system` process (so a recycled PID belonging to something else is
-/// never touched), then removes the pidfile. Returns the number reaped.
+/// cleanup (SIGKILL/OOM). At startup, any VM still marked `running`/`paused` in
+/// the DB is an orphan (a clean shutdown drains + marks them stopped). For each,
+/// SIGKILL its recorded pid only if it is still a live `qemu-system` process
+/// (so a recycled PID is never touched). Must run BEFORE mark_stale_vms_stopped.
+/// Returns the number reaped.
 #[cfg(target_os = "linux")]
-pub fn reap_orphaned_vmms(runtime_dir: &std::path::Path) -> usize {
-    let entries = match std::fs::read_dir(runtime_dir) {
-        Ok(e) => e,
-        Err(_) => return 0,
+pub fn reap_orphaned_vmms(state: &husker_state::StateStore) -> usize {
+    let vms = match state.list_vms() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "reaper: failed to list VMs");
+            return 0;
+        }
     };
     let mut reaped = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+    for vm in vms {
+        if vm.state != "running" && vm.state != "paused" {
             continue;
         }
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(pid) = contents.trim().parse::<i32>() else {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        };
-        // /proc/<pid>/cmdline confirms both liveness and identity; only a live
-        // qemu-system process is killed.
+        let Some(pid) = vm.pid else { continue };
+        // /proc/<pid>/cmdline confirms liveness + identity; only a live
+        // qemu-system process is killed (never a recycled non-qemu PID).
         let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        if cmdline.contains("qemu-system") {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .status();
-            warn!(pid, "reaped orphaned qemu process");
+        if cmdline.contains("qemu-system")
+            && unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0
+        {
             reaped += 1;
+            warn!(pid, vm = %vm.name, "reaped orphaned qemu process from a prior daemon");
         }
-        let _ = std::fs::remove_file(&path);
     }
     reaped
 }
@@ -2579,39 +2573,67 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     }
 
     #[cfg(target_os = "linux")]
+    fn make_vm_record(name: &str, state: &str, pid: Option<u32>, vmm: &str) -> husker_state::VmRecord {
+        husker_state::VmRecord {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            state: state.into(),
+            pid,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 3,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: vmm.into(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn reap_removes_stale_pidfiles_without_killing_non_qemu() {
-        let dir = tempfile::tempdir().unwrap();
-        // A pidfile pointing at our own (non-qemu) PID: must NOT be killed, but
-        // the stale pidfile must be cleaned.
+    fn reap_does_not_kill_non_qemu_running_vm() {
+        // A VM in `running` state whose pid points at our own process (non-qemu):
+        // must NOT be killed, reaped count stays 0, and we stay alive.
+        let state = husker_state::StateStore::open_memory().unwrap();
         let self_pid = std::process::id();
-        std::fs::write(dir.path().join("abc.pid"), self_pid.to_string()).unwrap();
-        // A pidfile with garbage: cleaned, counted as not reaped.
-        std::fs::write(dir.path().join("def.pid"), "not-a-pid").unwrap();
-        // A non-.pid file: untouched.
-        std::fs::write(dir.path().join("keep.serial.log"), "x").unwrap();
-        let reaped = crate::reap_orphaned_vmms(dir.path());
+        let rec = make_vm_record("live-non-qemu", "running", Some(self_pid), "firecracker");
+        state.insert_vm(&rec).unwrap();
+
+        let reaped = crate::reap_orphaned_vmms(&state);
+
         assert_eq!(reaped, 0, "must not kill a non-qemu process");
-        assert!(!dir.path().join("abc.pid").exists(), "stale pidfile removed");
-        assert!(!dir.path().join("def.pid").exists(), "garbage pidfile removed");
-        assert!(dir.path().join("keep.serial.log").exists(), "non-pid file untouched");
-        // We are still alive (were not killed).
+        // We are still alive.
         assert_eq!(std::process::id(), self_pid);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn reap_removes_pidfile_for_dead_process() {
-        let dir = tempfile::tempdir().unwrap();
-        // PID 4194304 is above the Linux kernel's default pid_max (4194304 is
-        // 2^22; the default is 32768 or 4194304 depending on config, but a
-        // freshly allocated temp PID this large is virtually guaranteed to be
-        // unoccupied). /proc/<pid>/cmdline will not exist, so neither the kill
-        // branch nor the qemu check fires - the pidfile is simply cleaned up.
-        let dead_pid: u32 = 4_194_304;
-        std::fs::write(dir.path().join("dead.pid"), dead_pid.to_string()).unwrap();
-        let reaped = crate::reap_orphaned_vmms(dir.path());
-        assert_eq!(reaped, 0, "a dead/nonexistent process is not counted as reaped");
-        assert!(!dir.path().join("dead.pid").exists(), "pidfile for dead process is removed");
+    fn reap_skips_stopped_vms_and_dead_pids() {
+        let state = husker_state::StateStore::open_memory().unwrap();
+        // A stopped VM - must be ignored regardless of pid.
+        let stopped = make_vm_record("stopped-vm", "stopped", Some(std::process::id()), "qemu");
+        state.insert_vm(&stopped).unwrap();
+        // A running VM whose pid is almost certainly dead (above default pid_max).
+        let dead_pid: u32 = 4_000_000;
+        let dead = make_vm_record("orphan-dead-pid", "running", Some(dead_pid), "qemu");
+        state.insert_vm(&dead).unwrap();
+        // A running VM with no pid recorded.
+        let no_pid = make_vm_record("orphan-no-pid", "running", None, "qemu");
+        state.insert_vm(&no_pid).unwrap();
+
+        let reaped = crate::reap_orphaned_vmms(&state);
+
+        assert_eq!(reaped, 0, "stopped VMs and dead/absent pids must not be counted as reaped");
+        // We are still alive.
+        assert!(std::process::id() > 0);
     }
 }
