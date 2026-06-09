@@ -53,6 +53,11 @@ impl QemuKvmBackend {
         self.runtime_dir.join(format!("{id}.boot.log"))
     }
 
+    /// Per-VM writable OVMF variable store (a copy of the firmware VARS template).
+    pub(crate) fn ovmf_vars_copy(&self, id: Uuid) -> PathBuf {
+        self.runtime_dir.join(format!("{id}.OVMF_VARS.fd"))
+    }
+
     /// Build the full `qemu-system-*` argument vector. Pure function of
     /// (id, config, runtime paths) so it is unit-testable without spawning QEMU.
     pub fn build_args(&self, id: Uuid, config: &VmConfig) -> Vec<String> {
@@ -87,41 +92,61 @@ impl QemuKvmBackend {
             // Guest agent transport: host<->guest vsock. cid allocated by core.
             "-device".into(),
             format!("vhost-vsock-pci,guest-cid={}", config.vsock_cid),
-            // Root disk: husker clones a RAW ext4 rootfs (not qcow2).
-            "-drive".into(),
-            format!(
-                "file={},format=raw,if=virtio,cache=writeback",
-                config.rootfs_path.display()
-            ),
         ];
 
-        // Direct kernel boot. husker's kernel_args carry console + static ip=;
-        // QEMU additionally needs the root device for the virtio disk.
-        #[cfg(target_arch = "aarch64")]
-        let default_console = "console=ttyAMA0";
-        #[cfg(not(target_arch = "aarch64"))]
-        let default_console = "console=ttyS0";
-        let base_args = config
-            .kernel_args
-            .clone()
-            .unwrap_or_else(|| default_console.to_string());
-        // QEMU q35 carries every virtio device (vsock/net/rng) on the PCIe bus.
-        // husker-core adds `pci=off` for Firecracker's PCI-less microVM machine;
-        // leaving it in would stop the QEMU guest from enumerating those devices
-        // (no network, no vsock, no agent). Strip it for QEMU.
-        let base_args = base_args
-            .split_whitespace()
-            .filter(|tok| *tok != "pci=off")
-            .collect::<Vec<_>>()
-            .join(" ");
-        args.push("-kernel".into());
-        args.push(config.kernel_path.display().to_string());
-        if let Some(initrd) = &config.initrd_path {
-            args.push("-initrd".into());
-            args.push(initrd.display().to_string());
+        match &config.boot {
+            crate::BootMode::DirectKernel => {
+                // Root disk: husker clones a RAW ext4 rootfs (not qcow2).
+                args.push("-drive".into());
+                args.push(format!(
+                    "file={},format=raw,if=virtio,cache=writeback",
+                    config.rootfs_path.display()
+                ));
+
+                #[cfg(target_arch = "aarch64")]
+                let default_console = "console=ttyAMA0";
+                #[cfg(not(target_arch = "aarch64"))]
+                let default_console = "console=ttyS0";
+                let base_args = config
+                    .kernel_args
+                    .clone()
+                    .unwrap_or_else(|| default_console.to_string());
+                // Strip Firecracker's microVM `pci=off`; QEMU q35 needs PCIe enumeration.
+                let base_args = base_args
+                    .split_whitespace()
+                    .filter(|tok| *tok != "pci=off")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                args.push("-kernel".into());
+                args.push(config.kernel_path.display().to_string());
+                if let Some(initrd) = &config.initrd_path {
+                    args.push("-initrd".into());
+                    args.push(initrd.display().to_string());
+                }
+                args.push("-append".into());
+                args.push(format!("{base_args} root=/dev/vda rw"));
+            }
+            crate::BootMode::Uefi { ovmf_code, ovmf_vars_template: _ } => {
+                // OVMF firmware: read-only CODE + a per-VM writable VARS copy (made in `create`).
+                args.push("-drive".into());
+                args.push(format!(
+                    "if=pflash,format=raw,unit=0,readonly=on,file={}",
+                    ovmf_code.display()
+                ));
+                args.push("-drive".into());
+                args.push(format!(
+                    "if=pflash,format=raw,unit=1,file={}",
+                    self.ovmf_vars_copy(id).display()
+                ));
+                // Boot disk: the cloned + resized qcow2 cloud image. The image's own
+                // bootloader runs under UEFI, so there is no -kernel/-initrd/-append.
+                args.push("-drive".into());
+                args.push(format!(
+                    "file={},format=qcow2,if=virtio,cache=writeback",
+                    config.rootfs_path.display()
+                ));
+            }
         }
-        args.push("-append".into());
-        args.push(format!("{base_args} root=/dev/vda rw"));
 
         // Networking: husker-core already created/attached `config.tap_device`.
         // script=no/downscript=no => QEMU must not manage the TAP lifecycle.
@@ -505,5 +530,56 @@ mod tests {
         assert!(!append.contains("pci=off"), "pci=off must be stripped for QEMU: {append}");
         assert!(append.contains("console=ttyS0"), "other args preserved: {append}");
         assert!(append.contains("panic=1"), "other args preserved: {append}");
+    }
+
+    fn uefi_config() -> VmConfig {
+        let mut cfg = sample_config();
+        cfg.rootfs_path = "/var/lib/husker/vms/qvm/disk.qcow2".into();
+        cfg.boot = crate::BootMode::Uefi {
+            ovmf_code: "/usr/share/OVMF/OVMF_CODE_4M.fd".into(),
+            ovmf_vars_template: "/usr/share/OVMF/OVMF_VARS_4M.fd".into(),
+        };
+        cfg
+    }
+
+    #[test]
+    fn build_args_uefi_uses_pflash_and_qcow2_no_kernel() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let id = Uuid::nil();
+        let args = be.build_args(id, &uefi_config());
+
+        for flag in ["-kernel", "-initrd", "-append"] {
+            assert!(!args.iter().any(|a| a == flag), "UEFI must not emit {flag}: {args:?}");
+        }
+        assert!(
+            args.iter().any(|a| a.contains("if=pflash")
+                && a.contains("unit=0")
+                && a.contains("readonly=on")
+                && a.contains("OVMF_CODE_4M.fd")),
+            "missing read-only CODE pflash: {args:?}"
+        );
+        let vars_copy = be.ovmf_vars_copy(id);
+        assert!(
+            args.iter().any(|a| a.contains("if=pflash")
+                && a.contains("unit=1")
+                && a.contains(&vars_copy.display().to_string())),
+            "missing per-VM VARS pflash: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.contains("disk.qcow2")
+                && a.contains("format=qcow2")
+                && a.contains("if=virtio")),
+            "missing qcow2 virtio disk: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "vhost-vsock-pci,guest-cid=7"), "vsock missing: {args:?}");
+    }
+
+    #[test]
+    fn build_args_direct_kernel_still_has_kernel_and_raw_rootfs() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let args = be.build_args(Uuid::nil(), &sample_config());
+        assert!(args.iter().any(|a| a == "-kernel"), "direct boot must keep -kernel");
+        assert!(args.iter().any(|a| a.contains("format=raw") && a.contains("if=virtio")));
+        assert!(!args.iter().any(|a| a.contains("if=pflash")), "direct boot must not emit pflash");
     }
 }
