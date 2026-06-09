@@ -484,6 +484,12 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_firecracker_bin")]
     firecracker_bin: PathBuf,
+    #[cfg(feature = "linux-net")]
+    #[serde(default)]
+    vmm: VmmSelection,
+    #[cfg(feature = "linux-net")]
+    #[serde(default = "default_qemu_bin")]
+    qemu_bin: PathBuf,
     #[serde(default = "default_data_dir")]
     data_dir: PathBuf,
     #[serde(default = "husker::default_kernel_path")]
@@ -537,6 +543,31 @@ struct Config {
 #[cfg(feature = "linux-net")]
 fn default_firecracker_bin() -> PathBuf {
     PathBuf::from("firecracker")
+}
+
+#[cfg(feature = "linux-net")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VmmSelection {
+    #[default]
+    Firecracker,
+    Qemu,
+}
+
+#[cfg(feature = "linux-net")]
+impl VmmSelection {
+    fn from_env_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "firecracker" | "fc" => Some(Self::Firecracker),
+            "qemu" | "kvm" => Some(Self::Qemu),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "linux-net")]
+fn default_qemu_bin() -> PathBuf {
+    PathBuf::from("qemu-system-x86_64")
 }
 
 fn default_api_max_request_bytes() -> usize {
@@ -945,6 +976,10 @@ impl Default for Config {
         Self {
             #[cfg(feature = "linux-net")]
             firecracker_bin: default_firecracker_bin(),
+            #[cfg(feature = "linux-net")]
+            vmm: VmmSelection::default(),
+            #[cfg(feature = "linux-net")]
+            qemu_bin: default_qemu_bin(),
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
             default_rootfs: default_rootfs_path(),
@@ -3421,6 +3456,14 @@ fn apply_env_overrides(config: &mut Config) {
         if let Ok(val) = std::env::var("HUSKER_FIRECRACKER_BIN") {
             config.firecracker_bin = PathBuf::from(val);
         }
+        if let Ok(val) = std::env::var("HUSKER_QEMU_BIN") {
+            config.qemu_bin = PathBuf::from(val);
+        }
+        if let Ok(val) = std::env::var("HUSKER_VMM")
+            && let Some(sel) = VmmSelection::from_env_str(&val)
+        {
+            config.vmm = sel;
+        }
         if let Ok(val) = std::env::var("HUSKER_HOST_INTERFACE") {
             config.host_interface = val;
         }
@@ -3897,9 +3940,6 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
     #[cfg(feature = "linux-net")]
     {
-        let vmm =
-            husker_vmm::firecracker::FirecrackerBackend::new(&config.firecracker_bin, &runtime_dir);
-
         let (base, prefix_len) = parse_cidr(&config.bridge_subnet)?;
         let ip_allocator = husker_net::IpAllocator::new(base, prefix_len);
 
@@ -3918,31 +3958,52 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         .await
         .context("initializing nftables")?;
 
-        let core = Arc::new(husker_core::HuskerCore::new(
-            vmm,
-            state,
-            ip_allocator,
-            storage,
-            config.bridge_name.clone(),
-            config.dns_servers,
-            runtime_dir.clone(),
-        ));
-
-        run_initial_service_reconcile(&core).await;
-
-        let restored = core.reconcile_port_forwards_from_state().await;
-        if restored > 0 {
-            tracing::info!(restored, "restored persisted port-forward nftables rules");
+        match config.vmm {
+            VmmSelection::Qemu => {
+                let vmm =
+                    husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir);
+                let core = Arc::new(husker_core::HuskerCore::new(
+                    vmm,
+                    state,
+                    ip_allocator,
+                    storage,
+                    config.bridge_name.clone(),
+                    config.dns_servers,
+                    runtime_dir.clone(),
+                ));
+                run_linux_daemon(
+                    core,
+                    listen,
+                    api_token.clone(),
+                    service_reconcile_enabled,
+                    service_reconcile_interval,
+                )
+                .await?;
+            }
+            VmmSelection::Firecracker => {
+                let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
+                    &config.firecracker_bin,
+                    &runtime_dir,
+                );
+                let core = Arc::new(husker_core::HuskerCore::new(
+                    vmm,
+                    state,
+                    ip_allocator,
+                    storage,
+                    config.bridge_name.clone(),
+                    config.dns_servers,
+                    runtime_dir.clone(),
+                ));
+                run_linux_daemon(
+                    core,
+                    listen,
+                    api_token.clone(),
+                    service_reconcile_enabled,
+                    service_reconcile_interval,
+                )
+                .await?;
+            }
         }
-
-        spawn_service_reconcile_loop(
-            Arc::clone(&core),
-            service_reconcile_enabled,
-            service_reconcile_interval,
-        );
-        spawn_log_rotation(Arc::clone(&core));
-        husker_api::serve_with_auth(Arc::clone(&core), listen, api_token.clone()).await?;
-        drain_vms_on_shutdown(&core).await;
 
         // Network cleanup after VM drain. If the process is killed
         // (SIGKILL, panic, OOM), the stale bridge cleanup at startup above
@@ -4030,6 +4091,34 @@ async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
     if let Err(e) = core.create_service_ordinal_index() {
         tracing::warn!(error = %e, "failed to create service ordinal index");
     }
+}
+
+/// Run the shared post-core daemon logic for the Linux (linux-net) path.
+///
+/// Runs service reconcile, restores port-forward rules, spawns background loops,
+/// serves the API, and drains VMs on shutdown.
+#[cfg(feature = "linux-net")]
+async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
+    core: std::sync::Arc<husker_core::HuskerCore<B>>,
+    listen: std::net::SocketAddr,
+    api_token: Option<String>,
+    service_reconcile_enabled: bool,
+    service_reconcile_interval: u64,
+) -> Result<()> {
+    run_initial_service_reconcile(&core).await;
+    let restored = core.reconcile_port_forwards_from_state().await;
+    if restored > 0 {
+        tracing::info!(restored, "restored persisted port-forward nftables rules");
+    }
+    spawn_service_reconcile_loop(
+        std::sync::Arc::clone(&core),
+        service_reconcile_enabled,
+        service_reconcile_interval,
+    );
+    spawn_log_rotation(std::sync::Arc::clone(&core));
+    husker_api::serve_with_auth(std::sync::Arc::clone(&core), listen, api_token).await?;
+    drain_vms_on_shutdown(&core).await;
+    Ok(())
 }
 
 /// Spawn the periodic self-healing reconcile loop (only when enabled).
@@ -5072,5 +5161,17 @@ mod tests {
             assert!(msg.contains("not network-aligned"), "got: {msg}");
             assert!(msg.contains("10.0.0.0/16"), "got: {msg}");
         }
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn vmm_selection_parses() {
+        assert_eq!(VmmSelection::from_env_str("qemu"), Some(VmmSelection::Qemu));
+        assert_eq!(
+            VmmSelection::from_env_str("FC"),
+            Some(VmmSelection::Firecracker)
+        );
+        assert_eq!(VmmSelection::from_env_str("xen"), None);
+        assert_eq!(VmmSelection::default(), VmmSelection::Firecracker);
     }
 }
