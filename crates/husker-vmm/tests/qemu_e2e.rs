@@ -58,3 +58,54 @@ async fn qemu_boots_and_vsock() {
     backend.destroy_vm(info.id).await.unwrap();
     assert!(connected, "agent vsock unreachable on port 52");
 }
+
+/// A QEMU process that exits before opening its QMP socket must surface its
+/// stderr (the boot log) in the create error, not just "QMP socket did not
+/// appear". Driven deterministically by a stand-in binary that writes to
+/// stderr and exits immediately, so the QMP socket never appears and the
+/// boot-log tail is folded into the error. Uses the inherent `create` to skip
+/// the /dev/kvm precheck, so it does not depend on real QEMU/KVM.
+#[tokio::test]
+#[ignore = "slow (~5s QMP wait); gated by HUSKER_RUN_IGNORED_E2E"]
+async fn qemu_create_failure_surfaces_boot_log_tail() {
+    if std::env::var("HUSKER_RUN_IGNORED_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping qemu_create_failure_surfaces_boot_log_tail: set HUSKER_RUN_IGNORED_E2E=1"
+        );
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake-qemu");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho 'fake-qemu: simulated startup failure' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let backend = QemuKvmBackend::new(&fake, dir.path());
+    let config = husker_vmm::VmConfig {
+        name: "e2e-broken".into(),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        kernel_path: "/dev/null".into(),
+        rootfs_path: "/dev/null".into(),
+        kernel_args: Some("console=ttyS0".into()),
+        initrd_path: None,
+        vsock_cid: 99,
+        tap_device: None,
+        guest_mac: None,
+    };
+    let err = backend.create(config).await.expect_err("create must fail");
+    let msg = err.to_string();
+    eprintln!("create error:\n{msg}");
+    assert!(
+        msg.contains("qemu boot log (tail)"),
+        "error should include the qemu boot-log tail, got: {msg}"
+    );
+    assert!(
+        msg.contains("simulated startup failure"),
+        "boot-log tail should carry the stand-in's stderr, got: {msg}"
+    );
+}
