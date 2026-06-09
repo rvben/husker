@@ -50,10 +50,20 @@ async fn qemu_boots_and_vsock() {
     };
     let info = backend.create_vm(config).await.expect("create_vm");
 
-    // Give the guest agent time to come up, then connect on port 52.
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
-    let stream = backend.vsock_connect(info.id, 52).await;
-    let connected = stream.is_ok();
+    // Poll for vsock connectivity with backoff rather than a fixed sleep so
+    // fast guests are not penalised and the overall deadline is bounded.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(200);
+    let mut connected = false;
+    while tokio::time::Instant::now() < deadline {
+        if backend.vsock_connect(info.id, 52).await.is_ok() {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    }
     // Always tear the VM down before asserting, so a failure does not leak it.
     backend.destroy_vm(info.id).await.unwrap();
     assert!(connected, "agent vsock unreachable on port 52");
