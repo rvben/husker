@@ -598,6 +598,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             tap_device: Some(tap_name.clone()),
             guest_mac: Some(mac),
             vmm: vmm_kind,
+            boot: husker_vmm::BootMode::DirectKernel,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -688,6 +689,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             tap_device: None,
             guest_mac: None,
             vmm: None,
+            boot: husker_vmm::BootMode::DirectKernel,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;

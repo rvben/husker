@@ -48,6 +48,7 @@ async fn qemu_boots_and_vsock() {
         tap_device: None,
         guest_mac: None,
         vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
     };
     let info = backend.create_vm(config).await.expect("create_vm");
 
@@ -114,6 +115,7 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
         tap_device: None,
         guest_mac: None,
         vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
     };
     let err = backend.create(config).await.expect_err("create must fail");
     let msg = err.to_string();

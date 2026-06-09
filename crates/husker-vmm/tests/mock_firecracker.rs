@@ -197,6 +197,7 @@ async fn create_vm_missing_binary() {
         tap_device: None,
         guest_mac: None,
         vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
     };
 
     let err = backend.create_vm(config).await.unwrap_err();
@@ -228,6 +229,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
         tap_device: None,
         guest_mac: None,
         vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
     };
 
     let _ = backend.create_vm(config).await.unwrap_err();
@@ -317,6 +319,7 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         tap_device: None,
         guest_mac: None,
         vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
     };
 
     let err = backend.create_vm(config).await.unwrap_err();

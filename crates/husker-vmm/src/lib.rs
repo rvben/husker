@@ -43,6 +43,9 @@ pub struct VmConfig {
     /// default; single-backend backends ignore it.
     #[serde(default)]
     pub vmm: Option<VmmKind>,
+    /// How this VM boots. Defaults to direct-kernel for back-compat.
+    #[serde(default)]
+    pub boot: BootMode,
 }
 
 /// Runtime information about a VM.
@@ -82,6 +85,33 @@ impl std::str::FromStr for VmmKind {
             "firecracker" | "fc" => Ok(VmmKind::Firecracker),
             "qemu" | "kvm" => Ok(VmmKind::Qemu),
             other => Err(VmmError::InvalidConfig(format!("unknown vmm '{other}'"))),
+        }
+    }
+}
+
+/// How the guest boots. `DirectKernel` is husker's microVM default (host-supplied
+/// kernel + initrd + appended cmdline). `Uefi` boots the disk's own bootloader via
+/// OVMF firmware and carries the firmware paths it needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum BootMode {
+    #[default]
+    #[serde(rename = "direct")]
+    DirectKernel,
+    Uefi {
+        /// Read-only OVMF code image (e.g. `/usr/share/OVMF/OVMF_CODE_4M.fd`).
+        ovmf_code: PathBuf,
+        /// OVMF variable-store template; the backend copies it per VM (writable).
+        ovmf_vars_template: PathBuf,
+    },
+}
+
+impl BootMode {
+    /// Stable lowercase tag for persistence/display (`"direct"` / `"uefi"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BootMode::DirectKernel => "direct",
+            BootMode::Uefi { .. } => "uefi",
         }
     }
 }
@@ -240,5 +270,44 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "only line").unwrap();
         assert_eq!(tail_lines(f.path(), 20).unwrap(), "only line");
+    }
+
+    #[test]
+    fn boot_mode_default_is_direct_kernel() {
+        use super::BootMode;
+        assert_eq!(BootMode::default(), BootMode::DirectKernel);
+        assert_eq!(BootMode::DirectKernel.as_str(), "direct");
+        let uefi = BootMode::Uefi {
+            ovmf_code: "/usr/share/OVMF/OVMF_CODE_4M.fd".into(),
+            ovmf_vars_template: "/usr/share/OVMF/OVMF_VARS_4M.fd".into(),
+        };
+        assert_eq!(uefi.as_str(), "uefi");
+    }
+
+    #[test]
+    fn vm_config_boot_defaults_when_absent_in_json() {
+        use super::{BootMode, VmConfig};
+        // A JSON document without `boot` deserializes to DirectKernel (back-compat).
+        let json = r#"{
+            "name": "v", "vcpu_count": 1, "mem_size_mib": 128,
+            "kernel_path": "/k", "rootfs_path": "/r",
+            "kernel_args": null, "initrd_path": null,
+            "vsock_cid": 3, "tap_device": null, "guest_mac": null
+        }"#;
+        let cfg: VmConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.boot, BootMode::DirectKernel);
+    }
+
+    #[test]
+    fn boot_mode_serde_tag_matches_as_str() {
+        use super::BootMode;
+        let direct = serde_json::to_value(BootMode::DirectKernel).unwrap();
+        assert_eq!(direct["mode"], "direct");
+        let uefi = serde_json::to_value(BootMode::Uefi {
+            ovmf_code: "/c".into(),
+            ovmf_vars_template: "/v".into(),
+        })
+        .unwrap();
+        assert_eq!(uefi["mode"], "uefi");
     }
 }

@@ -507,6 +507,7 @@ mod tests {
             tap_device: Some("husker3".into()),
             guest_mac: Some("AA:FC:00:00:00:03".into()),
             vmm: None,
+            boot: crate::BootMode::DirectKernel,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["name"], "test");
@@ -609,6 +610,7 @@ mod tests {
             tap_device: None,
             guest_mac: None,
             vmm: None,
+            boot: crate::BootMode::DirectKernel,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();
@@ -637,6 +639,7 @@ mod tests {
             tap_device: None,
             guest_mac: None,
             vmm: None,
+            boot: crate::BootMode::DirectKernel,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();

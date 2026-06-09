@@ -373,6 +373,7 @@ mod tests {
             tap_device: Some("husker7".into()),
             guest_mac: Some("52:54:00:00:00:07".into()),
             vmm: None,
+            boot: crate::BootMode::DirectKernel,
         }
     }
 
