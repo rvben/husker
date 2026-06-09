@@ -1,0 +1,179 @@
+//! Per-VM backend dispatcher for Linux: routes each VM to Firecracker or QEMU
+//! by an in-memory `id -> VmmKind` map, exposing a unified `VmmBackend` so
+//! `HuskerCore`/`husker-api` stay backend-agnostic.
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+use crate::firecracker::FirecrackerBackend;
+use crate::qemu::QemuKvmBackend;
+use crate::{VmConfig, VmInfo, VmmBackend, VmmError, VmmKind};
+
+/// Unified vsock stream over the two backends' concrete stream types. Both
+/// inner types are `Unpin`, so delegation needs no pin-projection.
+pub enum LinuxVsockStream {
+    Firecracker(tokio::net::UnixStream),
+    Qemu(tokio_vsock::VsockStream),
+}
+
+impl AsyncRead for LinuxVsockStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            LinuxVsockStream::Firecracker(s) => Pin::new(s).poll_read(cx, buf),
+            LinuxVsockStream::Qemu(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for LinuxVsockStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            LinuxVsockStream::Firecracker(s) => Pin::new(s).poll_write(cx, buf),
+            LinuxVsockStream::Qemu(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            LinuxVsockStream::Firecracker(s) => Pin::new(s).poll_flush(cx),
+            LinuxVsockStream::Qemu(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            LinuxVsockStream::Firecracker(s) => Pin::new(s).poll_shutdown(cx),
+            LinuxVsockStream::Qemu(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Routes each VM to the backend that created it.
+pub struct LinuxDispatchBackend {
+    firecracker: FirecrackerBackend,
+    qemu: QemuKvmBackend,
+    default_kind: VmmKind,
+    routes: Mutex<HashMap<Uuid, VmmKind>>,
+}
+
+impl LinuxDispatchBackend {
+    pub fn new(firecracker: FirecrackerBackend, qemu: QemuKvmBackend, default_kind: VmmKind) -> Self {
+        Self {
+            firecracker,
+            qemu,
+            default_kind,
+            routes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn kind_of(&self, id: Uuid) -> Result<VmmKind, VmmError> {
+        self.routes
+            .lock()
+            .await
+            .get(&id)
+            .copied()
+            .ok_or(VmmError::VmNotFound(id))
+    }
+}
+
+impl VmmBackend for LinuxDispatchBackend {
+    type VsockStream = LinuxVsockStream;
+
+    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        let kind = config.vmm.unwrap_or(self.default_kind);
+        let info = match kind {
+            VmmKind::Firecracker => self.firecracker.create_vm(config).await?,
+            VmmKind::Qemu => self.qemu.create_vm(config).await?,
+        };
+        self.routes.lock().await.insert(info.id, kind);
+        Ok(info)
+    }
+
+    async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        match self.kind_of(id).await? {
+            VmmKind::Firecracker => self.firecracker.stop_vm(id).await,
+            VmmKind::Qemu => self.qemu.stop_vm(id).await,
+        }
+    }
+
+    async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        let kind = self.kind_of(id).await?;
+        let result = match kind {
+            VmmKind::Firecracker => self.firecracker.destroy_vm(id).await,
+            VmmKind::Qemu => self.qemu.destroy_vm(id).await,
+        };
+        self.routes.lock().await.remove(&id);
+        result
+    }
+
+    async fn vm_info(&self, id: Uuid) -> Result<VmInfo, VmmError> {
+        match self.kind_of(id).await? {
+            VmmKind::Firecracker => self.firecracker.vm_info(id).await,
+            VmmKind::Qemu => self.qemu.vm_info(id).await,
+        }
+    }
+
+    async fn pause_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        match self.kind_of(id).await? {
+            VmmKind::Firecracker => self.firecracker.pause_vm(id).await,
+            VmmKind::Qemu => self.qemu.pause_vm(id).await,
+        }
+    }
+
+    async fn resume_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        match self.kind_of(id).await? {
+            VmmKind::Firecracker => self.firecracker.resume_vm(id).await,
+            VmmKind::Qemu => self.qemu.resume_vm(id).await,
+        }
+    }
+
+    async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
+        match self.kind_of(id).await? {
+            VmmKind::Firecracker => Ok(LinuxVsockStream::Firecracker(
+                self.firecracker.vsock_connect(id, port).await?,
+            )),
+            VmmKind::Qemu => Ok(LinuxVsockStream::Qemu(
+                self.qemu.vsock_connect(id, port).await?,
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Compile-time proof the enum stream satisfies the trait's bound.
+    fn _assert_stream_bounds<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>() {}
+    #[test]
+    fn linux_vsock_stream_satisfies_bounds() {
+        _assert_stream_bounds::<LinuxVsockStream>();
+    }
+
+    // Delegation is exercised via the Firecracker variant over a real UnixStream
+    // pair (tokio_vsock::VsockStream cannot be built from an in-memory duplex; its
+    // delegation is identical and covered by the Linux/real-KVM e2e).
+    #[tokio::test]
+    async fn firecracker_variant_round_trips() {
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        let mut left = LinuxVsockStream::Firecracker(a);
+        let mut right = LinuxVsockStream::Firecracker(b);
+        left.write_all(b"ping").await.unwrap();
+        left.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        right.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+}

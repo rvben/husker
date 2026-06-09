@@ -12,6 +12,11 @@ pub mod qmp;
 #[cfg(unix)]
 pub mod qemu;
 
+#[cfg(target_os = "linux")]
+pub mod dispatch;
+#[cfg(target_os = "linux")]
+pub use dispatch::{LinuxDispatchBackend, LinuxVsockStream};
+
 #[cfg(target_os = "macos")]
 pub mod apple_vz;
 
