@@ -34,6 +34,10 @@ pub struct VmConfig {
     pub vsock_cid: u32,
     pub tap_device: Option<String>,
     pub guest_mac: Option<String>,
+    /// Which backend should run this VM. `None` lets the dispatcher use its
+    /// default; single-backend backends ignore it.
+    #[serde(default)]
+    pub vmm: Option<VmmKind>,
 }
 
 /// Runtime information about a VM.
@@ -46,6 +50,35 @@ pub struct VmInfo {
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
     pub vsock_cid: u32,
+}
+
+/// Which VMM backend runs a VM. The canonical backend identity used by the
+/// per-VM dispatcher; the wire/persistence layer carries its lowercase string form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VmmKind {
+    Firecracker,
+    Qemu,
+}
+
+impl std::fmt::Display for VmmKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VmmKind::Firecracker => "firecracker",
+            VmmKind::Qemu => "qemu",
+        })
+    }
+}
+
+impl std::str::FromStr for VmmKind {
+    type Err = VmmError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "firecracker" | "fc" => Ok(VmmKind::Firecracker),
+            "qemu" | "kvm" => Ok(VmmKind::Qemu),
+            other => Err(VmmError::InvalidConfig(format!("unknown vmm '{other}'"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,8 +200,17 @@ pub trait VmmBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::tail_lines;
+    use super::{tail_lines, VmmKind};
     use std::io::Write;
+
+    #[test]
+    fn vmm_kind_parse_and_display() {
+        use std::str::FromStr;
+        assert_eq!(VmmKind::from_str("qemu").unwrap(), VmmKind::Qemu);
+        assert_eq!(VmmKind::from_str("FireCracker").unwrap(), VmmKind::Firecracker);
+        assert!(VmmKind::from_str("xen").is_err());
+        assert_eq!(VmmKind::Qemu.to_string(), "qemu");
+    }
 
     #[test]
     fn tail_lines_missing_file_is_none() {

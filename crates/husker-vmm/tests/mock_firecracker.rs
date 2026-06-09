@@ -196,6 +196,7 @@ async fn create_vm_missing_binary() {
         vsock_cid: 3,
         tap_device: None,
         guest_mac: None,
+        vmm: None,
     };
 
     let err = backend.create_vm(config).await.unwrap_err();
@@ -226,6 +227,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
         vsock_cid: 3,
         tap_device: None,
         guest_mac: None,
+        vmm: None,
     };
 
     let _ = backend.create_vm(config).await.unwrap_err();
@@ -314,6 +316,7 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         vsock_cid: 3,
         tap_device: None,
         guest_mac: None,
+        vmm: None,
     };
 
     let err = backend.create_vm(config).await.unwrap_err();

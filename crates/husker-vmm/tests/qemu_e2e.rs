@@ -47,6 +47,7 @@ async fn qemu_boots_and_vsock() {
         vsock_cid,
         tap_device: None,
         guest_mac: None,
+        vmm: None,
     };
     let info = backend.create_vm(config).await.expect("create_vm");
 
@@ -106,6 +107,7 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
         vsock_cid: 99,
         tap_device: None,
         guest_mac: None,
+        vmm: None,
     };
     let err = backend.create(config).await.expect_err("create must fail");
     let msg = err.to_string();
