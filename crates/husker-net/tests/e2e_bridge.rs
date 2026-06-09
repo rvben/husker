@@ -5,8 +5,7 @@
 //!
 //!   cargo test -p husker-net --test e2e_bridge -- --ignored --test-threads=1
 //!
-//! `--test-threads=1` is required because tests share the global `husker`
-//! nftables table.
+//! `--test-threads=1` is required because tests share kernel state.
 //!
 //! Each test cleans up after itself. Unique interface names per test prevent
 //! bridge/TAP interference.
@@ -46,15 +45,17 @@ fn ip_forward_enabled() -> bool {
     output.contains("= 1")
 }
 
-fn nft_table_exists() -> bool {
+fn nft_table_exists(bridge: &str) -> bool {
+    let table = husker_net::nft_table_for_bridge(bridge);
     Command::new("nft")
-        .args(["list", "table", "ip", "husker"])
+        .args(["list", "table", "ip", &table])
         .output()
         .is_ok_and(|o| o.status.success())
 }
 
-fn nft_table_output() -> String {
-    cmd_output("nft", &["list", "table", "ip", "husker"])
+fn nft_table_output(bridge: &str) -> String {
+    let table = husker_net::nft_table_for_bridge(bridge);
+    cmd_output("nft", &["list", "table", "ip", &table])
 }
 
 // ── Bridge lifecycle ─────────────────────────────────────────────────
@@ -223,18 +224,20 @@ async fn multiple_taps_on_bridge() {
 #[tokio::test]
 #[ignore]
 async fn nftables_init_and_cleanup() {
+    let bridge = "huskertest0";
+
     // Clean up from prior runs
-    let _ = husker_net::cleanup_nat().await;
+    let _ = husker_net::cleanup_nat(bridge).await;
 
     // Initialize NAT with test bridge
-    husker_net::init_nat("huskertest0", "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
         .await
         .expect("init_nat should succeed");
 
-    assert!(nft_table_exists(), "husker nftables table should exist");
+    assert!(nft_table_exists(bridge), "husker nftables table should exist");
     assert!(ip_forward_enabled(), "init_nat should enable IP forwarding");
 
-    let output = nft_table_output();
+    let output = nft_table_output(bridge);
     assert!(
         output.contains("masquerade"),
         "should have masquerade rule: {output}"
@@ -267,9 +270,9 @@ async fn nftables_init_and_cleanup() {
     );
 
     // Cleanup
-    husker_net::cleanup_nat().await.expect("cleanup_nat");
+    husker_net::cleanup_nat(bridge).await.expect("cleanup_nat");
     assert!(
-        !nft_table_exists(),
+        !nft_table_exists(bridge),
         "husker table should be gone after cleanup"
     );
 }
@@ -279,19 +282,20 @@ async fn nftables_init_and_cleanup() {
 #[tokio::test]
 #[ignore]
 async fn port_forward_add_and_remove() {
-    let _ = husker_net::cleanup_nat().await;
+    let bridge = "huskertest0";
+    let _ = husker_net::cleanup_nat(bridge).await;
 
     // Init NAT first (creates the table and chains)
-    husker_net::init_nat("huskertest0", "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
         .await
         .expect("init_nat");
 
     // Add a port forward
-    husker_net::add_port_forward(8080, Ipv4Addr::new(10, 99, 0, 2), 80, "huskertst1")
+    husker_net::add_port_forward(8080, Ipv4Addr::new(10, 99, 0, 2), 80, "huskertst1", bridge)
         .await
         .expect("add_port_forward");
 
-    let output = nft_table_output();
+    let output = nft_table_output(bridge);
     assert!(output.contains("dnat"), "should have DNAT rule: {output}");
     assert!(
         output.contains("husker-pf:huskertst1:8080"),
@@ -299,16 +303,16 @@ async fn port_forward_add_and_remove() {
     );
 
     // Add a second port forward
-    husker_net::add_port_forward(9090, Ipv4Addr::new(10, 99, 0, 3), 443, "huskertst2")
+    husker_net::add_port_forward(9090, Ipv4Addr::new(10, 99, 0, 3), 443, "huskertst2", bridge)
         .await
         .expect("add_port_forward 2");
 
     // Remove first port forward
-    husker_net::remove_port_forward(8080, "huskertst1")
+    husker_net::remove_port_forward(8080, "huskertst1", bridge)
         .await
         .expect("remove_port_forward");
 
-    let output = nft_table_output();
+    let output = nft_table_output(bridge);
     assert!(
         !output.contains("husker-pf:huskertst1:8080"),
         "first port forward should be removed"
@@ -319,18 +323,18 @@ async fn port_forward_add_and_remove() {
     );
 
     // Remove all port forwards for huskertst2
-    husker_net::remove_all_port_forwards("huskertst2")
+    husker_net::remove_all_port_forwards("huskertst2", bridge)
         .await
         .expect("remove_all_port_forwards");
 
-    let output = nft_table_output();
+    let output = nft_table_output(bridge);
     assert!(
         !output.contains("husker-pf:huskertst2"),
         "all huskertst2 port forwards should be removed"
     );
 
     // Cleanup
-    husker_net::cleanup_nat().await.expect("cleanup_nat");
+    husker_net::cleanup_nat(bridge).await.expect("cleanup_nat");
 }
 
 // ── Full lifecycle simulation ────────────────────────────────────────
@@ -341,7 +345,7 @@ async fn full_lifecycle_bridge_tap_nat() {
     let bridge = "huskertst8";
 
     // Cleanup from prior runs
-    let _ = husker_net::cleanup_nat().await;
+    let _ = husker_net::cleanup_nat(bridge).await;
     let _ = husker_net::delete_tap("huskertst9").await;
     let _ = husker_net::delete_tap("hskts10").await;
     let _ = husker_net::delete_bridge(bridge).await;
@@ -394,19 +398,19 @@ async fn full_lifecycle_bridge_tap_nat() {
     assert!(interface_has_master(tap2, bridge));
 
     // 6. Add port forwards
-    husker_net::add_port_forward(2222, vm1_ip, 22, tap1)
+    husker_net::add_port_forward(2222, vm1_ip, 22, tap1, bridge)
         .await
         .expect("add pf vm1");
-    husker_net::add_port_forward(2223, vm2_ip, 22, tap2)
+    husker_net::add_port_forward(2223, vm2_ip, 22, tap2, bridge)
         .await
         .expect("add pf vm2");
 
-    let nft_out = nft_table_output();
+    let nft_out = nft_table_output(bridge);
     assert!(nft_out.contains("husker-pf:huskertst9:2222"));
     assert!(nft_out.contains("husker-pf:hskts10:2223"));
 
     // 7. Destroy VM 1
-    husker_net::remove_all_port_forwards(tap1)
+    husker_net::remove_all_port_forwards(tap1, bridge)
         .await
         .expect("remove pf vm1");
     husker_net::delete_tap(tap1).await.expect("delete tap vm1");
@@ -414,7 +418,7 @@ async fn full_lifecycle_bridge_tap_nat() {
 
     // VM 2 still intact
     assert!(interface_has_master(tap2, bridge));
-    let nft_out = nft_table_output();
+    let nft_out = nft_table_output(bridge);
     assert!(!nft_out.contains("husker-pf:huskertst9:2222"));
     assert!(nft_out.contains("husker-pf:hskts10:2223"));
 
@@ -423,7 +427,7 @@ async fn full_lifecycle_bridge_tap_nat() {
     assert_eq!(vm3_ip, vm1_ip, "should reuse released IP");
 
     // 9. Destroy VM 2 and cleanup
-    husker_net::remove_all_port_forwards(tap2)
+    husker_net::remove_all_port_forwards(tap2, bridge)
         .await
         .expect("remove pf vm2");
     husker_net::delete_tap(tap2).await.expect("delete tap vm2");
@@ -431,7 +435,7 @@ async fn full_lifecycle_bridge_tap_nat() {
     alloc.release(vm3_ip).expect("release vm3 ip");
 
     // 10. Daemon shutdown
-    husker_net::cleanup_nat().await.expect("cleanup_nat");
+    husker_net::cleanup_nat(bridge).await.expect("cleanup_nat");
     husker_net::delete_bridge(bridge)
         .await
         .expect("delete_bridge");
@@ -440,7 +444,7 @@ async fn full_lifecycle_bridge_tap_nat() {
     assert!(!interface_exists(bridge));
     assert!(!interface_exists(tap1));
     assert!(!interface_exists(tap2));
-    assert!(!nft_table_exists());
+    assert!(!nft_table_exists(bridge));
 }
 
 // ── init_nat idempotency ─────────────────────────────────────────────
@@ -448,25 +452,63 @@ async fn full_lifecycle_bridge_tap_nat() {
 #[tokio::test]
 #[ignore]
 async fn init_nat_is_idempotent() {
-    let _ = husker_net::cleanup_nat().await;
+    let bridge = "huskertest0";
+    let _ = husker_net::cleanup_nat(bridge).await;
 
     // First init
-    husker_net::init_nat("huskertest0", "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
         .await
         .expect("first init_nat");
 
     // Second init (should not error — deletes and recreates)
-    husker_net::init_nat("huskertest0", "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
         .await
         .expect("second init_nat should also succeed");
 
     // Should still have exactly the right rules (no duplicates)
-    let output = nft_table_output();
+    let output = nft_table_output(bridge);
     let masq_count = output.matches("husker:bridge-masq").count();
     assert_eq!(
         masq_count, 1,
         "should have exactly one masquerade rule, got {masq_count}"
     );
 
-    husker_net::cleanup_nat().await.expect("cleanup");
+    husker_net::cleanup_nat(bridge).await.expect("cleanup");
+}
+
+// ── two-daemon coexistence ───────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn two_bridges_do_not_clobber_each_others_nat() {
+    let bridge_a = "huskercoex0";
+    let bridge_b = "huskercoex1";
+    let _ = husker_net::cleanup_nat(bridge_a).await;
+    let _ = husker_net::cleanup_nat(bridge_b).await;
+
+    husker_net::init_nat(bridge_a, "10.99.10.0/24", "eth0")
+        .await
+        .expect("init_nat A");
+    husker_net::init_nat(bridge_b, "10.99.11.0/24", "eth0")
+        .await
+        .expect("init_nat B");
+
+    husker_net::add_port_forward(18080, Ipv4Addr::new(10, 99, 10, 2), 80, "huskercoexa", bridge_a)
+        .await
+        .expect("pf A");
+    husker_net::add_port_forward(18081, Ipv4Addr::new(10, 99, 11, 2), 80, "huskercoexb", bridge_b)
+        .await
+        .expect("pf B");
+
+    assert!(nft_table_exists(bridge_a), "table A missing");
+    assert!(nft_table_exists(bridge_b), "table B missing");
+    assert!(nft_table_output(bridge_a).contains("18080"), "A lost its DNAT");
+    assert!(nft_table_output(bridge_b).contains("18081"), "B lost its DNAT");
+
+    husker_net::cleanup_nat(bridge_a).await.expect("cleanup A");
+    assert!(!nft_table_exists(bridge_a), "table A should be gone");
+    assert!(nft_table_exists(bridge_b), "table B must survive A cleanup");
+    assert!(nft_table_output(bridge_b).contains("18081"), "B's DNAT must survive");
+
+    husker_net::cleanup_nat(bridge_b).await.expect("cleanup B");
 }
