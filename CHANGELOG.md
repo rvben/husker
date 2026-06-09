@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.2] - 2026-06-09
+
+### Added
+
+- **Configurable CID base** (`cid_base` config / `HUSKER_CID_BASE` env, default 3).
+  Two husker daemons on one host can now be given distinct bases so they hand out
+  disjoint vsock CIDs and TAP device names, completing multi-daemon coexistence
+  alongside the per-bridge nftables tables from 0.3.1.
+
+### Fixed
+
+- **Reap orphaned QEMU processes on daemon startup.** When a daemon exits without
+  cleanup (SIGKILL/OOM), the VM processes it left behind are now killed on the
+  next start - matched by the persisted pid plus a live `qemu-system` check, so a
+  recycled PID is never touched - instead of lingering and holding their vsock CID.
+
+### Changed
+
+- Agent readiness in the QEMU end-to-end test is verified with a real ping/pong
+  round trip; `LinuxVsockStream` forwards vectored writes to the inner stream.
+
 ## [0.3.1] - 2026-06-09
 
 ### Added
