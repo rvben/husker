@@ -380,6 +380,14 @@ fn default_rows() -> u16 {
     24
 }
 
+// ── Ready Types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReadyResponse {
+    pub vm: String,
+    pub ready: bool,
+}
+
 // ── Logs Types ───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -455,6 +463,7 @@ pub enum WsShellOutput {
         write_file_handler,
         shell_ws,
         get_logs,
+        get_ready,
         metrics_handler,
     ),
     components(schemas(
@@ -481,6 +490,7 @@ pub enum WsShellOutput {
         WriteFileResponse,
         HealthResponse,
         VmCounts,
+        ReadyResponse,
         LogsQuery,
         WsShellInput,
         WsShellOutput,
@@ -708,6 +718,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
         .route("/v1/vms/{name}/shell", get(shell_ws::<B>))
         .route("/v1/vms/{name}/logs", get(get_logs::<B>))
+        .route("/v1/vms/{name}/ready", get(get_ready::<B>))
         .route("/v1/metrics", get(metrics_handler::<B>));
 
     #[cfg(feature = "linux-net")]
@@ -889,7 +900,7 @@ fn is_protected_route(method: &Method, path: &str) -> bool {
     if *method != Method::GET {
         return true;
     }
-    path.ends_with("/shell") || path.ends_with("/logs")
+    path.ends_with("/shell") || path.ends_with("/logs") || path.ends_with("/ready")
 }
 
 async fn auth_middleware(
@@ -2117,6 +2128,26 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
 async fn send_ws_output(ws: &mut WebSocket, msg: &WsShellOutput) -> Result<(), axum::Error> {
     let text = serde_json::to_string(msg).expect("WsShellOutput is always serializable");
     ws.send(Message::Text(text.into())).await
+}
+
+// ── Ready Handler ────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/v1/vms/{name}/ready",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 200, description = "Agent readiness", body = ReadyResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse)
+    )
+)]
+async fn get_ready<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<ReadyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let ready = core.probe_ready(&name).await.map_err(map_error)?;
+    Ok(Json(ReadyResponse { vm: name, ready }))
 }
 
 // ── Logs Handler ─────────────────────────────────────────────────────
@@ -3619,6 +3650,7 @@ mod tests {
         assert!(is_protected_route(&Method::DELETE, "/v1/vms/example"));
         assert!(is_protected_route(&Method::GET, "/v1/vms/example/shell"));
         assert!(is_protected_route(&Method::GET, "/v1/vms/example/logs"));
+        assert!(is_protected_route(&Method::GET, "/v1/vms/example/ready"));
         assert!(is_protected_route(&Method::GET, "/v1/metrics"));
     }
 

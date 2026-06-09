@@ -95,6 +95,7 @@ async fn openapi_contains_critical_paths() {
         "/v1/vms/{name}/files/read",
         "/v1/vms/{name}/files/write",
         "/v1/vms/{name}/logs",
+        "/v1/vms/{name}/ready",
         "/v1/vms/{name}/shell",
     ] {
         assert!(
