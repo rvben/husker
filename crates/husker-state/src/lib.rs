@@ -88,6 +88,8 @@ pub struct VmRecord {
     pub service_id: Option<Uuid>,
     /// Stable instance ordinal within the owning service (0..desired-1).
     pub service_ordinal: Option<u32>,
+    /// VMM backend that created this VM ("firecracker" or "qemu").
+    pub vmm: String,
 }
 
 /// Persistent port forward record.
@@ -292,6 +294,12 @@ impl StateStore {
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_id TEXT", []);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_ordinal INTEGER", []);
 
+        // Migration: record which VMM backend created each VM (idempotent).
+        let _ = conn.execute(
+            "ALTER TABLE vms ADD COLUMN vmm TEXT NOT NULL DEFAULT 'firecracker'",
+            [],
+        );
+
         // Migration: service VM template columns (idempotent).
         // NOT NULL with DEFAULT '' so ADD COLUMN succeeds on tables with rows.
         let _ = conn.execute(
@@ -320,8 +328,8 @@ impl StateStore {
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                               created_at, updated_at, userdata, userdata_status, userdata_env,
-                              service_id, service_ordinal)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                              service_id, service_ordinal, vmm)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -342,6 +350,7 @@ impl StateStore {
                 record.userdata_env,
                 record.service_id.map(|id| id.to_string()),
                 record.service_ordinal,
+                record.vmm,
             ],
         )
         .map_err(|e| match &e {
@@ -363,7 +372,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal
+                    service_id, service_ordinal, vmm
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -381,7 +390,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal
+                    service_id, service_ordinal, vmm
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -399,7 +408,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal
+                    service_id, service_ordinal, vmm
              FROM vms ORDER BY created_at",
         )?;
 
@@ -417,7 +426,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal
+                    service_id, service_ordinal, vmm
              FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
         )?;
         let records = stmt
@@ -1161,6 +1170,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
                 })?),
             }
         },
+        vmm: row.get(19)?,
     })
 }
 
@@ -1273,6 +1283,7 @@ mod tests {
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
+            vmm: "firecracker".into(),
         }
     }
 
@@ -1336,6 +1347,44 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn vmm_field_round_trips() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("qemu-vm");
+        rec.vmm = "qemu".into();
+        store.insert_vm(&rec).unwrap();
+        let fetched = store.get_vm_by_name("qemu-vm").unwrap();
+        assert_eq!(fetched.vmm, "qemu");
+    }
+
+    #[test]
+    fn vmm_migration_default_applied() {
+        // Simulate an older database that lacks the vmm column and verify
+        // that after StateStore::open_memory() runs migrations, a VM inserted
+        // via raw SQL (without vmm) gets the default "firecracker" value.
+        let store = StateStore::open_memory().unwrap();
+
+        // Insert a pre-vmm row by omitting the vmm column. The DEFAULT
+        // 'firecracker' set by the migration must fill it.
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                                  tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                                  created_at, updated_at, userdata, userdata_status, userdata_env,
+                                  service_id, service_ordinal)
+                 VALUES ('11111111-1111-1111-1111-111111111111', 'legacy-vm', 'stopped',
+                         NULL, 1, 128, 5, NULL, NULL, NULL, '/kernel', '/rootfs',
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                         NULL, NULL, NULL, NULL, NULL)",
+                [],
+            ).unwrap();
+        }
+
+        let fetched = store.get_vm_by_name("legacy-vm").unwrap();
+        assert_eq!(fetched.vmm, "firecracker", "legacy row should default to firecracker");
     }
 
     #[test]

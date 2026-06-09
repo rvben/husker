@@ -24,6 +24,7 @@ fn make_record(name: &str) -> VmRecord {
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
+        vmm: "firecracker".into(),
     }
 }
 
