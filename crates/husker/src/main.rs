@@ -4066,53 +4066,54 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         .await
         .context("initializing nftables")?;
 
-        match config.vmm {
-            #[cfg(target_os = "linux")]
-            VmmSelection::Qemu => {
-                let vmm =
-                    husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir);
-                let core = Arc::new(husker_core::HuskerCore::new(
-                    vmm,
-                    state,
-                    ip_allocator,
-                    storage,
-                    config.bridge_name.clone(),
-                    config.dns_servers,
-                    runtime_dir.clone(),
-                ));
-                run_linux_daemon(
-                    core,
-                    listen,
-                    api_token.clone(),
-                    service_reconcile_enabled,
-                    service_reconcile_interval,
-                )
-                .await?;
-            }
-            VmmSelection::Firecracker => {
-                let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
-                    &config.firecracker_bin,
-                    &runtime_dir,
-                );
-                let core = Arc::new(husker_core::HuskerCore::new(
-                    vmm,
-                    state,
-                    ip_allocator,
-                    storage,
-                    config.bridge_name.clone(),
-                    config.dns_servers,
-                    runtime_dir.clone(),
-                ));
-                run_linux_daemon(
-                    core,
-                    listen,
-                    api_token.clone(),
-                    service_reconcile_enabled,
-                    service_reconcile_interval,
-                )
-                .await?;
-            }
-        }
+        #[cfg(target_os = "linux")]
+        let core = {
+            let firecracker = husker_vmm::firecracker::FirecrackerBackend::new(
+                &config.firecracker_bin,
+                &runtime_dir,
+            );
+            let qemu = husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir);
+            let default_kind = match config.vmm {
+                VmmSelection::Qemu => husker_vmm::VmmKind::Qemu,
+                VmmSelection::Firecracker => husker_vmm::VmmKind::Firecracker,
+            };
+            let vmm = husker_vmm::LinuxDispatchBackend::new(firecracker, qemu, default_kind);
+            Arc::new(husker_core::HuskerCore::new(
+                vmm,
+                state,
+                ip_allocator,
+                storage,
+                config.bridge_name.clone(),
+                config.dns_servers,
+                runtime_dir.clone(),
+            ))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let core = {
+            // linux-net without target_os=linux (not a real deployment target):
+            // no QEMU/vsock available, so Firecracker only.
+            let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
+                &config.firecracker_bin,
+                &runtime_dir,
+            );
+            Arc::new(husker_core::HuskerCore::new(
+                vmm,
+                state,
+                ip_allocator,
+                storage,
+                config.bridge_name.clone(),
+                config.dns_servers,
+                runtime_dir.clone(),
+            ))
+        };
+        run_linux_daemon(
+            core,
+            listen,
+            api_token.clone(),
+            service_reconcile_enabled,
+            service_reconcile_interval,
+        )
+        .await?;
 
         // Network cleanup after VM drain. If the process is killed
         // (SIGKILL, panic, OOM), the stale bridge cleanup at startup above
