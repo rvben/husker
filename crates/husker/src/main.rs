@@ -91,6 +91,10 @@ enum Commands {
         /// Environment variables for userdata script (KEY=VALUE)
         #[arg(long, short = 'e')]
         env: Vec<String>,
+
+        /// Backend to run this VM on
+        #[arg(long, value_parser = ["firecracker", "qemu"])]
+        vmm: Option<String>,
     },
 
     /// List running VMs
@@ -963,7 +967,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
     );
     let output_fields: Vec<&'static str> = match path {
         "run" => vec!["status", "action", "vm", "userdata_queued"],
-        "list" => vec!["name", "state", "vcpu_count", "mem_size_mib", "guest_ip"],
+        "list" => vec!["name", "state", "vcpu_count", "mem_size_mib", "guest_ip", "vmm"],
         "info" => vec![
             "name",
             "state",
@@ -973,6 +977,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "host_ip",
             "userdata_status",
             "id",
+            "vmm",
         ],
         "wait" => vec!["status", "action", "vm", "ready"],
         "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
@@ -1088,6 +1093,7 @@ async fn run(cli: Cli) -> Result<()> {
             memory,
             userdata,
             env,
+            vmm,
         } => {
             let config = load_config(config_path.as_deref());
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
@@ -1141,6 +1147,9 @@ async fn run(cli: Cli) -> Result<()> {
                 "mem_size_mib": memory,
                 "env": env_pairs,
             });
+            if let Some(ref vmm_kind) = vmm {
+                body["vmm"] = serde_json::json!(vmm_kind);
+            }
             if let Some(ref initrd_path) = initrd {
                 body["initrd_path"] = serde_json::json!(initrd_path);
             } else if let Some(ref default_initrd) = config.default_initrd
