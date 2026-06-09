@@ -86,6 +86,20 @@ pub enum VmmError {
     Io(#[from] std::io::Error),
 }
 
+/// Return the last `max_lines` lines of a file (trailing whitespace trimmed),
+/// or `None` if the file is missing, unreadable, or empty. Used to fold boot
+/// diagnostics into create-failure error messages.
+pub(crate) fn tail_lines(path: &std::path::Path, max_lines: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    Some(lines[start..].join("\n"))
+}
+
 /// Trait abstracting over different VMM implementations.
 ///
 /// Each backend (Firecracker, Apple VZ) implements this trait.
@@ -134,4 +148,35 @@ pub trait VmmBackend: Send + Sync {
         id: Uuid,
         port: u32,
     ) -> impl std::future::Future<Output = Result<Self::VsockStream, VmmError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_lines;
+    use std::io::Write;
+
+    #[test]
+    fn tail_lines_missing_file_is_none() {
+        assert!(tail_lines(std::path::Path::new("/no/such/file"), 10).is_none());
+    }
+
+    #[test]
+    fn tail_lines_empty_file_is_none() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(tail_lines(f.path(), 10).is_none());
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "a\nb\nc\nd\ne").unwrap(); // no trailing newline
+        assert_eq!(tail_lines(f.path(), 2).unwrap(), "d\ne");
+    }
+
+    #[test]
+    fn tail_lines_fewer_than_n_returns_all() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "only line").unwrap();
+        assert_eq!(tail_lines(f.path(), 20).unwrap(), "only line");
+    }
 }
