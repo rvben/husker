@@ -554,6 +554,9 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_dns_servers")]
     dns_servers: Vec<String>,
+    #[cfg(feature = "linux-net")]
+    #[serde(default = "default_cid_base")]
+    cid_base: u32,
 }
 
 #[cfg(feature = "linux-net")]
@@ -634,6 +637,11 @@ fn default_bridge_subnet() -> String {
 #[cfg(feature = "linux-net")]
 fn default_dns_servers() -> Vec<String> {
     vec!["8.8.8.8".into(), "1.1.1.1".into()]
+}
+
+#[cfg(feature = "linux-net")]
+fn default_cid_base() -> u32 {
+    3
 }
 
 /// Extract a clean error message from an API error response.
@@ -1027,6 +1035,8 @@ impl Default for Config {
             bridge_subnet: default_bridge_subnet(),
             #[cfg(feature = "linux-net")]
             dns_servers: default_dns_servers(),
+            #[cfg(feature = "linux-net")]
+            cid_base: default_cid_base(),
         }
     }
 }
@@ -3544,6 +3554,11 @@ fn apply_env_overrides(config: &mut Config) {
         if let Ok(val) = std::env::var("HUSKER_DNS_SERVERS") {
             config.dns_servers = val.split(',').map(|s| s.trim().to_string()).collect();
         }
+        if let Ok(val) = std::env::var("HUSKER_CID_BASE")
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            config.cid_base = parsed;
+        }
     }
 }
 
@@ -4040,6 +4055,11 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         .context("reconciling stale VM state")?;
     if stale_count > 0 {
         tracing::info!(stale_count, "marked stale VMs as stopped");
+    }
+
+    #[cfg(feature = "linux-net")]
+    if let Err(e) = state.ensure_cid_base(config.cid_base) {
+        tracing::warn!(error = %e, "failed to apply cid_base");
     }
 
     let storage = husker_storage::StorageConfig {

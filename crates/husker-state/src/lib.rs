@@ -977,6 +977,20 @@ impl StateStore {
         Ok(cid)
     }
 
+    /// Raise the CID allocator's floor to `base` (never lowers it), so a second
+    /// daemon configured with a distinct base hands out a disjoint CID range
+    /// (and thus disjoint `husker<cid>` TAP names and vsock CIDs). CIDs 0-2 are
+    /// reserved by vsock, so `base` is clamped to >= 3.
+    pub fn ensure_cid_base(&self, base: u32) -> Result<(), StateError> {
+        let base = base.max(3);
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE cid_allocator SET next_cid = MAX(next_cid, ?1) WHERE id = 1",
+            params![base],
+        )?;
+        Ok(())
+    }
+
     /// Release a vsock CID back to the pool.
     ///
     /// Idempotent — releasing an already-freed CID is a no-op.
@@ -1444,6 +1458,21 @@ mod tests {
         assert_eq!(store.allocate_cid().unwrap(), 3);
         assert_eq!(store.allocate_cid().unwrap(), 4);
         assert_eq!(store.allocate_cid().unwrap(), 5);
+    }
+
+    #[test]
+    fn ensure_cid_base_raises_floor_only() {
+        let store = StateStore::open_memory().unwrap();
+        store.ensure_cid_base(1000).unwrap();
+        assert_eq!(store.allocate_cid().unwrap(), 1000);
+        assert_eq!(store.allocate_cid().unwrap(), 1001);
+        // A lower base never rewinds the allocator.
+        store.ensure_cid_base(5).unwrap();
+        assert_eq!(store.allocate_cid().unwrap(), 1002);
+        // Below the reserved floor is clamped to >= 3.
+        let store2 = StateStore::open_memory().unwrap();
+        store2.ensure_cid_base(0).unwrap();
+        assert_eq!(store2.allocate_cid().unwrap(), 3);
     }
 
     #[test]
