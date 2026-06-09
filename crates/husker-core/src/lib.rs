@@ -2598,4 +2598,20 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         // We are still alive (were not killed).
         assert_eq!(std::process::id(), self_pid);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_removes_pidfile_for_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        // PID 4194304 is above the Linux kernel's default pid_max (4194304 is
+        // 2^22; the default is 32768 or 4194304 depending on config, but a
+        // freshly allocated temp PID this large is virtually guaranteed to be
+        // unoccupied). /proc/<pid>/cmdline will not exist, so neither the kill
+        // branch nor the qemu check fires - the pidfile is simply cleaned up.
+        let dead_pid: u32 = 4_194_304;
+        std::fs::write(dir.path().join("dead.pid"), dead_pid.to_string()).unwrap();
+        let reaped = crate::reap_orphaned_vmms(dir.path());
+        assert_eq!(reaped, 0, "a dead/nonexistent process is not counted as reaped");
+        assert!(!dir.path().join("dead.pid").exists(), "pidfile for dead process is removed");
+    }
 }

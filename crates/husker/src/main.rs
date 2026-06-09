@@ -554,6 +554,10 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_dns_servers")]
     dns_servers: Vec<String>,
+    /// Starting CID for vsock and TAP-name allocation (`husker<cid>`). Two
+    /// co-located daemons must use distinct non-overlapping bases so their CID
+    /// and TAP-name spaces are disjoint. Default 3 (no separation; suitable
+    /// for a single-daemon setup).
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_cid_base")]
     cid_base: u32,
@@ -4058,9 +4062,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     }
 
     #[cfg(feature = "linux-net")]
-    if let Err(e) = state.ensure_cid_base(config.cid_base) {
-        tracing::warn!(error = %e, "failed to apply cid_base");
-    }
+    state.ensure_cid_base(config.cid_base).context("applying cid_base")?;
 
     #[cfg(target_os = "linux")]
     {

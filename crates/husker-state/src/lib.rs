@@ -984,6 +984,10 @@ impl StateStore {
     pub fn ensure_cid_base(&self, base: u32) -> Result<(), StateError> {
         let base = base.max(3);
         let conn = self.lock()?;
+        // Purge freed CIDs below the new floor so allocate_cid (which returns
+        // the lowest freed entry first) cannot hand out a CID outside the
+        // intended range, breaking the disjoint-range guarantee.
+        conn.execute("DELETE FROM freed_cids WHERE cid < ?1", params![base])?;
         conn.execute(
             "UPDATE cid_allocator SET next_cid = MAX(next_cid, ?1) WHERE id = 1",
             params![base],
@@ -1473,6 +1477,12 @@ mod tests {
         let store2 = StateStore::open_memory().unwrap();
         store2.ensure_cid_base(0).unwrap();
         assert_eq!(store2.allocate_cid().unwrap(), 3);
+        // A freed CID below the new base must not be handed out.
+        let store3 = StateStore::open_memory().unwrap();
+        let _ = store3.allocate_cid().unwrap(); // 3
+        store3.release_cid(3).unwrap();          // freed: {3}
+        store3.ensure_cid_base(1000).unwrap();
+        assert_eq!(store3.allocate_cid().unwrap(), 1000, "freed CID below base must not be returned");
     }
 
     #[test]

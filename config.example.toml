@@ -97,6 +97,10 @@
 # DNS servers injected into guest /etc/resolv.conf via the agent.
 # dns_servers = ["8.8.8.8", "1.1.1.1"]
 
+# Starting CID for vsock and TAP-name allocation. Two co-located daemons must
+# use distinct bases so their CID/TAP spaces are disjoint (e.g. 3 + 1000).
+# cid_base = 1000
+
 # ── Service Reconciler ───────────────────────────────────────────────
 
 # Background reconciler for service workloads.
@@ -122,6 +126,7 @@
 #   HUSKER_BRIDGE_NAME                       →  bridge_name        (Linux only)
 #   HUSKER_BRIDGE_SUBNET                     →  bridge_subnet      (Linux only)
 #   HUSKER_DNS_SERVERS                       →  dns_servers        (Linux only, comma-separated)
+#   HUSKER_CID_BASE                          →  cid_base           (Linux only)
 #
 # Example:
 #   HUSKER_DATA_DIR=/tmp/husker husker daemon
