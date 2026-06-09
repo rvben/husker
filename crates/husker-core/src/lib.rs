@@ -355,6 +355,46 @@ pub struct ReconcileOutcome {
     pub failed: Vec<(String, String)>,
 }
 
+/// Kill VMM child processes orphaned by a previous daemon that exited without
+/// cleanup (SIGKILL/OOM). Scans `runtime_dir` for `{id}.pid` files (written by
+/// the QEMU backend) and, for each, SIGKILLs the process only if it is still a
+/// live `qemu-system` process (so a recycled PID belonging to something else is
+/// never touched), then removes the pidfile. Returns the number reaped.
+#[cfg(target_os = "linux")]
+pub fn reap_orphaned_vmms(runtime_dir: &std::path::Path) -> usize {
+    let entries = match std::fs::read_dir(runtime_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut reaped = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<i32>() else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        // /proc/<pid>/cmdline confirms both liveness and identity; only a live
+        // qemu-system process is killed.
+        let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if cmdline.contains("qemu-system") {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status();
+            warn!(pid, "reaped orphaned qemu process");
+            reaped += 1;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    reaped
+}
+
 /// Core orchestrator that ties together all subsystems.
 pub struct HuskerCore<B: VmmBackend> {
     vmm: B,
@@ -2536,5 +2576,26 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_removes_stale_pidfiles_without_killing_non_qemu() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pidfile pointing at our own (non-qemu) PID: must NOT be killed, but
+        // the stale pidfile must be cleaned.
+        let self_pid = std::process::id();
+        std::fs::write(dir.path().join("abc.pid"), self_pid.to_string()).unwrap();
+        // A pidfile with garbage: cleaned, counted as not reaped.
+        std::fs::write(dir.path().join("def.pid"), "not-a-pid").unwrap();
+        // A non-.pid file: untouched.
+        std::fs::write(dir.path().join("keep.serial.log"), "x").unwrap();
+        let reaped = crate::reap_orphaned_vmms(dir.path());
+        assert_eq!(reaped, 0, "must not kill a non-qemu process");
+        assert!(!dir.path().join("abc.pid").exists(), "stale pidfile removed");
+        assert!(!dir.path().join("def.pid").exists(), "garbage pidfile removed");
+        assert!(dir.path().join("keep.serial.log").exists(), "non-pid file untouched");
+        // We are still alive (were not killed).
+        assert_eq!(std::process::id(), self_pid);
     }
 }

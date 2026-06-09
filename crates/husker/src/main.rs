@@ -4062,6 +4062,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         tracing::warn!(error = %e, "failed to apply cid_base");
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        let reaped = husker_core::reap_orphaned_vmms(&runtime_dir);
+        if reaped > 0 {
+            tracing::info!(reaped, "reaped orphaned qemu processes from a prior run");
+        }
+    }
+
     let storage = husker_storage::StorageConfig {
         data_dir: config.data_dir,
     };
