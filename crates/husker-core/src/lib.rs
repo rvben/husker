@@ -694,7 +694,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         #[cfg(feature = "linux-net")]
         if let Some(ref tap) = resources.tap_name {
             debug!(tap, "rolling back: removing TAP");
-            if let Err(e) = husker_net::remove_all_port_forwards(tap).await {
+            if let Err(e) = husker_net::remove_all_port_forwards(tap, &self.bridge_name).await {
                 warn!(tap, error = %e, "rollback: failed to remove port forwards");
             }
             if let Err(e) = husker_net::delete_tap(tap).await {
@@ -827,7 +827,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         #[cfg(feature = "linux-net")]
         {
             if let Some(ref tap) = record.tap_device {
-                if let Err(e) = husker_net::remove_all_port_forwards(tap).await {
+                if let Err(e) = husker_net::remove_all_port_forwards(tap, &self.bridge_name).await {
                     warn!(%name, tap, error = %e, "failed to remove port forwards during destroy");
                 }
                 if let Err(e) = husker_net::delete_tap(tap).await {
@@ -1652,7 +1652,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             return Ok(());
         }
 
-        husker_net::add_port_forward(host_port, guest_ip, guest_port, tap_name).await?;
+        husker_net::add_port_forward(host_port, guest_ip, guest_port, tap_name, &self.bridge_name).await?;
 
         let pf_record = husker_state::PortForwardRecord {
             id: 0,
@@ -1675,7 +1675,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 other => CoreError::State(other),
             })
         {
-            if let Err(rollback_err) = husker_net::remove_port_forward(host_port, tap_name).await {
+            if let Err(rollback_err) = husker_net::remove_port_forward(host_port, tap_name, &self.bridge_name).await {
                 warn!(
                     %name,
                     host_port,
@@ -1700,7 +1700,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             .as_deref()
             .ok_or_else(|| CoreError::VmNotFound(format!("{name}: no TAP device")))?;
 
-        husker_net::remove_port_forward(host_port, tap_name).await?;
+        husker_net::remove_port_forward(host_port, tap_name, &self.bridge_name).await?;
         self.state.delete_port_forward(host_port)?;
 
         info!(%name, host_port, "port forward removed");
@@ -1756,7 +1756,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             };
 
             for pf in forwards {
-                match husker_net::add_port_forward(pf.host_port, guest_ip, pf.guest_port, tap_name)
+                match husker_net::add_port_forward(pf.host_port, guest_ip, pf.guest_port, tap_name, &self.bridge_name)
                     .await
                 {
                     Ok(()) => {
