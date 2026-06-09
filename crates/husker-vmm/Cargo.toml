@@ -1,6 +1,6 @@
 [package]
 name = "husker-vmm"
-description = "VMM abstraction layer with Firecracker and Cloud Hypervisor backends"
+description = "VMM abstraction layer with Firecracker, Apple VZ, and QEMU/KVM backends"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

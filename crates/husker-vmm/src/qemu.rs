@@ -1,8 +1,9 @@
 //! QEMU/KVM backend logic (cross-platform parts).
 //!
+//! The lifecycle methods are public API; the VmmBackend impl (Linux-only) delegates to them.
 //! The `VmmBackend` trait impl and vsock connect (Linux-only, needs vhost-vsock)
-//! live in a separate, Linux-gated block added later. The struct, argument
-//! builder, and lifecycle methods here are platform-independent and unit-tested.
+//! live in a separate, Linux-gated block. The struct, argument builder, and lifecycle
+//! methods here are platform-independent and unit-tested.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,20 +15,19 @@ use uuid::Uuid;
 use crate::{VmConfig, VmInfo, VmState, VmmError};
 
 /// A running QEMU VM tracked by the backend.
-pub struct QemuInstance {
-    pub info: VmInfo,
-    pub qmp_path: PathBuf,
-    pub pidfile_path: PathBuf,
-    pub serial_log_path: PathBuf,
-    pub vsock_cid: u32,
-    pub process: tokio::process::Child,
+pub(crate) struct QemuInstance {
+    pub(crate) info: VmInfo,
+    pub(crate) qmp_path: PathBuf,
+    pub(crate) pidfile_path: PathBuf,
+    pub(crate) serial_log_path: PathBuf,
+    pub(crate) process: tokio::process::Child,
 }
 
 /// QEMU/KVM VMM backend. One `qemu-system` child process per VM.
 pub struct QemuKvmBackend {
     pub(crate) binary: PathBuf,
     pub(crate) runtime_dir: PathBuf,
-    pub instances: Arc<Mutex<HashMap<Uuid, QemuInstance>>>,
+    pub(crate) instances: Arc<Mutex<HashMap<Uuid, QemuInstance>>>,
 }
 
 impl QemuKvmBackend {
@@ -93,10 +93,14 @@ impl QemuKvmBackend {
 
         // Direct kernel boot. husker's kernel_args carry console + static ip=;
         // QEMU additionally needs the root device for the virtio disk.
+        #[cfg(target_arch = "aarch64")]
+        let default_console = "console=ttyAMA0";
+        #[cfg(not(target_arch = "aarch64"))]
+        let default_console = "console=ttyS0";
         let base_args = config
             .kernel_args
             .clone()
-            .unwrap_or_else(|| "console=ttyS0".to_string());
+            .unwrap_or_else(|| default_console.to_string());
         args.push("-kernel".into());
         args.push(config.kernel_path.display().to_string());
         if let Some(initrd) = &config.initrd_path {
@@ -153,6 +157,7 @@ impl QemuKvmBackend {
         }
         if !appeared {
             // `process` drops here (kill_on_drop) -> QEMU killed.
+            let _ = std::fs::remove_file(self.qmp_socket(id));
             let _ = std::fs::remove_file(self.pidfile(id));
             let _ = std::fs::remove_file(self.serial_log(id));
             return Err(VmmError::ProcessError(
@@ -176,13 +181,15 @@ impl QemuKvmBackend {
                 qmp_path,
                 pidfile_path: self.pidfile(id),
                 serial_log_path: self.serial_log(id),
-                vsock_cid: config.vsock_cid,
                 process,
             },
         );
         Ok(info)
     }
 
+    /// Best-effort, asynchronous shutdown: sends an ACPI powerdown event and marks
+    /// the VM `Stopped`, but the QEMU process may still be winding down. Callers
+    /// must not assume the process has exited (mirrors the Firecracker backend).
     pub async fn stop(&self, id: Uuid) -> Result<(), VmmError> {
         let qmp_path = {
             let instances = self.instances.lock().await;
@@ -265,6 +272,11 @@ impl crate::VmmBackend for QemuKvmBackend {
     type VsockStream = tokio_vsock::VsockStream;
 
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        if !std::path::Path::new("/dev/vhost-vsock").exists() {
+            return Err(VmmError::InvalidConfig(
+                "/dev/vhost-vsock missing (load the vhost_vsock kernel module)".into(),
+            ));
+        }
         self.create(config).await
     }
 
@@ -291,7 +303,7 @@ impl crate::VmmBackend for QemuKvmBackend {
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
         let cid = {
             let instances = self.instances.lock().await;
-            instances.get(&id).ok_or(VmmError::VmNotFound(id))?.vsock_cid
+            instances.get(&id).ok_or(VmmError::VmNotFound(id))?.info.vsock_cid
         };
         tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port))
             .await
@@ -313,7 +325,7 @@ mod tests {
             kernel_path: "/var/lib/husker/kernels/vmlinux".into(),
             rootfs_path: "/var/lib/husker/vms/qvm/rootfs.ext4".into(),
             kernel_args: Some(
-                "console=ttyS0 ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off".into(),
+                "console=ttyS0 ip=192.0.2.2::192.0.2.1:255.255.255.252::eth0:off".into(),
             ),
             initrd_path: None,
             vsock_cid: 7,
@@ -376,7 +388,6 @@ mod tests {
             qmp_path: dir.path().join("x.qmp"),
             pidfile_path: dir.path().join("x.pid"),
             serial_log_path: dir.path().join("x.serial.log"),
-            vsock_cid: 3,
             process: tokio::process::Command::new("true").spawn().unwrap(),
         });
         let mut cfg = sample_config();
@@ -400,7 +411,6 @@ mod tests {
             info: VmInfo { id, name: "x".into(), state: VmState::Running, pid: Some(1),
                            vcpu_count: 1, mem_size_mib: 128, vsock_cid: 3 },
             qmp_path: qmp.clone(), pidfile_path: pid.clone(), serial_log_path: serial.clone(),
-            vsock_cid: 3,
             process: tokio::process::Command::new("true").spawn().unwrap(),
         });
         be.destroy(id).await.unwrap();
@@ -419,7 +429,7 @@ mod tests {
             qmp_path: dir.path().join("d.qmp"),
             pidfile_path: dir.path().join("d.pid"),
             serial_log_path: dir.path().join("d.serial.log"),
-            vsock_cid: 3, process,
+            process,
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let info = be.info(id).await.unwrap();
@@ -435,5 +445,7 @@ mod tests {
         assert!(matches!(be.info(id).await, Err(VmmError::VmNotFound(_))));
         assert!(matches!(be.destroy(id).await, Err(VmmError::VmNotFound(_))));
         assert!(matches!(be.stop(id).await, Err(VmmError::VmNotFound(_))));
+        assert!(matches!(be.pause(id).await, Err(VmmError::VmNotFound(_))));
+        assert!(matches!(be.resume(id).await, Err(VmmError::VmNotFound(_))));
     }
 }

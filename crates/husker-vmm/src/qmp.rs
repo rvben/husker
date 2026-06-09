@@ -4,12 +4,16 @@
 //! -> commands return `{"return": ...}` or `{"error": ...}`; async `{"event": ...}`
 //! lines are skipped.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::VmmError;
+
+const QMP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct QmpClient {
     stream: BufReader<UnixStream>,
@@ -87,10 +91,13 @@ impl QmpClient {
 
     async fn read_line(&mut self) -> Result<String, VmmError> {
         let mut line = String::new();
-        self.stream
-            .read_line(&mut line)
+        let n = tokio::time::timeout(QMP_TIMEOUT, self.stream.read_line(&mut line))
             .await
+            .map_err(|_| VmmError::ApiError("QMP read timed out".into()))?
             .map_err(|e| VmmError::ApiError(format!("QMP read: {e}")))?;
+        if n == 0 {
+            return Err(VmmError::ApiError("QMP connection closed (EOF)".into()));
+        }
         Ok(line.trim_end().to_string())
     }
 
