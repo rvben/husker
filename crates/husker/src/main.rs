@@ -76,13 +76,13 @@ enum Commands {
         #[arg(long)]
         initrd: Option<PathBuf>,
 
-        /// Number of vCPUs
-        #[arg(long, default_value = "1")]
-        cpus: u32,
+        /// Number of vCPUs (default: 1)
+        #[arg(long)]
+        cpus: Option<u32>,
 
-        /// Memory in MiB
-        #[arg(long, default_value = "128")]
-        memory: u32,
+        /// Memory in MiB (default: 128)
+        #[arg(long)]
+        memory: Option<u32>,
 
         /// Path to userdata script to execute after VM boots
         #[arg(long)]
@@ -108,6 +108,10 @@ enum Commands {
         /// (repeatable; cloud-image only)
         #[arg(long = "ssh-key")]
         ssh_key: Vec<PathBuf>,
+
+        /// Apply a named VM preset from config (explicit flags win)
+        #[arg(long)]
+        profile: Option<String>,
     },
 
     /// List running VMs
@@ -590,6 +594,71 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_cid_base")]
     cid_base: u32,
+    #[serde(default)]
+    profiles: std::collections::HashMap<String, Profile>,
+}
+
+/// Named VM preset, selectable with `--profile <name>` on run/job. Every key
+/// is optional; explicit CLI flags always win over profile values.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    cloud_image: Option<PathBuf>,
+    rootfs: Option<PathBuf>,
+    kernel: Option<PathBuf>,
+    initrd: Option<PathBuf>,
+    cpus: Option<u32>,
+    memory: Option<u32>,
+    disk_size: Option<String>,
+    #[serde(default)]
+    ssh_keys: Vec<PathBuf>,
+    vmm: Option<String>,
+    #[serde(default)]
+    env: Vec<String>,
+}
+
+/// Expand a leading `~/` against $HOME (profile ssh_keys convenience).
+fn expand_tilde(path: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix("~")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    path.to_path_buf()
+}
+
+/// Flags shared by `run` and `job` that describe the VM to create.
+#[derive(Debug, Default)]
+struct VmRequestArgs {
+    rootfs: Option<PathBuf>,
+    kernel: Option<PathBuf>,
+    initrd: Option<PathBuf>,
+    cpus: Option<u32>,
+    memory: Option<u32>,
+    vmm: Option<String>,
+    cloud_image: Option<PathBuf>,
+    disk_size: Option<String>,
+    ssh_key: Vec<PathBuf>,
+    env: Vec<String>,
+}
+
+/// Fill unset fields from a profile: explicit CLI values always win;
+/// list fields use the profile only when the CLI provided none.
+fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
+    args.cloud_image = args.cloud_image.take().or_else(|| p.cloud_image.clone());
+    args.rootfs = args.rootfs.take().or_else(|| p.rootfs.clone());
+    args.kernel = args.kernel.take().or_else(|| p.kernel.clone());
+    args.initrd = args.initrd.take().or_else(|| p.initrd.clone());
+    args.cpus = args.cpus.or(p.cpus);
+    args.memory = args.memory.or(p.memory);
+    args.disk_size = args.disk_size.take().or_else(|| p.disk_size.clone());
+    args.vmm = args.vmm.take().or_else(|| p.vmm.clone());
+    if args.ssh_key.is_empty() {
+        args.ssh_key = p.ssh_keys.iter().map(|k| expand_tilde(k)).collect();
+    }
+    if args.env.is_empty() {
+        args.env = p.env.clone();
+    }
 }
 
 #[cfg(feature = "linux-net")]
@@ -1100,8 +1169,147 @@ impl Default for Config {
             dns_servers: default_dns_servers(),
             #[cfg(feature = "linux-net")]
             cid_base: default_cid_base(),
+            profiles: Default::default(),
         }
     }
+}
+
+/// Resolve profile + defaults + guards into the create-VM JSON body.
+/// Shared by `run` and `job`. Exits the process (via exit_with_error) on
+/// user errors, matching the existing run-handler behavior.
+fn build_vm_request_body(
+    name: &str,
+    mut args: VmRequestArgs,
+    profile: Option<&str>,
+    config: &Config,
+    output: OutputFormat,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(p) = profile {
+        match config.profiles.get(p) {
+            Some(prof) => apply_profile(&mut args, prof),
+            None => {
+                let mut names: Vec<&String> = config.profiles.keys().collect();
+                names.sort();
+                let list = if names.is_empty() {
+                    "none defined".to_string()
+                } else {
+                    names
+                        .iter()
+                        .map(|n| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                exit_with_error(output, format!("unknown profile '{p}' (available: {list})"));
+            }
+        }
+    }
+
+    if args.disk_size.is_some() && args.cloud_image.is_none() {
+        exit_with_error(output, "--disk-size requires --cloud-image".to_string());
+    }
+    if !args.ssh_key.is_empty() && args.cloud_image.is_none() {
+        exit_with_error(output, "--ssh-key requires --cloud-image".to_string());
+    }
+
+    let env_pairs: Vec<(String, String)> = args
+        .env
+        .iter()
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+
+    let mut body = serde_json::json!({
+        "name": name,
+        "vcpu_count": args.cpus.unwrap_or(1),
+        "mem_size_mib": args.memory.unwrap_or(128),
+        "env": env_pairs,
+    });
+
+    if let Some(ref vmm_kind) = args.vmm {
+        body["vmm"] = serde_json::json!(vmm_kind);
+    }
+
+    if let Some(ref img) = args.cloud_image.clone() {
+        body["cloud_image"] = serde_json::json!(img);
+        let disk_size_source = if args.disk_size.is_some() {
+            "--disk-size"
+        } else {
+            "config default_disk_size"
+        };
+        if let Some(ref size) = args.disk_size.clone().or(config.default_disk_size.clone()) {
+            let bytes = husker::parse_disk_size(size)
+                .map_err(|e| anyhow::anyhow!("{disk_size_source}: {e}"))?;
+            body["disk_size"] = serde_json::json!(bytes);
+        }
+        if !args.ssh_key.is_empty() {
+            let mut keys: Vec<String> = Vec::new();
+            for path in &args.ssh_key {
+                let content = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading SSH public key {}", path.display()))?;
+                let parsed = husker::parse_ssh_public_keys(&content)
+                    .map_err(|e| anyhow::anyhow!("--ssh-key {}: {e}", path.display()))?;
+                keys.extend(parsed);
+            }
+            body["ssh_authorized_keys"] = serde_json::json!(keys);
+        }
+        if output == OutputFormat::Text {
+            eprintln!("Using: cloud-image={}", img.display());
+        }
+    } else {
+        let resolved_rootfs = match args.rootfs {
+            Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
+            None => {
+                let default = config.default_rootfs.clone();
+                if !default.exists() {
+                    eprintln!(
+                        "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass a rootfs path explicitly.",
+                        default.display()
+                    );
+                    exit_with_error(output, "default rootfs not available".to_string());
+                }
+                default
+            }
+        };
+        let resolved_kernel = match args.kernel {
+            Some(path) => path,
+            None => {
+                let default = config.default_kernel.clone();
+                if !default.exists() {
+                    eprintln!(
+                        "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
+                        default.display()
+                    );
+                    exit_with_error(output, "default kernel not available".to_string());
+                }
+                default
+            }
+        };
+        if let Some(ref initrd_path) = args.initrd {
+            body["initrd_path"] = serde_json::json!(initrd_path);
+        } else if let Some(ref default_initrd) = config.default_initrd
+            && default_initrd.exists()
+        {
+            body["initrd_path"] = serde_json::json!(default_initrd);
+        }
+        if output == OutputFormat::Text {
+            let initrd_str = body
+                .get("initrd_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(none)");
+            eprintln!(
+                "Using: kernel={} rootfs={} initrd={}",
+                resolved_kernel.display(),
+                resolved_rootfs.display(),
+                initrd_str,
+            );
+        }
+        body["kernel_path"] = serde_json::json!(resolved_kernel);
+        body["rootfs_path"] = serde_json::json!(resolved_rootfs);
+    }
+
+    Ok(body)
 }
 
 #[tokio::main]
@@ -1170,122 +1378,33 @@ async fn run(cli: Cli) -> Result<()> {
             cloud_image,
             disk_size,
             ssh_key,
+            profile,
         } => {
             let config = load_config(config_path.as_deref());
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
 
-            if disk_size.is_some() && cloud_image.is_none() {
-                exit_with_error(output, "--disk-size requires --cloud-image".to_string());
-            }
-            if !ssh_key.is_empty() && cloud_image.is_none() {
-                exit_with_error(output, "--ssh-key requires --cloud-image".to_string());
-            }
-
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
-            let env_pairs: Vec<(String, String)> = env
-                .iter()
-                .filter_map(|s| {
-                    let (k, v) = s.split_once('=')?;
-                    Some((k.to_string(), v.to_string()))
-                })
-                .collect();
+            let args = VmRequestArgs {
+                rootfs,
+                kernel,
+                initrd,
+                cpus,
+                memory,
+                vmm,
+                cloud_image,
+                disk_size,
+                ssh_key,
+                env,
+            };
+            let mut body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
-            let mut body = serde_json::json!({
-                "name": name,
-                "vcpu_count": cpus,
-                "mem_size_mib": memory,
-                "env": env_pairs,
-            });
-
-            if let Some(ref vmm_kind) = vmm {
-                body["vmm"] = serde_json::json!(vmm_kind);
-            }
             if let Some(ref userdata_path) = userdata {
                 let script = std::fs::read_to_string(userdata_path).with_context(|| {
                     format!("reading userdata script {}", userdata_path.display())
                 })?;
                 body["userdata"] = serde_json::json!(script);
-            }
-
-            if let Some(ref img) = cloud_image {
-                body["cloud_image"] = serde_json::json!(img);
-                let disk_size_source = if disk_size.is_some() {
-                    "--disk-size"
-                } else {
-                    "config default_disk_size"
-                };
-                if let Some(ref size) = disk_size.clone().or(config.default_disk_size.clone()) {
-                    let bytes = husker::parse_disk_size(size)
-                        .map_err(|e| anyhow::anyhow!("{disk_size_source}: {e}"))?;
-                    body["disk_size"] = serde_json::json!(bytes);
-                }
-                if !ssh_key.is_empty() {
-                    let mut keys: Vec<String> = Vec::new();
-                    for path in &ssh_key {
-                        let content = std::fs::read_to_string(path).with_context(|| {
-                            format!("reading SSH public key {}", path.display())
-                        })?;
-                        let parsed = husker::parse_ssh_public_keys(&content)
-                            .map_err(|e| anyhow::anyhow!("--ssh-key {}: {e}", path.display()))?;
-                        keys.extend(parsed);
-                    }
-                    body["ssh_authorized_keys"] = serde_json::json!(keys);
-                }
-                if output == OutputFormat::Text {
-                    eprintln!("Using: cloud-image={}", img.display());
-                }
-            } else {
-                let resolved_rootfs = match rootfs {
-                    Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
-                    None => {
-                        let default = config.default_rootfs.clone();
-                        if !default.exists() {
-                            eprintln!(
-                                "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass a rootfs path explicitly.",
-                                default.display()
-                            );
-                            exit_with_error(output, "default rootfs not available".to_string());
-                        }
-                        default
-                    }
-                };
-                let resolved_kernel = match kernel {
-                    Some(path) => path,
-                    None => {
-                        let default = config.default_kernel.clone();
-                        if !default.exists() {
-                            eprintln!(
-                                "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
-                                default.display()
-                            );
-                            exit_with_error(output, "default kernel not available".to_string());
-                        }
-                        default
-                    }
-                };
-                if let Some(ref initrd_path) = initrd {
-                    body["initrd_path"] = serde_json::json!(initrd_path);
-                } else if let Some(ref default_initrd) = config.default_initrd
-                    && default_initrd.exists()
-                {
-                    body["initrd_path"] = serde_json::json!(default_initrd);
-                }
-                if output == OutputFormat::Text {
-                    let initrd_str = body
-                        .get("initrd_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(none)");
-                    eprintln!(
-                        "Using: kernel={} rootfs={} initrd={}",
-                        resolved_kernel.display(),
-                        resolved_rootfs.display(),
-                        initrd_str,
-                    );
-                }
-                body["kernel_path"] = serde_json::json!(resolved_kernel);
-                body["rootfs_path"] = serde_json::json!(resolved_rootfs);
             }
 
             #[cfg(all(target_os = "linux", feature = "linux-net"))]
@@ -4226,6 +4345,45 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
         );
     }
 
+    let mut profile_names: Vec<&String> = config.profiles.keys().collect();
+    profile_names.sort();
+    for name in profile_names {
+        let p = &config.profiles[name.as_str()];
+        let mut problems: Vec<String> = Vec::new();
+        for key in &p.ssh_keys {
+            let expanded = expand_tilde(key);
+            if !expanded.exists() {
+                problems.push(format!("ssh key {} not found", expanded.display()));
+            }
+        }
+        for path in [&p.rootfs, &p.kernel, &p.initrd].into_iter().flatten() {
+            if !path.exists() {
+                problems.push(format!("{} not found", path.display()));
+            }
+        }
+        if let Some(ref size) = p.disk_size
+            && let Err(e) = husker::parse_disk_size(size)
+        {
+            problems.push(format!("disk_size: {e}"));
+        }
+        if let Some(ref v) = p.vmm
+            && !["firecracker", "qemu"].contains(&v.as_str())
+        {
+            problems.push(format!("unknown vmm '{v}'"));
+        }
+        for e in &p.env {
+            if !e.contains('=') {
+                problems.push(format!("env entry '{e}' is not KEY=VALUE"));
+            }
+        }
+        if problems.is_empty() {
+            println!("  profile {name} ... OK");
+        } else {
+            println!("  profile {name} ... FAIL ({})", problems.join("; "));
+            all_ok = false;
+        }
+    }
+
     if all_ok {
         Ok(())
     } else {
@@ -5554,5 +5712,66 @@ mod tests {
         );
         assert_eq!(VmmSelection::from_env_str("xen"), None);
         assert_eq!(VmmSelection::default(), VmmSelection::Firecracker);
+    }
+
+    fn sample_profile() -> Profile {
+        Profile {
+            cloud_image: Some(PathBuf::from("ubuntu-2404")),
+            memory: Some(2048),
+            cpus: Some(2),
+            disk_size: Some("10G".into()),
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn profile_fills_unset_flags_only() {
+        let mut args = VmRequestArgs::default();
+        args.memory = Some(4096); // explicit flag wins
+        apply_profile(&mut args, &sample_profile());
+        assert_eq!(args.memory, Some(4096));
+        assert_eq!(args.cpus, Some(2));
+        assert_eq!(args.cloud_image, Some(PathBuf::from("ubuntu-2404")));
+        assert_eq!(args.disk_size.as_deref(), Some("10G"));
+    }
+
+    #[test]
+    fn profile_ssh_keys_and_env_used_when_cli_empty() {
+        let mut args = VmRequestArgs::default();
+        args.ssh_key = vec![PathBuf::from("/cli/key.pub")];
+        let mut p = Profile::default();
+        p.ssh_keys = vec![PathBuf::from("/profile/key.pub")];
+        p.env = vec!["A=1".into()];
+        apply_profile(&mut args, &p);
+        assert_eq!(args.ssh_key, vec![PathBuf::from("/cli/key.pub")]); // CLI wins
+        assert_eq!(args.env, vec!["A=1".to_string()]); // profile fills empty
+    }
+
+    #[test]
+    fn profile_parses_from_toml_and_rejects_unknown_keys() {
+        let cfg: Config =
+            toml::from_str("[profiles.sandbox]\ncloud_image = \"ubuntu-2404\"\nmemory = 2048\n")
+                .unwrap();
+        assert_eq!(
+            cfg.profiles["sandbox"].cloud_image,
+            Some(PathBuf::from("ubuntu-2404"))
+        );
+        assert!(
+            toml::from_str::<Config>("[profiles.bad]\nnope = 1\n").is_err(),
+            "unknown profile keys must be rejected"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_expands_home_prefix() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            expand_tilde(Path::new("~/x.pub")),
+            PathBuf::from(format!("{home}/x.pub"))
+        );
+        assert_eq!(
+            expand_tilde(Path::new("/abs/x.pub")),
+            PathBuf::from("/abs/x.pub")
+        );
     }
 }
