@@ -96,7 +96,7 @@ enum Commands {
         #[arg(long, value_parser = ["firecracker", "qemu"])]
         vmm: Option<String>,
 
-        /// Boot a cloud image (qcow2) as a full UEFI VM via QEMU (Linux only)
+        /// Boot a cloud image as a full UEFI VM via QEMU (Linux only): a catalog image name or a qcow2 path
         #[arg(long)]
         cloud_image: Option<PathBuf>,
 
@@ -440,6 +440,9 @@ enum ImageAction {
         /// Optional image format (default inferred from extension)
         #[arg(long)]
         format: Option<String>,
+        /// Image kind: rootfs (default) or cloud-image (qcow2 for UEFI boot)
+        #[arg(long, value_parser = ["rootfs", "cloud-image"])]
+        kind: Option<String>,
     },
     /// List imported images
     List,
@@ -2753,6 +2756,7 @@ async fn image_command(
             name,
             source,
             format,
+            kind,
         } => {
             let mut body = serde_json::json!({
                 "name": &name,
@@ -2760,6 +2764,9 @@ async fn image_command(
             });
             if let Some(image_format) = format.as_deref() {
                 body["format"] = serde_json::json!(image_format);
+            }
+            if let Some(image_kind) = kind.as_deref() {
+                body["kind"] = serde_json::json!(image_kind);
             }
 
             let resp = api_request(
@@ -2813,11 +2820,15 @@ async fn image_command(
             } else if images.is_empty() {
                 println!("No images found");
             } else {
-                println!("{:<20} {:<8} {:>10}   FILE", "NAME", "FORMAT", "SIZE");
+                println!(
+                    "{:<20} {:<12} {:<8} {:>10}   FILE",
+                    "NAME", "KIND", "FORMAT", "SIZE"
+                );
                 for image in &images {
                     println!(
-                        "{:<20} {:<8} {:>10}   {}",
+                        "{:<20} {:<12} {:<8} {:>10}   {}",
                         image["name"].as_str().unwrap_or("-"),
+                        image["kind"].as_str().unwrap_or("rootfs"),
                         image["format"].as_str().unwrap_or("-"),
                         image["size_bytes"].as_u64().unwrap_or(0),
                         image["file_path"].as_str().unwrap_or("-"),
@@ -2851,6 +2862,10 @@ async fn image_command(
             } else {
                 let s = |key: &str| image[key].as_str().unwrap_or("-");
                 println!("Name:        {}", s("name"));
+                println!(
+                    "Kind:        {}",
+                    image["kind"].as_str().unwrap_or("rootfs")
+                );
                 println!("Format:      {}", s("format"));
                 println!("Size bytes:  {}", image["size_bytes"].as_u64().unwrap_or(0));
                 println!("Source path: {}", s("source_path"));
@@ -4799,11 +4814,13 @@ mod tests {
                         name,
                         source,
                         format,
+                        kind,
                     },
             } => {
                 assert_eq!(name, "ubuntu-base");
                 assert_eq!(source, PathBuf::from("/tmp/source.ext4"));
                 assert_eq!(format.as_deref(), Some("ext4"));
+                assert!(kind.is_none());
             }
             _ => panic!("expected image import command"),
         }

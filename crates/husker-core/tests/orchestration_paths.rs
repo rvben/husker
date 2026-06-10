@@ -1260,6 +1260,7 @@ async fn image_roundtrip_import_list_get_export_delete() {
             name: "ubuntu-base".into(),
             source_path: source_image.clone(),
             format: None,
+            kind: None,
         })
         .await
         .unwrap();
@@ -1500,6 +1501,7 @@ async fn import_image_rejects_unsafe_names() {
                 name: (*name).into(),
                 source_path: source.clone(),
                 format: None,
+                kind: None,
             })
             .await
             .unwrap_err();
@@ -1608,6 +1610,7 @@ async fn import_image_rejects_relative_source_path() {
             name: "ubuntu".into(),
             source_path: PathBuf::from("relative/rootfs.ext4"),
             format: None,
+            kind: None,
         })
         .await
         .unwrap_err();
@@ -1626,6 +1629,7 @@ async fn import_image_rejects_source_with_parent_traversal() {
             name: "ubuntu".into(),
             source_path: PathBuf::from("/var/lib/husker/../../etc/shadow"),
             format: None,
+            kind: None,
         })
         .await
         .unwrap_err();
@@ -1650,6 +1654,7 @@ async fn import_image_rejects_symlink_source() {
             name: "ubuntu".into(),
             source_path: link,
             format: None,
+            kind: None,
         })
         .await
         .unwrap_err();
@@ -1669,6 +1674,7 @@ async fn export_image_rejects_relative_destination_path() {
         name: "base".into(),
         source_path: source,
         format: None,
+        kind: None,
     })
     .await
     .unwrap();
@@ -1698,6 +1704,7 @@ async fn export_image_rejects_destination_with_parent_traversal() {
         name: "base".into(),
         source_path: source,
         format: None,
+        kind: None,
     })
     .await
     .unwrap();
@@ -1728,6 +1735,7 @@ async fn export_image_rejects_symlink_destination() {
         name: "base".into(),
         source_path: source,
         format: None,
+        kind: None,
     })
     .await
     .unwrap();

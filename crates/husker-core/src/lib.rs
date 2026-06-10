@@ -186,6 +186,9 @@ pub struct ImportImageRequest {
     pub source_path: PathBuf,
     #[serde(default)]
     pub format: Option<String>,
+    /// Image kind: "rootfs" (default) or "cloud-image" (qcow2 for UEFI boot).
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// Parameters for exporting a catalog image.
@@ -625,6 +628,32 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Choose the boot disk + mode. A cloud image boots via UEFI/OVMF from a cloned
         // qcow2; the default path boots a host kernel from a raw ext4 rootfs.
         let (disk_path, boot, is_cloud, seed_path) = if let Some(image) = req.cloud_image.as_ref() {
+            // Resolve --cloud-image: an existing host path wins; otherwise it
+            // names a catalog image of kind "cloud-image".
+            let image_path = {
+                let as_path = std::path::Path::new(image);
+                if as_path.exists() {
+                    as_path.to_path_buf()
+                } else {
+                    let rec = self.state.get_image_by_name(image).map_err(|e| match e {
+                        husker_state::StateError::ImageNotFoundByName(_) => {
+                            CoreError::InvalidArgument(format!(
+                                "cloud image '{image}' is neither an existing file nor a \
+                                 catalog image (register one with `husker image import \
+                                 --kind cloud-image`)"
+                            ))
+                        }
+                        other => CoreError::State(other),
+                    })?;
+                    if rec.kind != "cloud-image" {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "catalog image '{image}' has kind '{}', not 'cloud-image'",
+                            rec.kind
+                        )));
+                    }
+                    PathBuf::from(rec.file_path)
+                }
+            };
             // Cloud-image boot is QEMU-only. Reject an explicit non-QEMU backend request.
             if let Some(v) = req.vmm.as_deref() {
                 let kind = v.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm)?;
@@ -646,7 +675,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             let disk = vm_dir.join("disk.qcow2");
             let boot = prepare_cloud_disk(
                 self.storage_driver.as_ref(),
-                image,
+                &image_path,
                 req.disk_size,
                 &disk,
                 &self.ovmf_code_path,
@@ -1359,17 +1388,22 @@ impl<B: VmmBackend> HuskerCore<B> {
         .await
     }
 
-    /// Import a rootfs image into the managed image catalog.
+    /// Import an image into the managed image catalog.
     pub async fn import_image(&self, req: ImportImageRequest) -> Result<ImageRecord, CoreError> {
         validate_resource_name("image", &req.name)?;
         validate_host_path("import source", &req.source_path)?;
+        let kind = validate_image_kind(req.kind.as_deref())?;
         match self.state.get_image_by_name(&req.name) {
             Ok(_) => return Err(CoreError::ImageAlreadyExists(req.name)),
             Err(husker_state::StateError::ImageNotFoundByName(_)) => {}
             Err(other) => return Err(CoreError::State(other)),
         }
 
-        husker_storage::validate_rootfs(&req.source_path)?;
+        if kind == "cloud-image" {
+            husker_storage::validate_cloud_image(&req.source_path)?;
+        } else {
+            husker_storage::validate_rootfs(&req.source_path)?;
+        }
 
         let catalog_dir = self.storage.images_dir().join("catalog");
         tokio::fs::create_dir_all(&catalog_dir)
@@ -1389,15 +1423,19 @@ impl<B: VmmBackend> HuskerCore<B> {
         let metadata = tokio::fs::metadata(&image_path)
             .await
             .map_err(husker_storage::StorageError::Io)?;
+        let format = if kind == "cloud-image" && req.format.is_none() {
+            "qcow2".to_string()
+        } else {
+            req.format
+                .unwrap_or_else(|| infer_image_format(&req.source_path))
+        };
         let record = ImageRecord {
             id: Uuid::new_v4(),
             name: req.name.clone(),
             source_path: req.source_path.to_string_lossy().into_owned(),
             file_path: image_path.to_string_lossy().into_owned(),
-            format: req
-                .format
-                .unwrap_or_else(|| infer_image_format(&req.source_path)),
-            kind: "rootfs".to_string(),
+            format,
+            kind,
             size_bytes: metadata.len(),
             created_at: chrono::Utc::now(),
         };
@@ -2329,6 +2367,17 @@ fn infer_image_format(path: &Path) -> String {
         .unwrap_or_else(|| "ext4".to_string())
 }
 
+/// Validate and default an image-import kind ("rootfs" when unset).
+fn validate_image_kind(kind: Option<&str>) -> Result<String, CoreError> {
+    match kind {
+        None | Some("rootfs") => Ok("rootfs".to_string()),
+        Some("cloud-image") => Ok("cloud-image".to_string()),
+        Some(other) => Err(CoreError::InvalidArgument(format!(
+            "unknown image kind '{other}' (expected 'rootfs' or 'cloud-image')"
+        ))),
+    }
+}
+
 /// Serial log files exceeding this size are eligible for rotation.
 const LOG_ROTATE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MiB
 
@@ -2371,17 +2420,16 @@ async fn rotate_log_file(path: &std::path::Path, keep_bytes: u64) -> std::io::Re
 #[cfg(feature = "linux-net")]
 async fn prepare_cloud_disk(
     storage_driver: &dyn husker_storage::StorageDriver,
-    image: &str,
+    image: &Path,
     disk_size: Option<u64>,
     dest_disk: &Path,
     ovmf_code: &Path,
     ovmf_vars_template: &Path,
 ) -> Result<husker_vmm::BootMode, CoreError> {
-    let image_path = PathBuf::from(image);
-    if !image_path.exists() {
+    if !image.exists() {
         return Err(CoreError::InvalidArgument(format!(
             "cloud image not found: {}",
-            image_path.display()
+            image.display()
         )));
     }
     if !ovmf_code.exists() || !ovmf_vars_template.exists() {
@@ -2391,7 +2439,7 @@ async fn prepare_cloud_disk(
             ovmf_vars_template.display()
         )));
     }
-    storage_driver.clone_rootfs(&image_path, dest_disk).await?;
+    storage_driver.clone_rootfs(image, dest_disk).await?;
     if let Some(size) = disk_size {
         husker_storage::resize_disk(dest_disk, size).await?;
     }
@@ -2505,16 +2553,9 @@ mod tests {
         let dest = tmp.path().join("vm/disk.qcow2");
         let driver = husker_storage::default_storage_driver();
         // disk_size = None so no qemu-img resize is needed (keeps the test hermetic).
-        let boot = super::prepare_cloud_disk(
-            driver.as_ref(),
-            image.to_str().unwrap(),
-            None,
-            &dest,
-            &code,
-            &vars,
-        )
-        .await
-        .unwrap();
+        let boot = super::prepare_cloud_disk(driver.as_ref(), &image, None, &dest, &code, &vars)
+            .await
+            .unwrap();
         match boot {
             husker_vmm::BootMode::Uefi {
                 ovmf_code,
@@ -2540,7 +2581,7 @@ mod tests {
         let driver = husker_storage::default_storage_driver();
         let err = super::prepare_cloud_disk(
             driver.as_ref(),
-            "/no/such/image.qcow2",
+            Path::new("/no/such/image.qcow2"),
             None,
             &tmp.path().join("d.qcow2"),
             &code,
@@ -2563,7 +2604,7 @@ mod tests {
         let driver = husker_storage::default_storage_driver();
         let err = super::prepare_cloud_disk(
             driver.as_ref(),
-            image.to_str().unwrap(),
+            &image,
             None,
             &tmp.path().join("d.qcow2"),
             &tmp.path().join("missing-code.fd"),
@@ -2956,6 +2997,17 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(req.cloud_image.is_none());
         assert!(req.disk_size.is_none());
         assert!(req.ssh_authorized_keys.is_empty());
+    }
+
+    #[test]
+    fn import_image_kind_validation() {
+        assert_eq!(validate_image_kind(None).unwrap(), "rootfs");
+        assert_eq!(
+            validate_image_kind(Some("cloud-image")).unwrap(),
+            "cloud-image"
+        );
+        assert_eq!(validate_image_kind(Some("rootfs")).unwrap(), "rootfs");
+        assert!(validate_image_kind(Some("bogus")).is_err());
     }
 
     #[test]
