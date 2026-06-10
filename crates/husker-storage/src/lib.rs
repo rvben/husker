@@ -17,6 +17,8 @@ pub enum StorageError {
     KernelNotFound(PathBuf),
     #[error("{0}")]
     InvalidKernel(String),
+    #[error("invalid cloud image: {0}")]
+    InvalidCloudImage(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("command failed: {0}")]
@@ -235,6 +237,30 @@ pub fn validate_rootfs(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Validate that a cloud image exists and is a qcow2 file (the UEFI boot path
+/// attaches it with format=qcow2, so anything else fails inside QEMU later
+/// with a much less useful error).
+pub fn validate_cloud_image(path: &Path) -> Result<(), StorageError> {
+    use std::io::Read;
+    if !path.exists() {
+        return Err(StorageError::InvalidCloudImage(format!(
+            "file not found: {}",
+            path.display()
+        )));
+    }
+    let mut file = std::fs::File::open(path).map_err(StorageError::Io)?;
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic).map_err(StorageError::Io)?;
+    // qcow2 magic: "QFI\xfb"
+    if n < 4 || magic != [0x51, 0x46, 0x49, 0xfb] {
+        return Err(StorageError::InvalidCloudImage(format!(
+            "not a qcow2 image (bad magic): {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +410,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StorageError::CommandFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn validate_cloud_image_accepts_qcow2_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("img.qcow2");
+        let mut data = vec![0u8; 512];
+        data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
+        std::fs::write(&path, &data).unwrap();
+        assert!(validate_cloud_image(&path).is_ok());
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_non_qcow2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("img.raw");
+        std::fs::write(&path, vec![0u8; 512]).unwrap();
+        assert!(matches!(
+            validate_cloud_image(&path),
+            Err(StorageError::InvalidCloudImage(_))
+        ));
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_missing_file() {
+        assert!(validate_cloud_image(Path::new("/nonexistent/img.qcow2")).is_err());
     }
 }
