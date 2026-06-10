@@ -3107,6 +3107,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
+                network: "nat".into(),
             })
             .unwrap();
 
@@ -3136,6 +3137,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
+                network: "nat".into(),
             })
             .unwrap();
 
@@ -3434,6 +3436,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
+                network: "nat".into(),
             })
             .unwrap();
 
@@ -3803,6 +3806,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
+                network: "nat".into(),
             })
             .unwrap();
 
@@ -3926,6 +3930,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
+                network: "nat".into(),
             })
             .unwrap();
         let core = make_core(
@@ -4749,6 +4754,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: Some("data".into()),
+                network: "nat".into(),
             })
             .unwrap();
 

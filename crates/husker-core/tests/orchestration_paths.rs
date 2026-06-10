@@ -196,6 +196,7 @@ fn vm_record(
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     }
 }
 

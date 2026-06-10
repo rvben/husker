@@ -119,6 +119,7 @@ async fn health_counts_vms_correctly() {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
+            network: "nat".into(),
         };
         state.insert_vm(&record).unwrap();
     }
@@ -331,6 +332,7 @@ async fn snapshot_endpoints_roundtrip() {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
+            network: "nat".into(),
         })
         .unwrap();
 
@@ -849,6 +851,7 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1003,6 +1006,7 @@ async fn vm_response_json_structure() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1085,6 +1089,7 @@ async fn list_vms_returns_all_records() {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
+            network: "nat".into(),
         };
         state.insert_vm(&record).unwrap();
     }
@@ -1322,6 +1327,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1376,6 +1382,7 @@ async fn vm_response_with_null_optional_fields() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1450,6 +1457,7 @@ async fn logs_returns_serial_output() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1508,6 +1516,7 @@ async fn logs_tail_returns_last_n_lines() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1566,6 +1575,7 @@ async fn logs_no_serial_file_returns_404() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1626,6 +1636,7 @@ fn logs_test_core(
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 
@@ -1867,6 +1878,7 @@ async fn logs_large_file_is_truncated() {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state.insert_vm(&record).unwrap();
 

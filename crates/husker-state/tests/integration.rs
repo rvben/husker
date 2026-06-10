@@ -28,6 +28,7 @@ fn make_record(name: &str) -> VmRecord {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     }
 }
 

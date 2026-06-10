@@ -902,6 +902,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
+            network: "nat".to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1024,6 +1025,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot_mode: "direct".to_string(),
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
+            network: "nat".to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -3370,6 +3372,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
+            network: "nat".into(),
         }
     }
 
@@ -3648,6 +3651,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             boot_mode: "direct".into(),
             balloon: false,
             volume: Some("mydata".into()),
+            network: "nat".into(),
         };
         state.insert_vm(&vm).unwrap();
 

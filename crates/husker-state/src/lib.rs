@@ -102,6 +102,8 @@ pub struct VmRecord {
     pub balloon: bool,
     /// Name of the persistent volume attached to this VM, or None.
     pub volume: Option<String>,
+    /// Network mode: "nat" (husker-managed NAT) or "bridged" (LAN bridge via DHCP).
+    pub network: String,
 }
 
 /// Persistent port forward record.
@@ -398,6 +400,13 @@ impl StateStore {
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN volume TEXT", []);
         let _ = conn.execute("ALTER TABLE services ADD COLUMN volume TEXT", []);
 
+        // Migration: record the network mode (idempotent). NOT NULL DEFAULT keeps
+        // ADD COLUMN working on populated tables and back-fills legacy rows.
+        let _ = conn.execute(
+            "ALTER TABLE vms ADD COLUMN network TEXT NOT NULL DEFAULT 'nat'",
+            [],
+        );
+
         Ok(())
     }
 
@@ -410,8 +419,9 @@ impl StateStore {
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                               created_at, updated_at, userdata, userdata_status, userdata_env,
-                              service_id, service_ordinal, vmm, boot_mode, balloon, volume)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                              service_id, service_ordinal, vmm, boot_mode, balloon, volume,
+                              network)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -436,6 +446,7 @@ impl StateStore {
                 record.boot_mode,
                 record.balloon as i64,
                 record.volume,
+                record.network,
             ],
         )
         .map_err(|e| match &e {
@@ -457,7 +468,8 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume,
+                    network
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -475,7 +487,8 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume,
+                    network
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -493,7 +506,8 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume,
+                    network
              FROM vms ORDER BY created_at",
         )?;
 
@@ -511,7 +525,8 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume,
+                    network
              FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
         )?;
         let records = stmt
@@ -1319,7 +1334,8 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume,
+                    network
              FROM vms WHERE volume = ?1 LIMIT 1",
             params![volume_name],
             row_to_vm_record,
@@ -1391,6 +1407,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
             raw != 0
         },
         volume: row.get(22)?,
+        network: row.get(23)?,
     })
 }
 
@@ -1541,6 +1558,7 @@ mod tests {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
+            network: "nat".into(),
         }
     }
 
@@ -2848,6 +2866,45 @@ mod tests {
         assert!(
             fetched.volume.is_none(),
             "legacy service row must have volume = None"
+        );
+    }
+
+    // ── vms.network field ─────────────────────────────────────────────
+
+    #[test]
+    fn network_field_round_trips() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("net-vm");
+        rec.network = "nat".to_string();
+        store.insert_vm(&rec).unwrap();
+        let fetched = store.get_vm_by_name("net-vm").unwrap();
+        assert_eq!(fetched.network, "nat");
+    }
+
+    #[test]
+    fn network_migration_default_applied() {
+        // A row inserted without the network column must read back as "nat"
+        // because the migration NOT NULL DEFAULT 'nat' backfills it.
+        let store = StateStore::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                                  tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                                  created_at, updated_at, userdata, userdata_status, userdata_env,
+                                  service_id, service_ordinal, vmm, boot_mode, balloon, volume)
+                 VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', 'legacy-net', 'stopped',
+                         NULL, 1, 128, 5, NULL, NULL, NULL, '/kernel', '/rootfs',
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                         NULL, NULL, NULL, NULL, NULL, 'firecracker', 'direct', 0, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let rec = store.get_vm_by_name("legacy-net").unwrap();
+        assert_eq!(
+            rec.network, "nat",
+            "legacy VM row without network column must default to nat"
         );
     }
 }

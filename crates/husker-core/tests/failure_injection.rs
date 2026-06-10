@@ -147,6 +147,7 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
+        network: "nat".into(),
     };
     state_store.insert_vm(&record).unwrap();
 
