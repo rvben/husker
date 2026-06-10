@@ -603,7 +603,7 @@ impl StateStore {
         let conn = self.lock()?;
         let disk_size_i64 = record
             .disk_size
-            .map(|v| i64::try_from(v))
+            .map(i64::try_from)
             .transpose()
             .map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(

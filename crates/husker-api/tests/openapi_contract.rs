@@ -91,6 +91,7 @@ async fn openapi_contains_critical_paths() {
         "/v1/snapshots/{name}/restore",
         "/v1/vms",
         "/v1/vms/{name}",
+        "/v1/vms/{name}/balloon",
         "/v1/vms/{name}/exec",
         "/v1/vms/{name}/files/read",
         "/v1/vms/{name}/files/write",

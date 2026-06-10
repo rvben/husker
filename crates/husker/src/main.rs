@@ -109,6 +109,10 @@ enum Commands {
         #[arg(long = "ssh-key")]
         ssh_key: Vec<PathBuf>,
 
+        /// Attach a virtio memory balloon (resize later with: husker balloon)
+        #[arg(long)]
+        balloon: bool,
+
         /// Apply a named VM preset from config (explicit flags win)
         #[arg(long)]
         profile: Option<String>,
@@ -147,6 +151,14 @@ enum Commands {
     Destroy {
         /// VM name
         name: String,
+    },
+
+    /// Resize a VM's memory balloon (MiB reclaimed from the guest)
+    Balloon {
+        /// VM name
+        name: String,
+        /// Target balloon size in MiB (memory reclaimed from the guest)
+        amount_mib: u32,
     },
 
     /// Execute a command in a VM
@@ -223,6 +235,10 @@ enum Commands {
         /// (repeatable; cloud-image only)
         #[arg(long = "ssh-key")]
         ssh_key: Vec<PathBuf>,
+
+        /// Attach a virtio memory balloon (resize later with: husker balloon)
+        #[arg(long)]
+        balloon: bool,
 
         /// Apply a named VM preset from config (explicit flags win)
         #[arg(long)]
@@ -400,6 +416,7 @@ enum HostGroupAction {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum ServiceAction {
     /// Create a service
     Create {
@@ -435,6 +452,16 @@ enum ServiceAction {
         /// Environment variable KEY=VALUE for the userdata script (repeatable)
         #[arg(long = "env")]
         env: Vec<String>,
+        /// Boot instances from a stock cloud image (catalog name or qcow2 path);
+        /// when set, --rootfs and --kernel become optional
+        #[arg(long)]
+        cloud_image: Option<String>,
+        /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
+        #[arg(long)]
+        disk_size: Option<String>,
+        /// Attach a virtio memory balloon to each instance
+        #[arg(long)]
+        balloon: bool,
     },
     /// List services
     List,
@@ -684,6 +711,7 @@ struct Profile {
     vmm: Option<String>,
     #[serde(default)]
     env: Vec<String>,
+    balloon: Option<bool>,
 }
 
 /// Expand a leading `~/` against $HOME (profile ssh_keys convenience).
@@ -709,10 +737,13 @@ struct VmRequestArgs {
     disk_size: Option<String>,
     ssh_key: Vec<PathBuf>,
     env: Vec<String>,
+    balloon: bool,
 }
 
 /// Fill unset fields from a profile: explicit CLI values always win;
 /// list fields use the profile only when the CLI provided none.
+/// For bool fields (balloon), the profile fills only when the CLI flag is false
+/// (since false is the default/unset state; true is always an explicit opt-in).
 fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
     args.cloud_image = args.cloud_image.take().or_else(|| p.cloud_image.clone());
     args.rootfs = args.rootfs.take().or_else(|| p.rootfs.clone());
@@ -727,6 +758,9 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
     }
     if args.env.is_empty() {
         args.env = p.env.clone();
+    }
+    if !args.balloon {
+        args.balloon = p.balloon.unwrap_or(false);
     }
 }
 
@@ -1159,6 +1193,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "secret reveal"
     );
     let output_fields: Vec<&'static str> = match path {
+        "balloon" => vec!["status", "action", "vm", "amount_mib"],
         "run" => vec!["status", "action", "vm", "userdata_queued"],
         "job" => vec!["status", "action", "vm", "exit_code", "stdout", "stderr"],
         "list" => vec![
@@ -1281,6 +1316,8 @@ fn build_vm_request_body(
         exit_with_error(output, "--ssh-key requires --cloud-image".to_string());
     }
 
+    let balloon = args.balloon;
+
     let env_pairs: Vec<(String, String)> = args
         .env
         .iter()
@@ -1379,6 +1416,10 @@ fn build_vm_request_body(
         body["rootfs_path"] = serde_json::json!(resolved_rootfs);
     }
 
+    if balloon {
+        body["balloon"] = serde_json::json!(true);
+    }
+
     Ok(body)
 }
 
@@ -1448,6 +1489,7 @@ async fn run(cli: Cli) -> Result<()> {
             cloud_image,
             disk_size,
             ssh_key,
+            balloon,
             profile,
         } => {
             let config = load_config(config_path.as_deref());
@@ -1467,6 +1509,7 @@ async fn run(cli: Cli) -> Result<()> {
                 disk_size,
                 ssh_key,
                 env,
+                balloon,
             };
             let mut body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
@@ -1738,6 +1781,36 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Commands::Balloon { name, amount_mib } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            let client = reqwest::Client::new();
+            let body = serde_json::json!({ "amount_mib": amount_mib });
+            let resp = api_request(
+                with_api_auth(
+                    client.put(format!("{api_url}/v1/vms/{name}/balloon")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "balloon",
+                        "vm": name,
+                        "amount_mib": amount_mib,
+                    }),
+                    format!("Balloon set: {name} -> {amount_mib} MiB"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+            Ok(())
+        }
         Commands::Exec {
             name,
             workdir,
@@ -1826,6 +1899,7 @@ async fn run(cli: Cli) -> Result<()> {
             cloud_image,
             disk_size,
             ssh_key,
+            balloon,
             profile,
             timeout,
             keep,
@@ -1848,6 +1922,7 @@ async fn run(cli: Cli) -> Result<()> {
                 disk_size,
                 ssh_key,
                 env: Vec::new(),
+                balloon,
             };
             let body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
@@ -2687,43 +2762,57 @@ async fn service_command(
             memory,
             userdata,
             env,
+            cloud_image,
+            disk_size,
+            balloon,
         } => {
-            // Rootfs resolution precedence:
-            //   1. --rootfs given: resolve through catalog (same as `husker run`)
-            //   2. --image given: treat the value as a rootfs reference (path or
-            //      bare image name) and resolve through the same catalog lookup
-            //   3. neither: fall back to the configured default_rootfs
-            let rootfs = match rootfs {
-                Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
-                None => match image.as_ref().map(PathBuf::from) {
-                    Some(image_path) => husker::resolve_rootfs_arg(image_path, &config.data_dir),
+            // Rootfs/kernel resolution:
+            //   When --cloud-image is given, rootfs and kernel are omitted from
+            //   the request body (the core validates/boots via UEFI).
+            //   Otherwise, the existing default-resolution path applies.
+            let (rootfs_val, kernel_val) = if cloud_image.is_some() {
+                // cloud-image path: kernel and rootfs are not required
+                (None, None)
+            } else {
+                // Rootfs resolution precedence:
+                //   1. --rootfs given: resolve through catalog (same as `husker run`)
+                //   2. --image given: treat the value as a rootfs reference (path or
+                //      bare image name) and resolve through the same catalog lookup
+                //   3. neither: fall back to the configured default_rootfs
+                let resolved_rootfs = match rootfs {
+                    Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
+                    None => match image.as_ref().map(PathBuf::from) {
+                        Some(image_path) => {
+                            husker::resolve_rootfs_arg(image_path, &config.data_dir)
+                        }
+                        None => {
+                            let default = config.default_rootfs.clone();
+                            if !default.exists() {
+                                eprintln!(
+                                    "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass --rootfs, --image, or --cloud-image.",
+                                    default.display()
+                                );
+                                exit_with_error(output, "default rootfs not available".to_string());
+                            }
+                            default
+                        }
+                    },
+                };
+                let resolved_kernel = match kernel {
+                    Some(path) => path,
                     None => {
-                        let default = config.default_rootfs.clone();
+                        let default = config.default_kernel.clone();
                         if !default.exists() {
                             eprintln!(
-                                "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass --rootfs or --image explicitly.",
+                                "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel or --cloud-image.",
                                 default.display()
                             );
-                            exit_with_error(output, "default rootfs not available".to_string());
+                            exit_with_error(output, "default kernel not available".to_string());
                         }
                         default
                     }
-                },
-            };
-
-            let kernel = match kernel {
-                Some(path) => path,
-                None => {
-                    let default = config.default_kernel.clone();
-                    if !default.exists() {
-                        eprintln!(
-                            "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
-                            default.display()
-                        );
-                        exit_with_error(output, "default kernel not available".to_string());
-                    }
-                    default
-                }
+                };
+                (Some(resolved_rootfs), Some(resolved_kernel))
             };
 
             let env_pairs: Vec<(String, String)> = env
@@ -2737,10 +2826,14 @@ async fn service_command(
             let mut body = serde_json::json!({
                 "name": &name,
                 "desired_instances": desired_instances,
-                "rootfs_path": rootfs,
-                "kernel_path": kernel,
                 "env": env_pairs,
             });
+            if let Some(ref rootfs) = rootfs_val {
+                body["rootfs_path"] = serde_json::json!(rootfs);
+            }
+            if let Some(ref kernel) = kernel_val {
+                body["kernel_path"] = serde_json::json!(kernel);
+            }
             if let Some(group) = host_group.as_deref() {
                 body["host_group"] = serde_json::json!(group);
             }
@@ -2749,7 +2842,8 @@ async fn service_command(
             }
             if let Some(ref initrd_path) = initrd {
                 body["initrd_path"] = serde_json::json!(initrd_path);
-            } else if let Some(ref default_initrd) = config.default_initrd
+            } else if rootfs_val.is_some()
+                && let Some(ref default_initrd) = config.default_initrd
                 && default_initrd.exists()
             {
                 body["initrd_path"] = serde_json::json!(default_initrd);
@@ -2765,6 +2859,19 @@ async fn service_command(
                     format!("reading userdata script {}", userdata_path.display())
                 })?;
                 body["userdata"] = serde_json::json!(script);
+            }
+            if let Some(ref ci) = cloud_image {
+                body["cloud_image"] = serde_json::json!(ci);
+                if let Some(ref size) = disk_size {
+                    let bytes = husker::parse_disk_size(size)
+                        .map_err(|e| anyhow::anyhow!("--disk-size: {e}"))?;
+                    body["disk_size"] = serde_json::json!(bytes);
+                }
+            } else if disk_size.is_some() {
+                exit_with_error(output, "--disk-size requires --cloud-image".to_string());
+            }
+            if balloon {
+                body["balloon"] = serde_json::json!(true);
             }
 
             let resp = api_request(
@@ -2901,6 +3008,15 @@ async fn service_command(
                     "Image:             {}",
                     service["image"].as_str().unwrap_or("-")
                 );
+                if let Some(ci) = service["cloud_image"].as_str() {
+                    println!("Cloud image:       {ci}");
+                }
+                if let Some(ds) = service["disk_size"].as_u64() {
+                    println!("Disk size:         {ds}");
+                }
+                if service["balloon"].as_bool().unwrap_or(false) {
+                    println!("Balloon:           true");
+                }
                 println!(
                     "Host group ID:     {}",
                     service["host_group_id"].as_str().unwrap_or("-")
@@ -5244,6 +5360,9 @@ mod tests {
                         memory,
                         userdata,
                         env,
+                        cloud_image,
+                        disk_size,
+                        balloon,
                     },
             } => {
                 assert_eq!(name, "api");
@@ -5257,6 +5376,9 @@ mod tests {
                 assert!(memory.is_none());
                 assert!(userdata.is_none());
                 assert!(env.is_empty());
+                assert!(cloud_image.is_none());
+                assert!(disk_size.is_none());
+                assert!(!balloon);
             }
             _ => panic!("expected service create command"),
         }
@@ -5292,6 +5414,9 @@ mod tests {
                         memory,
                         userdata,
                         env,
+                        cloud_image,
+                        disk_size,
+                        balloon,
                     },
             } => {
                 assert_eq!(name, "api");
@@ -5299,6 +5424,9 @@ mod tests {
                 assert_eq!(desired_instances, 3);
                 assert_eq!(image.as_deref(), Some("ghcr.io/acme/api:1.2.3"));
                 assert!(rootfs.is_none());
+                assert!(cloud_image.is_none());
+                assert!(disk_size.is_none());
+                assert!(!balloon);
                 assert!(kernel.is_none());
                 assert!(initrd.is_none());
                 assert!(vcpus.is_none());
@@ -5308,6 +5436,174 @@ mod tests {
             }
             _ => panic!("expected service create command"),
         }
+    }
+
+    #[test]
+    fn parse_balloon_command() {
+        let cli = Cli::try_parse_from(["husker", "balloon", "myvm", "128"])
+            .expect("balloon command parses");
+        match cli.command {
+            Commands::Balloon { name, amount_mib } => {
+                assert_eq!(name, "myvm");
+                assert_eq!(amount_mib, 128);
+            }
+            _ => panic!("expected balloon command"),
+        }
+    }
+
+    #[test]
+    fn parse_run_with_balloon_flag() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "run",
+            "--cloud-image",
+            "/tmp/ubuntu.qcow2",
+            "--balloon",
+        ])
+        .expect("run --balloon parses");
+        match cli.command {
+            Commands::Run { balloon, .. } => {
+                assert!(balloon, "balloon flag should be set");
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn parse_run_without_balloon_flag_defaults_false() {
+        let cli = Cli::try_parse_from(["husker", "run"]).expect("run without balloon parses");
+        match cli.command {
+            Commands::Run { balloon, .. } => {
+                assert!(!balloon, "balloon should default to false");
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn parse_job_with_balloon_flag() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "job",
+            "--cloud-image",
+            "/tmp/ubuntu.qcow2",
+            "--balloon",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .expect("job --balloon parses");
+        match cli.command {
+            Commands::Job { balloon, .. } => {
+                assert!(balloon, "balloon flag should be set");
+            }
+            _ => panic!("expected job command"),
+        }
+    }
+
+    #[test]
+    fn parse_service_create_with_cloud_image_flags() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "service",
+            "create",
+            "cloudsvc",
+            "--cloud-image",
+            "ubuntu-2404",
+            "--disk-size",
+            "20G",
+            "--balloon",
+            "--desired-instances",
+            "2",
+        ])
+        .expect("service create with cloud flags parses");
+        match cli.command {
+            Commands::Service {
+                action:
+                    ServiceAction::Create {
+                        name,
+                        cloud_image,
+                        disk_size,
+                        balloon,
+                        desired_instances,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "cloudsvc");
+                assert_eq!(cloud_image.as_deref(), Some("ubuntu-2404"));
+                assert_eq!(disk_size.as_deref(), Some("20G"));
+                assert!(balloon);
+                assert_eq!(desired_instances, 2);
+            }
+            _ => panic!("expected service create command"),
+        }
+    }
+
+    #[test]
+    fn apply_profile_balloon_false_uses_profile_value() {
+        let mut args = VmRequestArgs {
+            balloon: false,
+            ..VmRequestArgs::default()
+        };
+        let p = Profile {
+            balloon: Some(true),
+            ..Profile::default()
+        };
+        apply_profile(&mut args, &p);
+        assert!(
+            args.balloon,
+            "profile balloon=true should fill when CLI is false"
+        );
+    }
+
+    #[test]
+    fn apply_profile_balloon_true_not_overridden_by_profile() {
+        let mut args = VmRequestArgs {
+            balloon: true,
+            ..VmRequestArgs::default()
+        };
+        let p = Profile {
+            balloon: Some(false),
+            ..Profile::default()
+        };
+        apply_profile(&mut args, &p);
+        assert!(
+            args.balloon,
+            "CLI balloon=true should win over profile false"
+        );
+    }
+
+    #[test]
+    fn apply_profile_balloon_none_in_profile_leaves_false() {
+        let mut args = VmRequestArgs {
+            balloon: false,
+            ..VmRequestArgs::default()
+        };
+        let p = Profile {
+            balloon: None,
+            ..Profile::default()
+        };
+        apply_profile(&mut args, &p);
+        assert!(!args.balloon, "no profile balloon should leave false");
+    }
+
+    #[test]
+    fn cli_schema_balloon_command_annotated() {
+        let schema = build_cli_schema();
+        let cmds = &schema["commands"];
+        assert!(
+            cmds["balloon"].is_object(),
+            "balloon command must exist in schema"
+        );
+        assert_eq!(
+            cmds["balloon"]["mutating"], true,
+            "balloon is a mutating command"
+        );
+        let fields = cmds["balloon"]["output_fields"].as_array().unwrap();
+        let field_strs: Vec<&str> = fields.iter().filter_map(|v| v.as_str()).collect();
+        assert!(field_strs.contains(&"status"));
+        assert!(field_strs.contains(&"amount_mib"));
+        assert!(field_strs.contains(&"vm"));
     }
 
     #[test]

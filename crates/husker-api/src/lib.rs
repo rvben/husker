@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 #[cfg(feature = "linux-net")]
 use axum::routing::delete;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use utoipa::OpenApi;
@@ -81,6 +81,11 @@ pub struct ServiceResponse {
     pub kernel_path: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_size: Option<u64>,
+    pub balloon: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -169,6 +174,16 @@ pub struct RevealedSecretResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ScaleServiceRequest {
     pub desired_instances: u32,
+}
+
+/// Body for `PUT /v1/vms/{name}/balloon`.
+///
+/// `amount_mib` is the balloon target: memory reclaimed FROM the guest, not
+/// the remaining guest size. Requires the VM to have been created with
+/// `balloon: true`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BalloonRequest {
+    pub amount_mib: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -490,6 +505,7 @@ pub enum WsShellOutput {
         pause_vm,
         resume_vm,
         destroy_vm,
+        set_balloon,
         exec_vm,
         read_file_handler,
         write_file_handler,
@@ -535,6 +551,7 @@ pub enum WsShellOutput {
         CreateSecretRequest,
         RotateSecretRequest,
         ScaleServiceRequest,
+        BalloonRequest,
         CreateVmRequest,
     )),
     tags(
@@ -745,6 +762,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
         .route("/v1/vms/{name}/pause", post(pause_vm::<B>))
         .route("/v1/vms/{name}/resume", post(resume_vm::<B>))
+        .route("/v1/vms/{name}/balloon", put(set_balloon::<B>))
         .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
@@ -1757,6 +1775,30 @@ async fn resume_vm<B: VmmBackend + 'static>(
 }
 
 #[utoipa::path(
+    put,
+    path = "/v1/vms/{name}/balloon",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    request_body = BalloonRequest,
+    responses(
+        (status = 204, description = "Balloon resized"),
+        (status = 400, description = "VM was not created with --balloon", body = ErrorResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "VM is not running", body = ErrorResponse)
+    )
+)]
+async fn set_balloon<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Json(req): Json<BalloonRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.set_balloon(&name, req.amount_mib)
+        .await
+        .map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
     delete,
     path = "/v1/vms/{name}",
     tag = "vms",
@@ -2739,6 +2781,9 @@ fn service_to_response<B: VmmBackend + 'static>(
         kernel_path: r.kernel_path,
         created_at: r.created_at.to_rfc3339(),
         updated_at: r.updated_at.to_rfc3339(),
+        cloud_image: r.cloud_image,
+        disk_size: r.disk_size,
+        balloon: r.balloon,
     }
 }
 
@@ -3693,6 +3738,87 @@ mod tests {
             .oneshot(
                 Request::post("/v1/vms/nonexistent/resume")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── balloon handler tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn balloon_on_vm_without_balloon_flag_returns_400() {
+        // Insert a VM with balloon=false (the default); the endpoint must
+        // return 400 before ever calling the VMM backend.
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let now = chrono::Utc::now();
+        state
+            .insert_vm(&husker_state::VmRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "no-balloon-vm".into(),
+                state: "running".into(),
+                pid: Some(42),
+                vcpu_count: 1,
+                mem_size_mib: 256,
+                vsock_cid: 10,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "/tmp/vmlinux".into(),
+                rootfs_path: "/tmp/rootfs.ext4".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+                service_id: None,
+                service_ordinal: None,
+                vmm: "firecracker".into(),
+                boot_mode: "direct".into(),
+                balloon: false,
+            })
+            .unwrap();
+        let core = make_core(
+            state,
+            husker_storage::StorageConfig {
+                data_dir: std::path::PathBuf::from("/tmp/husker-test"),
+            },
+            std::path::PathBuf::from("/tmp/husker-test/run"),
+        );
+        let app = router(core);
+        let body = serde_json::json!({ "amount_mib": 64 });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/vms/no-balloon-vm/balloon")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "invalid_argument");
+        assert!(
+            json["message"].as_str().unwrap_or("").contains("--balloon"),
+            "error message should mention --balloon"
+        );
+    }
+
+    #[tokio::test]
+    async fn balloon_on_missing_vm_returns_404() {
+        let app = router(test_core());
+        let body = serde_json::json!({ "amount_mib": 64 });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/vms/nonexistent/balloon")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
             )
             .await
