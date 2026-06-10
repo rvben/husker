@@ -88,6 +88,17 @@ jobs:
           uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" maturin wheel
           echo "${RUNNER_TEMP}/build-venv/bin" >> "$GITHUB_PATH"
 
+      # Cloud-image is x86_64 Linux only (OVMF is x86_64; aarch64 cloud images
+      # are not supported). Only the x86_64-unknown-linux-gnu target embeds the
+      # guest agent; aarch64 Linux and both macOS targets skip this step.
+      - name: Build + stage guest agent for embedding (x86_64 Linux only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --package husker-agent --profile agent --target x86_64-unknown-linux-musl
+          echo "HUSKER_EMBED_AGENT_BIN=${GITHUB_WORKSPACE}/target/x86_64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
+
       - name: Build binary (Linux, cross via zigbuild for manylinux_2_28)
         if: runner.os == 'Linux'
         run: cargo zigbuild --release --target ${{ matrix.target }}.2.28 --package husker

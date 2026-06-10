@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -32,6 +32,13 @@ build-agent:
 build-with-agent: build-agent
 	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/x86_64-unknown-linux-musl/agent/husker-agent \
 		cargo build -p husker
+
+# Release build of the daemon WITH the embedded guest agent (cloud-image support).
+# Requires the x86_64-musl target + linker (Linux/CI). Release/CI for cloud-image
+# support builds the agent first; see .github/workflows/release.yml.
+build-release-with-agent: build-agent
+	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/x86_64-unknown-linux-musl/agent/husker-agent \
+		cargo build --release -p husker
 
 # Build guest agent for ARM64 (for macOS/VZ guests)
 build-agent-aarch64:
