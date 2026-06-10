@@ -1397,6 +1397,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             format: req
                 .format
                 .unwrap_or_else(|| infer_image_format(&req.source_path)),
+            kind: "rootfs".to_string(),
             size_bytes: metadata.len(),
             created_at: chrono::Utc::now(),
         };

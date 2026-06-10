@@ -155,6 +155,9 @@ pub struct ImageRecord {
     pub source_path: String,
     pub file_path: String,
     pub format: String,
+    /// Image kind: "rootfs" (raw ext4 for direct-kernel boot, the default)
+    /// or "cloud-image" (qcow2 booted via UEFI/OVMF).
+    pub kind: String,
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
 }
@@ -273,6 +276,7 @@ impl StateStore {
                 source_path TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 format TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'rootfs',
                 size_bytes INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -306,6 +310,14 @@ impl StateStore {
         // ADD COLUMN working on populated tables and back-fills legacy rows.
         let _ = conn.execute(
             "ALTER TABLE vms ADD COLUMN boot_mode TEXT NOT NULL DEFAULT 'direct'",
+            [],
+        );
+
+        // Migration: add kind column to the image catalog (idempotent).
+        // NOT NULL DEFAULT keeps ADD COLUMN working on populated tables and
+        // back-fills legacy rows as "rootfs".
+        let _ = conn.execute(
+            "ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'rootfs'",
             [],
         );
 
@@ -771,14 +783,15 @@ impl StateStore {
 
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO images (id, name, source_path, file_path, format, size_bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO images (id, name, source_path, file_path, format, kind, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 record.id.to_string(),
                 record.name,
                 record.source_path,
                 record.file_path,
                 record.format,
+                record.kind,
                 size_bytes_i64,
                 record.created_at.to_rfc3339(),
             ],
@@ -798,7 +811,7 @@ impl StateStore {
     pub fn get_image(&self, id: Uuid) -> Result<ImageRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, source_path, file_path, format, size_bytes, created_at
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at
              FROM images WHERE id = ?1",
             params![id.to_string()],
             row_to_image_record,
@@ -813,7 +826,7 @@ impl StateStore {
     pub fn get_image_by_name(&self, name: &str) -> Result<ImageRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, source_path, file_path, format, size_bytes, created_at
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at
              FROM images WHERE name = ?1",
             params![name],
             row_to_image_record,
@@ -828,7 +841,7 @@ impl StateStore {
     pub fn list_images(&self) -> Result<Vec<ImageRecord>, StateError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, source_path, file_path, format, size_bytes, created_at
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at
              FROM images ORDER BY created_at",
         )?;
         let records = stmt
@@ -1256,10 +1269,10 @@ fn row_to_snapshot_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotR
 
 fn row_to_image_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord> {
     let id_str: String = row.get(0)?;
-    let created_str: String = row.get(6)?;
-    let size_bytes: i64 = row.get(5)?;
+    let created_str: String = row.get(7)?;
+    let size_bytes: i64 = row.get(6)?;
     let size_bytes = u64::try_from(size_bytes)
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, size_bytes))?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size_bytes))?;
 
     Ok(ImageRecord {
         id: parse_uuid(&id_str)?,
@@ -1267,6 +1280,7 @@ fn row_to_image_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord>
         source_path: row.get(2)?,
         file_path: row.get(3)?,
         format: row.get(4)?,
+        kind: row.get(5)?,
         size_bytes,
         created_at: parse_datetime(&created_str)?,
     })
@@ -1363,6 +1377,7 @@ mod tests {
             source_path: format!("/tmp/source/{name}.ext4"),
             file_path: format!("/tmp/husker-images/{name}.ext4"),
             format: "ext4".into(),
+            kind: "rootfs".into(),
             size_bytes: 1024,
             created_at: Utc::now(),
         }
@@ -2339,6 +2354,28 @@ mod tests {
         }
         let rec = store.get_vm_by_name("legacy").unwrap();
         assert_eq!(rec.boot_mode, "direct");
+    }
+
+    // ── images.kind field ─────────────────────────────────────────────
+
+    #[test]
+    fn image_kind_migration_default_applied() {
+        // A row inserted via the legacy column set (no kind column) must read
+        // back "rootfs" because the migration DEFAULT backfills it.
+        let store = StateStore::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO images (id, name, source_path, file_path, format, size_bytes, created_at)
+                 VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'legacy',
+                         '/tmp/source/legacy.ext4', '/tmp/husker-images/legacy.ext4',
+                         'ext4', 1024, '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let fetched = store.get_image_by_name("legacy").unwrap();
+        assert_eq!(fetched.kind, "rootfs");
     }
 
     #[test]
