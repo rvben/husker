@@ -89,6 +89,10 @@ impl StorageConfig {
     pub fn vm_dir(&self, vm_name: &str) -> PathBuf {
         self.data_dir.join("vms").join(vm_name)
     }
+
+    pub fn volumes_dir(&self) -> PathBuf {
+        self.data_dir.join("volumes")
+    }
 }
 
 /// Create a copy-on-write clone of a rootfs for a VM.

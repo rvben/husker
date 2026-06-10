@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 pub use husker_state::{
     HostGroupRecord, ImageRecord, SecretRecord, ServiceRecord, SnapshotRecord, VmRecord,
+    VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 
@@ -48,6 +49,10 @@ pub enum CoreError {
     ImageNotFound(String),
     #[error("image already exists: {0}")]
     ImageAlreadyExists(String),
+    #[error("volume not found: {0}")]
+    VolumeNotFound(String),
+    #[error("volume already exists: {0}")]
+    VolumeAlreadyExists(String),
     #[error("secret not found: {0}")]
     SecretNotFound(String),
     #[error("secret already exists: {0}")]
@@ -118,6 +123,10 @@ pub struct CreateVmRequest {
     /// device is installed at boot and `set_balloon` can resize it at runtime.
     #[serde(default)]
     pub balloon: bool,
+    /// Named persistent volume to attach as the second disk (/dev/vdb in the guest).
+    /// Exactly one VM may hold a given volume at a time.
+    #[serde(default)]
+    pub volume: Option<String>,
 }
 
 /// Parameters for creating a host group.
@@ -166,6 +175,9 @@ pub struct CreateServiceRequest {
     /// Opt each instance into a virtio memory balloon device.
     #[serde(default)]
     pub balloon: bool,
+    /// Named persistent volume to attach to each instance as the second disk.
+    #[serde(default)]
+    pub volume: Option<String>,
 }
 
 /// Parameters for creating a snapshot.
@@ -223,6 +235,15 @@ pub struct ExportImageResult {
     pub name: String,
     #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub destination_path: PathBuf,
+    pub size_bytes: u64,
+}
+
+/// Parameters for creating a persistent volume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CreateVolumeRequest {
+    pub name: String,
+    /// Disk size in bytes. The image is created as a sparse ext4 file of this size.
     pub size_bytes: u64,
 }
 
@@ -657,6 +678,22 @@ impl<B: VmmBackend> HuskerCore<B> {
         // still cleaned up on failure.
         resources.vm_dir = Some(vm_dir.clone());
 
+        // Resolve the named volume before disk setup so the cloud-init seed can
+        // reflect the correct mount_volume value in a single pass. The
+        // exclusivity check (find_vm_by_volume) runs here right before the
+        // VmRecord insert; there is a small TOCTOU window between this check
+        // and the insert, but at homelab scale that race is acceptable.
+        let volume_attachment = self.resolve_volume_attachment(&req.volume)?;
+        if let Some((ref vol_name, _)) = volume_attachment
+            && let Some(holder) = self.state.find_vm_by_volume(vol_name)?
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "volume '{vol_name}' is already attached to VM '{}'",
+                holder.name
+            )));
+        }
+        let mount_volume = volume_attachment.is_some();
+
         // Choose the boot disk + mode. A cloud image boots via UEFI/OVMF from a cloned
         // qcow2; the default path boots a host kernel from a raw ext4 rootfs.
         // cloud_source_path: the resolved source image (catalog path or user path) used as
@@ -720,7 +757,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await?;
             // Build the NoCloud seed: install + start the embedded agent and apply a
             // static network config (husker's allocated IP) so cloud-init does not
-            // stall on DHCP before the agent comes up.
+            // stall on DHCP before the agent comes up. When a volume is attached,
+            // include a mounts entry so cloud-init mounts it at /data on first boot.
             let seed = husker_cloudinit::build_seed(&husker_cloudinit::SeedSpec {
                 agent: self.embedded_agent,
                 hostname: req.name.clone(),
@@ -732,7 +770,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                     gateway,
                     dns: self.dns_servers.clone(),
                 },
-                mount_volume: false,
+                mount_volume,
             })
             .map_err(seed_error_to_core)?;
             let seed_path = vm_dir.join("seed.img");
@@ -795,6 +833,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             )
         };
 
+        let volume_path = volume_attachment.as_ref().map(|(_, p)| p.clone());
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
@@ -817,7 +856,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot,
             seed_path,
             balloon: req.balloon,
-            volume_path: None,
+            volume_path,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -860,7 +899,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "direct".to_string()
             },
             balloon: req.balloon,
-            volume: None,
+            volume: volume_attachment.map(|(vol_name, _)| vol_name),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -909,6 +948,20 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.storage_driver.clone_rootfs(rootfs, &vm_rootfs).await?;
         resources.vm_dir = Some(vm_dir);
 
+        // Resolve the named volume to its image path. The exclusivity check runs
+        // here, right before the VmRecord insert; there is a small TOCTOU window
+        // between this check and the insert, but at homelab scale that race is
+        // acceptable.
+        let volume_attachment = self.resolve_volume_attachment(&req.volume)?;
+        if let Some((ref vol_name, _)) = volume_attachment
+            && let Some(holder) = self.state.find_vm_by_volume(vol_name)?
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "volume '{vol_name}' is already attached to VM '{}'",
+                holder.name
+            )));
+        }
+
         // Resolve initrd: use explicit path, or look for conventional location
         let initrd_path = req.initrd_path.clone().or_else(|| {
             let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
@@ -917,6 +970,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let kernel_str = kernel.to_string_lossy().into_owned();
         let rootfs_str = rootfs.to_string_lossy().into_owned();
+        let volume_path = volume_attachment.as_ref().map(|(_, p)| p.clone());
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
@@ -932,7 +986,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot: husker_vmm::BootMode::DirectKernel,
             seed_path: None,
             balloon: req.balloon,
-            volume_path: None,
+            volume_path,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -967,7 +1021,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: "apple_vz".to_string(),
             boot_mode: "direct".to_string(),
             balloon: req.balloon,
-            volume: None,
+            volume: volume_attachment.map(|(vol_name, _)| vol_name),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1363,7 +1417,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             cloud_image: req.cloud_image,
             disk_size: req.disk_size,
             balloon: req.balloon,
-            volume: None,
+            volume: req.volume,
         };
         self.state.insert_service(&record).map_err(|e| match e {
             husker_state::StateError::ServiceAlreadyExists(name) => {
@@ -1544,6 +1598,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
             balloon: false,
+            volume: None,
         })
         .await
     }
@@ -2396,13 +2451,132 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await
             .map_err(CoreError::Vmm)
     }
+
+    // ── Volume lifecycle ─────────────────────────────────────────────────────
+
+    /// Resolve a volume name to its record and image path for attachment.
+    ///
+    /// Returns `(volume_name, image_path)` when a name is provided. Returns
+    /// `None` when no volume is requested (name is None).
+    fn resolve_volume_attachment(
+        &self,
+        name: &Option<String>,
+    ) -> Result<Option<(String, PathBuf)>, CoreError> {
+        let Some(vol_name) = name else {
+            return Ok(None);
+        };
+        let record = self
+            .state
+            .get_volume_by_name(vol_name)
+            .map_err(|e| match e {
+                husker_state::StateError::VolumeNotFoundByName(_) => {
+                    CoreError::InvalidArgument(format!("volume '{vol_name}' not found"))
+                }
+                other => CoreError::State(other),
+            })?;
+        husker_storage::validate_volume(std::path::Path::new(&record.file_path))
+            .map_err(CoreError::Storage)?;
+        Ok(Some((record.name, PathBuf::from(record.file_path))))
+    }
+
+    /// Create a named persistent volume.
+    ///
+    /// Validates the name, rejects duplicates, creates a sparse ext4 image
+    /// under `{data_dir}/volumes/`, and inserts the catalog record. On insert
+    /// failure the image file is removed (mirror of `import_image`'s
+    /// compensation pattern).
+    pub async fn create_volume(&self, req: CreateVolumeRequest) -> Result<VolumeRecord, CoreError> {
+        validate_resource_name("volume", &req.name)?;
+        match self.state.get_volume_by_name(&req.name) {
+            Ok(_) => return Err(CoreError::VolumeAlreadyExists(req.name)),
+            Err(husker_state::StateError::VolumeNotFoundByName(_)) => {}
+            Err(other) => return Err(CoreError::State(other)),
+        }
+
+        let volumes_dir = self.storage.volumes_dir();
+        let image_path = volumes_dir.join(format!("{}.img", req.name));
+
+        husker_storage::create_volume_image(&image_path, req.size_bytes).await?;
+
+        let record = VolumeRecord {
+            id: uuid::Uuid::new_v4(),
+            name: req.name.clone(),
+            file_path: image_path.to_string_lossy().into_owned(),
+            size_bytes: req.size_bytes,
+            created_at: chrono::Utc::now(),
+        };
+
+        if let Err(err) = self.state.insert_volume(&record).map_err(|e| match e {
+            husker_state::StateError::VolumeAlreadyExists(name) => {
+                CoreError::VolumeAlreadyExists(name)
+            }
+            other => CoreError::State(other),
+        }) {
+            let _ = tokio::fs::remove_file(&image_path).await;
+            return Err(err);
+        }
+
+        Ok(record)
+    }
+
+    /// List all catalog volumes.
+    pub fn list_volumes(&self) -> Result<Vec<VolumeRecord>, CoreError> {
+        Ok(self.state.list_volumes()?)
+    }
+
+    /// Get a catalog volume by name.
+    pub fn get_volume(&self, name: &str) -> Result<VolumeRecord, CoreError> {
+        self.state.get_volume_by_name(name).map_err(|e| match e {
+            husker_state::StateError::VolumeNotFoundByName(_) => {
+                CoreError::VolumeNotFound(name.into())
+            }
+            other => CoreError::State(other),
+        })
+    }
+
+    /// Delete a catalog volume by name.
+    ///
+    /// Refuses deletion while any VM record holds the volume. After the record
+    /// is deleted the image file is removed on a best-effort basis.
+    pub async fn delete_volume(&self, name: &str) -> Result<(), CoreError> {
+        let record = self.get_volume(name)?;
+
+        if let Some(holder) = self.state.find_vm_by_volume(name)? {
+            return Err(CoreError::InvalidArgument(format!(
+                "volume '{}' is attached to VM '{}'",
+                name, holder.name
+            )));
+        }
+
+        self.state.delete_volume(record.id).map_err(|e| match e {
+            husker_state::StateError::VolumeNotFound(_) => CoreError::VolumeNotFound(name.into()),
+            other => CoreError::State(other),
+        })?;
+
+        // Best-effort: log but do not fail if the file is already gone.
+        match tokio::fs::remove_file(&record.file_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    volume = %name,
+                    path = %record.file_path,
+                    error = %e,
+                    "failed to remove volume image file during delete"
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Build the create request for one service instance.
 ///
 /// Cloud-image services boot the image via UEFI; direct services use the
 /// recorded rootfs and kernel. Both variants forward the service's balloon
-/// preference so replacement instances keep the same device configuration.
+/// and volume preferences so replacement instances keep the same device
+/// configuration.
 pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmRequest {
     let env: Vec<(String, String)> = svc
         .userdata_env
@@ -2424,6 +2598,7 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             vmm: None,
             ssh_authorized_keys: Vec::new(),
             balloon: svc.balloon,
+            volume: svc.volume.clone(),
         }
     } else {
         CreateVmRequest {
@@ -2440,6 +2615,7 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             vmm: None,
             ssh_authorized_keys: Vec::new(),
             balloon: svc.balloon,
+            volume: svc.volume.clone(),
         }
     }
 }
@@ -3391,6 +3567,287 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert_eq!(
             default_ready_timeout("something-else"),
             std::time::Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS)
+        );
+    }
+
+    // ── Volume CRUD tests ────────────────────────────────────────────────────
+
+    /// Insert a volume record directly via state (no mkfs needed) and verify
+    /// that a duplicate name is rejected with `VolumeAlreadyExists`.
+    #[test]
+    fn create_volume_duplicate_name_rejected() {
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let vol = husker_state::VolumeRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "data".into(),
+            file_path: "/volumes/data.img".into(),
+            size_bytes: 1024 * 1024 * 1024,
+            created_at: chrono::Utc::now(),
+        };
+        state.insert_volume(&vol).unwrap();
+
+        // Inserting another volume with the same name must fail with VolumeAlreadyExists.
+        let dup = husker_state::VolumeRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "data".into(),
+            file_path: "/volumes/data2.img".into(),
+            size_bytes: 512 * 1024 * 1024,
+            created_at: chrono::Utc::now(),
+        };
+        let err = state.insert_volume(&dup).unwrap_err();
+        assert!(
+            matches!(err, husker_state::StateError::VolumeAlreadyExists(_)),
+            "expected VolumeAlreadyExists, got {err:?}"
+        );
+    }
+
+    /// A volume that is not attached to any VM can be deleted by the core.
+    /// A volume attached to a VM must be refused.
+    #[test]
+    fn delete_volume_refused_while_attached() {
+        let state = husker_state::StateStore::open_memory().unwrap();
+
+        // Insert a volume record.
+        let vol = husker_state::VolumeRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "mydata".into(),
+            file_path: "/volumes/mydata.img".into(),
+            size_bytes: 1024 * 1024 * 1024,
+            created_at: chrono::Utc::now(),
+        };
+        state.insert_volume(&vol).unwrap();
+
+        // Insert a VM record that references the volume.
+        let vm = husker_state::VmRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "vm-with-vol".into(),
+            state: "running".into(),
+            pid: None,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 4,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: "apple_vz".into(),
+            boot_mode: "direct".into(),
+            balloon: false,
+            volume: Some("mydata".into()),
+        };
+        state.insert_vm(&vm).unwrap();
+
+        // find_vm_by_volume should find the holder.
+        let holder = state.find_vm_by_volume("mydata").unwrap();
+        assert!(holder.is_some(), "volume should be found as attached");
+        assert_eq!(holder.unwrap().name, "vm-with-vol");
+    }
+
+    /// Volumes not referenced by any VM are detected as unattached.
+    #[test]
+    fn find_vm_by_volume_returns_none_when_unattached() {
+        let state = husker_state::StateStore::open_memory().unwrap();
+
+        let vol = husker_state::VolumeRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "free-vol".into(),
+            file_path: "/volumes/free.img".into(),
+            size_bytes: 512 * 1024 * 1024,
+            created_at: chrono::Utc::now(),
+        };
+        state.insert_volume(&vol).unwrap();
+
+        let found = state.find_vm_by_volume("free-vol").unwrap();
+        assert!(
+            found.is_none(),
+            "unattached volume must return None from find_vm_by_volume"
+        );
+    }
+
+    /// `instance_request` threads the service's volume field into the VM request
+    /// for both cloud and direct boot paths.
+    #[test]
+    fn instance_request_threads_volume_cloud() {
+        let now = chrono::Utc::now();
+        let svc = husker_state::ServiceRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "svc".into(),
+            host_group_id: None,
+            desired_instances: 1,
+            image: None,
+            kernel_path: "".into(),
+            rootfs_path: "".into(),
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            userdata_env: None,
+            created_at: now,
+            updated_at: now,
+            cloud_image: Some("u24".into()),
+            disk_size: None,
+            balloon: false,
+            volume: Some("data".into()),
+        };
+        let req = super::instance_request(&svc, "svc-0");
+        assert_eq!(
+            req.volume.as_deref(),
+            Some("data"),
+            "volume must be forwarded to cloud instance request"
+        );
+    }
+
+    #[test]
+    fn instance_request_threads_volume_direct() {
+        let now = chrono::Utc::now();
+        let svc = husker_state::ServiceRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "svc".into(),
+            host_group_id: None,
+            desired_instances: 1,
+            image: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            userdata_env: None,
+            created_at: now,
+            updated_at: now,
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
+            volume: Some("persist".into()),
+        };
+        let req = super::instance_request(&svc, "svc-0");
+        assert_eq!(
+            req.volume.as_deref(),
+            Some("persist"),
+            "volume must be forwarded to direct instance request"
+        );
+    }
+
+    /// `CreateVmRequest` and `CreateServiceRequest` default `volume` to `None`
+    /// when not present in JSON, preserving backward compatibility.
+    #[test]
+    fn create_vm_request_volume_defaults_to_none() {
+        let req: super::CreateVmRequest = serde_json::from_str(r#"{"name":"v"}"#).unwrap();
+        assert!(req.volume.is_none(), "volume must default to None");
+    }
+
+    #[test]
+    fn create_service_request_volume_defaults_to_none() {
+        let req: super::CreateServiceRequest =
+            serde_json::from_str(r#"{"name":"svc","kernel_path":"/k","rootfs_path":"/r"}"#)
+                .unwrap();
+        assert!(req.volume.is_none(), "volume must default to None");
+    }
+
+    /// `create_volume` with mkfs.ext4 available: creates the sparse file and
+    /// inserts the catalog record. Skips the mkfs assertion gracefully on macOS
+    /// dev hosts where mkfs.ext4 is absent.
+    #[tokio::test]
+    async fn create_volume_full_path_when_mkfs_available() {
+        // Check for mkfs.ext4; skip the destructive mkfs assertion on macOS.
+        let has_mkfs = std::process::Command::new("which")
+            .arg("mkfs.ext4")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        #[cfg(not(feature = "linux-net"))]
+        let core = HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        );
+        #[cfg(feature = "linux-net")]
+        let core = HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        );
+
+        if !has_mkfs {
+            eprintln!("create_volume test: mkfs.ext4 not found, skipping mkfs assertion");
+            // Verify the name validation still works without mkfs.
+            let bad = core
+                .create_volume(CreateVolumeRequest {
+                    name: "../escape".into(),
+                    size_bytes: 1024,
+                })
+                .await;
+            assert!(bad.is_err(), "path-traversal name must be rejected");
+            return;
+        }
+
+        let req = CreateVolumeRequest {
+            name: "testvol".into(),
+            size_bytes: 64 * 1024 * 1024, // 64 MiB sparse
+        };
+        let rec = core.create_volume(req).await.unwrap();
+        assert_eq!(rec.name, "testvol");
+        assert_eq!(rec.size_bytes, 64 * 1024 * 1024);
+        assert!(
+            std::path::Path::new(&rec.file_path).exists(),
+            "volume image must exist on disk"
+        );
+
+        // Duplicate must be rejected.
+        let dup = core
+            .create_volume(CreateVolumeRequest {
+                name: "testvol".into(),
+                size_bytes: 64 * 1024 * 1024,
+            })
+            .await;
+        assert!(
+            matches!(dup, Err(CoreError::VolumeAlreadyExists(_))),
+            "duplicate volume must return VolumeAlreadyExists"
+        );
+
+        // get_volume round-trip.
+        let fetched = core.get_volume("testvol").unwrap();
+        assert_eq!(fetched.id, rec.id);
+
+        // list_volumes includes the new volume.
+        let list = core.list_volumes().unwrap();
+        assert!(list.iter().any(|v| v.name == "testvol"));
+
+        // delete_volume removes the record and the file.
+        core.delete_volume("testvol").await.unwrap();
+        assert!(
+            !std::path::Path::new(&rec.file_path).exists(),
+            "volume image must be removed after delete"
+        );
+        assert!(
+            matches!(
+                core.get_volume("testvol"),
+                Err(CoreError::VolumeNotFound(_))
+            ),
+            "volume must not be found after delete"
         );
     }
 }

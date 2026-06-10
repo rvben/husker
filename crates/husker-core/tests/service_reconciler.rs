@@ -221,6 +221,7 @@ fn req_with_desired(
         cloud_image: None,
         disk_size: None,
         balloon: false,
+        volume: None,
     }
 }
 
@@ -355,6 +356,7 @@ async fn reconcile_foreign_running_collision() {
         disk_size: None,
         ssh_authorized_keys: Vec::new(),
         balloon: false,
+        volume: None,
     })
     .await
     .unwrap();
@@ -405,6 +407,7 @@ async fn reconcile_foreign_stopped_collision() {
         disk_size: None,
         ssh_authorized_keys: Vec::new(),
         balloon: false,
+        volume: None,
     })
     .await
     .unwrap();
@@ -465,6 +468,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
+                volume: None,
             },
             Some(ServiceTag {
                 service_id: id,
@@ -492,6 +496,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
+                volume: None,
             },
             Some(ServiceTag {
                 service_id: id,
@@ -861,6 +866,7 @@ async fn set_balloon_rejects_vm_without_balloon_device() {
         disk_size: None,
         ssh_authorized_keys: Vec::new(),
         balloon: false,
+        volume: None,
     })
     .await
     .unwrap();
@@ -892,6 +898,7 @@ async fn set_balloon_rejects_stopped_vm() {
         disk_size: None,
         ssh_authorized_keys: Vec::new(),
         balloon: true,
+        volume: None,
     })
     .await
     .unwrap();
@@ -939,6 +946,7 @@ async fn set_balloon_happy_path_forwards_to_vmm() {
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
             balloon: true,
+            volume: None,
         })
         .await
         .unwrap();

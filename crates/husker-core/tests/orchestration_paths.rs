@@ -530,6 +530,7 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
             balloon: false,
+            volume: None,
         })
         .await
         .unwrap_err();
@@ -565,6 +566,7 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
             balloon: false,
+            volume: None,
         })
         .await
         .unwrap_err()
@@ -625,6 +627,7 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
             balloon: false,
+            volume: None,
         })
         .await
         .unwrap_err()
@@ -1470,6 +1473,7 @@ async fn create_vm_rejects_unsafe_names() {
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
+                volume: None,
             })
             .await
             .unwrap_err();
@@ -1579,6 +1583,7 @@ async fn create_service_rejects_unsafe_names() {
                 cloud_image: None,
                 disk_size: None,
                 balloon: false,
+                volume: None,
             })
             .await
             .unwrap_err();
@@ -1800,6 +1805,7 @@ async fn create_vm_accepts_safe_names() {
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
+                volume: None,
             })
             .await
             .unwrap_err();
@@ -1832,6 +1838,7 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
             balloon: false,
+            volume: None,
         })
         .await
         .unwrap_err();
@@ -1874,6 +1881,7 @@ async fn concurrent_create_same_name_one_winner() {
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
+                volume: None,
             })
             .await
         })

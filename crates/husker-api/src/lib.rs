@@ -2665,6 +2665,14 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "image_already_exists",
             err.to_string(),
         ),
+        CoreError::VolumeNotFound(_) => {
+            (StatusCode::NOT_FOUND, "volume_not_found", err.to_string())
+        }
+        CoreError::VolumeAlreadyExists(_) => (
+            StatusCode::CONFLICT,
+            "volume_already_exists",
+            err.to_string(),
+        ),
         CoreError::SecretAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "secret_already_exists",
