@@ -4,6 +4,16 @@ use std::path::{Path, PathBuf};
 pub mod firecracker;
 pub mod images;
 
+/// The guest agent binary embedded by `build.rs` (from the musl build output or
+/// `HUSKER_EMBED_AGENT_BIN`). Empty when no agent was embedded at build time, in
+/// which case cloud-image support errors clearly at runtime.
+pub const EMBEDDED_AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent.bin"));
+
+/// Whether a guest agent was embedded at build time.
+pub fn agent_embedded() -> bool {
+    !EMBEDDED_AGENT.is_empty()
+}
+
 /// Default source for `husker images pull`. The repo URL form triggers the
 /// runtime resolver in `images::resolve_download_base`, which queries the
 /// GitHub API for the most recent `images-YYYY-MM-DD` release. Users can
@@ -163,6 +173,14 @@ pub fn default_initrd_some() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_agent_const_is_accessible() {
+        // On a normal dev/CI build the agent is absent, so this is empty; the point
+        // is that the const + include_bytes! compile and the accessor is consistent.
+        let _ = super::EMBEDDED_AGENT.len();
+        assert_eq!(super::agent_embedded(), !super::EMBEDDED_AGENT.is_empty());
+    }
 
     #[test]
     fn parse_disk_size_units() {
