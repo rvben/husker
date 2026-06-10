@@ -523,6 +523,12 @@ struct Config {
     #[cfg(all(feature = "linux-net", target_os = "linux"))]
     #[serde(default = "default_qemu_bin")]
     qemu_bin: PathBuf,
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
+    #[serde(default = "default_ovmf_code")]
+    ovmf_code: PathBuf,
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
+    #[serde(default = "default_ovmf_vars")]
+    ovmf_vars: PathBuf,
     #[serde(default = "default_data_dir")]
     data_dir: PathBuf,
     #[serde(default = "husker::default_kernel_path")]
@@ -531,6 +537,10 @@ struct Config {
     default_rootfs: PathBuf,
     #[serde(default = "husker::default_initrd_some")]
     default_initrd: Option<PathBuf>,
+    /// Default disk size for cloud-image VMs when --disk-size is omitted
+    /// (human units, e.g. "10G"). None leaves the image's own size.
+    #[serde(default)]
+    default_disk_size: Option<String>,
     #[serde(default = "husker::default_images_base_url")]
     images_base_url: String,
     #[serde(default)]
@@ -610,6 +620,16 @@ impl VmmSelection {
 #[cfg(all(feature = "linux-net", target_os = "linux"))]
 fn default_qemu_bin() -> PathBuf {
     PathBuf::from("qemu-system-x86_64")
+}
+
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+fn default_ovmf_code() -> PathBuf {
+    PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd")
+}
+
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+fn default_ovmf_vars() -> PathBuf {
+    PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd")
 }
 
 fn default_api_max_request_bytes() -> usize {
@@ -1038,10 +1058,15 @@ impl Default for Config {
             vmm: VmmSelection::default(),
             #[cfg(all(feature = "linux-net", target_os = "linux"))]
             qemu_bin: default_qemu_bin(),
+            #[cfg(all(feature = "linux-net", target_os = "linux"))]
+            ovmf_code: default_ovmf_code(),
+            #[cfg(all(feature = "linux-net", target_os = "linux"))]
+            ovmf_vars: default_ovmf_vars(),
             data_dir: default_data_dir(),
             default_kernel: default_kernel_path(),
             default_rootfs: default_rootfs_path(),
             default_initrd: Some(default_initrd_path()),
+            default_disk_size: None,
             images_base_url: default_images_base_url(),
             api_token: None,
             api_max_request_bytes: default_api_max_request_bytes(),
@@ -1221,9 +1246,14 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if let Some(ref img) = cloud_image {
                 body["cloud_image"] = serde_json::json!(img);
-                if let Some(ref size) = disk_size {
+                let disk_size_source = if disk_size.is_some() {
+                    "--disk-size"
+                } else {
+                    "config default_disk_size"
+                };
+                if let Some(ref size) = disk_size.clone().or(config.default_disk_size.clone()) {
                     let bytes = husker::parse_disk_size(size)
-                        .map_err(|e| anyhow::anyhow!("--disk-size: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("{disk_size_source}: {e}"))?;
                     body["disk_size"] = serde_json::json!(bytes);
                 }
                 if !ssh_key.is_empty() {
@@ -3560,6 +3590,9 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(val) = std::env::var("HUSKER_DEFAULT_INITRD") {
         config.default_initrd = Some(PathBuf::from(val));
     }
+    if let Ok(val) = std::env::var("HUSKER_DEFAULT_DISK_SIZE") {
+        config.default_disk_size = Some(val);
+    }
     if let Ok(val) = std::env::var("HUSKER_IMAGES_BASE_URL") {
         config.images_base_url = val;
     }
@@ -3642,6 +3675,14 @@ fn apply_env_overrides(config: &mut Config) {
         #[cfg(target_os = "linux")]
         if let Ok(val) = std::env::var("HUSKER_QEMU_BIN") {
             config.qemu_bin = PathBuf::from(val);
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(val) = std::env::var("HUSKER_OVMF_CODE") {
+            config.ovmf_code = PathBuf::from(val);
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(val) = std::env::var("HUSKER_OVMF_VARS") {
+            config.ovmf_vars = PathBuf::from(val);
         }
         if let Ok(val) = std::env::var("HUSKER_VMM") {
             match VmmSelection::from_env_str(&val) {
@@ -4112,6 +4153,52 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
         }
     }
 
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
+    {
+        let hint = if std::env::var("HUSKER_OVMF_CODE").is_ok() {
+            " (from HUSKER_OVMF_CODE)"
+        } else {
+            ""
+        };
+        if config.ovmf_code.exists() {
+            println!("  ovmf_code ({}) ... OK{hint}", config.ovmf_code.display());
+        } else {
+            println!(
+                "  ovmf_code ({}) ... MISSING (cloud-image boot unavailable){hint}",
+                config.ovmf_code.display()
+            );
+        }
+        let hint = if std::env::var("HUSKER_OVMF_VARS").is_ok() {
+            " (from HUSKER_OVMF_VARS)"
+        } else {
+            ""
+        };
+        if config.ovmf_vars.exists() {
+            println!("  ovmf_vars ({}) ... OK{hint}", config.ovmf_vars.display());
+        } else {
+            println!(
+                "  ovmf_vars ({}) ... MISSING (cloud-image boot unavailable){hint}",
+                config.ovmf_vars.display()
+            );
+        }
+        match std::process::Command::new("qemu-img")
+            .arg("--version")
+            .output()
+        {
+            Ok(out) if out.status.success() => println!("  qemu-img ... OK"),
+            _ => println!("  qemu-img ... MISSING (cloud-image disk resize unavailable)"),
+        }
+    }
+    if let Some(ref size) = config.default_disk_size {
+        match husker::parse_disk_size(size) {
+            Ok(_) => println!("  default_disk_size ({size}) ... OK"),
+            Err(e) => {
+                println!("  default_disk_size ({size}) ... FAIL ({e})");
+                all_ok = false;
+            }
+        }
+    }
+
     if all_ok {
         Ok(())
     } else {
@@ -4236,7 +4323,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     config.dns_servers,
                     runtime_dir.clone(),
                 )
-                .with_embedded_agent(husker::EMBEDDED_AGENT),
+                .with_embedded_agent(husker::EMBEDDED_AGENT)
+                .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone()),
             )
         };
         #[cfg(not(target_os = "linux"))]

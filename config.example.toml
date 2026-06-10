@@ -32,8 +32,15 @@
 
 # Optional initrd/initramfs path used alongside the default kernel.
 # Apple VZ requires one for Alpine linux-virt (virtio_blk is a module,
-# not built-in) — build with `make build-initramfs`.
+# not built-in) - build with `make build-initramfs`.
 # default_initrd = "/var/lib/husker/kernels/initramfs-virt.gz"
+
+# Default disk size for cloud-image VMs when --disk-size is omitted (e.g. "10G").
+# default_disk_size = "10G"
+
+# OVMF firmware for UEFI/cloud-image boot (Linux only).
+# ovmf_code = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+# ovmf_vars = "/usr/share/OVMF/OVMF_VARS_4M.fd"
 
 # Base URL for `husker images pull`. Must host kernel-<arch>,
 # initramfs-<arch>.gz, rootfs-<arch>.ext4, and SHA256SUMS at the root.
@@ -116,12 +123,15 @@
 #   HUSKER_DEFAULT_KERNEL                    →  default_kernel
 #   HUSKER_DEFAULT_ROOTFS                    →  default_rootfs
 #   HUSKER_DEFAULT_INITRD                    →  default_initrd
+#   HUSKER_DEFAULT_DISK_SIZE                 →  default_disk_size
 #   HUSKER_IMAGES_BASE_URL                   →  images_base_url
 #   HUSKER_SERVICE_RECONCILE_INTERVAL        →  service_reconcile_interval_secs
 #   HUSKER_SERVICE_RECONCILE_ENABLED         →  service_reconcile_enabled (1/true/TRUE/yes)
 #   HUSKER_FIRECRACKER_BIN                   →  firecracker_bin    (Linux only)
 #   HUSKER_VMM                               →  vmm                (Linux only)
 #   HUSKER_QEMU_BIN                          →  qemu_bin           (Linux only)
+#   HUSKER_OVMF_CODE                         →  ovmf_code          (Linux only)
+#   HUSKER_OVMF_VARS                         →  ovmf_vars          (Linux only)
 #   HUSKER_HOST_INTERFACE                    →  host_interface     (Linux only)
 #   HUSKER_BRIDGE_NAME                       →  bridge_name        (Linux only)
 #   HUSKER_BRIDGE_SUBNET                     →  bridge_subnet      (Linux only)

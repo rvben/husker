@@ -512,6 +512,15 @@ impl<B: VmmBackend> HuskerCore<B> {
         self
     }
 
+    /// Override the OVMF firmware paths used for UEFI/cloud-image boot.
+    /// Defaults target the Ubuntu/Debian `ovmf` package layout.
+    #[cfg(feature = "linux-net")]
+    pub fn with_uefi_firmware(mut self, code: PathBuf, vars_template: PathBuf) -> Self {
+        self.ovmf_code_path = code;
+        self.ovmf_vars_template_path = vars_template;
+        self
+    }
+
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.vm_name_locks.lock().expect("vm_name_locks poisoned");
         map.entry(name.to_string())
@@ -2539,6 +2548,34 @@ async fn remove_file_best_effort(path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn with_uefi_firmware_sets_both_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("OVMF_CODE_4M.fd");
+        let vars = tmp.path().join("OVMF_VARS_4M.fd");
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        let core = HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        )
+        .with_uefi_firmware(code.clone(), vars.clone());
+        assert_eq!(core.ovmf_code_path, code);
+        assert_eq!(core.ovmf_vars_template_path, vars);
+    }
 
     #[cfg(feature = "linux-net")]
     #[tokio::test]
