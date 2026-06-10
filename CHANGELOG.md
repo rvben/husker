@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.5] - 2026-06-10
+
+### Added
+
+- **Bridged LAN networking for cloud-image VMs (Linux).** With a host bridge
+  configured (`lan_bridge` / `HUSKER_LAN_BRIDGE`), `husker run --cloud-image
+  ... --net bridged` puts the VM's NIC directly on that bridge: the guest gets
+  its address via the LAN's DHCP (cloud-init), making it a first-class LAN
+  citizen. Bridged VMs reject port forwards (they are on the LAN already);
+  microVMs stay NAT-only for now. `husker info` reports the network mode, and
+  `config check` verifies the configured bridge exists.
+
+### Fixed
+
+- **Guest-initiated shutdown is now detected on macOS.** The Apple VZ backend
+  queries the live virtual-machine state, so a guest that powers itself off
+  shows `stopped` in `husker list`/`info` and `wait` fails fast, matching the
+  Linux backends.
+
 ## [0.4.4] - 2026-06-10
 
 ### Added
