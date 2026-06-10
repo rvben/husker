@@ -158,7 +158,8 @@ enum Commands {
         #[arg(long, short = 'e')]
         env: Vec<String>,
 
-        /// Seconds to wait for the guest agent to become reachable before failing
+        /// Seconds to wait for the guest agent to become reachable before
+        /// failing (server default: 30, or 180 for UEFI/cloud VMs)
         #[arg(long)]
         connect_timeout: Option<u64>,
 
@@ -258,9 +259,9 @@ enum Commands {
     Wait {
         /// VM name
         name: String,
-        /// Maximum seconds to wait
-        #[arg(long, default_value_t = 120)]
-        timeout: u64,
+        /// Maximum seconds to wait (default: 120, or 180 for UEFI/cloud VMs)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Print version information (client and daemon)
@@ -1788,8 +1789,29 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Wait { name, timeout } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let url = format!("{api_url}/v1/vms/{name}/ready");
             let client = reqwest::Client::new();
+            let timeout = match timeout {
+                Some(t) => t,
+                None => {
+                    // Boot-mode-aware default: UEFI/cloud VMs boot much slower
+                    // than direct-kernel microVMs.
+                    let info_url = format!("{api_url}/v1/vms/{name}");
+                    let resp =
+                        api_request(with_api_auth(client.get(&info_url), api_token.as_deref()))
+                            .await?;
+                    if !resp.status().is_success() {
+                        let msg = api_error(resp, &format!("VM '{name}'")).await;
+                        exit_with_error(output, msg);
+                    }
+                    let vm: serde_json::Value = resp.json().await?;
+                    if vm.get("boot_mode").and_then(|b| b.as_str()) == Some("uefi") {
+                        husker_core::UEFI_READY_TIMEOUT_SECS
+                    } else {
+                        husker_core::DEFAULT_READY_TIMEOUT_SECS
+                    }
+                }
+            };
+            let url = format!("{api_url}/v1/vms/{name}/ready");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             let mut backoff = std::time::Duration::from_millis(200);
             loop {
