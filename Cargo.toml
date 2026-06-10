@@ -9,6 +9,7 @@ members = [
     "crates/husker-agent-proto",
     "crates/husker-api",
     "crates/husker-state",
+    "crates/husker-cloudinit",
 ]
 resolver = "3"
 
@@ -56,6 +57,9 @@ anyhow = "1"
 flate2 = "1"
 tar = "0.4"
 
+# FAT filesystem
+fatfs = "0.3"
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
@@ -87,6 +91,7 @@ husker-storage = { path = "crates/husker-storage" }
 husker-agent-proto = { path = "crates/husker-agent-proto" }
 husker-api = { path = "crates/husker-api", default-features = false }
 husker-state = { path = "crates/husker-state" }
+husker-cloudinit = { path = "crates/husker-cloudinit" }
 
 [profile.release]
 lto = true
