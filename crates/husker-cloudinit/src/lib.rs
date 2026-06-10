@@ -39,6 +39,10 @@ pub struct SeedSpec<'a> {
     /// SSH public keys to authorize for the default user. Empty omits the block.
     pub ssh_authorized_keys: Vec<String>,
     pub network: NetworkConfig,
+    /// When true, cloud-init mounts the persistent volume at `/data` via
+    /// a `mounts:` entry in user-data. The `nofail` option ensures a missing
+    /// disk never blocks boot.
+    pub mount_volume: bool,
 }
 
 /// Build a NoCloud `cidata` vfat image (bytes) from `spec`.
@@ -138,6 +142,10 @@ fn render_user_data(spec: &SeedSpec) -> String {
             s.push('\n');
         }
     }
+    if spec.mount_volume {
+        s.push_str("mounts:\n");
+        s.push_str("  - [ /dev/vdb, /data, ext4, \"defaults,nofail\", \"0\", \"2\" ]\n");
+    }
     s.push_str("runcmd:\n");
     s.push_str("  - modprobe vmw_vsock_virtio_transport || true\n");
     s.push_str("  - systemctl daemon-reload\n");
@@ -181,6 +189,7 @@ mod tests {
                 gateway: "192.0.2.1".parse().unwrap(),
                 dns: vec!["192.0.2.1".into()],
             },
+            mount_volume: false,
         }
     }
 
@@ -298,5 +307,56 @@ mod tests {
             build_seed(&spec),
             Err(CloudInitError::InvalidSshKey(_))
         ));
+    }
+
+    #[test]
+    fn mount_volume_absent_by_default() {
+        let image = build_seed(&sample_spec(b"x")).unwrap();
+        let ud = String::from_utf8(read_seed_file(&image, "user-data")).unwrap();
+        assert!(
+            !ud.contains("mounts:"),
+            "mounts block must be absent when mount_volume is false: {ud}"
+        );
+        assert!(
+            !ud.contains("/dev/vdb"),
+            "/dev/vdb must not appear when mount_volume is false: {ud}"
+        );
+    }
+
+    #[test]
+    fn mount_volume_appends_mounts_block() {
+        let agent = b"fake-agent";
+        let mut spec = sample_spec(agent);
+        spec.mount_volume = true;
+        let image = build_seed(&spec).unwrap();
+        let ud = String::from_utf8(read_seed_file(&image, "user-data")).unwrap();
+        assert!(
+            ud.contains("mounts:"),
+            "mounts: block must be present when mount_volume is true: {ud}"
+        );
+        assert!(
+            ud.contains("/dev/vdb"),
+            "/dev/vdb must appear in mounts block: {ud}"
+        );
+        assert!(
+            ud.contains("/data"),
+            "mount point /data must appear in mounts block: {ud}"
+        );
+        assert!(
+            ud.contains("nofail"),
+            "nofail option must be present in mounts block: {ud}"
+        );
+        assert!(
+            ud.contains("ext4"),
+            "filesystem type ext4 must be present in mounts block: {ud}"
+        );
+        // The mounts block must appear before runcmd so cloud-init processes
+        // it in the correct order.
+        let mounts_pos = ud.find("mounts:").unwrap();
+        let runcmd_pos = ud.find("runcmd:").unwrap();
+        assert!(
+            mounts_pos < runcmd_pos,
+            "mounts: must appear before runcmd: in user-data: {ud}"
+        );
     }
 }
