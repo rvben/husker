@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1] - 2026-06-10
+
+### Fixed
+
+- **Guest-initiated shutdown is now detected at runtime.** A guest that powers
+  itself off or reboots (an ephemeral CI runner finishing its job, or `poweroff`
+  inside a cloud VM) used to leave a defunct VM process and a stale `running`
+  state forever; the service reconciler never replaced such instances, so a
+  runner pool deadlocked after its first job. The reconciler now verifies each
+  instance against the live process (reaping exited children) before deciding,
+  and `husker list` / `info` / `wait` report `stopped` instead of lying -
+  `wait` on a dead VM fails fast with a clear error rather than polling to its
+  timeout. Linux backends (Firecracker/QEMU) only; Apple VZ does not yet detect
+  self-terminated guests.
+
 ## [0.4.0] - 2026-06-10
 
 ### Added
