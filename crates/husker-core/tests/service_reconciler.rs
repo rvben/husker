@@ -698,8 +698,14 @@ async fn restart_recreates_all_instances_at_same_ordinals() {
 
 /// Creates a service with `desired_instances = 1`, reconciles once so the
 /// instance is running, then returns a handle to the core, the mock backend
-/// (for direct manipulation), and the service record.
-async fn service_with_one_running_instance() -> (Arc<HuskerCore<MockVmm>>, MockVmm, ServiceRecord) {
+/// (for direct manipulation), the service record, and the temp directory
+/// (caller binds it as `_tmp` to keep it alive for the test's duration).
+async fn service_with_one_running_instance() -> (
+    Arc<HuskerCore<MockVmm>>,
+    MockVmm,
+    ServiceRecord,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("run");
     let data_dir = tmp.path().join("data");
@@ -727,18 +733,13 @@ async fn service_with_one_running_instance() -> (Arc<HuskerCore<MockVmm>>, MockV
     // Ensure the instance is running before returning.
     assert_eq!(core.get_vm("web-0").unwrap().state, "running");
 
-    // Keep `tmp` alive for the lifetime of the test by leaking it (its
-    // contents only need to persist until the test assertion, and the kernel/
-    // rootfs bytes are already read by the mock).
-    std::mem::forget(tmp);
-
-    (core, mock, svc)
+    (core, mock, svc, tmp)
 }
 
 // 14. Guest-initiated shutdown: backend reports Stopped; reconcile replaces the instance.
 #[tokio::test]
 async fn guest_initiated_shutdown_is_replaced_on_reconcile() {
-    let (core, mock, svc) = service_with_one_running_instance().await;
+    let (core, mock, svc, _tmp) = service_with_one_running_instance().await;
 
     // Simulate the guest shutting itself down: the process exited, so the
     // backend's vm_info now reports Stopped (this is what try_wait detects
@@ -765,7 +766,7 @@ async fn guest_initiated_shutdown_is_replaced_on_reconcile() {
 // 15. Backend no longer tracks the VM at all (process long gone); reconcile replaces the instance.
 #[tokio::test]
 async fn backend_unknown_instance_is_replaced_on_reconcile() {
-    let (core, mock, svc) = service_with_one_running_instance().await;
+    let (core, mock, svc, _tmp) = service_with_one_running_instance().await;
 
     // Simulate a VM the backend no longer tracks at all (process long gone).
     mock.inner.vms.lock().await.clear();
@@ -773,6 +774,9 @@ async fn backend_unknown_instance_is_replaced_on_reconcile() {
     let outcome = core.reconcile_service(&svc).await;
     assert_eq!(outcome.destroyed.len(), 1);
     assert_eq!(outcome.created.len(), 1);
+    let vms = core.list_vms().unwrap();
+    assert_eq!(vms.len(), 1);
+    assert_eq!(vms[0].state, "running");
 }
 
 // 12. concurrent reconcile passes on the same service do not double-create instances.

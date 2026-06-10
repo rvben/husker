@@ -1193,15 +1193,17 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// all - the record is marked stopped in state and the updated record is
     /// returned. Errors persisting the state are logged, not fatal: the caller
     /// still sees the corrected in-memory record.
+    ///
+    /// Platform scope: currently only the Firecracker and QEMU backends detect
+    /// process exit this way (their `vm_info` `try_wait`s the child); the Apple
+    /// VZ backend's `vm_info` is a memory-only read, so guest-initiated shutdown
+    /// is not yet detected on macOS.
     pub async fn refresh_vm_liveness(&self, vm: &VmRecord) -> VmRecord {
         if vm.state != "running" && vm.state != "paused" {
             return vm.clone();
         }
         let alive = match self.vmm.vm_info(vm.id).await {
-            Ok(info) => matches!(
-                info.state,
-                husker_vmm::VmState::Running | husker_vmm::VmState::Paused
-            ),
+            Ok(info) => matches!(info.state, VmState::Running | VmState::Paused),
             // Backend does not track this VM (e.g. process reaped or daemon
             // restarted): it is not running.
             Err(_) => false,
@@ -1209,7 +1211,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         if alive {
             return vm.clone();
         }
-        info!(name = %vm.name, "VM process is gone (guest-initiated shutdown); marking stopped");
+        info!(name = %vm.name, "VM process is gone; marking stopped");
         if let Err(e) = self.state.update_vm_state(vm.id, "stopped") {
             warn!(name = %vm.name, error = %e, "failed to persist stopped state");
         }
