@@ -4241,6 +4241,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         allowed_read_paths: config.allowed_read_paths.clone(),
         allowed_write_paths: config.allowed_write_paths.clone(),
         exec_timeout_secs: config.exec_timeout_secs,
+        exec_timeout_max_secs: 3600,
         exec_allowlist: config.exec_allowlist.clone(),
         exec_denylist: config.exec_denylist.clone(),
         exec_env_allowlist: config.exec_env_allowlist.clone(),

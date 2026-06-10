@@ -193,6 +193,8 @@ pub struct ApiPolicy {
     pub allowed_read_paths: Vec<String>,
     pub allowed_write_paths: Vec<String>,
     pub exec_timeout_secs: u64,
+    /// Upper bound for per-request exec timeouts (`ExecRequest.timeout_secs`).
+    pub exec_timeout_max_secs: u64,
     pub exec_allowlist: Vec<String>,
     pub exec_denylist: Vec<String>,
     pub exec_env_allowlist: Vec<String>,
@@ -208,6 +210,7 @@ impl Default for ApiPolicy {
             allowed_read_paths: Vec::new(),
             allowed_write_paths: Vec::new(),
             exec_timeout_secs: 30,
+            exec_timeout_max_secs: 3600,
             exec_allowlist: Vec::new(),
             exec_denylist: Vec::new(),
             exec_env_allowlist: Vec::new(),
@@ -294,6 +297,10 @@ pub struct ExecRequest {
     /// `DEFAULT_EXEC_CONNECT_TIMEOUT_SECS` (or the UEFI readiness timeout for
     /// cloud VMs, which boot slower) and is clamped to a sane range.
     pub connect_timeout_secs: Option<u64>,
+    /// Maximum seconds the command may run. Defaults to the daemon's
+    /// `exec_timeout_secs` and is clamped to `exec_timeout_max_secs`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Default agent-readiness wait for exec when the caller does not specify one.
@@ -313,6 +320,15 @@ fn resolve_exec_connect_timeout(requested: Option<u64>, boot_mode: &str) -> Dura
     let secs = requested
         .unwrap_or(default)
         .clamp(1, MAX_EXEC_CONNECT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Resolve the exec execution bound: the daemon default when unset, the
+/// caller's value clamped to `[1, exec_timeout_max_secs]` otherwise.
+fn resolve_exec_run_timeout(requested: Option<u64>, policy: &ApiPolicy) -> Duration {
+    let secs = requested
+        .unwrap_or(policy.exec_timeout_secs)
+        .clamp(1, policy.exec_timeout_max_secs.max(1));
     Duration::from_secs(secs)
 }
 
@@ -1782,7 +1798,7 @@ async fn exec_vm<B: VmmBackend + 'static>(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let result = tokio::time::timeout(
-        Duration::from_secs(policy.exec_timeout_secs.max(1)),
+        resolve_exec_run_timeout(req.timeout_secs, &policy),
         conn.exec(&req.command, &args, req.working_dir.as_deref(), &env),
     )
     .await
@@ -3888,6 +3904,31 @@ mod tests {
         assert_eq!(
             resolve_exec_connect_timeout(Some(u64::MAX), "direct"),
             Duration::from_secs(MAX_EXEC_CONNECT_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn exec_run_timeout_defaults_and_clamps() {
+        let policy = ApiPolicy {
+            exec_timeout_secs: 30,
+            exec_timeout_max_secs: 3600,
+            ..ApiPolicy::default()
+        };
+        assert_eq!(
+            resolve_exec_run_timeout(None, &policy),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_exec_run_timeout(Some(600), &policy),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            resolve_exec_run_timeout(Some(0), &policy),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            resolve_exec_run_timeout(Some(u64::MAX), &policy),
+            Duration::from_secs(3600)
         );
     }
 
