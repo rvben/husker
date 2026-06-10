@@ -802,6 +802,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: vmm_kind,
             boot,
             seed_path,
+            balloon: false,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -914,6 +915,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: None,
             boot: husker_vmm::BootMode::DirectKernel,
             seed_path: None,
+            balloon: false,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;

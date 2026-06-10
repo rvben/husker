@@ -22,6 +22,8 @@ pub(crate) struct QemuInstance {
     pub(crate) serial_log_path: PathBuf,
     pub(crate) boot_log_path: PathBuf,
     pub(crate) process: tokio::process::Child,
+    /// Whether the balloon device was installed at boot.
+    pub(crate) balloon: bool,
 }
 
 /// QEMU/KVM VMM backend. One `qemu-system` child process per VM.
@@ -93,6 +95,12 @@ impl QemuKvmBackend {
             "-device".into(),
             format!("vhost-vsock-pci,guest-cid={}", config.vsock_cid),
         ];
+
+        // Memory balloon device (machine-level, independent of boot mode).
+        if config.balloon {
+            args.push("-device".into());
+            args.push("virtio-balloon-pci".into());
+        }
 
         match &config.boot {
             crate::BootMode::DirectKernel => {
@@ -266,6 +274,7 @@ impl QemuKvmBackend {
                 serial_log_path: self.serial_log(id),
                 boot_log_path,
                 process,
+                balloon: config.balloon,
             },
         );
         Ok(info)
@@ -359,6 +368,41 @@ impl QemuKvmBackend {
         }
         Ok(())
     }
+
+    /// Convert husker's `amount_mib` (MiB reclaimed FROM the guest) to the QMP
+    /// `balloon` value (target guest physical memory in bytes).
+    ///
+    /// QMP `balloon` takes the desired GUEST size; husker's interface uses the
+    /// amount to reclaim. The conversion is: guest_target = mem_size - amount.
+    /// Returns `InvalidConfig` when `amount_mib >= mem_size_mib` because the
+    /// resulting guest size would be zero or negative.
+    pub(crate) fn balloon_qmp_bytes(mem_size_mib: u32, amount_mib: u32) -> Result<u64, VmmError> {
+        if amount_mib >= mem_size_mib {
+            return Err(VmmError::InvalidConfig(format!(
+                "balloon amount {amount_mib} MiB must be less than VM memory {mem_size_mib} MiB"
+            )));
+        }
+        Ok(u64::from(mem_size_mib - amount_mib) * 1024 * 1024)
+    }
+
+    pub async fn set_balloon_impl(&self, id: Uuid, amount_mib: u32) -> Result<(), VmmError> {
+        let (qmp_path, balloon, mem_size_mib) = {
+            let instances = self.instances.lock().await;
+            let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            (inst.qmp_path.clone(), inst.balloon, inst.info.mem_size_mib)
+        };
+        if !balloon {
+            return Err(VmmError::InvalidConfig(
+                "VM was created without a balloon device; rebuild with VmConfig.balloon = true"
+                    .into(),
+            ));
+        }
+        let value = Self::balloon_qmp_bytes(mem_size_mib, amount_mib)?;
+        let mut qmp = crate::qmp::QmpClient::connect(&qmp_path).await?;
+        qmp.execute("balloon", Some(serde_json::json!({ "value": value })))
+            .await?;
+        Ok(())
+    }
 }
 
 /// `VmmBackend` impl is Linux-only: it needs `tokio-vsock` (host AF_VSOCK) to
@@ -418,6 +462,10 @@ impl crate::VmmBackend for QemuKvmBackend {
                 VmmError::ProcessError(format!("vsock connect cid={cid} port={port}: {e}"))
             })
     }
+
+    async fn set_balloon(&self, id: Uuid, amount_mib: u32) -> Result<(), VmmError> {
+        self.set_balloon_impl(id, amount_mib).await
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +489,7 @@ mod tests {
             vmm: None,
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
+            balloon: false,
         }
     }
 
@@ -529,6 +578,7 @@ mod tests {
                 serial_log_path: dir.path().join("x.serial.log"),
                 boot_log_path: dir.path().join("x.boot.log"),
                 process: tokio::process::Command::new("true").spawn().unwrap(),
+                balloon: false,
             },
         );
         let mut cfg = sample_config();
@@ -565,6 +615,7 @@ mod tests {
                 serial_log_path: serial.clone(),
                 boot_log_path: dir.path().join("a.boot.log"),
                 process: tokio::process::Command::new("true").spawn().unwrap(),
+                balloon: false,
             },
         );
         be.destroy(id).await.unwrap();
@@ -594,6 +645,7 @@ mod tests {
                 serial_log_path: dir.path().join("d.serial.log"),
                 boot_log_path: dir.path().join("d.boot.log"),
                 process,
+                balloon: false,
             },
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -750,12 +802,118 @@ mod tests {
                 serial_log_path: dir.path().join("u.serial.log"),
                 boot_log_path: dir.path().join("u.boot.log"),
                 process: tokio::process::Command::new("true").spawn().unwrap(),
+                balloon: false,
             },
         );
         be.destroy(id).await.unwrap();
         assert!(
             !vars.exists(),
             "destroy must remove the per-VM OVMF VARS copy"
+        );
+    }
+
+    // ── balloon_qmp_bytes math ────────────────────────────────────────────
+
+    #[test]
+    fn balloon_qmp_bytes_normal_case() {
+        // 64 MiB reclaimed from a 512 MiB VM -> guest target = 448 MiB in bytes.
+        let bytes = QemuKvmBackend::balloon_qmp_bytes(512, 64).unwrap();
+        assert_eq!(bytes, 448 * 1024 * 1024);
+    }
+
+    #[test]
+    fn balloon_qmp_bytes_zero_reclaim_returns_full_memory() {
+        // Reclaiming 0 MiB leaves all memory to the guest.
+        let bytes = QemuKvmBackend::balloon_qmp_bytes(256, 0).unwrap();
+        assert_eq!(bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn balloon_qmp_bytes_equal_to_mem_is_rejected() {
+        // amount == mem_size is invalid (would leave guest with 0 bytes).
+        let err = QemuKvmBackend::balloon_qmp_bytes(512, 512).unwrap_err();
+        assert!(
+            matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("512")),
+            "expected InvalidConfig with size info, got: {err}"
+        );
+    }
+
+    #[test]
+    fn balloon_qmp_bytes_exceeding_mem_is_rejected() {
+        let err = QemuKvmBackend::balloon_qmp_bytes(512, 600).unwrap_err();
+        assert!(
+            matches!(err, VmmError::InvalidConfig(_)),
+            "expected InvalidConfig, got: {err}"
+        );
+    }
+
+    // ── build_args balloon flag ───────────────────────────────────────────
+
+    #[test]
+    fn build_args_includes_balloon_device_when_enabled() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.balloon = true;
+        let args = be.build_args(Uuid::nil(), &cfg);
+        assert!(
+            args.iter().any(|a| a == "virtio-balloon-pci"),
+            "balloon device missing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_omits_balloon_device_by_default() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let args = be.build_args(Uuid::nil(), &sample_config());
+        assert!(
+            !args.iter().any(|a| a == "virtio-balloon-pci"),
+            "balloon device present when not requested: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_uefi_includes_balloon_device_when_enabled() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let mut cfg = uefi_config();
+        cfg.balloon = true;
+        let args = be.build_args(Uuid::nil(), &cfg);
+        assert!(
+            args.iter().any(|a| a == "virtio-balloon-pci"),
+            "balloon device missing in UEFI boot: {args:?}"
+        );
+    }
+
+    // ── set_balloon_impl early error ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_balloon_without_device_is_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let id = Uuid::new_v4();
+        be.instances.lock().await.insert(
+            id,
+            QemuInstance {
+                info: VmInfo {
+                    id,
+                    name: "nb".into(),
+                    state: VmState::Running,
+                    pid: Some(1),
+                    vcpu_count: 1,
+                    mem_size_mib: 512,
+                    vsock_cid: 3,
+                },
+                qmp_path: dir.path().join("nb.qmp"),
+                pidfile_path: dir.path().join("nb.pid"),
+                serial_log_path: dir.path().join("nb.serial.log"),
+                boot_log_path: dir.path().join("nb.boot.log"),
+                process: tokio::process::Command::new("true").spawn().unwrap(),
+                balloon: false,
+            },
+        );
+        let err = be.set_balloon_impl(id, 64).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("balloon")),
+            "expected InvalidConfig mentioning balloon, got: {err}"
         );
     }
 }

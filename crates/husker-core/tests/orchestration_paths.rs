@@ -154,6 +154,10 @@ impl VmmBackend for MockVmm {
             .await
             .map_err(VmmError::Io)
     }
+
+    async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

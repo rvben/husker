@@ -172,6 +172,13 @@ impl VmmBackend for LinuxDispatchBackend {
             )),
         }
     }
+
+    async fn set_balloon(&self, id: Uuid, amount_mib: u32) -> Result<(), VmmError> {
+        match self.kind_of(id).await? {
+            VmmKind::Firecracker => self.firecracker.set_balloon(id, amount_mib).await,
+            VmmKind::Qemu => self.qemu.set_balloon(id, amount_mib).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +239,10 @@ mod tests {
         ));
         assert!(matches!(
             be.vsock_connect(id, 52).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            be.set_balloon(id, 64).await,
             Err(crate::VmmError::VmNotFound(_))
         ));
     }

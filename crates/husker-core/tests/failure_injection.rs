@@ -108,6 +108,10 @@ impl VmmBackend for FailingVmm {
     async fn vsock_connect(&self, id: Uuid, _port: u32) -> Result<Self::VsockStream, VmmError> {
         Err(VmmError::VmNotFound(id))
     }
+
+    async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
+        Ok(())
+    }
 }
 
 fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<HuskerCore<FailingVmm>> {

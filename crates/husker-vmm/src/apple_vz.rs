@@ -491,6 +491,12 @@ impl VmmBackend for AppleVzBackend {
         Ok(())
     }
 
+    async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
+        Err(VmmError::ProcessError(
+            "memory balloon is not supported on the Apple VZ backend".into(),
+        ))
+    }
+
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
         let (vm, queue) = {
             let instances = self.instances.lock().await;

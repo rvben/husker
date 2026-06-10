@@ -103,6 +103,10 @@ impl VmmBackend for MockVmm {
     async fn vsock_connect(&self, _id: Uuid, _port: u32) -> Result<Self::VsockStream, VmmError> {
         Err(VmmError::ProcessError("not configured".into()))
     }
+
+    async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

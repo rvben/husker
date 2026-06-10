@@ -20,6 +20,8 @@ struct FcInstance {
     boot_log_path: PathBuf,
     serial_log_path: PathBuf,
     process: tokio::process::Child,
+    /// Whether the balloon device was installed at boot.
+    balloon: bool,
 }
 
 /// Firecracker VMM backend.
@@ -105,6 +107,16 @@ impl FirecrackerBackend {
         body: &serde_json::Value,
     ) -> Result<(), VmmError> {
         Self::fc_request(socket_path, "PUT", path, Some(body)).await?;
+        Ok(())
+    }
+
+    /// Convenience wrapper for PATCH requests (runtime Firecracker updates).
+    async fn fc_patch(
+        socket_path: &Path,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), VmmError> {
+        Self::fc_request(socket_path, "PATCH", path, Some(body)).await?;
         Ok(())
     }
 
@@ -246,6 +258,20 @@ impl FirecrackerBackend {
         )
         .await?;
 
+        // Balloon device (must be configured before InstanceStart)
+        if config.balloon {
+            Self::fc_put(
+                socket_path,
+                "/balloon",
+                &serde_json::json!({
+                    "amount_mib": 0,
+                    "deflate_on_oom": true,
+                    "stats_polling_interval_s": 0,
+                }),
+            )
+            .await?;
+        }
+
         // Start the VM
         Self::fc_put(
             socket_path,
@@ -273,6 +299,7 @@ impl FirecrackerBackend {
             boot_log_path: boot_log_path.to_owned(),
             serial_log_path: serial_log_path.to_owned(),
             process,
+            balloon: config.balloon,
         };
 
         self.instances.lock().await.insert(id, instance);
@@ -458,6 +485,26 @@ impl VmmBackend for FirecrackerBackend {
             .await
             .map_err(|e| VmmError::ProcessError(format!("{e}")))
     }
+
+    async fn set_balloon(&self, id: Uuid, amount_mib: u32) -> Result<(), VmmError> {
+        let (socket_path, balloon) = {
+            let instances = self.instances.lock().await;
+            let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            (inst.socket_path.clone(), inst.balloon)
+        };
+        if !balloon {
+            return Err(VmmError::InvalidConfig(
+                "VM was created without a balloon device; rebuild with VmConfig.balloon = true"
+                    .into(),
+            ));
+        }
+        Self::fc_patch(
+            &socket_path,
+            "/balloon",
+            &serde_json::json!({ "amount_mib": amount_mib }),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -504,6 +551,7 @@ mod tests {
             vmm: None,
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
+            balloon: false,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["name"], "test");
@@ -591,6 +639,7 @@ mod tests {
             boot_log_path: dir.path().join("fake.boot.log"),
             serial_log_path: dir.path().join("fake.serial.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
+            balloon: false,
         };
         backend.instances.lock().await.insert(id, instance);
 
@@ -608,6 +657,7 @@ mod tests {
             vmm: None,
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
+            balloon: false,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();
@@ -638,6 +688,7 @@ mod tests {
             vmm: None,
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
+            balloon: false,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();
@@ -719,6 +770,7 @@ mod tests {
             boot_log_path: boot_log_path.clone(),
             serial_log_path: serial_log_path.clone(),
             process: tokio::process::Command::new("true").spawn().unwrap(),
+            balloon: false,
         };
         backend.instances.lock().await.insert(id, instance);
 
@@ -754,6 +806,7 @@ mod tests {
             boot_log_path: dir.path().join("test.boot.log"),
             serial_log_path: dir.path().join("test.serial.log"),
             process,
+            balloon: false,
         };
         backend.instances.lock().await.insert(id, instance);
 
@@ -763,5 +816,50 @@ mod tests {
         let info = backend.vm_info(id).await.unwrap();
         assert_eq!(info.state, VmState::Stopped);
         assert!(info.pid.is_none());
+    }
+
+    /// `set_balloon` on an unknown id returns VmNotFound.
+    #[tokio::test]
+    async fn set_balloon_unknown_id_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let id = Uuid::new_v4();
+        assert!(matches!(
+            backend.set_balloon(id, 64).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+    }
+
+    /// `set_balloon` on an instance created without a balloon device returns a
+    /// clear InvalidConfig error before touching the Firecracker API.
+    #[tokio::test]
+    async fn set_balloon_without_device_is_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let id = Uuid::new_v4();
+        let instance = FcInstance {
+            info: VmInfo {
+                id,
+                name: "no-balloon".into(),
+                state: VmState::Running,
+                pid: Some(999),
+                vcpu_count: 1,
+                mem_size_mib: 256,
+                vsock_cid: 5,
+            },
+            socket_path: dir.path().join("nb.sock"),
+            vsock_path: dir.path().join("nb.vsock"),
+            boot_log_path: dir.path().join("nb.boot.log"),
+            serial_log_path: dir.path().join("nb.serial.log"),
+            process: tokio::process::Command::new("true").spawn().unwrap(),
+            balloon: false,
+        };
+        backend.instances.lock().await.insert(id, instance);
+
+        let err = backend.set_balloon(id, 64).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("balloon")),
+            "expected InvalidConfig mentioning balloon, got: {err}"
+        );
     }
 }

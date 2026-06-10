@@ -50,6 +50,11 @@ pub struct VmConfig {
     /// UEFI cloud-image boot; `None` for direct-kernel VMs.
     #[serde(default)]
     pub seed_path: Option<PathBuf>,
+    /// Attach a virtio memory balloon device at boot. When `true` the backend
+    /// installs the device so the balloon size can be changed at runtime via
+    /// `set_balloon`. Defaults to `false` for back-compat.
+    #[serde(default)]
+    pub balloon: bool,
 }
 
 /// Runtime information about a VM.
@@ -235,6 +240,15 @@ pub trait VmmBackend: Send + Sync {
         id: Uuid,
         port: u32,
     ) -> impl std::future::Future<Output = Result<Self::VsockStream, VmmError>> + Send;
+
+    /// Resize the VM's memory balloon to `amount_mib` (the balloon target:
+    /// memory reclaimed from the guest). Errors if the VM was created
+    /// without `balloon` or the backend does not support ballooning.
+    fn set_balloon(
+        &self,
+        id: Uuid,
+        amount_mib: u32,
+    ) -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
 }
 
 #[cfg(test)]
@@ -303,6 +317,7 @@ mod tests {
         }"#;
         let cfg: VmConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.boot, BootMode::DirectKernel);
+        assert!(!cfg.balloon, "balloon defaults to false");
     }
 
     #[test]

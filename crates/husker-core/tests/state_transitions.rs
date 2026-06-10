@@ -97,6 +97,10 @@ impl VmmBackend for MockVmm {
         // Not needed for state transition tests.
         Err(VmmError::VmNotFound(id))
     }
+
+    async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
+        Ok(())
+    }
 }
 
 /// Build a core backed by the mock VMM with a pre-populated VM record.
