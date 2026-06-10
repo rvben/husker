@@ -163,6 +163,28 @@ pub fn parse_disk_size(s: &str) -> anyhow::Result<u64> {
     Ok((value * mult as f64) as u64)
 }
 
+/// Parse SSH public keys from `.pub` or `authorized_keys`-style file content:
+/// one key per non-empty, non-comment line. Rejects private-key material and
+/// control characters (keys are rendered into a cloud-init YAML document).
+pub fn parse_ssh_public_keys(content: &str) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        !content.contains("PRIVATE KEY"),
+        "this looks like a private key; pass the public key (.pub) file"
+    );
+    let keys: Vec<String> = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    anyhow::ensure!(!keys.is_empty(), "no SSH public keys found");
+    anyhow::ensure!(
+        keys.iter().all(|k| !k.chars().any(char::is_control)),
+        "SSH key contains control characters"
+    );
+    Ok(keys)
+}
+
 /// Serde helper: wraps `default_initrd_path` in `Some` so `default_initrd`
 /// in the CLI Config defaults to the computed initramfs path rather than
 /// None. Users can explicitly set it to `null` in config to opt out.
@@ -225,5 +247,28 @@ mod tests {
         // the caller can surface a clear "rootfs not found" error.
         let arg = PathBuf::from("does-not-exist.ext4");
         assert_eq!(resolve_rootfs_arg(arg.clone(), data_dir.path()), arg);
+    }
+
+    #[test]
+    fn parse_ssh_public_keys_single_and_multiple() {
+        let keys = parse_ssh_public_keys("ssh-ed25519 AAAAC3Nza key1@host\n").unwrap();
+        assert_eq!(keys, vec!["ssh-ed25519 AAAAC3Nza key1@host"]);
+
+        let multi = "# comment\nssh-ed25519 AAAA key1\n\nssh-rsa BBBB key2\n";
+        let keys = parse_ssh_public_keys(multi).unwrap();
+        assert_eq!(keys, vec!["ssh-ed25519 AAAA key1", "ssh-rsa BBBB key2"]);
+    }
+
+    #[test]
+    fn parse_ssh_public_keys_rejects_private_key() {
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n";
+        let err = parse_ssh_public_keys(pem).unwrap_err();
+        assert!(err.to_string().contains("private key"));
+    }
+
+    #[test]
+    fn parse_ssh_public_keys_rejects_empty() {
+        assert!(parse_ssh_public_keys("").is_err());
+        assert!(parse_ssh_public_keys("# only a comment\n").is_err());
     }
 }

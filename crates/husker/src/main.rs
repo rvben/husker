@@ -103,6 +103,11 @@ enum Commands {
         /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
         #[arg(long)]
         disk_size: Option<String>,
+
+        /// Authorize this SSH public key file in the cloud VM via cloud-init
+        /// (repeatable; cloud-image only)
+        #[arg(long = "ssh-key")]
+        ssh_key: Vec<PathBuf>,
     },
 
     /// List running VMs
@@ -1126,12 +1131,16 @@ async fn run(cli: Cli) -> Result<()> {
             vmm,
             cloud_image,
             disk_size,
+            ssh_key,
         } => {
             let config = load_config(config_path.as_deref());
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
 
             if disk_size.is_some() && cloud_image.is_none() {
                 exit_with_error(output, "--disk-size requires --cloud-image".to_string());
+            }
+            if !ssh_key.is_empty() && cloud_image.is_none() {
+                exit_with_error(output, "--ssh-key requires --cloud-image".to_string());
             }
 
             let (rootfs, kernel) = if let Some(ref img) = cloud_image {
@@ -1212,6 +1221,18 @@ async fn run(cli: Cli) -> Result<()> {
                     let bytes = husker::parse_disk_size(size)
                         .map_err(|e| anyhow::anyhow!("--disk-size: {e}"))?;
                     body["disk_size"] = serde_json::json!(bytes);
+                }
+                if !ssh_key.is_empty() {
+                    let mut keys: Vec<String> = Vec::new();
+                    for path in &ssh_key {
+                        let content = std::fs::read_to_string(path).with_context(|| {
+                            format!("reading SSH public key {}", path.display())
+                        })?;
+                        let parsed = husker::parse_ssh_public_keys(&content)
+                            .map_err(|e| anyhow::anyhow!("--ssh-key {}: {e}", path.display()))?;
+                        keys.extend(parsed);
+                    }
+                    body["ssh_authorized_keys"] = serde_json::json!(keys);
                 }
             }
 
