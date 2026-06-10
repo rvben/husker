@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.3] - 2026-06-10
+
+### Added
+
+- **Cloud-image services.** `husker service create --cloud-image <name|path>`
+  runs a self-healing pool of stock cloud-image VMs (with `--disk-size`), no
+  custom rootfs needed. A guest that powers itself off is replaced by the
+  reconciler; note that under QEMU a guest `reboot` reboots in place, so
+  ephemeral-style instances should `poweroff`.
+- **Opt-in memory balloon.** `--balloon` on `run`/`job`/`service create`
+  attaches a virtio balloon; `husker balloon <vm> <mib>` resizes it at runtime
+  (`amount` = MiB reclaimed from the guest, deflate with 0). Supported on
+  Firecracker and QEMU; VMs created without the flag get a clear error. The
+  microVM initramfs now ships `virtio_balloon` (included in the next images
+  release; existing downloaded images need a refresh for ballooning microVMs).
+- The service API/CLI surface (`service get`, responses) reports cloud image,
+  disk size, and balloon settings; profiles gain a `balloon` key.
+
 ## [0.4.2] - 2026-06-10
 
 ### Added
