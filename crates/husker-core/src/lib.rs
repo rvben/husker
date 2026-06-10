@@ -1160,6 +1160,41 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.lookup_vm(name)
     }
 
+    /// Refresh a persisted VM record against the backend's live process view.
+    ///
+    /// The backend's `vm_info` performs the actual liveness check (`try_wait`,
+    /// which also reaps a child that exited on its own, e.g. a guest-initiated
+    /// `poweroff`/`reboot`). When the DB says running/paused but the process is
+    /// gone - the backend reports Stopped/Failed, or no longer tracks the VM at
+    /// all - the record is marked stopped in state and the updated record is
+    /// returned. Errors persisting the state are logged, not fatal: the caller
+    /// still sees the corrected in-memory record.
+    pub async fn refresh_vm_liveness(&self, vm: &VmRecord) -> VmRecord {
+        if vm.state != "running" && vm.state != "paused" {
+            return vm.clone();
+        }
+        let alive = match self.vmm.vm_info(vm.id).await {
+            Ok(info) => matches!(
+                info.state,
+                husker_vmm::VmState::Running | husker_vmm::VmState::Paused
+            ),
+            // Backend does not track this VM (e.g. process reaped or daemon
+            // restarted): it is not running.
+            Err(_) => false,
+        };
+        if alive {
+            return vm.clone();
+        }
+        info!(name = %vm.name, "VM process is gone (guest-initiated shutdown); marking stopped");
+        if let Err(e) = self.state.update_vm_state(vm.id, "stopped") {
+            warn!(name = %vm.name, error = %e, "failed to persist stopped state");
+        }
+        let mut updated = vm.clone();
+        updated.state = "stopped".to_string();
+        updated.pid = None;
+        updated
+    }
+
     /// Create a host group.
     pub fn create_host_group(
         &self,
@@ -2166,6 +2201,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let mut by_ordinal: std::collections::BTreeMap<u32, VmRecord> =
             std::collections::BTreeMap::new();
         for vm in instances {
+            let vm = self.refresh_vm_liveness(&vm).await;
             let Some(ord) = vm.service_ordinal else {
                 let _ = self.destroy_instance(&vm, &mut outcome).await; // orphan
                 continue;

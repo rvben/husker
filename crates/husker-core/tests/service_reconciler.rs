@@ -692,6 +692,89 @@ async fn restart_recreates_all_instances_at_same_ordinals() {
     assert_eq!(outcome.destroyed.len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// Helpers for liveness tests
+// ---------------------------------------------------------------------------
+
+/// Creates a service with `desired_instances = 1`, reconciles once so the
+/// instance is running, then returns a handle to the core, the mock backend
+/// (for direct manipulation), and the service record.
+async fn service_with_one_running_instance() -> (Arc<HuskerCore<MockVmm>>, MockVmm, ServiceRecord) {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let (kernel, rootfs) = write_fixtures(tmp.path());
+
+    let mock = MockVmm::new();
+    let state = StateStore::open_memory().unwrap();
+    let storage = StorageConfig {
+        data_dir: data_dir.to_path_buf(),
+    };
+    let core = Arc::new(HuskerCore::new(
+        mock.clone(),
+        state,
+        storage,
+        runtime_dir.to_path_buf(),
+    ));
+
+    let (svc, _) = core
+        .create_service(req_with_desired(1, &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    // Ensure the instance is running before returning.
+    assert_eq!(core.get_vm("web-0").unwrap().state, "running");
+
+    // Keep `tmp` alive for the lifetime of the test by leaking it (its
+    // contents only need to persist until the test assertion, and the kernel/
+    // rootfs bytes are already read by the mock).
+    std::mem::forget(tmp);
+
+    (core, mock, svc)
+}
+
+// 14. Guest-initiated shutdown: backend reports Stopped; reconcile replaces the instance.
+#[tokio::test]
+async fn guest_initiated_shutdown_is_replaced_on_reconcile() {
+    let (core, mock, svc) = service_with_one_running_instance().await;
+
+    // Simulate the guest shutting itself down: the process exited, so the
+    // backend's vm_info now reports Stopped (this is what try_wait detects
+    // for a real child). The DB still says running.
+    {
+        let mut vms = mock.inner.vms.lock().await;
+        let info = vms.values_mut().next().expect("one instance");
+        info.state = VmState::Stopped;
+        info.pid = None;
+    }
+
+    let outcome = core.reconcile_service(&svc).await;
+    assert_eq!(
+        outcome.destroyed.len(),
+        1,
+        "dead instance must be destroyed"
+    );
+    assert_eq!(outcome.created.len(), 1, "and replaced");
+    let vms = core.list_vms().unwrap();
+    assert_eq!(vms.len(), 1);
+    assert_eq!(vms[0].state, "running");
+}
+
+// 15. Backend no longer tracks the VM at all (process long gone); reconcile replaces the instance.
+#[tokio::test]
+async fn backend_unknown_instance_is_replaced_on_reconcile() {
+    let (core, mock, svc) = service_with_one_running_instance().await;
+
+    // Simulate a VM the backend no longer tracks at all (process long gone).
+    mock.inner.vms.lock().await.clear();
+
+    let outcome = core.reconcile_service(&svc).await;
+    assert_eq!(outcome.destroyed.len(), 1);
+    assert_eq!(outcome.created.len(), 1);
+}
+
 // 12. concurrent reconcile passes on the same service do not double-create instances.
 #[tokio::test]
 async fn concurrent_reconcile_same_service_no_double_create() {
