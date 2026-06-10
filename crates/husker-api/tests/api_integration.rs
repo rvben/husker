@@ -1017,10 +1017,12 @@ async fn vm_response_json_structure() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = response_json(response).await;
 
-    // Verify all expected fields are present and correctly typed
+    // Verify all expected fields are present and correctly typed.
+    // The record was inserted as "running" with no backend process behind it,
+    // so the liveness-refreshed read correctly reports it stopped (pid cleared).
     assert_eq!(json["name"].as_str().unwrap(), "shape-test");
-    assert_eq!(json["state"].as_str().unwrap(), "running");
-    assert_eq!(json["pid"].as_u64().unwrap(), 999);
+    assert_eq!(json["state"].as_str().unwrap(), "stopped");
+    assert!(json["pid"].is_null());
     assert_eq!(json["vcpu_count"].as_u64().unwrap(), 2);
     assert_eq!(json["mem_size_mib"].as_u64().unwrap(), 256);
     assert_eq!(json["vsock_cid"].as_u64().unwrap(), 5);
