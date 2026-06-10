@@ -1035,6 +1035,8 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "id",
             "vmm",
             "boot_mode",
+            "kernel_path",
+            "rootfs_path",
         ],
         "wait" => vec!["status", "action", "vm", "ready"],
         "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
@@ -1405,6 +1407,14 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("Memory:    {} MiB", vm["mem_size_mib"]);
                 println!("Backend:   {}", s("vmm"));
                 println!("Boot:      {}", s("boot_mode"));
+                let kernel = vm["kernel_path"].as_str().unwrap_or("");
+                if !kernel.is_empty() {
+                    println!("Kernel:    {kernel}");
+                }
+                let rootfs = vm["rootfs_path"].as_str().unwrap_or("");
+                if !rootfs.is_empty() {
+                    println!("Rootfs:    {rootfs}");
+                }
                 if let Some(ip) = vm["guest_ip"].as_str() {
                     println!("Guest IP:  {ip}");
                 }

@@ -53,6 +53,11 @@ pub struct VmResponse {
     pub userdata_status: Option<String>,
     pub vmm: String,
     pub boot_mode: String,
+    /// Source rootfs (direct boot) or cloud image (UEFI boot) this VM was
+    /// created from. Empty when unknown.
+    pub rootfs_path: String,
+    /// Kernel the VM boots (direct-kernel boot only; empty for UEFI boot).
+    pub kernel_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -133,6 +138,8 @@ pub struct ImageResponse {
     pub source_path: String,
     pub file_path: String,
     pub format: String,
+    /// Image kind: "rootfs" (direct-kernel boot) or "cloud-image" (UEFI/OVMF boot).
+    pub kind: String,
     pub size_bytes: u64,
     pub created_at: String,
 }
@@ -2681,6 +2688,7 @@ fn image_to_response(r: ImageRecord) -> ImageResponse {
         source_path: r.source_path,
         file_path: r.file_path,
         format: r.format,
+        kind: r.kind,
         size_bytes: r.size_bytes,
         created_at: r.created_at.to_rfc3339(),
     }
@@ -2729,6 +2737,8 @@ fn record_to_response(r: VmRecord) -> VmResponse {
         userdata_status: r.userdata_status,
         vmm: r.vmm,
         boot_mode: r.boot_mode,
+        rootfs_path: r.rootfs_path,
+        kernel_path: r.kernel_path,
     }
 }
 
