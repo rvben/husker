@@ -62,6 +62,8 @@ pub struct VmResponse {
     /// Name of the persistent volume attached to this VM, or None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<String>,
+    /// Network mode for this VM: "nat" (husker-managed NAT) or "bridged" (LAN bridge via DHCP).
+    pub network: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2978,6 +2980,7 @@ fn record_to_response(r: VmRecord) -> VmResponse {
         rootfs_path: r.rootfs_path,
         kernel_path: r.kernel_path,
         volume: r.volume,
+        network: r.network,
     }
 }
 

@@ -1050,11 +1050,15 @@ async fn vm_response_json_structure() {
     // boot_mode is surfaced in the response
     assert_eq!(json["boot_mode"].as_str().unwrap(), "direct");
 
+    // network mode is surfaced in the response
+    assert_eq!(json["network"].as_str().unwrap(), "nat");
+
     // Verify JSON can be deserialized to VmResponse
     let vm: VmResponse = serde_json::from_value(json).unwrap();
     assert_eq!(vm.name, "shape-test");
     assert_eq!(vm.vcpu_count, 2);
     assert_eq!(vm.boot_mode, "direct");
+    assert_eq!(vm.network, "nat");
 }
 
 // ── List with Pre-populated State ────────────────────────────────────

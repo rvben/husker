@@ -110,6 +110,12 @@
 # use distinct bases so their CID/TAP spaces are disjoint (e.g. 3 + 1000).
 # cid_base = 1000
 
+# Host bridge to use for bridged-mode VMs (--net bridged). The bridge must be
+# pre-created by the administrator; husker only enslaves the VM's TAP to it.
+# Bridged mode also requires --cloud-image (DHCP via cloud-init). Unset means
+# bridged mode is unavailable and any --net bridged request is rejected.
+# lan_bridge = "br0"
+
 # ── Service Reconciler ───────────────────────────────────────────────
 
 # Background reconciler for service workloads.
@@ -141,6 +147,7 @@
 #   HUSKER_BRIDGE_SUBNET                     →  bridge_subnet      (Linux only)
 #   HUSKER_DNS_SERVERS                       →  dns_servers        (Linux only, comma-separated)
 #   HUSKER_CID_BASE                          →  cid_base           (Linux only)
+#   HUSKER_LAN_BRIDGE                        →  lan_bridge         (Linux only)
 #
 # Example:
 #   HUSKER_DATA_DIR=/tmp/husker husker daemon

@@ -487,8 +487,7 @@ impl VmmBackend for AppleVzBackend {
         let (info, maybe_live) = {
             let instances = self.instances.lock().await;
             let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
-            let needs_check =
-                matches!(inst.info.state, VmState::Running | VmState::Paused);
+            let needs_check = matches!(inst.info.state, VmState::Running | VmState::Paused);
             let live = if needs_check {
                 Some((QueueConfined(inst.vm.0.clone()), inst.queue.clone()))
             } else {

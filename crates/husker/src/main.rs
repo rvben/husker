@@ -117,6 +117,11 @@ enum Commands {
         #[arg(long)]
         volume: Option<String>,
 
+        /// Network mode: nat (default, husker-managed NAT) or bridged (attach VM to the
+        /// configured lan_bridge; cloud-image only, Linux only)
+        #[arg(long, value_parser = ["nat", "bridged"])]
+        net: Option<String>,
+
         /// Apply a named VM preset from config (explicit flags win)
         #[arg(long)]
         profile: Option<String>,
@@ -247,6 +252,11 @@ enum Commands {
         /// Attach a named persistent volume as the second disk (/dev/vdb)
         #[arg(long)]
         volume: Option<String>,
+
+        /// Network mode: nat (default, husker-managed NAT) or bridged (attach VM to the
+        /// configured lan_bridge; cloud-image only, Linux only)
+        #[arg(long, value_parser = ["nat", "bridged"])]
+        net: Option<String>,
 
         /// Apply a named VM preset from config (explicit flags win)
         #[arg(long)]
@@ -727,6 +737,12 @@ struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_cid_base")]
     cid_base: u32,
+    /// Host bridge device to attach bridged-mode VMs to (Linux only).
+    /// The bridge must be pre-created by the administrator; husker only
+    /// enslaves the VM's TAP to it. Unset means bridged mode is unavailable.
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
+    #[serde(default)]
+    lan_bridge: Option<String>,
     #[serde(default)]
     profiles: std::collections::HashMap<String, Profile>,
 }
@@ -750,6 +766,7 @@ struct Profile {
     env: Vec<String>,
     balloon: Option<bool>,
     volume: Option<String>,
+    network: Option<String>,
 }
 
 /// Expand a leading `~/` against $HOME (profile ssh_keys convenience).
@@ -777,6 +794,7 @@ struct VmRequestArgs {
     env: Vec<String>,
     balloon: bool,
     volume: Option<String>,
+    network: Option<String>,
 }
 
 /// Fill unset fields from a profile: explicit CLI values always win;
@@ -802,6 +820,7 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
         args.balloon = p.balloon.unwrap_or(false);
     }
     args.volume = args.volume.take().or_else(|| p.volume.clone());
+    args.network = args.network.take().or_else(|| p.network.clone());
 }
 
 #[cfg(feature = "linux-net")]
@@ -1259,6 +1278,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "boot_mode",
             "kernel_path",
             "rootfs_path",
+            "network",
         ],
         "wait" => vec!["status", "action", "vm", "ready"],
         "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
@@ -1319,6 +1339,8 @@ impl Default for Config {
             dns_servers: default_dns_servers(),
             #[cfg(feature = "linux-net")]
             cid_base: default_cid_base(),
+            #[cfg(all(feature = "linux-net", target_os = "linux"))]
+            lan_bridge: None,
             profiles: Default::default(),
         }
     }
@@ -1469,6 +1491,10 @@ fn build_vm_request_body(
         body["volume"] = serde_json::json!(vol);
     }
 
+    if let Some(ref net) = args.network {
+        body["network"] = serde_json::json!(net);
+    }
+
     Ok(body)
 }
 
@@ -1540,6 +1566,7 @@ async fn run(cli: Cli) -> Result<()> {
             ssh_key,
             balloon,
             volume,
+            net,
             profile,
         } => {
             let config = load_config(config_path.as_deref());
@@ -1561,6 +1588,7 @@ async fn run(cli: Cli) -> Result<()> {
                 env,
                 balloon,
                 volume,
+                network: net,
             };
             let mut body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
@@ -1697,6 +1725,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("Memory:    {} MiB", vm["mem_size_mib"]);
                 println!("Backend:   {}", s("vmm"));
                 println!("Boot:      {}", s("boot_mode"));
+                println!("Network:   {}", s("network"));
                 let kernel = vm["kernel_path"].as_str().unwrap_or("");
                 if !kernel.is_empty() {
                     println!("Kernel:    {kernel}");
@@ -1955,6 +1984,7 @@ async fn run(cli: Cli) -> Result<()> {
             ssh_key,
             balloon,
             volume,
+            net,
             profile,
             timeout,
             keep,
@@ -1979,6 +2009,7 @@ async fn run(cli: Cli) -> Result<()> {
                 env: Vec::new(),
                 balloon,
                 volume,
+                network: net,
             };
             let body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
@@ -4446,6 +4477,10 @@ fn apply_env_overrides(config: &mut Config) {
         {
             config.cid_base = parsed;
         }
+        #[cfg(target_os = "linux")]
+        if let Ok(val) = std::env::var("HUSKER_LAN_BRIDGE") {
+            config.lan_bridge = if val.is_empty() { None } else { Some(val) };
+        }
     }
 }
 
@@ -4887,6 +4922,28 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
                 all_ok = false;
             }
         }
+
+        // lan_bridge (optional; when configured, the bridge must exist)
+        #[cfg(target_os = "linux")]
+        if let Some(ref bridge) = config.lan_bridge {
+            let bridge_env_hint = if std::env::var("HUSKER_LAN_BRIDGE").is_ok() {
+                " (from HUSKER_LAN_BRIDGE)"
+            } else {
+                ""
+            };
+            let ok = std::process::Command::new("ip")
+                .args(["link", "show", bridge.as_str()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_or(false, |s| s.success());
+            if ok {
+                println!("  lan_bridge ({bridge}) ... OK{bridge_env_hint}");
+            } else {
+                println!("  lan_bridge ({bridge}) ... FAIL (bridge not found){bridge_env_hint}");
+                all_ok = false;
+            }
+        }
     }
 
     #[cfg(all(feature = "linux-net", target_os = "linux"))]
@@ -5122,7 +5179,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     runtime_dir.clone(),
                 )
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
-                .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone()),
+                .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
+                .with_lan_bridge(config.lan_bridge.clone()),
             )
         };
         #[cfg(not(target_os = "linux"))]
@@ -6614,5 +6672,103 @@ mod tests {
             Commands::Exec { timeout, .. } => assert_eq!(timeout, Some(600)),
             _ => panic!("expected Exec"),
         }
+    }
+
+    #[test]
+    fn run_net_nat_parses() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "run",
+            "--cloud-image",
+            "ubuntu.qcow2",
+            "--net",
+            "nat",
+        ])
+        .expect("run --net nat parses");
+        match cli.command {
+            Commands::Run { net, .. } => assert_eq!(net.as_deref(), Some("nat")),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn run_net_bridged_parses() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "run",
+            "--cloud-image",
+            "ubuntu.qcow2",
+            "--net",
+            "bridged",
+        ])
+        .expect("run --net bridged parses");
+        match cli.command {
+            Commands::Run { net, .. } => assert_eq!(net.as_deref(), Some("bridged")),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn run_net_invalid_is_rejected() {
+        assert!(
+            Cli::try_parse_from(["husker", "run", "--net", "invalid"]).is_err(),
+            "--net with invalid value should be rejected"
+        );
+    }
+
+    #[test]
+    fn job_net_bridged_parses() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "job",
+            "--cloud-image",
+            "ubuntu.qcow2",
+            "--net",
+            "bridged",
+            "--",
+            "true",
+        ])
+        .expect("job --net bridged parses");
+        match cli.command {
+            Commands::Job { net, .. } => assert_eq!(net.as_deref(), Some("bridged")),
+            _ => panic!("expected Job"),
+        }
+    }
+
+    #[test]
+    fn profile_network_fills_when_cli_unset() {
+        let mut args = VmRequestArgs::default();
+        let p = Profile {
+            network: Some("bridged".into()),
+            ..Profile::default()
+        };
+        apply_profile(&mut args, &p);
+        assert_eq!(args.network.as_deref(), Some("bridged"));
+    }
+
+    #[test]
+    fn profile_network_cli_wins_over_profile() {
+        let mut args = VmRequestArgs {
+            network: Some("nat".into()),
+            ..VmRequestArgs::default()
+        };
+        let p = Profile {
+            network: Some("bridged".into()),
+            ..Profile::default()
+        };
+        apply_profile(&mut args, &p);
+        assert_eq!(args.network.as_deref(), Some("nat"));
+    }
+
+    #[test]
+    fn profile_network_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            "[profiles.bridged-svc]\ncloud_image = \"ubuntu.qcow2\"\nnetwork = \"bridged\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.profiles["bridged-svc"].network.as_deref(),
+            Some("bridged")
+        );
     }
 }
