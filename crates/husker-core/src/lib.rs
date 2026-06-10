@@ -63,6 +63,9 @@ pub enum CoreError {
     #[cfg(feature = "linux-net")]
     #[error("network error: {0}")]
     Network(#[from] husker_net::NetError),
+    #[cfg(feature = "linux-net")]
+    #[error("cloud-init seed error: {0}")]
+    CloudInit(#[from] husker_cloudinit::CloudInitError),
     #[error("storage error: {0}")]
     Storage(#[from] husker_storage::StorageError),
     #[error("state error: {0}")]
@@ -409,6 +412,8 @@ pub struct HuskerCore<B: VmmBackend> {
     #[cfg(feature = "linux-net")]
     ovmf_vars_template_path: PathBuf,
     #[cfg(feature = "linux-net")]
+    embedded_agent: &'static [u8],
+    #[cfg(feature = "linux-net")]
     bridge_name: String,
     #[cfg(feature = "linux-net")]
     dns_servers: Vec<String>,
@@ -442,6 +447,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage_driver: husker_storage::default_storage_driver(),
             ovmf_code_path: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
             ovmf_vars_template_path: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
+            embedded_agent: &[],
             bridge_name,
             dns_servers,
             runtime_dir,
@@ -470,6 +476,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Provide the embedded guest agent used to build cloud-init seeds. Empty (the
+    /// default) disables cloud-image support with a clear error at create time.
+    #[cfg(feature = "linux-net")]
+    pub fn with_embedded_agent(mut self, agent: &'static [u8]) -> Self {
+        self.embedded_agent = agent;
+        self
     }
 
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -587,7 +601,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         // Choose the boot disk + mode. A cloud image boots via UEFI/OVMF from a cloned
         // qcow2; the default path boots a host kernel from a raw ext4 rootfs.
-        let (disk_path, boot, is_cloud) = if let Some(image) = req.cloud_image.as_ref() {
+        let (disk_path, boot, is_cloud, seed_path) = if let Some(image) = req.cloud_image.as_ref() {
             // Cloud-image boot is QEMU-only. Reject an explicit non-QEMU backend request.
             if let Some(v) = req.vmm.as_deref() {
                 let kind = v.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm)?;
@@ -596,6 +610,15 @@ impl<B: VmmBackend> HuskerCore<B> {
                         "cloud-image boot requires the QEMU backend (--vmm qemu)".into(),
                     ));
                 }
+            }
+            // The seed delivers the guest agent; fail fast (before cloning) if the
+            // daemon was built without one.
+            if self.embedded_agent.is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "cloud-image support needs the embedded guest agent; build the daemon with \
+                     `make build-agent` (or set HUSKER_EMBED_AGENT_BIN) first"
+                        .into(),
+                ));
             }
             let disk = vm_dir.join("disk.qcow2");
             let boot = prepare_cloud_disk(
@@ -607,13 +630,32 @@ impl<B: VmmBackend> HuskerCore<B> {
                 &self.ovmf_vars_template_path,
             )
             .await?;
-            (disk, boot, true)
+            // Build the NoCloud seed: install + start the embedded agent and apply a
+            // static network config (husker's allocated IP) so cloud-init does not
+            // stall on DHCP before the agent comes up.
+            let seed = husker_cloudinit::build_seed(&husker_cloudinit::SeedSpec {
+                agent: self.embedded_agent,
+                hostname: req.name.clone(),
+                instance_id: req.name.clone(),
+                ssh_authorized_keys: Vec::new(),
+                network: husker_cloudinit::NetworkConfig {
+                    ip: guest_ip,
+                    prefix_len: self.ip_allocator.prefix_len(),
+                    gateway,
+                    dns: self.dns_servers.clone(),
+                },
+            })?;
+            let seed_path = vm_dir.join("seed.img");
+            tokio::fs::write(&seed_path, &seed)
+                .await
+                .map_err(|e| CoreError::Storage(husker_storage::StorageError::Io(e)))?;
+            (disk, boot, true, Some(seed_path))
         } else {
             let vm_rootfs = vm_dir.join("rootfs.ext4");
             self.storage_driver
                 .clone_rootfs(&req.rootfs_path, &vm_rootfs)
                 .await?;
-            (vm_rootfs, husker_vmm::BootMode::DirectKernel, false)
+            (vm_rootfs, husker_vmm::BootMode::DirectKernel, false, None)
         };
 
         // resolv.conf injection loop-mounts the ext4 rootfs; skip it for qcow2 cloud
@@ -647,7 +689,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             guest_mac: Some(mac),
             vmm: vmm_kind,
             boot,
-            seed_path: None,
+            seed_path,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;

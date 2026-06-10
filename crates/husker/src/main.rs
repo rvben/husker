@@ -4141,15 +4141,23 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                 VmmSelection::Firecracker => husker_vmm::VmmKind::Firecracker,
             };
             let vmm = husker_vmm::LinuxDispatchBackend::new(firecracker, qemu, default_kind);
-            Arc::new(husker_core::HuskerCore::new(
-                vmm,
-                state,
-                ip_allocator,
-                storage,
-                config.bridge_name.clone(),
-                config.dns_servers,
-                runtime_dir.clone(),
-            ))
+            if husker::agent_embedded() {
+                tracing::info!("cloud-image support enabled (guest agent embedded)");
+            } else {
+                tracing::info!("cloud-image support disabled (no embedded agent; run make build-agent)");
+            }
+            Arc::new(
+                husker_core::HuskerCore::new(
+                    vmm,
+                    state,
+                    ip_allocator,
+                    storage,
+                    config.bridge_name.clone(),
+                    config.dns_servers,
+                    runtime_dir.clone(),
+                )
+                .with_embedded_agent(husker::EMBEDDED_AGENT),
+            )
         };
         #[cfg(not(target_os = "linux"))]
         let core = {

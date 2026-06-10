@@ -908,6 +908,7 @@ dependencies = [
  "chrono",
  "husker-agent",
  "husker-agent-proto",
+ "husker-cloudinit",
  "husker-net",
  "husker-state",
  "husker-storage",

@@ -7,12 +7,13 @@ rust-version.workspace = true
 
 [features]
 default = ["linux-net"]
-linux-net = ["husker-net", "dep:tempfile"]
+linux-net = ["husker-net", "dep:tempfile", "dep:husker-cloudinit"]
 utoipa = ["dep:utoipa"]
 
 [dependencies]
 husker-vmm = { workspace = true }
 husker-net = { workspace = true, optional = true }
+husker-cloudinit = { workspace = true, optional = true }
 husker-storage = { workspace = true }
 husker-state = { workspace = true }
 husker-agent-proto = { workspace = true }
