@@ -1365,10 +1365,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// returned. Errors persisting the state are logged, not fatal: the caller
     /// still sees the corrected in-memory record.
     ///
-    /// Platform scope: currently only the Firecracker and QEMU backends detect
-    /// process exit this way (their `vm_info` `try_wait`s the child); the Apple
-    /// VZ backend's `vm_info` is a memory-only read, so guest-initiated shutdown
-    /// is not yet detected on macOS.
+    /// Platform scope: Firecracker and QEMU backends detect process exit via
+    /// `try_wait` on the child process. The Apple VZ backend queries the live
+    /// `VZVirtualMachine.state()` on the VM's dispatch queue so guest-initiated
+    /// shutdown (poweroff, kernel panic) is also detected on macOS.
     pub async fn refresh_vm_liveness(&self, vm: &VmRecord) -> VmRecord {
         if vm.state != "running" && vm.state != "paused" {
             return vm.clone();

@@ -19,6 +19,7 @@ use objc2_virtualization::{
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
     VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtualMachineState,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -479,9 +480,63 @@ impl VmmBackend for AppleVzBackend {
     }
 
     async fn vm_info(&self, id: Uuid) -> Result<VmInfo, VmmError> {
-        let instances = self.instances.lock().await;
-        let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
-        Ok(inst.info.clone())
+        // For Running/Paused VMs, query the live VZVirtualMachine state on the
+        // VM's dispatch queue to detect guest-initiated shutdown (poweroff,
+        // reboot, kernel panic). For Stopped/Failed/other states, the stored
+        // info is already final and no live query is needed.
+        let (info, maybe_live) = {
+            let instances = self.instances.lock().await;
+            let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            let needs_check =
+                matches!(inst.info.state, VmState::Running | VmState::Paused);
+            let live = if needs_check {
+                Some((QueueConfined(inst.vm.0.clone()), inst.queue.clone()))
+            } else {
+                None
+            };
+            (inst.info.clone(), live)
+        };
+
+        let Some((vm, queue)) = maybe_live else {
+            return Ok(info);
+        };
+
+        let live_state = dispatch_sync_result(queue, move || -> VZVirtualMachineState {
+            let _capture_whole = &vm;
+            // Safety: Called on the VM's serial dispatch queue.
+            unsafe { vm.0.state() }
+        })
+        .await?;
+
+        // Map the live VZ state to our VmState. Only act when the live state
+        // indicates the guest has stopped; all other transitions (Starting,
+        // Pausing, Resuming, Saving, Restoring) are transient and the stored
+        // state is the right thing to return.
+        let updated_state = match live_state {
+            VZVirtualMachineState::Stopped | VZVirtualMachineState::Stopping => {
+                Some(VmState::Stopped)
+            }
+            VZVirtualMachineState::Error => Some(VmState::Failed),
+            _ => None,
+        };
+
+        let Some(new_state) = updated_state else {
+            return Ok(info);
+        };
+
+        // Guest has stopped or errored. Update the stored VmInfo so subsequent
+        // calls reflect the actual state without re-querying the dispatch queue.
+        let mut updated = info;
+        updated.state = new_state;
+        updated.pid = None;
+        {
+            let mut instances = self.instances.lock().await;
+            if let Some(inst) = instances.get_mut(&id) {
+                inst.info.state = new_state;
+                inst.info.pid = None;
+            }
+        }
+        Ok(updated)
     }
 
     async fn pause_vm(&self, id: Uuid) -> Result<(), VmmError> {
