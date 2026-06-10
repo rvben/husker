@@ -706,7 +706,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let tap_name = format!("husker{cid}");
         let mac = husker_net::generate_mac(cid);
 
-        // NAT-only values; only evaluated when network_mode == "nat".
+        // Computed for the NAT branches below; bridged mode never applies them.
         let gateway = self.ip_allocator.gateway();
         let netmask = husker_net::prefix_len_to_netmask(self.ip_allocator.prefix_len());
 
