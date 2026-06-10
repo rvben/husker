@@ -3930,6 +3930,17 @@ mod tests {
             resolve_exec_run_timeout(Some(u64::MAX), &policy),
             Duration::from_secs(3600)
         );
+        // A zero daemon default still yields the 1s floor when the request
+        // does not specify a timeout (pre-existing behavior).
+        let zero_default = ApiPolicy {
+            exec_timeout_secs: 0,
+            exec_timeout_max_secs: 3600,
+            ..ApiPolicy::default()
+        };
+        assert_eq!(
+            resolve_exec_run_timeout(None, &zero_default),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

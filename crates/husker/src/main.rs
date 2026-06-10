@@ -5271,6 +5271,7 @@ mod tests {
             EnvVarGuard::set("HUSKER_ALLOWED_READ_PATHS", " /etc , /var/log ,,"),
             EnvVarGuard::set("HUSKER_ALLOWED_WRITE_PATHS", "/tmp,/var/tmp"),
             EnvVarGuard::set("HUSKER_EXEC_TIMEOUT_SECS", "45"),
+            EnvVarGuard::set("HUSKER_EXEC_TIMEOUT_MAX_SECS", "7200"),
             EnvVarGuard::set("HUSKER_EXEC_ALLOWLIST", "echo,cat"),
             EnvVarGuard::set("HUSKER_EXEC_DENYLIST", "rm,reboot"),
             EnvVarGuard::set("HUSKER_EXEC_ENV_ALLOWLIST", "PATH,TERM"),
@@ -5284,6 +5285,7 @@ mod tests {
         assert_eq!(config.allowed_read_paths, vec!["/etc", "/var/log"]);
         assert_eq!(config.allowed_write_paths, vec!["/tmp", "/var/tmp"]);
         assert_eq!(config.exec_timeout_secs, 45);
+        assert_eq!(config.exec_timeout_max_secs, 7200);
         assert_eq!(config.exec_allowlist, vec!["echo", "cat"]);
         assert_eq!(config.exec_denylist, vec!["rm", "reboot"]);
         assert_eq!(config.exec_env_allowlist, vec!["PATH", "TERM"]);
