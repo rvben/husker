@@ -23,6 +23,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("command failed: {0}")]
     CommandFailed(String),
+    #[error("volume image error: {0}")]
+    VolumeImage(String),
 }
 
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -261,6 +263,73 @@ pub fn validate_cloud_image(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Create a sparse ext4 volume image at `path` with the given size.
+///
+/// The file is first created as a sparse file (only metadata occupies disk
+/// space until data is written) and then formatted with `mkfs.ext4 -F -q`.
+/// If mkfs fails the partial file is removed to avoid leaving a half-made
+/// volume on disk.
+///
+/// `path` must not already exist; returns `StorageError::VolumeImage` if it does.
+pub async fn create_volume_image(path: &Path, size_bytes: u64) -> Result<(), StorageError> {
+    if path.exists() {
+        return Err(StorageError::VolumeImage(format!(
+            "volume image already exists: {}",
+            path.display()
+        )));
+    }
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    // Create a sparse file of the requested size.
+    {
+        let file = std::fs::File::create(path)?;
+        file.set_len(size_bytes)?;
+    }
+
+    // Format with mkfs.ext4.
+    let output = tokio::process::Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg("-q")
+        .arg(path)
+        .output()
+        .await;
+
+    match output {
+        Err(e) => {
+            // mkfs not found or failed to spawn; clean up and propagate.
+            let _ = std::fs::remove_file(path);
+            Err(StorageError::VolumeImage(format!(
+                "mkfs.ext4 spawn failed: {e}"
+            )))
+        }
+        Ok(out) if !out.status.success() => {
+            let _ = std::fs::remove_file(path);
+            Err(StorageError::VolumeImage(format!(
+                "mkfs.ext4 {} failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Validate that a volume image file exists at `path`.
+///
+/// Used at attach time to confirm the image has not been deleted outside husker.
+pub fn validate_volume(path: &Path) -> Result<(), StorageError> {
+    if !path.exists() {
+        return Err(StorageError::VolumeImage(format!(
+            "volume image not found: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +505,68 @@ mod tests {
     #[test]
     fn validate_cloud_image_rejects_missing_file() {
         assert!(validate_cloud_image(Path::new("/nonexistent/img.qcow2")).is_err());
+    }
+
+    // ── Volume image helpers ─────────────────────────────────────────
+
+    fn mkfs_ext4_available() -> bool {
+        std::process::Command::new("which")
+            .arg("mkfs.ext4")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn create_volume_image_creates_sparse_file_and_formats() {
+        if !mkfs_ext4_available() {
+            eprintln!("skipping create_volume_image test: mkfs.ext4 not found (macOS dev host)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.img");
+        let size = 64 * 1024 * 1024; // 64 MiB
+
+        create_volume_image(&path, size).await.unwrap();
+
+        // The file must exist and report the correct apparent size.
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            meta.len(),
+            size,
+            "volume image should have the requested apparent size"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_volume_image_refuses_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exists.img");
+        std::fs::write(&path, b"preexisting").unwrap();
+
+        let err = create_volume_image(&path, 64 * 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::VolumeImage(_)),
+            "expected VolumeImage error for existing path, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_volume_accepts_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vol.img");
+        std::fs::write(&path, b"data").unwrap();
+        assert!(validate_volume(&path).is_ok());
+    }
+
+    #[test]
+    fn validate_volume_rejects_missing_file() {
+        let err = validate_volume(Path::new("/nonexistent/vol.img")).unwrap_err();
+        assert!(
+            matches!(err, StorageError::VolumeImage(_)),
+            "expected VolumeImage error, got: {err:?}"
+        );
     }
 }
