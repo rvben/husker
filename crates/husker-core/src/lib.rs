@@ -430,6 +430,26 @@ pub struct HuskerCore<B: VmmBackend> {
 /// Per-attempt timeout for agent connect+ping in readiness loops.
 const AGENT_PING_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Default agent-readiness wait (seconds) for direct-kernel microVMs.
+pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 120;
+
+/// Default agent-readiness wait (seconds) for UEFI/cloud VMs, which boot much
+/// slower than microVMs (OVMF firmware + GRUB + full distro init + cloud-init
+/// installing and starting the agent).
+pub const UEFI_READY_TIMEOUT_SECS: u64 = 180;
+
+/// Boot-mode-aware default readiness timeout. `boot_mode` is the persisted
+/// `VmRecord.boot_mode` value ("direct" or "uefi"); unknown values use the
+/// direct-kernel default.
+pub fn default_ready_timeout(boot_mode: &str) -> std::time::Duration {
+    let secs = if boot_mode == "uefi" {
+        UEFI_READY_TIMEOUT_SECS
+    } else {
+        DEFAULT_READY_TIMEOUT_SECS
+    };
+    std::time::Duration::from_secs(secs)
+}
+
 impl<B: VmmBackend> HuskerCore<B> {
     /// Create a new HuskerCore with Linux networking (bridge + TAP + nftables).
     #[cfg(feature = "linux-net")]
@@ -1745,9 +1765,10 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Execute the userdata script inside a running VM.
     ///
-    /// Retries agent connection with exponential backoff (up to 120s total),
-    /// writes the script to `/tmp/husker-userdata.sh`, executes it via `sh`,
-    /// and updates `userdata_status` to `completed` or `failed`.
+    /// Retries agent connection with exponential backoff (bounded by the
+    /// boot-mode-aware default readiness timeout), writes the script to
+    /// `/tmp/husker-userdata.sh`, executes it via `sh`, and updates
+    /// `userdata_status` to `completed` or `failed`.
     pub async fn run_userdata(&self, name: &str) -> Result<(), CoreError> {
         let record = self.lookup_vm(name)?;
         let script = match record.userdata {
@@ -1759,7 +1780,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let result: Result<(), CoreError> = async {
             let mut conn = self
-                .agent_connect_ready(name, std::time::Duration::from_secs(120))
+                .agent_connect_ready(name, default_ready_timeout(&record.boot_mode))
                 .await?;
 
             conn.write_file("/tmp/husker-userdata.sh", script.as_bytes(), Some(0o755))
@@ -2905,5 +2926,22 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(req.cloud_image.is_none());
         assert!(req.disk_size.is_none());
         assert!(req.ssh_authorized_keys.is_empty());
+    }
+
+    #[test]
+    fn ready_timeout_is_boot_mode_aware() {
+        assert_eq!(
+            default_ready_timeout("direct"),
+            std::time::Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            default_ready_timeout("uefi"),
+            std::time::Duration::from_secs(UEFI_READY_TIMEOUT_SECS)
+        );
+        // Unknown values fall back to the conservative direct-kernel default.
+        assert_eq!(
+            default_ready_timeout("something-else"),
+            std::time::Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS)
+        );
     }
 }
