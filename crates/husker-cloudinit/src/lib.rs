@@ -16,6 +16,8 @@ pub enum CloudInitError {
     Fat(String),
     #[error("guest agent binary is empty (the daemon was built without an embedded agent)")]
     EmptyAgent,
+    #[error("invalid SSH public key: {0}")]
+    InvalidSshKey(String),
 }
 
 /// Static guest network, rendered into cloud-init network-config v2.
@@ -43,6 +45,19 @@ pub struct SeedSpec<'a> {
 pub fn build_seed(spec: &SeedSpec) -> Result<Vec<u8>, CloudInitError> {
     if spec.agent.is_empty() {
         return Err(CloudInitError::EmptyAgent);
+    }
+    // Keys are rendered verbatim as YAML scalar values. Any control character
+    // (including \n, \r, \t) breaks the YAML structure and allows injecting
+    // arbitrary cloud-config directives. SSH public keys are ASCII tokens, so
+    // char::is_control covers every dangerous byte without over-blocking valid keys.
+    // Unicode line separators (U+2028/U+2029) are not control characters but
+    // cannot appear in a valid ASCII SSH public key either.
+    for key in &spec.ssh_authorized_keys {
+        if key.trim().is_empty() || key.chars().any(char::is_control) {
+            return Err(CloudInitError::InvalidSshKey(
+                "keys must be non-empty single lines without control characters".into(),
+            ));
+        }
     }
     let meta_data = format!(
         "instance-id: {}\nlocal-hostname: {}\n",
@@ -249,5 +264,39 @@ mod tests {
     fn build_seed_rejects_empty_agent() {
         let err = build_seed(&sample_spec(b"")).unwrap_err();
         assert!(matches!(err, CloudInitError::EmptyAgent), "got {err:?}");
+    }
+
+    #[test]
+    fn ssh_key_with_newline_is_rejected() {
+        let agent = b"fake-agent";
+        let mut spec = sample_spec(agent);
+        spec.ssh_authorized_keys = vec!["ssh-ed25519 AAAA x\nruncmd:\n  - rm -rf /".into()];
+        let err = build_seed(&spec).expect_err("newline key must be rejected");
+        assert!(matches!(err, CloudInitError::InvalidSshKey(_)));
+    }
+
+    #[test]
+    fn empty_ssh_key_is_rejected() {
+        let agent = b"fake-agent";
+        let mut spec = sample_spec(agent);
+        spec.ssh_authorized_keys = vec!["   ".into()];
+        let err = build_seed(&spec).expect_err("blank key must be rejected");
+        assert!(matches!(err, CloudInitError::InvalidSshKey(_)));
+    }
+
+    #[test]
+    fn ssh_key_with_other_control_chars_is_rejected() {
+        let agent = b"fake-agent";
+        let mut spec = sample_spec(agent);
+        spec.ssh_authorized_keys = vec!["ssh-ed25519 AAAA\tx".into()];
+        assert!(matches!(
+            build_seed(&spec),
+            Err(CloudInitError::InvalidSshKey(_))
+        ));
+        spec.ssh_authorized_keys = vec!["ssh-ed25519 AAAA x\r".into()];
+        assert!(matches!(
+            build_seed(&spec),
+            Err(CloudInitError::InvalidSshKey(_))
+        ));
     }
 }
