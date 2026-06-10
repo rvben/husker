@@ -325,8 +325,8 @@ async fn reconcile_foreign_running_collision() {
     // Create a foreign running VM named "web-1"
     core.create_vm(CreateVmRequest {
         name: "web-1".into(),
-        kernel_path: kernel.clone(),
-        rootfs_path: rootfs.clone(),
+        kernel_path: Some(kernel.clone()),
+        rootfs_path: Some(rootfs.clone()),
         vcpu_count: Some(1),
         mem_size_mib: Some(128),
         initrd_path: None,
@@ -374,8 +374,8 @@ async fn reconcile_foreign_stopped_collision() {
     // Create and stop a foreign VM named "web-1"
     core.create_vm(CreateVmRequest {
         name: "web-1".into(),
-        kernel_path: kernel.clone(),
-        rootfs_path: rootfs.clone(),
+        kernel_path: Some(kernel.clone()),
+        rootfs_path: Some(rootfs.clone()),
         vcpu_count: Some(1),
         mem_size_mib: Some(128),
         initrd_path: None,
@@ -433,8 +433,8 @@ async fn reconcile_dedupes_duplicate_ordinal() {
         .create_vm_record(
             CreateVmRequest {
                 name: "web-0".into(),
-                kernel_path: kernel.clone(),
-                rootfs_path: rootfs.clone(),
+                kernel_path: Some(kernel.clone()),
+                rootfs_path: Some(rootfs.clone()),
                 vcpu_count: Some(1),
                 mem_size_mib: Some(128),
                 initrd_path: None,
@@ -459,8 +459,8 @@ async fn reconcile_dedupes_duplicate_ordinal() {
         .create_vm_record(
             CreateVmRequest {
                 name: "dup-0".into(),
-                kernel_path: kernel.clone(),
-                rootfs_path: rootfs.clone(),
+                kernel_path: Some(kernel.clone()),
+                rootfs_path: Some(rootfs.clone()),
                 vcpu_count: Some(1),
                 mem_size_mib: Some(128),
                 initrd_path: None,

@@ -512,8 +512,8 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
     let err = core
         .create_vm(CreateVmRequest {
             name: "dup-vm".into(),
-            kernel_path: PathBuf::from("/path/that/does/not/matter"),
-            rootfs_path: PathBuf::from("/path/that/also/does/not/matter"),
+            kernel_path: Some(PathBuf::from("/path/that/does/not/matter")),
+            rootfs_path: Some(PathBuf::from("/path/that/also/does/not/matter")),
             vcpu_count: Some(1),
             mem_size_mib: Some(128),
             initrd_path: None,
@@ -546,8 +546,8 @@ async fn create_vm_missing_kernel_returns_storage_error() {
     let err = core
         .create_vm(CreateVmRequest {
             name: "vm-missing-kernel".into(),
-            kernel_path: tmp.path().join("missing-kernel"),
-            rootfs_path: tmp.path().join("missing-rootfs"),
+            kernel_path: Some(tmp.path().join("missing-kernel")),
+            rootfs_path: Some(tmp.path().join("missing-rootfs")),
             vcpu_count: Some(1),
             mem_size_mib: Some(128),
             initrd_path: None,
@@ -605,8 +605,8 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
     let err = core
         .create_vm(CreateVmRequest {
             name: "replace-vm".into(),
-            kernel_path: tmp.path().join("missing-kernel-after-replace"),
-            rootfs_path: tmp.path().join("missing-rootfs-after-replace"),
+            kernel_path: Some(tmp.path().join("missing-kernel-after-replace")),
+            rootfs_path: Some(tmp.path().join("missing-rootfs-after-replace")),
             vcpu_count: Some(1),
             mem_size_mib: Some(128),
             initrd_path: None,
@@ -1449,8 +1449,8 @@ async fn create_vm_rejects_unsafe_names() {
         let err = core
             .create_vm(CreateVmRequest {
                 name: (*name).into(),
-                kernel_path: PathBuf::from("/missing-kernel"),
-                rootfs_path: PathBuf::from("/missing-rootfs"),
+                kernel_path: Some(PathBuf::from("/missing-kernel")),
+                rootfs_path: Some(PathBuf::from("/missing-rootfs")),
                 vcpu_count: Some(1),
                 mem_size_mib: Some(128),
                 initrd_path: None,
@@ -1775,8 +1775,8 @@ async fn create_vm_accepts_safe_names() {
         let err = core
             .create_vm(CreateVmRequest {
                 name: (*name).into(),
-                kernel_path: PathBuf::from("/missing-kernel"),
-                rootfs_path: PathBuf::from("/missing-rootfs"),
+                kernel_path: Some(PathBuf::from("/missing-kernel")),
+                rootfs_path: Some(PathBuf::from("/missing-rootfs")),
                 vcpu_count: Some(1),
                 mem_size_mib: Some(128),
                 initrd_path: None,
@@ -1806,8 +1806,8 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
     let err = core
         .create_vm(CreateVmRequest {
             name: "cloudvm".into(),
-            kernel_path: std::path::PathBuf::from("/unused"),
-            rootfs_path: std::path::PathBuf::from("/unused"),
+            kernel_path: None,
+            rootfs_path: None,
             vcpu_count: Some(1),
             mem_size_mib: Some(128),
             initrd_path: None,
@@ -1847,8 +1847,8 @@ async fn concurrent_create_same_name_one_winner() {
         tokio::spawn(async move {
             c.create_vm(CreateVmRequest {
                 name: "racer".into(),
-                kernel_path: kernel,
-                rootfs_path: rootfs,
+                kernel_path: Some(kernel),
+                rootfs_path: Some(rootfs),
                 vcpu_count: Some(1),
                 mem_size_mib: Some(128),
                 initrd_path: None,

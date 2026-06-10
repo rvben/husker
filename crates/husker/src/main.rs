@@ -1172,43 +1172,6 @@ async fn run(cli: Cli) -> Result<()> {
                 exit_with_error(output, "--ssh-key requires --cloud-image".to_string());
             }
 
-            let (rootfs, kernel) = if let Some(ref img) = cloud_image {
-                // Cloud-image boot: kernel/rootfs are unused by the UEFI path. Satisfy
-                // the required request fields with the image path and skip the default
-                // kernel/rootfs lookups (they would hard-fail if the defaults are absent).
-                (img.clone(), img.clone())
-            } else {
-                let rootfs = match rootfs {
-                    Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
-                    None => {
-                        let default = config.default_rootfs.clone();
-                        if !default.exists() {
-                            eprintln!(
-                                "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass a rootfs path explicitly.",
-                                default.display()
-                            );
-                            exit_with_error(output, "default rootfs not available".to_string());
-                        }
-                        default
-                    }
-                };
-                let kernel = match kernel {
-                    Some(path) => path,
-                    None => {
-                        let default = config.default_kernel.clone();
-                        if !default.exists() {
-                            eprintln!(
-                                "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
-                                default.display()
-                            );
-                            exit_with_error(output, "default kernel not available".to_string());
-                        }
-                        default
-                    }
-                };
-                (rootfs, kernel)
-            };
-
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
@@ -1222,21 +1185,13 @@ async fn run(cli: Cli) -> Result<()> {
 
             let mut body = serde_json::json!({
                 "name": name,
-                "kernel_path": kernel,
-                "rootfs_path": rootfs,
                 "vcpu_count": cpus,
                 "mem_size_mib": memory,
                 "env": env_pairs,
             });
+
             if let Some(ref vmm_kind) = vmm {
                 body["vmm"] = serde_json::json!(vmm_kind);
-            }
-            if let Some(ref initrd_path) = initrd {
-                body["initrd_path"] = serde_json::json!(initrd_path);
-            } else if let Some(ref default_initrd) = config.default_initrd
-                && default_initrd.exists()
-            {
-                body["initrd_path"] = serde_json::json!(default_initrd);
             }
             if let Some(ref userdata_path) = userdata {
                 let script = std::fs::read_to_string(userdata_path).with_context(|| {
@@ -1244,6 +1199,7 @@ async fn run(cli: Cli) -> Result<()> {
                 })?;
                 body["userdata"] = serde_json::json!(script);
             }
+
             if let Some(ref img) = cloud_image {
                 body["cloud_image"] = serde_json::json!(img);
                 let disk_size_source = if disk_size.is_some() {
@@ -1268,23 +1224,59 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     body["ssh_authorized_keys"] = serde_json::json!(keys);
                 }
-            }
-
-            if output == OutputFormat::Text {
-                if let Some(ref img) = cloud_image {
+                if output == OutputFormat::Text {
                     eprintln!("Using: cloud-image={}", img.display());
-                } else {
+                }
+            } else {
+                let resolved_rootfs = match rootfs {
+                    Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
+                    None => {
+                        let default = config.default_rootfs.clone();
+                        if !default.exists() {
+                            eprintln!(
+                                "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass a rootfs path explicitly.",
+                                default.display()
+                            );
+                            exit_with_error(output, "default rootfs not available".to_string());
+                        }
+                        default
+                    }
+                };
+                let resolved_kernel = match kernel {
+                    Some(path) => path,
+                    None => {
+                        let default = config.default_kernel.clone();
+                        if !default.exists() {
+                            eprintln!(
+                                "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
+                                default.display()
+                            );
+                            exit_with_error(output, "default kernel not available".to_string());
+                        }
+                        default
+                    }
+                };
+                if let Some(ref initrd_path) = initrd {
+                    body["initrd_path"] = serde_json::json!(initrd_path);
+                } else if let Some(ref default_initrd) = config.default_initrd
+                    && default_initrd.exists()
+                {
+                    body["initrd_path"] = serde_json::json!(default_initrd);
+                }
+                if output == OutputFormat::Text {
                     let initrd_str = body
                         .get("initrd_path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("(none)");
                     eprintln!(
                         "Using: kernel={} rootfs={} initrd={}",
-                        kernel.display(),
-                        rootfs.display(),
+                        resolved_kernel.display(),
+                        resolved_rootfs.display(),
                         initrd_str,
                     );
                 }
+                body["kernel_path"] = serde_json::json!(resolved_kernel);
+                body["rootfs_path"] = serde_json::json!(resolved_rootfs);
             }
 
             #[cfg(all(target_os = "linux", feature = "linux-net"))]

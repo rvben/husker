@@ -79,10 +79,14 @@ pub enum CoreError {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct CreateVmRequest {
     pub name: String,
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
-    pub kernel_path: PathBuf,
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
-    pub rootfs_path: PathBuf,
+    /// Kernel for direct-kernel boot. Required unless `cloud_image` is set.
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub kernel_path: Option<PathBuf>,
+    /// Root filesystem for direct-kernel boot. Required unless `cloud_image` is set.
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub rootfs_path: Option<PathBuf>,
     pub vcpu_count: Option<u32>,
     pub mem_size_mib: Option<u32>,
     /// Path to an initramfs/initrd image (needed for kernels with modular drivers).
@@ -579,8 +583,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         if req.cloud_image.is_none() {
-            husker_storage::validate_kernel(&req.kernel_path)?;
-            husker_storage::validate_rootfs(&req.rootfs_path)?;
+            let kernel = req.kernel_path.as_deref().ok_or_else(|| {
+                CoreError::InvalidArgument("kernel_path is required for direct-kernel boot".into())
+            })?;
+            let rootfs = req.rootfs_path.as_deref().ok_or_else(|| {
+                CoreError::InvalidArgument("rootfs_path is required for direct-kernel boot".into())
+            })?;
+            husker_storage::validate_kernel(kernel)?;
+            husker_storage::validate_rootfs(rootfs)?;
         }
 
         let mut resources = AllocatedResources::default();
@@ -636,7 +646,11 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         // Choose the boot disk + mode. A cloud image boots via UEFI/OVMF from a cloned
         // qcow2; the default path boots a host kernel from a raw ext4 rootfs.
-        let (disk_path, boot, is_cloud, seed_path) = if let Some(image) = req.cloud_image.as_ref() {
+        // cloud_source_path: the resolved source image (catalog path or user path) used as
+        // rootfs_path provenance in the VmRecord for cloud VMs; None for direct-kernel boot.
+        let (disk_path, boot, is_cloud, seed_path, cloud_source_path) = if let Some(image) =
+            req.cloud_image.as_ref()
+        {
             // Resolve --cloud-image: an existing host path wins; otherwise it
             // names a catalog image of kind "cloud-image".
             let image_path = {
@@ -711,13 +725,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             tokio::fs::write(&seed_path, &seed)
                 .await
                 .map_err(|e| CoreError::Storage(husker_storage::StorageError::Io(e)))?;
-            (disk, boot, true, Some(seed_path))
+            (disk, boot, true, Some(seed_path), Some(image_path))
         } else {
+            let rootfs = req.rootfs_path.as_deref().ok_or_else(|| {
+                CoreError::InvalidArgument("rootfs_path is required for direct-kernel boot".into())
+            })?;
             let vm_rootfs = vm_dir.join("rootfs.ext4");
-            self.storage_driver
-                .clone_rootfs(&req.rootfs_path, &vm_rootfs)
-                .await?;
-            (vm_rootfs, husker_vmm::BootMode::DirectKernel, false, None)
+            self.storage_driver.clone_rootfs(rootfs, &vm_rootfs).await?;
+            (
+                vm_rootfs,
+                husker_vmm::BootMode::DirectKernel,
+                false,
+                None,
+                None,
+            )
         };
 
         // resolv.conf injection loop-mounts the ext4 rootfs; skip it for qcow2 cloud
@@ -735,11 +756,36 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         };
 
+        // For direct-kernel boot: resolve the kernel now (validation already ran in
+        // create_vm_record; try_create_vm may also be called from tests that skip it).
+        let (config_kernel_path, record_kernel_path, record_rootfs_path) = if is_cloud {
+            // Cloud VMs boot via UEFI; kernel_path is unused in VmConfig for that path.
+            // Persist an empty kernel_path and the resolved source image path as rootfs
+            // provenance so callers can trace which catalog/host image backed this VM.
+            let source = cloud_source_path
+                .expect("cloud_source_path is Some when is_cloud")
+                .to_string_lossy()
+                .into_owned();
+            (PathBuf::new(), String::new(), source)
+        } else {
+            let kernel = req.kernel_path.as_deref().ok_or_else(|| {
+                CoreError::InvalidArgument("kernel_path is required for direct-kernel boot".into())
+            })?;
+            let rootfs = req.rootfs_path.as_deref().ok_or_else(|| {
+                CoreError::InvalidArgument("rootfs_path is required for direct-kernel boot".into())
+            })?;
+            (
+                kernel.to_path_buf(),
+                kernel.to_string_lossy().into_owned(),
+                rootfs.to_string_lossy().into_owned(),
+            )
+        };
+
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
             mem_size_mib: req.mem_size_mib.unwrap_or(128),
-            kernel_path: req.kernel_path.clone(),
+            kernel_path: config_kernel_path,
             rootfs_path: disk_path,
             kernel_args: if is_cloud {
                 None
@@ -776,8 +822,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             // Kept for CLI display and API responses (shows the default gateway).
             host_ip: Some(gateway.to_string()),
             guest_ip: Some(guest_ip.to_string()),
-            kernel_path: req.kernel_path.to_string_lossy().into_owned(),
-            rootfs_path: req.rootfs_path.to_string_lossy().into_owned(),
+            kernel_path: record_kernel_path,
+            rootfs_path: record_rootfs_path,
             created_at: now,
             updated_at: now,
             userdata: req.userdata,
@@ -835,10 +881,14 @@ impl<B: VmmBackend> HuskerCore<B> {
                 warn!(dir = %vm_dir.display(), error = %e, "failed to remove stale VM directory");
             }
         }
+        let kernel = req.kernel_path.as_deref().ok_or_else(|| {
+            CoreError::InvalidArgument("kernel_path is required for direct-kernel boot".into())
+        })?;
+        let rootfs = req.rootfs_path.as_deref().ok_or_else(|| {
+            CoreError::InvalidArgument("rootfs_path is required for direct-kernel boot".into())
+        })?;
         let vm_rootfs = vm_dir.join("rootfs.ext4");
-        self.storage_driver
-            .clone_rootfs(&req.rootfs_path, &vm_rootfs)
-            .await?;
+        self.storage_driver.clone_rootfs(rootfs, &vm_rootfs).await?;
         resources.vm_dir = Some(vm_dir);
 
         // Resolve initrd: use explicit path, or look for conventional location
@@ -847,11 +897,13 @@ impl<B: VmmBackend> HuskerCore<B> {
             conventional.exists().then_some(conventional)
         });
 
+        let kernel_str = kernel.to_string_lossy().into_owned();
+        let rootfs_str = rootfs.to_string_lossy().into_owned();
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
             mem_size_mib: req.mem_size_mib.unwrap_or(128),
-            kernel_path: req.kernel_path.clone(),
+            kernel_path: kernel.to_path_buf(),
             rootfs_path: vm_rootfs,
             kernel_args: Some("console=hvc0 root=/dev/vda rw init=/sbin/init".into()),
             initrd_path,
@@ -879,8 +931,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             tap_device: None,
             host_ip: None,
             guest_ip: None,
-            kernel_path: req.kernel_path.to_string_lossy().into_owned(),
-            rootfs_path: req.rootfs_path.to_string_lossy().into_owned(),
+            kernel_path: kernel_str,
+            rootfs_path: rootfs_str,
             created_at: now,
             updated_at: now,
             userdata: req.userdata,
@@ -1382,8 +1434,8 @@ impl<B: VmmBackend> HuskerCore<B> {
         let snapshot = self.get_snapshot(snapshot_name)?;
         self.create_vm(CreateVmRequest {
             name: req.name,
-            kernel_path: req.kernel_path,
-            rootfs_path: PathBuf::from(snapshot.file_path),
+            kernel_path: Some(req.kernel_path),
+            rootfs_path: Some(PathBuf::from(snapshot.file_path)),
             vcpu_count: req.vcpu_count,
             mem_size_mib: req.mem_size_mib,
             initrd_path: req.initrd_path,
@@ -2187,8 +2239,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             .unwrap_or_default();
         let req = CreateVmRequest {
             name: name.clone(),
-            kernel_path: svc.kernel_path.clone().into(),
-            rootfs_path: svc.rootfs_path.clone().into(),
+            kernel_path: Some(svc.kernel_path.clone().into()),
+            rootfs_path: Some(svc.rootfs_path.clone().into()),
             vcpu_count: svc.vcpu_count,
             mem_size_mib: svc.mem_size_mib,
             initrd_path: svc.initrd_path.clone().map(Into::into),
@@ -3029,8 +3081,10 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[test]
     fn create_vm_request_defaults_cloud_fields_to_none() {
-        let json = r#"{"name":"v","kernel_path":"/k","rootfs_path":"/r"}"#;
+        let json = r#"{"name":"v"}"#;
         let req: super::CreateVmRequest = serde_json::from_str(json).unwrap();
+        assert!(req.kernel_path.is_none());
+        assert!(req.rootfs_path.is_none());
         assert!(req.cloud_image.is_none());
         assert!(req.disk_size.is_none());
         assert!(req.ssh_authorized_keys.is_empty());
