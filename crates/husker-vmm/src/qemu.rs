@@ -145,6 +145,10 @@ impl QemuKvmBackend {
                     "file={},format=qcow2,if=virtio,cache=writeback",
                     config.rootfs_path.display()
                 ));
+                if let Some(seed) = &config.seed_path {
+                    args.push("-drive".into());
+                    args.push(format!("file={},format=raw,if=virtio", seed.display()));
+                }
             }
         }
 
@@ -414,6 +418,7 @@ mod tests {
             guest_mac: Some("52:54:00:00:00:07".into()),
             vmm: None,
             boot: crate::BootMode::DirectKernel,
+            seed_path: None,
         }
     }
 
@@ -596,6 +601,27 @@ mod tests {
         assert!(args.iter().any(|a| a == "-kernel"), "direct boot must keep -kernel");
         assert!(args.iter().any(|a| a.contains("format=raw") && a.contains("if=virtio")));
         assert!(!args.iter().any(|a| a.contains("if=pflash")), "direct boot must not emit pflash");
+    }
+
+    #[test]
+    fn build_args_uefi_attaches_seed_when_present() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let mut cfg = uefi_config();
+        cfg.seed_path = Some("/var/lib/husker/vms/qvm/seed.img".into());
+        let args = be.build_args(Uuid::nil(), &cfg);
+        assert!(
+            args.iter().any(|a| a.contains("seed.img")
+                && a.contains("format=raw")
+                && a.contains("if=virtio")),
+            "seed disk not attached: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_uefi_omits_seed_when_absent() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let args = be.build_args(Uuid::nil(), &uefi_config()); // seed_path None
+        assert!(!args.iter().any(|a| a.contains("seed.img")), "unexpected seed: {args:?}");
     }
 
     #[tokio::test]

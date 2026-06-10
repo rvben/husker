@@ -647,6 +647,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             guest_mac: Some(mac),
             vmm: vmm_kind,
             boot,
+            seed_path: None,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -745,6 +746,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             guest_mac: None,
             vmm: None,
             boot: husker_vmm::BootMode::DirectKernel,
+            seed_path: None,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;

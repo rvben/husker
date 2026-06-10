@@ -508,6 +508,7 @@ mod tests {
             guest_mac: Some("AA:FC:00:00:00:03".into()),
             vmm: None,
             boot: crate::BootMode::DirectKernel,
+            seed_path: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["name"], "test");
@@ -611,6 +612,7 @@ mod tests {
             guest_mac: None,
             vmm: None,
             boot: crate::BootMode::DirectKernel,
+            seed_path: None,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();
@@ -640,6 +642,7 @@ mod tests {
             guest_mac: None,
             vmm: None,
             boot: crate::BootMode::DirectKernel,
+            seed_path: None,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();

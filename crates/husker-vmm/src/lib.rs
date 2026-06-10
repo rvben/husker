@@ -46,6 +46,10 @@ pub struct VmConfig {
     /// How this VM boots. Defaults to direct-kernel for back-compat.
     #[serde(default)]
     pub boot: BootMode,
+    /// NoCloud cloud-init seed image (raw vfat). Attached as a virtio disk for
+    /// UEFI cloud-image boot; `None` for direct-kernel VMs.
+    #[serde(default)]
+    pub seed_path: Option<PathBuf>,
 }
 
 /// Runtime information about a VM.
