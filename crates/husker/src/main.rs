@@ -998,6 +998,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "userdata_status",
             "id",
             "vmm",
+            "boot_mode",
         ],
         "wait" => vec!["status", "action", "vm", "ready"],
         "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
@@ -1348,6 +1349,8 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("State:     {}", s("state"));
                 println!("vCPUs:     {}", vm["vcpu_count"]);
                 println!("Memory:    {} MiB", vm["mem_size_mib"]);
+                println!("Backend:   {}", s("vmm"));
+                println!("Boot:      {}", s("boot_mode"));
                 if let Some(ip) = vm["guest_ip"].as_str() {
                     println!("Guest IP:  {ip}");
                 }

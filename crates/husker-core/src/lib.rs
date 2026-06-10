@@ -679,10 +679,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             mem_size_mib: req.mem_size_mib.unwrap_or(128),
             kernel_path: req.kernel_path.clone(),
             rootfs_path: disk_path,
-            kernel_args: Some(format!(
-                "console=ttyS0 reboot=k panic=1 pci=off \
-                 ip={guest_ip}::{gateway}:{netmask}::eth0:off"
-            )),
+            kernel_args: if is_cloud {
+                None
+            } else {
+                Some(format!(
+                    "console=ttyS0 reboot=k panic=1 pci=off \
+                     ip={guest_ip}::{gateway}:{netmask}::eth0:off"
+                ))
+            },
             initrd_path: req.initrd_path.clone(),
             vsock_cid: cid,
             tap_device: Some(tap_name.clone()),

@@ -52,6 +52,7 @@ pub struct VmResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub userdata_status: Option<String>,
     pub vmm: String,
+    pub boot_mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2716,6 +2717,7 @@ fn record_to_response(r: VmRecord) -> VmResponse {
         updated_at: r.updated_at.to_rfc3339(),
         userdata_status: r.userdata_status,
         vmm: r.vmm,
+        boot_mode: r.boot_mode,
     }
 }
 

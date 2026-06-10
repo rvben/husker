@@ -1033,10 +1033,14 @@ async fn vm_response_json_structure() {
     // Verify the id matches what we inserted
     assert_eq!(json["id"].as_str().unwrap(), record.id.to_string());
 
+    // boot_mode is surfaced in the response
+    assert_eq!(json["boot_mode"].as_str().unwrap(), "direct");
+
     // Verify JSON can be deserialized to VmResponse
     let vm: VmResponse = serde_json::from_value(json).unwrap();
     assert_eq!(vm.name, "shape-test");
     assert_eq!(vm.vcpu_count, 2);
+    assert_eq!(vm.boot_mode, "direct");
 }
 
 // ── List with Pre-populated State ────────────────────────────────────
