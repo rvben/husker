@@ -1155,9 +1155,33 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(self.state.list_vms()?)
     }
 
+    /// List all VMs with their state refreshed against the backend.
+    ///
+    /// Detects guest-initiated shutdowns (process exited without the daemon
+    /// observing it). Prefer this for user-facing reads; use `list_vms` for
+    /// internal callers that do not need a liveness check (e.g. the health
+    /// endpoint, which is called on a tight monitoring loop and can tolerate
+    /// VM counts lagging one reconcile interval).
+    pub async fn list_vms_refreshed(&self) -> Result<Vec<VmRecord>, CoreError> {
+        let vms = self.state.list_vms()?;
+        let mut out = Vec::with_capacity(vms.len());
+        for vm in &vms {
+            out.push(self.refresh_vm_liveness(vm).await);
+        }
+        Ok(out)
+    }
+
     /// Get info about a specific VM.
     pub fn get_vm(&self, name: &str) -> Result<VmRecord, CoreError> {
         self.lookup_vm(name)
+    }
+
+    /// Get a VM by name with its state refreshed against the backend.
+    ///
+    /// Detects guest-initiated shutdowns. Prefer this for user-facing reads.
+    pub async fn get_vm_refreshed(&self, name: &str) -> Result<VmRecord, CoreError> {
+        let record = self.get_vm(name)?;
+        Ok(self.refresh_vm_liveness(&record).await)
     }
 
     /// Refresh a persisted VM record against the backend's live process view.

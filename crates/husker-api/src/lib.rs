@@ -1599,7 +1599,7 @@ async fn restore_snapshot<B: VmmBackend + 'static>(
 async fn list_vms<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
 ) -> Result<Json<Vec<VmResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let vms = core.list_vms().map_err(map_error)?;
+    let vms = core.list_vms_refreshed().await.map_err(map_error)?;
     Ok(Json(vms.into_iter().map(record_to_response).collect()))
 }
 
@@ -1639,7 +1639,7 @@ async fn get_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<VmResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let record = core.get_vm(&name).map_err(map_error)?;
+    let record = core.get_vm_refreshed(&name).await.map_err(map_error)?;
     Ok(Json(record_to_response(record)))
 }
 
@@ -2164,6 +2164,11 @@ async fn get_ready<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<ReadyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Refresh liveness first so a VM whose process exited on its own has its
+    // state corrected in the DB. probe_ready then finds the updated state via
+    // its internal lookup and returns Err(InvalidState) -> 409, causing
+    // `husker wait` to fail fast rather than spin to timeout.
+    core.get_vm_refreshed(&name).await.map_err(map_error)?;
     let ready = core.probe_ready(&name).await.map_err(map_error)?;
     Ok(Json(ReadyResponse { vm: name, ready }))
 }
