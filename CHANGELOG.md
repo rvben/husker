@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - 2026-06-10
+
+### Added
+
+- **Cloud-image boot (UEFI/OVMF).** `husker run --cloud-image <name|path>` boots a
+  stock cloud image (e.g. Ubuntu 24.04 qcow2) as a full UEFI VM on the QEMU/KVM
+  backend: copy-on-write qcow2 clone, optional `--disk-size 10G` grow (cloud-init
+  expands the filesystem on first boot), per-VM OVMF variable store, and the
+  image's own bootloader - no custom kernel or rootfs build required.
+- **Self-contained cloud-init seed with the husker agent inside.** husker generates
+  the NoCloud seed itself (new `husker-cloudinit` crate, no genisoimage/cloud-localds
+  dependency) and injects the guest agent plus a static network config, so the whole
+  existing control plane - `exec`, `cp`, `shell`, `wait`, `--userdata`, `logs`,
+  services - works on cloud VMs unchanged over vsock. The agent is embedded in the
+  daemon binary at build time (`make build-with-agent`; release Linux binaries ship
+  with it).
+- **SSH key injection.** Repeatable `husker run --ssh-key <path.pub>` authorizes
+  keys for the image's default user via cloud-init (cloud-image VMs only).
+- **Cloud images in the image catalog.** `husker image import <name> --source x.img
+  --kind cloud-image` registers a qcow2 image (validated by magic bytes), and
+  `--cloud-image <name>` resolves it by name; a direct path still works. Image
+  listings and the API now report the image kind.
+- **Boot-mode-aware readiness timeouts.** UEFI/cloud VMs boot slower than microVMs,
+  so `husker wait`, the exec agent-connect default, and userdata execution now
+  default to 180s for them (microVM defaults unchanged).
+- **OVMF and disk-size configuration.** New `ovmf_code` / `ovmf_vars` /
+  `default_disk_size` config options (env: `HUSKER_OVMF_CODE`, `HUSKER_OVMF_VARS`,
+  `HUSKER_DEFAULT_DISK_SIZE`); `husker config check` verifies the OVMF firmware and
+  `qemu-img` when relevant.
+- `husker info` shows the VM's boot mode, kernel, and source image/rootfs; the
+  VM API response carries `boot_mode`, `kernel_path`, and `rootfs_path`.
+
+### Changed
+
+- `kernel_path` / `rootfs_path` in the create-VM API are now optional (required
+  only for direct-kernel boot). Cloud VMs persist the resolved source image path
+  as provenance instead of fake kernel/rootfs values.
+
+### Fixed
+
+- SSH keys containing control characters are rejected when the seed is built
+  (cloud-init YAML injection guard), and invalid keys submitted through the API
+  return 400 instead of 500.
+
 ## [0.3.2] - 2026-06-09
 
 ### Added
