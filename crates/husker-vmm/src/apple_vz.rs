@@ -143,7 +143,9 @@ impl AppleVzBackend {
                     vz_config.setBootLoader(Some(&*boot_loader));
                 }
 
-                // Block storage (rootfs)
+                // Block storage devices. The rootfs is always first (/dev/vda);
+                // the optional volume is second (/dev/vdb) — same order the QEMU
+                // backend enforces, keeping the guest device assignment stable.
                 let rootfs_path = config
                     .rootfs_path
                     .to_str()
@@ -159,16 +161,39 @@ impl AppleVzBackend {
                     )
                     .map_err(|e| VmmError::InvalidConfig(format!("disk attachment: {e}")))?
                 };
-                let block_device = unsafe {
+                let rootfs_block = unsafe {
                     VZVirtioBlockDeviceConfiguration::initWithAttachment(
                         VZVirtioBlockDeviceConfiguration::alloc(),
                         &disk_attachment,
                     )
                 };
-                let storage_device = block_device.into_super();
+                let mut storage_devices = vec![rootfs_block.into_super()];
+
+                if let Some(ref vol_path) = config.volume_path {
+                    let vol_str = vol_path.to_str().ok_or_else(|| {
+                        VmmError::InvalidConfig("volume path not valid UTF-8".into())
+                    })?;
+                    let vol_url = NSURL::fileURLWithPath(&NSString::from_str(vol_str));
+                    let vol_attachment = unsafe {
+                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                            VZDiskImageStorageDeviceAttachment::alloc(),
+                            &vol_url,
+                            false,
+                        )
+                        .map_err(|e| VmmError::InvalidConfig(format!("volume attachment: {e}")))?
+                    };
+                    let vol_block = unsafe {
+                        VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                            VZVirtioBlockDeviceConfiguration::alloc(),
+                            &vol_attachment,
+                        )
+                    };
+                    storage_devices.push(vol_block.into_super());
+                }
+
                 unsafe {
                     vz_config
-                        .setStorageDevices(&NSArray::from_retained_slice(&[storage_device]));
+                        .setStorageDevices(&NSArray::from_retained_slice(&storage_devices));
                 }
 
                 // Network (NAT — VZ handles it internally)

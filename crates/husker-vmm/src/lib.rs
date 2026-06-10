@@ -55,6 +55,11 @@ pub struct VmConfig {
     /// `set_balloon`. Defaults to `false` for back-compat.
     #[serde(default)]
     pub balloon: bool,
+    /// Optional second virtio disk (the persistent volume). The guest sees it
+    /// as `/dev/vdb` in both direct-kernel and UEFI/cloud-image boot modes.
+    /// `None` omits the drive; core sets this when a volume is attached.
+    #[serde(default)]
+    pub volume_path: Option<PathBuf>,
 }
 
 /// Runtime information about a VM.
@@ -318,6 +323,7 @@ mod tests {
         let cfg: VmConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.boot, BootMode::DirectKernel);
         assert!(!cfg.balloon, "balloon defaults to false");
+        assert!(cfg.volume_path.is_none(), "volume_path defaults to None");
     }
 
     #[test]

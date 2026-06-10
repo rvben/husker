@@ -104,12 +104,22 @@ impl QemuKvmBackend {
 
         match &config.boot {
             crate::BootMode::DirectKernel => {
-                // Root disk: husker clones a RAW ext4 rootfs (not qcow2).
+                // Root disk: husker clones a RAW ext4 rootfs (not qcow2). Guest sees /dev/vda.
                 args.push("-drive".into());
                 args.push(format!(
                     "file={},format=raw,if=virtio,cache=writeback",
                     config.rootfs_path.display()
                 ));
+
+                // Volume disk (persistent data, /dev/vdb). Placed immediately after
+                // the root disk so the guest device order is stable: vda=rootfs, vdb=volume.
+                if let Some(ref vol) = config.volume_path {
+                    args.push("-drive".into());
+                    args.push(format!(
+                        "file={},format=raw,if=virtio,cache=writeback",
+                        vol.display()
+                    ));
+                }
 
                 #[cfg(target_arch = "aarch64")]
                 let default_console = "console=ttyAMA0";
@@ -151,11 +161,23 @@ impl QemuKvmBackend {
                 ));
                 // Boot disk: the cloned + resized qcow2 cloud image. The image's own
                 // bootloader runs under UEFI, so there is no -kernel/-initrd/-append.
+                // Guest sees /dev/vda.
                 args.push("-drive".into());
                 args.push(format!(
                     "file={},format=qcow2,if=virtio,cache=writeback",
                     config.rootfs_path.display()
                 ));
+                // Volume disk (persistent data, /dev/vdb). Placed immediately after
+                // the boot disk and before the seed so the guest device order is
+                // stable: vda=boot-disk, vdb=volume, vdc=seed (NoCloud finds seed by
+                // filesystem label so its position is free).
+                if let Some(ref vol) = config.volume_path {
+                    args.push("-drive".into());
+                    args.push(format!(
+                        "file={},format=raw,if=virtio,cache=writeback",
+                        vol.display()
+                    ));
+                }
                 if let Some(seed) = &config.seed_path {
                     args.push("-drive".into());
                     args.push(format!("file={},format=raw,if=virtio", seed.display()));
@@ -490,6 +512,7 @@ mod tests {
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
             balloon: false,
+            volume_path: None,
         }
     }
 
@@ -914,6 +937,114 @@ mod tests {
         assert!(
             matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("balloon")),
             "expected InvalidConfig mentioning balloon, got: {err}"
+        );
+    }
+
+    // ── volume drive ordering ─────────────────────────────────────────────
+
+    /// In UEFI/cloud-image mode with a volume and a seed: the boot-disk -drive
+    /// must come first, then the volume -drive, then the seed -drive.
+    /// This pins the guest device assignment: vda=boot-disk, vdb=volume,
+    /// vdc=seed (NoCloud reads the seed by filesystem label so position is free).
+    #[test]
+    fn build_args_uefi_volume_ordering_disk_then_volume_then_seed() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let mut cfg = uefi_config();
+        cfg.volume_path = Some("/var/lib/husker/volumes/data.img".into());
+        cfg.seed_path = Some("/var/lib/husker/vms/qvm/seed.img".into());
+        let args = be.build_args(Uuid::nil(), &cfg);
+
+        // Collect the values that follow each `-drive` flag.
+        let drives: Vec<&str> = args
+            .windows(2)
+            .filter_map(|w| (w[0] == "-drive").then_some(w[1].as_str()))
+            .collect();
+
+        // Skip pflash entries (firmware drives); only virtio/virtio drives count.
+        let virtio: Vec<&str> = drives
+            .iter()
+            .copied()
+            .filter(|d| d.contains("if=virtio"))
+            .collect();
+
+        assert!(
+            virtio.len() >= 3,
+            "expected at least 3 virtio drives (disk, volume, seed), got: {virtio:?}"
+        );
+        let disk_idx = virtio
+            .iter()
+            .position(|d| d.contains("disk.qcow2"))
+            .expect("boot disk drive missing");
+        let volume_idx = virtio
+            .iter()
+            .position(|d| d.contains("data.img"))
+            .expect("volume drive missing");
+        let seed_idx = virtio
+            .iter()
+            .position(|d| d.contains("seed.img"))
+            .expect("seed drive missing");
+        assert!(
+            disk_idx < volume_idx,
+            "boot disk must precede volume: disk={disk_idx} volume={volume_idx} in {virtio:?}"
+        );
+        assert!(
+            volume_idx < seed_idx,
+            "volume must precede seed: volume={volume_idx} seed={seed_idx} in {virtio:?}"
+        );
+    }
+
+    /// In direct-kernel mode with a volume: the rootfs -drive must come before
+    /// the volume -drive so the guest sees vda=rootfs, vdb=volume.
+    #[test]
+    fn build_args_direct_volume_ordering_rootfs_then_volume() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.volume_path = Some("/var/lib/husker/volumes/data.img".into());
+        let args = be.build_args(Uuid::nil(), &cfg);
+
+        let drives: Vec<&str> = args
+            .windows(2)
+            .filter_map(|w| (w[0] == "-drive").then_some(w[1].as_str()))
+            .collect();
+        let virtio: Vec<&str> = drives
+            .iter()
+            .copied()
+            .filter(|d| d.contains("if=virtio"))
+            .collect();
+
+        assert!(
+            virtio.len() >= 2,
+            "expected at least 2 virtio drives (rootfs, volume), got: {virtio:?}"
+        );
+        let rootfs_idx = virtio
+            .iter()
+            .position(|d| d.contains("rootfs.ext4"))
+            .expect("rootfs drive missing");
+        let volume_idx = virtio
+            .iter()
+            .position(|d| d.contains("data.img"))
+            .expect("volume drive missing");
+        assert!(
+            rootfs_idx < volume_idx,
+            "rootfs must precede volume: rootfs={rootfs_idx} volume={volume_idx} in {virtio:?}"
+        );
+    }
+
+    /// When no volume is set, the volume -drive is absent in both boot modes.
+    #[test]
+    fn build_args_no_volume_drive_when_absent() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        // Direct-kernel, no volume
+        let args_direct = be.build_args(Uuid::nil(), &sample_config());
+        assert!(
+            !args_direct.iter().any(|a| a.contains("data.img")),
+            "unexpected volume drive in direct-kernel args: {args_direct:?}"
+        );
+        // UEFI, no volume
+        let args_uefi = be.build_args(Uuid::nil(), &uefi_config());
+        assert!(
+            !args_uefi.iter().any(|a| a.contains("data.img")),
+            "unexpected volume drive in uefi args: {args_uefi:?}"
         );
     }
 }

@@ -218,6 +218,22 @@ impl FirecrackerBackend {
         )
         .await?;
 
+        // Volume drive (second virtio disk, /dev/vdb in the guest)
+        if let Some(ref vol_path) = config.volume_path {
+            let vol_path_str = Self::path_to_str(vol_path, "volume_path")?;
+            Self::fc_put(
+                socket_path,
+                "/drives/volume",
+                &serde_json::json!({
+                    "drive_id": "volume",
+                    "path_on_host": vol_path_str,
+                    "is_root_device": false,
+                    "is_read_only": false,
+                }),
+            )
+            .await?;
+        }
+
         // Machine config
         Self::fc_put(
             socket_path,
@@ -552,6 +568,7 @@ mod tests {
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
             balloon: false,
+            volume_path: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["name"], "test");
@@ -658,6 +675,7 @@ mod tests {
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
             balloon: false,
+            volume_path: None,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();
@@ -689,6 +707,7 @@ mod tests {
             boot: crate::BootMode::DirectKernel,
             seed_path: None,
             balloon: false,
+            volume_path: None,
         };
 
         let err = backend.create_vm(config).await.unwrap_err();

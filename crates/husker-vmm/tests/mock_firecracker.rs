@@ -200,6 +200,7 @@ async fn create_vm_missing_binary() {
         boot: husker_vmm::BootMode::DirectKernel,
         seed_path: None,
         balloon: false,
+        volume_path: None,
     };
 
     let err = backend.create_vm(config).await.unwrap_err();
@@ -234,6 +235,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
         boot: husker_vmm::BootMode::DirectKernel,
         seed_path: None,
         balloon: false,
+        volume_path: None,
     };
 
     let _ = backend.create_vm(config).await.unwrap_err();
@@ -326,6 +328,7 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         boot: husker_vmm::BootMode::DirectKernel,
         seed_path: None,
         balloon: false,
+        volume_path: None,
     };
 
     let err = backend.create_vm(config).await.unwrap_err();

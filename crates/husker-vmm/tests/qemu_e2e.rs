@@ -51,6 +51,7 @@ async fn qemu_boots_and_vsock() {
         boot: husker_vmm::BootMode::DirectKernel,
         seed_path: None,
         balloon: false,
+        volume_path: None,
     };
     let info = backend.create_vm(config).await.expect("create_vm");
 
@@ -119,6 +120,7 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
         boot: husker_vmm::BootMode::DirectKernel,
         seed_path: None,
         balloon: false,
+        volume_path: None,
     };
     let err = backend.create(config).await.expect_err("create must fail");
     let msg = err.to_string();
@@ -174,6 +176,7 @@ async fn qemu_uefi_boots_cloud_image() {
         },
         seed_path: None,
         balloon: false,
+        volume_path: None,
     };
     let info = backend.create(config).await.expect("UEFI VM should boot");
     // Give OVMF + GRUB time, then assert the serial log shows firmware/boot progress.

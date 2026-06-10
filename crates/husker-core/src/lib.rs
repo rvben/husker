@@ -732,6 +732,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                     gateway,
                     dns: self.dns_servers.clone(),
                 },
+                mount_volume: false,
             })
             .map_err(seed_error_to_core)?;
             let seed_path = vm_dir.join("seed.img");
@@ -816,6 +817,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot,
             seed_path,
             balloon: req.balloon,
+            volume_path: None,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -930,6 +932,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot: husker_vmm::BootMode::DirectKernel,
             seed_path: None,
             balloon: req.balloon,
+            volume_path: None,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
