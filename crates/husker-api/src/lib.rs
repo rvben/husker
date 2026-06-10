@@ -1530,7 +1530,7 @@ async fn get_volume<B: VmmBackend + 'static>(
     responses(
         (status = 204, description = "Volume deleted"),
         (status = 404, description = "Volume not found", body = ErrorResponse),
-        (status = 400, description = "Volume is attached", body = ErrorResponse)
+        (status = 409, description = "Volume is attached to a VM", body = ErrorResponse)
     )
 )]
 async fn delete_volume<B: VmmBackend + 'static>(
@@ -2793,6 +2793,9 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "volume_already_exists",
             err.to_string(),
         ),
+        CoreError::VolumeAttached { .. } => {
+            (StatusCode::CONFLICT, "volume_attached", err.to_string())
+        }
         CoreError::SecretAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "secret_already_exists",
@@ -4766,9 +4769,9 @@ mod tests {
             )
             .await
             .unwrap();
-        // delete while attached returns 400 (InvalidArgument)
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // delete while attached returns 409 (Conflict)
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "invalid_argument");
+        assert_eq!(json["code"], "volume_attached");
     }
 }

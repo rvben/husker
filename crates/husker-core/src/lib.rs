@@ -53,6 +53,8 @@ pub enum CoreError {
     VolumeNotFound(String),
     #[error("volume already exists: {0}")]
     VolumeAlreadyExists(String),
+    #[error("volume '{volume}' is attached to VM '{vm}'")]
+    VolumeAttached { volume: String, vm: String },
     #[error("secret not found: {0}")]
     SecretNotFound(String),
     #[error("secret already exists: {0}")]
@@ -1394,6 +1396,10 @@ impl<B: VmmBackend> HuskerCore<B> {
             None => None,
         };
 
+        // Validate the volume name now so a typo'd volume fails service creation
+        // immediately rather than at instance spawn time.
+        self.resolve_volume_attachment(&req.volume)?;
+
         let now = chrono::Utc::now();
         let record = ServiceRecord {
             id: Uuid::new_v4(),
@@ -2542,10 +2548,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         let record = self.get_volume(name)?;
 
         if let Some(holder) = self.state.find_vm_by_volume(name)? {
-            return Err(CoreError::InvalidArgument(format!(
-                "volume '{}' is attached to VM '{}'",
-                name, holder.name
-            )));
+            return Err(CoreError::VolumeAttached {
+                volume: name.into(),
+                vm: holder.name,
+            });
         }
 
         self.state.delete_volume(record.id).map_err(|e| match e {
@@ -3848,6 +3854,74 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
                 Err(CoreError::VolumeNotFound(_))
             ),
             "volume must not be found after delete"
+        );
+    }
+
+    /// `create_service` with a non-existent volume name must fail before
+    /// persisting any record, with an error message that contains the volume name.
+    #[tokio::test]
+    async fn create_service_unknown_volume_fails_eagerly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        #[cfg(not(feature = "linux-net"))]
+        let core = std::sync::Arc::new(HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        ));
+        #[cfg(feature = "linux-net")]
+        let core = std::sync::Arc::new(HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        ));
+
+        let req = CreateServiceRequest {
+            name: "svc-bad-vol".into(),
+            host_group: None,
+            desired_instances: Some(1),
+            image: None,
+            rootfs_path: Some("/tmp/rootfs.ext4".into()),
+            kernel_path: Some("/tmp/vmlinux".into()),
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            env: vec![],
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
+            volume: Some("no-such-volume".into()),
+        };
+
+        let result = core.create_service(req).await;
+        assert!(
+            result.is_err(),
+            "create_service with unknown volume must fail"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no-such-volume"),
+            "error message must contain the volume name, got: {msg}"
+        );
+
+        // No service record must have been inserted.
+        let services = core.list_services().unwrap();
+        assert!(
+            services.is_empty(),
+            "no service must be persisted when volume validation fails"
         );
     }
 }
