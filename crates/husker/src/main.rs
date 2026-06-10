@@ -1911,14 +1911,14 @@ async fn run(cli: Cli) -> Result<()> {
                     {
                         let parts: Vec<u64> =
                             ver_str.split('.').filter_map(|p| p.parse().ok()).collect();
-                        if let [major, minor, patch] = parts.as_slice() {
-                            if (*major, *minor, *patch) < (0, 4, 2) {
-                                eprintln!(
-                                    "[job] warning: daemon {ver_str} does not support \
-                                     --timeout; execution will be capped at the daemon's \
-                                     exec_timeout_secs setting"
-                                );
-                            }
+                        if let [major, minor, patch] = parts.as_slice()
+                            && (*major, *minor, *patch) < (0, 4, 2)
+                        {
+                            eprintln!(
+                                "[job] warning: daemon {ver_str} does not support \
+                                 --timeout; execution will be capped at the daemon's \
+                                 exec_timeout_secs setting"
+                            );
                         }
                     }
                 }
@@ -6042,8 +6042,10 @@ mod tests {
 
     #[test]
     fn profile_fills_unset_flags_only() {
-        let mut args = VmRequestArgs::default();
-        args.memory = Some(4096); // explicit flag wins
+        let mut args = VmRequestArgs {
+            memory: Some(4096), // explicit flag wins
+            ..VmRequestArgs::default()
+        };
         apply_profile(&mut args, &sample_profile());
         assert_eq!(args.memory, Some(4096));
         assert_eq!(args.cpus, Some(2));
@@ -6053,11 +6055,15 @@ mod tests {
 
     #[test]
     fn profile_ssh_keys_and_env_used_when_cli_empty() {
-        let mut args = VmRequestArgs::default();
-        args.ssh_key = vec![PathBuf::from("/cli/key.pub")];
-        let mut p = Profile::default();
-        p.ssh_keys = vec![PathBuf::from("/profile/key.pub")];
-        p.env = vec!["A=1".into()];
+        let mut args = VmRequestArgs {
+            ssh_key: vec![PathBuf::from("/cli/key.pub")],
+            ..VmRequestArgs::default()
+        };
+        let p = Profile {
+            ssh_keys: vec![PathBuf::from("/profile/key.pub")],
+            env: vec!["A=1".into()],
+            ..Profile::default()
+        };
         apply_profile(&mut args, &p);
         assert_eq!(args.ssh_key, vec![PathBuf::from("/cli/key.pub")]); // CLI wins
         assert_eq!(args.env, vec!["A=1".to_string()]); // profile fills empty
