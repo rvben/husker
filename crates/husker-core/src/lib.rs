@@ -667,7 +667,8 @@ impl<B: VmmBackend> HuskerCore<B> {
                     gateway,
                     dns: self.dns_servers.clone(),
                 },
-            })?;
+            })
+            .map_err(seed_error_to_core)?;
             let seed_path = vm_dir.join("seed.img");
             tokio::fs::write(&seed_path, &seed)
                 .await
@@ -2399,6 +2400,19 @@ async fn prepare_cloud_disk(
     })
 }
 
+/// Convert a seed-build failure into a core error. Invalid SSH keys are the
+/// caller's input, not an internal fault, so they surface as InvalidArgument
+/// (HTTP 400) instead of an internal cloud-init error.
+#[cfg(feature = "linux-net")]
+fn seed_error_to_core(e: husker_cloudinit::CloudInitError) -> CoreError {
+    match e {
+        e @ husker_cloudinit::CloudInitError::InvalidSshKey(_) => {
+            CoreError::InvalidArgument(e.to_string())
+        }
+        other => CoreError::CloudInit(other),
+    }
+}
+
 /// Mount a rootfs image via loop, write `/etc/resolv.conf`, and unmount.
 #[cfg(feature = "linux-net")]
 async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Result<(), CoreError> {
@@ -2560,6 +2574,21 @@ mod tests {
             matches!(err, super::CoreError::InvalidArgument(_)),
             "got {err:?}"
         );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn invalid_ssh_key_seed_error_is_invalid_argument() {
+        let e = husker_cloudinit::CloudInitError::InvalidSshKey("bad".into());
+        assert!(matches!(
+            super::seed_error_to_core(e),
+            super::CoreError::InvalidArgument(_)
+        ));
+        let other = husker_cloudinit::CloudInitError::EmptyAgent;
+        assert!(matches!(
+            super::seed_error_to_core(other),
+            super::CoreError::CloudInit(_)
+        ));
     }
 
     #[tokio::test]
