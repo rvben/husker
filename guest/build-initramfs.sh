@@ -90,12 +90,15 @@ ln -s ../bin/busybox "$INITRAMFS/sbin/insmod"
 
 # Modules needed for boot:
 #   Block:      virtio_blk
+#   Balloon:    virtio_balloon
 #   Filesystem: crc16, crc32_generic, crc32c_generic, mbcache, jbd2, ext4
 #   Network:    af_packet (for DHCP), failover, net_failover, virtio_net
 #   Vsock:      vsock, vmw_vsock_virtio_transport_common, vmw_vsock_virtio_transport
 MODULES=(
     # Block
     "kernel/drivers/block/virtio_blk.ko"
+    # Memory balloon (husker run --balloon; harmless if unused)
+    "kernel/drivers/virtio/virtio_balloon.ko"
     # Filesystem
     "kernel/lib/crc16.ko"
     "kernel/crypto/crc32_generic.ko"
@@ -140,6 +143,9 @@ MDIR=/lib/modules/KVER_PLACEHOLDER
 
 # Load block device modules
 /bin/insmod $MDIR/virtio_blk.ko
+
+# Memory balloon (optional device; only active when the VM enables it)
+/bin/insmod $MDIR/virtio_balloon.ko
 
 # Load filesystem dependency modules
 /bin/insmod $MDIR/crc16.ko
