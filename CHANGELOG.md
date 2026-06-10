@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.4] - 2026-06-10
+
+### Added
+
+- **Persistent volumes.** `husker volume create data --size 10G` makes a named,
+  host-side ext4 disk; `--volume data` on `run`/`job`/`service create` attaches
+  it as the VM's second disk (`/dev/vdb` in both boot modes). Volumes survive
+  VM destruction, exactly one VM may hold a volume at a time, deletion is
+  refused while attached (409), and the service reconciler reattaches the
+  volume to replacement instances - stateful services on ephemeral VMs.
+- Cloud-image VMs auto-mount an attached volume at `/data` via cloud-init
+  (`nofail`); microVM guests mount `/dev/vdb` themselves.
+- `husker volume list/delete`, volume display in `info`/`service get`, a
+  `volume` profile key, and an `mkfs.ext4` check in `config check`.
+
 ## [0.4.3] - 2026-06-10
 
 ### Added
