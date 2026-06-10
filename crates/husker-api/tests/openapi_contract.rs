@@ -82,6 +82,8 @@ async fn openapi_contains_critical_paths() {
         "/v1/images",
         "/v1/images/{name}",
         "/v1/images/{name}/export",
+        "/v1/volumes",
+        "/v1/volumes/{name}",
         "/v1/secrets",
         "/v1/secrets/{name}",
         "/v1/secrets/{name}/reveal",

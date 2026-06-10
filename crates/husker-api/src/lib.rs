@@ -26,9 +26,10 @@ use utoipa::ToSchema;
 
 use husker_core::{
     CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
-    CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, ExportImageResult, HostGroupRecord,
-    HuskerCore, ImageRecord, ImportImageRequest, RestoreSnapshotRequest, RotateSecretRequest,
-    SecretMetadata, ServiceRecord, ShellEvent, SnapshotRecord, VmRecord,
+    CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest, ExportImageRequest,
+    ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord, ImportImageRequest,
+    RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata, ServiceRecord, ShellEvent,
+    SnapshotRecord, VmRecord, VolumeRecord,
 };
 use husker_vmm::VmmBackend;
 
@@ -58,6 +59,9 @@ pub struct VmResponse {
     pub rootfs_path: String,
     /// Kernel the VM boots (direct-kernel boot only; empty for UEFI boot).
     pub kernel_path: String,
+    /// Name of the persistent volume attached to this VM, or None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -86,6 +90,9 @@ pub struct ServiceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_size: Option<u64>,
     pub balloon: bool,
+    /// Name of the persistent volume attached to instances of this service, or None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -153,6 +160,21 @@ pub struct ImageResponse {
 pub struct ExportImageResponse {
     pub name: String,
     pub destination_path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VolumeResponse {
+    pub id: String,
+    pub name: String,
+    pub file_path: String,
+    pub size_bytes: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateVolumeApiRequest {
+    pub name: String,
     pub size_bytes: u64,
 }
 
@@ -487,6 +509,10 @@ pub enum WsShellOutput {
         get_image,
         delete_image,
         export_image,
+        list_volumes,
+        create_volume,
+        get_volume,
+        delete_volume,
         list_secrets,
         create_secret,
         get_secret,
@@ -527,6 +553,8 @@ pub enum WsShellOutput {
         SnapshotResponse,
         ImageResponse,
         ExportImageResponse,
+        VolumeResponse,
+        CreateVolumeApiRequest,
         SecretResponse,
         RevealedSecretResponse,
         ErrorResponse,
@@ -559,6 +587,7 @@ pub enum WsShellOutput {
         (name = "host_groups", description = "Host group management"),
         (name = "services", description = "Service model resources"),
         (name = "images", description = "Image catalog resources"),
+        (name = "volumes", description = "Persistent volume resources"),
         (name = "secrets", description = "Encrypted secret resources"),
         (name = "snapshots", description = "Snapshot lifecycle resources"),
         (name = "exec", description = "Command execution in VMs"),
@@ -738,6 +767,14 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
             get(get_image::<B>).delete(delete_image::<B>),
         )
         .route("/v1/images/{name}/export", post(export_image::<B>))
+        .route(
+            "/v1/volumes",
+            get(list_volumes::<B>).post(create_volume::<B>),
+        )
+        .route(
+            "/v1/volumes/{name}",
+            get(get_volume::<B>).delete(delete_volume::<B>),
+        )
         .route(
             "/v1/secrets",
             get(list_secrets::<B>).post(create_secret::<B>),
@@ -1418,6 +1455,89 @@ async fn delete_image<B: VmmBackend + 'static>(
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_image(&name).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/volumes",
+    tag = "volumes",
+    responses(
+        (status = 200, description = "List of volumes", body = Vec<VolumeResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+async fn list_volumes<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Result<Json<Vec<VolumeResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let volumes = core.list_volumes().map_err(map_error)?;
+    Ok(Json(
+        volumes
+            .into_iter()
+            .map(volume_to_response)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/volumes",
+    tag = "volumes",
+    request_body = CreateVolumeApiRequest,
+    responses(
+        (status = 201, description = "Volume created", body = VolumeResponse),
+        (status = 409, description = "Volume already exists", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
+async fn create_volume<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<CreateVolumeApiRequest>,
+) -> Result<(StatusCode, Json<VolumeResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let volume = core
+        .create_volume(CreateVolumeRequest {
+            name: req.name,
+            size_bytes: req.size_bytes,
+        })
+        .await
+        .map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(volume_to_response(volume))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/volumes/{name}",
+    tag = "volumes",
+    params(("name" = String, Path, description = "Volume name")),
+    responses(
+        (status = 200, description = "Volume details", body = VolumeResponse),
+        (status = 404, description = "Volume not found", body = ErrorResponse)
+    )
+)]
+async fn get_volume<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<VolumeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let volume = core.get_volume(&name).map_err(map_error)?;
+    Ok(Json(volume_to_response(volume)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/volumes/{name}",
+    tag = "volumes",
+    params(("name" = String, Path, description = "Volume name")),
+    responses(
+        (status = 204, description = "Volume deleted"),
+        (status = 404, description = "Volume not found", body = ErrorResponse),
+        (status = 400, description = "Volume is attached", body = ErrorResponse)
+    )
+)]
+async fn delete_volume<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.delete_volume(&name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2792,6 +2912,7 @@ fn service_to_response<B: VmmBackend + 'static>(
         cloud_image: r.cloud_image,
         disk_size: r.disk_size,
         balloon: r.balloon,
+        volume: r.volume,
     }
 }
 
@@ -2853,6 +2974,17 @@ fn record_to_response(r: VmRecord) -> VmResponse {
         boot_mode: r.boot_mode,
         rootfs_path: r.rootfs_path,
         kernel_path: r.kernel_path,
+        volume: r.volume,
+    }
+}
+
+fn volume_to_response(r: VolumeRecord) -> VolumeResponse {
+    VolumeResponse {
+        id: r.id.to_string(),
+        name: r.name,
+        file_path: r.file_path,
+        size_bytes: r.size_bytes,
+        created_at: r.created_at.to_rfc3339(),
     }
 }
 
@@ -4525,5 +4657,118 @@ mod tests {
             text.contains("husker_service_current_instances{service=\"svc\"} 1"),
             "missing husker_service_current_instances in:\n{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn volume_list_empty() {
+        let app = router(test_core());
+        let response = app
+            .oneshot(Request::get("/v1/volumes").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn volume_get_not_found() {
+        let app = router(test_core());
+        let response = app
+            .oneshot(
+                Request::get("/v1/volumes/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "volume_not_found");
+    }
+
+    #[tokio::test]
+    async fn volume_delete_not_found() {
+        let app = router(test_core());
+        let response = app
+            .oneshot(
+                Request::delete("/v1/volumes/ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "volume_not_found");
+    }
+
+    #[tokio::test]
+    async fn volume_delete_while_attached_returns_409() {
+        // Insert a volume record and a VM record that references it directly into
+        // state, bypassing mkfs, so this test runs everywhere.
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let now = chrono::Utc::now();
+        let vol_id = uuid::Uuid::new_v4();
+
+        state
+            .insert_volume(&husker_state::VolumeRecord {
+                id: vol_id,
+                name: "data".into(),
+                file_path: "/tmp/data.img".into(),
+                size_bytes: 1_073_741_824,
+                created_at: now,
+            })
+            .unwrap();
+
+        state
+            .insert_vm(&husker_state::VmRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "holder-vm".into(),
+                state: "running".into(),
+                pid: Some(42),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 200,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "/tmp/vmlinux".into(),
+                rootfs_path: "/tmp/rootfs.ext4".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+                service_id: None,
+                service_ordinal: None,
+                vmm: "firecracker".into(),
+                boot_mode: "direct".into(),
+                balloon: false,
+                volume: Some("data".into()),
+            })
+            .unwrap();
+
+        let core = make_core(
+            state,
+            husker_storage::StorageConfig {
+                data_dir: std::path::PathBuf::from("/tmp/husker-test"),
+            },
+            std::path::PathBuf::from("/tmp/husker-test/run"),
+        );
+        let app = router(core);
+
+        let response = app
+            .oneshot(
+                Request::delete("/v1/volumes/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // delete while attached returns 400 (InvalidArgument)
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["code"], "invalid_argument");
     }
 }

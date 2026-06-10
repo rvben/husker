@@ -113,6 +113,10 @@ enum Commands {
         #[arg(long)]
         balloon: bool,
 
+        /// Attach a named persistent volume as the second disk (/dev/vdb)
+        #[arg(long)]
+        volume: Option<String>,
+
         /// Apply a named VM preset from config (explicit flags win)
         #[arg(long)]
         profile: Option<String>,
@@ -240,6 +244,10 @@ enum Commands {
         #[arg(long)]
         balloon: bool,
 
+        /// Attach a named persistent volume as the second disk (/dev/vdb)
+        #[arg(long)]
+        volume: Option<String>,
+
         /// Apply a named VM preset from config (explicit flags win)
         #[arg(long)]
         profile: Option<String>,
@@ -309,6 +317,13 @@ enum Commands {
     Image {
         #[command(subcommand)]
         action: ImageAction,
+    },
+
+    /// Manage persistent volumes
+    #[command(visible_aliases = ["volumes", "vol"])]
+    Volume {
+        #[command(subcommand)]
+        action: VolumeAction,
     },
 
     /// Manage encrypted secrets
@@ -462,6 +477,9 @@ enum ServiceAction {
         /// Attach a virtio memory balloon to each instance
         #[arg(long)]
         balloon: bool,
+        /// Attach a named persistent volume to each instance as the second disk
+        #[arg(long)]
+        volume: Option<String>,
     },
     /// List services
     List,
@@ -572,6 +590,25 @@ enum ImageAction {
         /// Re-download even if destination files already exist
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeAction {
+    /// Create a named persistent volume
+    Create {
+        /// Volume name
+        name: String,
+        /// Volume size, e.g. 10G, 512M
+        #[arg(long)]
+        size: String,
+    },
+    /// List volumes
+    List,
+    /// Delete a volume by name
+    Delete {
+        /// Volume name
+        name: String,
     },
 }
 
@@ -712,6 +749,7 @@ struct Profile {
     #[serde(default)]
     env: Vec<String>,
     balloon: Option<bool>,
+    volume: Option<String>,
 }
 
 /// Expand a leading `~/` against $HOME (profile ssh_keys convenience).
@@ -738,6 +776,7 @@ struct VmRequestArgs {
     ssh_key: Vec<PathBuf>,
     env: Vec<String>,
     balloon: bool,
+    volume: Option<String>,
 }
 
 /// Fill unset fields from a profile: explicit CLI values always win;
@@ -762,6 +801,7 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
     if !args.balloon {
         args.balloon = p.balloon.unwrap_or(false);
     }
+    args.volume = args.volume.take().or_else(|| p.volume.clone());
 }
 
 #[cfg(feature = "linux-net")]
@@ -1188,6 +1228,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "snapshot get"
             | "image list"
             | "image get"
+            | "volume list"
             | "secret list"
             | "secret get"
             | "secret reveal"
@@ -1212,6 +1253,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "guest_ip",
             "host_ip",
             "userdata_status",
+            "volume",
             "id",
             "vmm",
             "boot_mode",
@@ -1226,6 +1268,9 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "service delete" => vec!["status", "action", "name", "outcome"],
         "service get" => vec!["status", "action", "service", "instances"],
         "service list" => vec!["status", "action", "services"],
+        "volume create" => vec!["status", "action", "volume"],
+        "volume delete" => vec!["status", "action", "name"],
+        "volume list" => vec!["status", "action", "volumes"],
         _ => vec![],
     };
     (!read_only, output_fields)
@@ -1420,6 +1465,10 @@ fn build_vm_request_body(
         body["balloon"] = serde_json::json!(true);
     }
 
+    if let Some(ref vol) = args.volume {
+        body["volume"] = serde_json::json!(vol);
+    }
+
     Ok(body)
 }
 
@@ -1490,6 +1539,7 @@ async fn run(cli: Cli) -> Result<()> {
             disk_size,
             ssh_key,
             balloon,
+            volume,
             profile,
         } => {
             let config = load_config(config_path.as_deref());
@@ -1510,6 +1560,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ssh_key,
                 env,
                 balloon,
+                volume,
             };
             let mut body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
@@ -1662,6 +1713,9 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 if let Some(status) = vm["userdata_status"].as_str() {
                     println!("Userdata:  {status}");
+                }
+                if let Some(vol) = vm["volume"].as_str() {
+                    println!("Volume:    {vol}");
                 }
                 println!("ID:        {}", s("id"));
             }
@@ -1900,6 +1954,7 @@ async fn run(cli: Cli) -> Result<()> {
             disk_size,
             ssh_key,
             balloon,
+            volume,
             profile,
             timeout,
             keep,
@@ -1923,6 +1978,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ssh_key,
                 env: Vec::new(),
                 balloon,
+                volume,
             };
             let body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
@@ -2247,6 +2303,10 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Image { action } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             image_command(api_url, api_token, action, output).await
+        }
+        Commands::Volume { action } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            volume_command(api_url, api_token, action, output).await
         }
         Commands::Secret { action } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -2765,6 +2825,7 @@ async fn service_command(
             cloud_image,
             disk_size,
             balloon,
+            volume,
         } => {
             // Rootfs/kernel resolution:
             //   When --cloud-image is given, rootfs and kernel are omitted from
@@ -2872,6 +2933,9 @@ async fn service_command(
             }
             if balloon {
                 body["balloon"] = serde_json::json!(true);
+            }
+            if let Some(ref vol) = volume {
+                body["volume"] = serde_json::json!(vol);
             }
 
             let resp = api_request(
@@ -3016,6 +3080,9 @@ async fn service_command(
                 }
                 if service["balloon"].as_bool().unwrap_or(false) {
                     println!("Balloon:           true");
+                }
+                if let Some(vol) = service["volume"].as_str() {
+                    println!("Volume:            {vol}");
                 }
                 println!(
                     "Host group ID:     {}",
@@ -3577,6 +3644,110 @@ async fn image_command(
                 }),
                 "Images pulled.",
             );
+        }
+    }
+    Ok(())
+}
+
+async fn volume_command(
+    api_url: String,
+    api_token: Option<String>,
+    action: VolumeAction,
+    output: OutputFormat,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        VolumeAction::Create { name, size } => {
+            let size_bytes =
+                husker::parse_disk_size(&size).map_err(|e| anyhow::anyhow!("--size: {e}"))?;
+            let body = serde_json::json!({
+                "name": &name,
+                "size_bytes": size_bytes,
+            });
+
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/volumes")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let volume: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "volume-create",
+                        "volume": volume,
+                    }),
+                    format!("Created volume: {}", volume["name"].as_str().unwrap_or("-")),
+                );
+            } else {
+                let msg = api_error(resp, &format!("volume '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        VolumeAction::List => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/volumes")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if !resp.status().is_success() {
+                let msg = api_error(resp, "listing volumes").await;
+                exit_with_error(output, msg);
+            }
+
+            let volumes: Vec<serde_json::Value> = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "volume-list",
+                        "volumes": volumes,
+                    }),
+                    "",
+                );
+            } else if volumes.is_empty() {
+                println!("No volumes found");
+            } else {
+                println!("{:<20} {:>12}   FILE", "NAME", "SIZE");
+                for vol in &volumes {
+                    println!(
+                        "{:<20} {:>12}   {}",
+                        vol["name"].as_str().unwrap_or("-"),
+                        vol["size_bytes"].as_u64().unwrap_or(0),
+                        vol["file_path"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        VolumeAction::Delete { name } => {
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/volumes/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "volume-delete",
+                        "name": &name,
+                    }),
+                    format!("Deleted volume: {name}"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("volume '{name}'")).await;
+                exit_with_error(output, msg);
+            }
         }
     }
     Ok(())
@@ -4753,6 +4924,15 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
             Ok(out) if out.status.success() => println!("  qemu-img ... OK"),
             _ => println!("  qemu-img ... MISSING (cloud-image disk resize unavailable)"),
         }
+        match std::process::Command::new("mkfs.ext4")
+            .arg("--version")
+            .output()
+        {
+            Ok(out) if out.status.success() || !out.stderr.is_empty() => {
+                println!("  mkfs.ext4 ... OK")
+            }
+            _ => println!("  mkfs.ext4 ... MISSING (volumes unavailable)"),
+        }
     }
     if let Some(ref size) = config.default_disk_size {
         match husker::parse_disk_size(size) {
@@ -5363,6 +5543,7 @@ mod tests {
                         cloud_image,
                         disk_size,
                         balloon,
+                        volume,
                     },
             } => {
                 assert_eq!(name, "api");
@@ -5379,6 +5560,7 @@ mod tests {
                 assert!(cloud_image.is_none());
                 assert!(disk_size.is_none());
                 assert!(!balloon);
+                assert!(volume.is_none());
             }
             _ => panic!("expected service create command"),
         }
@@ -5417,6 +5599,7 @@ mod tests {
                         cloud_image,
                         disk_size,
                         balloon,
+                        volume,
                     },
             } => {
                 assert_eq!(name, "api");
@@ -5427,6 +5610,7 @@ mod tests {
                 assert!(cloud_image.is_none());
                 assert!(disk_size.is_none());
                 assert!(!balloon);
+                assert!(volume.is_none());
                 assert!(kernel.is_none());
                 assert!(initrd.is_none());
                 assert!(vcpus.is_none());
