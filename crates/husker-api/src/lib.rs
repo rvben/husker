@@ -284,7 +284,8 @@ pub struct ExecRequest {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// Seconds to wait for the guest agent to become reachable. Defaults to
-    /// `DEFAULT_EXEC_CONNECT_TIMEOUT_SECS` and is clamped to a sane range.
+    /// `DEFAULT_EXEC_CONNECT_TIMEOUT_SECS` (or the UEFI readiness timeout for
+    /// cloud VMs, which boot slower) and is clamped to a sane range.
     pub connect_timeout_secs: Option<u64>,
 }
 
@@ -293,11 +294,17 @@ const DEFAULT_EXEC_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Upper bound so a caller cannot pin an exec connection open indefinitely.
 const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
 
-/// Resolve the exec agent-connect timeout: default when unset, clamped to
+/// Resolve the exec agent-connect timeout: boot-mode-aware default when
+/// unset (UEFI/cloud VMs boot far slower than microVMs), clamped to
 /// `[1, MAX_EXEC_CONNECT_TIMEOUT_SECS]` otherwise.
-fn resolve_exec_connect_timeout(requested: Option<u64>) -> Duration {
+fn resolve_exec_connect_timeout(requested: Option<u64>, boot_mode: &str) -> Duration {
+    let default = if boot_mode == "uefi" {
+        husker_core::UEFI_READY_TIMEOUT_SECS
+    } else {
+        DEFAULT_EXEC_CONNECT_TIMEOUT_SECS
+    };
     let secs = requested
-        .unwrap_or(DEFAULT_EXEC_CONNECT_TIMEOUT_SECS)
+        .unwrap_or(default)
         .clamp(1, MAX_EXEC_CONNECT_TIMEOUT_SECS);
     Duration::from_secs(secs)
 }
@@ -1750,13 +1757,14 @@ async fn exec_vm<B: VmmBackend + 'static>(
         env_count = req.env.len(),
         has_working_dir = req.working_dir.is_some()
     );
+    let record = core.get_vm(&name).map_err(map_error)?;
     // Race-tolerant connect: exec callers often hit the agent within a second
     // or two of VM boot, before the guest has bound vsock port 52. A short
     // retry window eliminates the need for client-side polling.
     let mut conn = core
         .agent_connect_ready(
             &name,
-            resolve_exec_connect_timeout(req.connect_timeout_secs),
+            resolve_exec_connect_timeout(req.connect_timeout_secs, &record.boot_mode),
         )
         .await
         .map_err(map_agent_connect_error)?;
@@ -3841,24 +3849,29 @@ mod tests {
 
     #[test]
     fn exec_connect_timeout_defaults_and_clamps() {
-        // Unset -> the default.
         assert_eq!(
-            resolve_exec_connect_timeout(None),
+            resolve_exec_connect_timeout(None, "direct"),
             Duration::from_secs(DEFAULT_EXEC_CONNECT_TIMEOUT_SECS)
         );
-        // In-range values pass through.
         assert_eq!(
-            resolve_exec_connect_timeout(Some(5)),
+            resolve_exec_connect_timeout(None, "uefi"),
+            Duration::from_secs(husker_core::UEFI_READY_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            resolve_exec_connect_timeout(Some(5), "direct"),
             Duration::from_secs(5)
         );
-        // Zero is clamped up to the 1s floor (never an instant-fail connect).
+        // An explicit timeout wins regardless of boot mode.
         assert_eq!(
-            resolve_exec_connect_timeout(Some(0)),
+            resolve_exec_connect_timeout(Some(5), "uefi"),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            resolve_exec_connect_timeout(Some(0), "direct"),
             Duration::from_secs(1)
         );
-        // Absurd values are clamped to the ceiling.
         assert_eq!(
-            resolve_exec_connect_timeout(Some(u64::MAX)),
+            resolve_exec_connect_timeout(Some(u64::MAX), "direct"),
             Duration::from_secs(MAX_EXEC_CONNECT_TIMEOUT_SECS)
         );
     }
