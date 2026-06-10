@@ -335,6 +335,7 @@ async fn reconcile_foreign_running_collision() {
         vmm: None,
         cloud_image: None,
         disk_size: None,
+        ssh_authorized_keys: Vec::new(),
     })
     .await
     .unwrap();
@@ -383,6 +384,7 @@ async fn reconcile_foreign_stopped_collision() {
         vmm: None,
         cloud_image: None,
         disk_size: None,
+        ssh_authorized_keys: Vec::new(),
     })
     .await
     .unwrap();
@@ -441,6 +443,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 vmm: None,
                 cloud_image: None,
                 disk_size: None,
+                ssh_authorized_keys: Vec::new(),
             },
             Some(ServiceTag {
                 service_id: id,
@@ -466,6 +469,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 vmm: None,
                 cloud_image: None,
                 disk_size: None,
+                ssh_authorized_keys: Vec::new(),
             },
             Some(ServiceTag {
                 service_id: id,

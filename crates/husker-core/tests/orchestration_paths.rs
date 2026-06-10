@@ -522,6 +522,7 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             vmm: None,
             cloud_image: None,
             disk_size: None,
+            ssh_authorized_keys: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -555,6 +556,7 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             vmm: None,
             cloud_image: None,
             disk_size: None,
+            ssh_authorized_keys: Vec::new(),
         })
         .await
         .unwrap_err()
@@ -613,6 +615,7 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             vmm: None,
             cloud_image: None,
             disk_size: None,
+            ssh_authorized_keys: Vec::new(),
         })
         .await
         .unwrap_err()
@@ -1455,6 +1458,7 @@ async fn create_vm_rejects_unsafe_names() {
                 vmm: None,
                 cloud_image: None,
                 disk_size: None,
+                ssh_authorized_keys: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -1773,6 +1777,7 @@ async fn create_vm_accepts_safe_names() {
                 vmm: None,
                 cloud_image: None,
                 disk_size: None,
+                ssh_authorized_keys: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -1803,6 +1808,7 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
             vmm: None,
             cloud_image: Some("/some/image.qcow2".into()),
             disk_size: None,
+            ssh_authorized_keys: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -1843,6 +1849,7 @@ async fn concurrent_create_same_name_one_winner() {
                 vmm: None,
                 cloud_image: None,
                 disk_size: None,
+                ssh_authorized_keys: Vec::new(),
             })
             .await
         })

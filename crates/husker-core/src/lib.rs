@@ -106,6 +106,10 @@ pub struct CreateVmRequest {
     /// Grow the cloud-image disk to this many bytes before boot (cloud-image only).
     #[serde(default)]
     pub disk_size: Option<u64>,
+    /// SSH public keys to authorize for the cloud image's default user via
+    /// cloud-init (cloud-image only; ignored for direct-kernel boot).
+    #[serde(default)]
+    pub ssh_authorized_keys: Vec<String>,
 }
 
 /// Parameters for creating a host group.
@@ -636,7 +640,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 agent: self.embedded_agent,
                 hostname: req.name.clone(),
                 instance_id: req.name.clone(),
-                ssh_authorized_keys: Vec::new(),
+                ssh_authorized_keys: req.ssh_authorized_keys.clone(),
                 network: husker_cloudinit::NetworkConfig {
                     ip: guest_ip,
                     prefix_len: self.ip_allocator.prefix_len(),
@@ -1329,6 +1333,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: None,
             cloud_image: None,
             disk_size: None,
+            ssh_authorized_keys: Vec::new(),
         })
         .await
     }
@@ -2122,6 +2127,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: None,
             cloud_image: None,
             disk_size: None,
+            ssh_authorized_keys: Vec::new(),
         };
         match self
             .create_vm_record(
@@ -2898,5 +2904,6 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let req: super::CreateVmRequest = serde_json::from_str(json).unwrap();
         assert!(req.cloud_image.is_none());
         assert!(req.disk_size.is_none());
+        assert!(req.ssh_authorized_keys.is_empty());
     }
 }
