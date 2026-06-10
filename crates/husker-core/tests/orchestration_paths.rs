@@ -528,6 +528,7 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             cloud_image: None,
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
+            balloon: false,
         })
         .await
         .unwrap_err();
@@ -562,6 +563,7 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             cloud_image: None,
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
+            balloon: false,
         })
         .await
         .unwrap_err()
@@ -621,6 +623,7 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             cloud_image: None,
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
+            balloon: false,
         })
         .await
         .unwrap_err()
@@ -1465,6 +1468,7 @@ async fn create_vm_rejects_unsafe_names() {
                 cloud_image: None,
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
+                balloon: false,
             })
             .await
             .unwrap_err();
@@ -1571,6 +1575,9 @@ async fn create_service_rejects_unsafe_names() {
                 mem_size_mib: None,
                 userdata: None,
                 env: vec![],
+                cloud_image: None,
+                disk_size: None,
+                balloon: false,
             })
             .await
             .unwrap_err();
@@ -1791,6 +1798,7 @@ async fn create_vm_accepts_safe_names() {
                 cloud_image: None,
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
+                balloon: false,
             })
             .await
             .unwrap_err();
@@ -1822,6 +1830,7 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
             cloud_image: Some("/some/image.qcow2".into()),
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
+            balloon: false,
         })
         .await
         .unwrap_err();
@@ -1863,6 +1872,7 @@ async fn concurrent_create_same_name_one_winner() {
                 cloud_image: None,
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
+                balloon: false,
             })
             .await
         })

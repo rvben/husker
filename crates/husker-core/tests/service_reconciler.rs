@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 struct MockInner {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
+    balloon_calls: Mutex<Vec<(Uuid, u32)>>,
 }
 
 #[derive(Clone)]
@@ -29,8 +30,13 @@ impl MockVmm {
         Self {
             inner: Arc::new(MockInner {
                 vms: Mutex::new(HashMap::new()),
+                balloon_calls: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    async fn balloon_calls(&self) -> Vec<(Uuid, u32)> {
+        self.inner.balloon_calls.lock().await.clone()
     }
 }
 
@@ -104,7 +110,8 @@ impl VmmBackend for MockVmm {
         Err(VmmError::ProcessError("not configured".into()))
     }
 
-    async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
+    async fn set_balloon(&self, id: Uuid, amount_mib: u32) -> Result<(), VmmError> {
+        self.inner.balloon_calls.lock().await.push((id, amount_mib));
         Ok(())
     }
 }
@@ -210,6 +217,9 @@ fn req_with_desired(
         mem_size_mib: Some(128),
         userdata: None,
         env: vec![],
+        cloud_image: None,
+        disk_size: None,
+        balloon: false,
     }
 }
 
@@ -343,6 +353,7 @@ async fn reconcile_foreign_running_collision() {
         cloud_image: None,
         disk_size: None,
         ssh_authorized_keys: Vec::new(),
+        balloon: false,
     })
     .await
     .unwrap();
@@ -392,6 +403,7 @@ async fn reconcile_foreign_stopped_collision() {
         cloud_image: None,
         disk_size: None,
         ssh_authorized_keys: Vec::new(),
+        balloon: false,
     })
     .await
     .unwrap();
@@ -451,6 +463,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 cloud_image: None,
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
+                balloon: false,
             },
             Some(ServiceTag {
                 service_id: id,
@@ -477,6 +490,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 cloud_image: None,
                 disk_size: None,
                 ssh_authorized_keys: Vec::new(),
+                balloon: false,
             },
             Some(ServiceTag {
                 service_id: id,
@@ -819,4 +833,139 @@ async fn concurrent_reconcile_same_service_no_double_create() {
         count, 3,
         "exactly 3 instances should exist after concurrent reconciles"
     );
+}
+
+// ---------------------------------------------------------------------------
+// set_balloon: rejection paths
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_balloon_rejects_vm_without_balloon_device() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    // Create a VM without --balloon (default).
+    core.create_vm(CreateVmRequest {
+        name: "no-balloon".into(),
+        kernel_path: Some(kernel.clone()),
+        rootfs_path: Some(rootfs.clone()),
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        initrd_path: None,
+        userdata: None,
+        env: vec![],
+        vmm: None,
+        cloud_image: None,
+        disk_size: None,
+        ssh_authorized_keys: Vec::new(),
+        balloon: false,
+    })
+    .await
+    .unwrap();
+
+    let err = core.set_balloon("no-balloon", 64).await.unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("--balloon")),
+        "expected InvalidArgument about --balloon, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn set_balloon_rejects_stopped_vm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs) = make_core_with_fixtures(&tmp);
+
+    // Create a VM with --balloon but stop it before trying to resize.
+    core.create_vm(CreateVmRequest {
+        name: "balloon-stopped".into(),
+        kernel_path: Some(kernel.clone()),
+        rootfs_path: Some(rootfs.clone()),
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        initrd_path: None,
+        userdata: None,
+        env: vec![],
+        vmm: None,
+        cloud_image: None,
+        disk_size: None,
+        ssh_authorized_keys: Vec::new(),
+        balloon: true,
+    })
+    .await
+    .unwrap();
+    core.stop_vm("balloon-stopped").await.unwrap();
+
+    let err = core.set_balloon("balloon-stopped", 64).await.unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidState { ref actual, .. } if actual == "stopped"),
+        "expected InvalidState(stopped), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn set_balloon_happy_path_forwards_to_vmm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let (kernel, rootfs) = write_fixtures(tmp.path());
+
+    let mock = MockVmm::new();
+    let storage = StorageConfig {
+        data_dir: data_dir.to_path_buf(),
+    };
+    let core = Arc::new(HuskerCore::new(
+        mock.clone(),
+        StateStore::open_memory().unwrap(),
+        storage,
+        runtime_dir.to_path_buf(),
+    ));
+
+    let vm = core
+        .create_vm(CreateVmRequest {
+            name: "ballooned".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(512),
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            cloud_image: None,
+            disk_size: None,
+            ssh_authorized_keys: Vec::new(),
+            balloon: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(vm.balloon, "VmRecord should have balloon=true");
+
+    core.set_balloon("ballooned", 128).await.unwrap();
+
+    let calls = mock.balloon_calls().await;
+    assert_eq!(calls.len(), 1, "exactly one set_balloon call forwarded");
+    assert_eq!(calls[0], (vm.id, 128));
+}
+
+// ---------------------------------------------------------------------------
+// Serde defaults: CreateVmRequest.balloon and CreateServiceRequest new fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_vm_request_balloon_defaults_false() {
+    let json = r#"{"name":"v"}"#;
+    let req: CreateVmRequest = serde_json::from_str(json).unwrap();
+    assert!(!req.balloon, "balloon must default to false");
+}
+
+#[test]
+fn create_service_request_new_fields_default() {
+    let json = r#"{"name":"svc","kernel_path":"/k","rootfs_path":"/r"}"#;
+    let req: CreateServiceRequest = serde_json::from_str(json).unwrap();
+    assert!(req.cloud_image.is_none());
+    assert!(req.disk_size.is_none());
+    assert!(!req.balloon, "balloon must default to false");
 }

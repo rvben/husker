@@ -114,6 +114,10 @@ pub struct CreateVmRequest {
     /// cloud-init (cloud-image only; ignored for direct-kernel boot).
     #[serde(default)]
     pub ssh_authorized_keys: Vec<String>,
+    /// Opt the VM into a virtio memory balloon device. When true, the balloon
+    /// device is installed at boot and `set_balloon` can resize it at runtime.
+    #[serde(default)]
+    pub balloon: bool,
 }
 
 /// Parameters for creating a host group.
@@ -153,6 +157,15 @@ pub struct CreateServiceRequest {
     pub userdata: Option<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Boot a stock cloud image. When set, `kernel_path` and `rootfs_path` are optional.
+    #[serde(default)]
+    pub cloud_image: Option<String>,
+    /// Grow the cloud-image disk to this many bytes (cloud-image only).
+    #[serde(default)]
+    pub disk_size: Option<u64>,
+    /// Opt each instance into a virtio memory balloon device.
+    #[serde(default)]
+    pub balloon: bool,
 }
 
 /// Parameters for creating a snapshot.
@@ -802,7 +815,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: vmm_kind,
             boot,
             seed_path,
-            balloon: false,
+            balloon: req.balloon,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -844,7 +857,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 "direct".to_string()
             },
-            balloon: false,
+            balloon: req.balloon,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -915,7 +928,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: None,
             boot: husker_vmm::BootMode::DirectKernel,
             seed_path: None,
-            balloon: false,
+            balloon: req.balloon,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -949,7 +962,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_ordinal: tags.map(|t| t.ordinal),
             vmm: "apple_vz".to_string(),
             boot_mode: "direct".to_string(),
-            balloon: false,
+            balloon: req.balloon,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1289,12 +1302,23 @@ impl<B: VmmBackend> HuskerCore<B> {
         let desired_instances = req.desired_instances.unwrap_or(1);
         validate_service_instance_names(&req.name, desired_instances)?;
 
-        let rootfs = req.rootfs_path.ok_or_else(|| {
-            CoreError::InvalidArgument("service requires a rootfs (--image or --rootfs)".into())
-        })?;
-        let kernel = req
-            .kernel_path
-            .ok_or_else(|| CoreError::InvalidArgument("service requires a kernel".into()))?;
+        let (rootfs, kernel) = if req.cloud_image.is_some() {
+            (
+                req.rootfs_path.unwrap_or_default(),
+                req.kernel_path.unwrap_or_default(),
+            )
+        } else {
+            (
+                req.rootfs_path.ok_or_else(|| {
+                    CoreError::InvalidArgument(
+                        "service requires a rootfs (--image or --rootfs) or --cloud-image".into(),
+                    )
+                })?,
+                req.kernel_path.ok_or_else(|| {
+                    CoreError::InvalidArgument("service requires a kernel".into())
+                })?,
+            )
+        };
 
         let host_group_id = match req.host_group.as_deref() {
             Some(group_name) => Some(
@@ -1331,9 +1355,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             created_at: now,
             updated_at: now,
-            cloud_image: None,
-            disk_size: None,
-            balloon: false,
+            cloud_image: req.cloud_image,
+            disk_size: req.disk_size,
+            balloon: req.balloon,
         };
         self.state.insert_service(&record).map_err(|e| match e {
             husker_state::StateError::ServiceAlreadyExists(name) => {
@@ -1513,6 +1537,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             cloud_image: None,
             disk_size: None,
             ssh_authorized_keys: Vec::new(),
+            balloon: false,
         })
         .await
     }
@@ -2214,7 +2239,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let _guard = self.reconcile_lock(svc.id).lock_owned().await;
         let mut outcome = ReconcileOutcome::default();
 
-        if svc.rootfs_path.is_empty() {
+        if svc.rootfs_path.is_empty() && svc.cloud_image.is_none() {
             outcome
                 .failed
                 .push((svc.name.clone(), "service has no rootfs template".into()));
@@ -2301,25 +2326,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             return;
         }
 
-        let env: Vec<(String, String)> = svc
-            .userdata_env
-            .as_deref()
-            .map(|s| serde_json::from_str(s).unwrap_or_default())
-            .unwrap_or_default();
-        let req = CreateVmRequest {
-            name: name.clone(),
-            kernel_path: Some(svc.kernel_path.clone().into()),
-            rootfs_path: Some(svc.rootfs_path.clone().into()),
-            vcpu_count: svc.vcpu_count,
-            mem_size_mib: svc.mem_size_mib,
-            initrd_path: svc.initrd_path.clone().map(Into::into),
-            userdata: svc.userdata.clone(),
-            env,
-            vmm: None,
-            cloud_image: None,
-            disk_size: None,
-            ssh_authorized_keys: Vec::new(),
-        };
+        let req = instance_request(svc, &name);
         match self
             .create_vm_record(
                 req,
@@ -2358,6 +2365,76 @@ impl<B: VmmBackend> HuskerCore<B> {
             husker_state::StateError::VmNotFoundByName(_) => CoreError::VmNotFound(name.into()),
             other => CoreError::State(other),
         })
+    }
+
+    /// Resize a running VM's memory balloon (amount = MiB reclaimed from the guest).
+    ///
+    /// Fails immediately when the VM was not created with `--balloon` (the
+    /// device is absent in the guest) or when the VM is not currently running.
+    pub async fn set_balloon(&self, name: &str, amount_mib: u32) -> Result<(), CoreError> {
+        let record = self.lookup_vm(name)?;
+        if !record.balloon {
+            return Err(CoreError::InvalidArgument(format!(
+                "VM '{name}' was created without --balloon"
+            )));
+        }
+        if record.state != "running" {
+            return Err(CoreError::InvalidState {
+                name: name.into(),
+                actual: record.state,
+                expected: "running".into(),
+            });
+        }
+        self.vmm
+            .set_balloon(record.id, amount_mib)
+            .await
+            .map_err(CoreError::Vmm)
+    }
+}
+
+/// Build the create request for one service instance.
+///
+/// Cloud-image services boot the image via UEFI; direct services use the
+/// recorded rootfs and kernel. Both variants forward the service's balloon
+/// preference so replacement instances keep the same device configuration.
+pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmRequest {
+    let env: Vec<(String, String)> = svc
+        .userdata_env
+        .as_deref()
+        .map(|s| serde_json::from_str(s).unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(ref image) = svc.cloud_image {
+        CreateVmRequest {
+            name: name.to_string(),
+            kernel_path: None,
+            rootfs_path: None,
+            cloud_image: Some(image.clone()),
+            disk_size: svc.disk_size,
+            vcpu_count: svc.vcpu_count,
+            mem_size_mib: svc.mem_size_mib,
+            initrd_path: None,
+            userdata: svc.userdata.clone(),
+            env,
+            vmm: None,
+            ssh_authorized_keys: Vec::new(),
+            balloon: svc.balloon,
+        }
+    } else {
+        CreateVmRequest {
+            name: name.to_string(),
+            kernel_path: Some(svc.kernel_path.clone().into()),
+            rootfs_path: Some(svc.rootfs_path.clone().into()),
+            cloud_image: None,
+            disk_size: None,
+            vcpu_count: svc.vcpu_count,
+            mem_size_mib: svc.mem_size_mib,
+            initrd_path: svc.initrd_path.clone().map(Into::into),
+            userdata: svc.userdata.clone(),
+            env,
+            vmm: None,
+            ssh_authorized_keys: Vec::new(),
+            balloon: svc.balloon,
+        }
     }
 }
 
@@ -3158,6 +3235,125 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(req.cloud_image.is_none());
         assert!(req.disk_size.is_none());
         assert!(req.ssh_authorized_keys.is_empty());
+        assert!(!req.balloon, "balloon must default to false");
+    }
+
+    #[test]
+    fn create_service_request_new_fields_default() {
+        let json = r#"{"name":"svc","kernel_path":"/k","rootfs_path":"/r"}"#;
+        let req: super::CreateServiceRequest = serde_json::from_str(json).unwrap();
+        assert!(req.cloud_image.is_none());
+        assert!(req.disk_size.is_none());
+        assert!(!req.balloon, "balloon must default to false");
+    }
+
+    #[test]
+    fn instance_request_direct_sets_kernel_and_rootfs() {
+        let now = chrono::Utc::now();
+        let svc = husker_state::ServiceRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "svc".into(),
+            host_group_id: None,
+            desired_instances: 1,
+            image: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            initrd_path: None,
+            vcpu_count: Some(2),
+            mem_size_mib: Some(256),
+            userdata: Some("echo hi".into()),
+            userdata_env: Some(r#"[["FOO","bar"]]"#.into()),
+            created_at: now,
+            updated_at: now,
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
+        };
+        let req = super::instance_request(&svc, "svc-0");
+        assert_eq!(req.name, "svc-0");
+        assert_eq!(
+            req.kernel_path,
+            Some(std::path::PathBuf::from("/boot/vmlinux"))
+        );
+        assert_eq!(
+            req.rootfs_path,
+            Some(std::path::PathBuf::from("/images/rootfs.ext4"))
+        );
+        assert!(req.cloud_image.is_none());
+        assert!(req.disk_size.is_none());
+        assert_eq!(req.vcpu_count, Some(2));
+        assert_eq!(req.mem_size_mib, Some(256));
+        assert_eq!(req.userdata.as_deref(), Some("echo hi"));
+        assert_eq!(req.env, vec![("FOO".to_string(), "bar".to_string())]);
+        assert!(!req.balloon);
+    }
+
+    #[test]
+    fn instance_request_direct_balloon_propagates() {
+        let now = chrono::Utc::now();
+        let svc = husker_state::ServiceRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "svc".into(),
+            host_group_id: None,
+            desired_instances: 1,
+            image: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            initrd_path: None,
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            userdata: None,
+            userdata_env: None,
+            created_at: now,
+            updated_at: now,
+            cloud_image: None,
+            disk_size: None,
+            balloon: true,
+        };
+        let req = super::instance_request(&svc, "svc-0");
+        assert!(
+            req.balloon,
+            "balloon should be forwarded from service record"
+        );
+    }
+
+    #[test]
+    fn instance_request_cloud_sets_image_fields() {
+        let now = chrono::Utc::now();
+        let svc = husker_state::ServiceRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "cloudsvc".into(),
+            host_group_id: None,
+            desired_instances: 1,
+            image: None,
+            kernel_path: "".into(),
+            rootfs_path: "".into(),
+            initrd_path: None,
+            vcpu_count: Some(2),
+            mem_size_mib: Some(2048),
+            userdata: None,
+            userdata_env: None,
+            created_at: now,
+            updated_at: now,
+            cloud_image: Some("ubuntu-2404".into()),
+            disk_size: Some(10 * 1024 * 1024 * 1024),
+            balloon: true,
+        };
+        let req = super::instance_request(&svc, "cloudsvc-0");
+        assert_eq!(req.name, "cloudsvc-0");
+        assert!(
+            req.kernel_path.is_none(),
+            "cloud arm must not set kernel_path"
+        );
+        assert!(
+            req.rootfs_path.is_none(),
+            "cloud arm must not set rootfs_path"
+        );
+        assert_eq!(req.cloud_image.as_deref(), Some("ubuntu-2404"));
+        assert_eq!(req.disk_size, Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(req.vcpu_count, Some(2));
+        assert_eq!(req.mem_size_mib, Some(2048));
+        assert!(req.balloon, "balloon forwarded from cloud service");
     }
 
     #[test]
