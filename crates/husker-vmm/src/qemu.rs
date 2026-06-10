@@ -126,7 +126,10 @@ impl QemuKvmBackend {
                 args.push("-append".into());
                 args.push(format!("{base_args} root=/dev/vda rw"));
             }
-            crate::BootMode::Uefi { ovmf_code, ovmf_vars_template: _ } => {
+            crate::BootMode::Uefi {
+                ovmf_code,
+                ovmf_vars_template: _,
+            } => {
                 // OVMF firmware: read-only CODE + a per-VM writable VARS copy (made in `create`).
                 args.push("-drive".into());
                 args.push(format!(
@@ -183,7 +186,10 @@ impl QemuKvmBackend {
 
         // UEFI VMs need their own writable OVMF variable store. Copy the firmware
         // template into the runtime dir; build_args points pflash unit=1 at it.
-        if let crate::BootMode::Uefi { ovmf_vars_template, .. } = &config.boot {
+        if let crate::BootMode::Uefi {
+            ovmf_vars_template, ..
+        } = &config.boot
+        {
             let vars_copy = self.ovmf_vars_copy(id);
             std::fs::copy(ovmf_vars_template, &vars_copy).map_err(|e| {
                 VmmError::ProcessError(format!(
@@ -271,7 +277,11 @@ impl QemuKvmBackend {
     pub async fn stop(&self, id: Uuid) -> Result<(), VmmError> {
         let qmp_path = {
             let instances = self.instances.lock().await;
-            instances.get(&id).ok_or(VmmError::VmNotFound(id))?.qmp_path.clone()
+            instances
+                .get(&id)
+                .ok_or(VmmError::VmNotFound(id))?
+                .qmp_path
+                .clone()
         };
         if let Ok(mut qmp) = crate::qmp::QmpClient::connect(&qmp_path).await {
             let _ = qmp.system_powerdown().await;
@@ -317,7 +327,11 @@ impl QemuKvmBackend {
     pub async fn pause(&self, id: Uuid) -> Result<(), VmmError> {
         let qmp_path = {
             let instances = self.instances.lock().await;
-            instances.get(&id).ok_or(VmmError::VmNotFound(id))?.qmp_path.clone()
+            instances
+                .get(&id)
+                .ok_or(VmmError::VmNotFound(id))?
+                .qmp_path
+                .clone()
         };
         let mut qmp = crate::qmp::QmpClient::connect(&qmp_path).await?;
         qmp.pause().await?;
@@ -331,7 +345,11 @@ impl QemuKvmBackend {
     pub async fn resume(&self, id: Uuid) -> Result<(), VmmError> {
         let qmp_path = {
             let instances = self.instances.lock().await;
-            instances.get(&id).ok_or(VmmError::VmNotFound(id))?.qmp_path.clone()
+            instances
+                .get(&id)
+                .ok_or(VmmError::VmNotFound(id))?
+                .qmp_path
+                .clone()
         };
         let mut qmp = crate::qmp::QmpClient::connect(&qmp_path).await?;
         qmp.resume().await?;
@@ -388,7 +406,11 @@ impl crate::VmmBackend for QemuKvmBackend {
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
         let cid = {
             let instances = self.instances.lock().await;
-            instances.get(&id).ok_or(VmmError::VmNotFound(id))?.info.vsock_cid
+            instances
+                .get(&id)
+                .ok_or(VmmError::VmNotFound(id))?
+                .info
+                .vsock_cid
         };
         tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port))
             .await
@@ -426,7 +448,14 @@ mod tests {
     fn build_args_has_core_flags() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config());
-        for flag in ["-machine", "-nographic", "-nodefaults", "-enable-kvm", "-kernel", "-append"] {
+        for flag in [
+            "-machine",
+            "-nographic",
+            "-nodefaults",
+            "-enable-kvm",
+            "-kernel",
+            "-append",
+        ] {
             assert!(args.iter().any(|a| a == flag), "missing {flag} in {args:?}");
         }
         let m = args.iter().position(|a| a == "-m").unwrap();
@@ -450,19 +479,32 @@ mod tests {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config());
         assert!(
-            args.iter().any(|a| a.contains("format=raw") && a.contains("if=virtio")),
+            args.iter()
+                .any(|a| a.contains("format=raw") && a.contains("if=virtio")),
             "rootfs not attached raw/virtio: {args:?}"
         );
-        let append = args.iter().find(|a| a.contains("root=/dev/vda")).expect("append root= missing");
-        assert!(append.contains("console=ttyS0"), "append dropped kernel_args: {append}");
+        let append = args
+            .iter()
+            .find(|a| a.contains("root=/dev/vda"))
+            .expect("append root= missing");
+        assert!(
+            append.contains("console=ttyS0"),
+            "append dropped kernel_args: {append}"
+        );
     }
 
     #[test]
     fn build_args_includes_tap_when_present() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config());
-        assert!(args.iter().any(|a| a.contains("ifname=husker7")), "tap netdev missing: {args:?}");
-        assert!(args.iter().any(|a| a.contains("mac=52:54:00:00:00:07")), "mac missing: {args:?}");
+        assert!(
+            args.iter().any(|a| a.contains("ifname=husker7")),
+            "tap netdev missing: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.contains("mac=52:54:00:00:00:07")),
+            "mac missing: {args:?}"
+        );
     }
 
     #[tokio::test]
@@ -470,15 +512,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
-        be.instances.lock().await.insert(id, QemuInstance {
-            info: VmInfo { id, name: "dup".into(), state: VmState::Running, pid: Some(1),
-                           vcpu_count: 1, mem_size_mib: 128, vsock_cid: 3 },
-            qmp_path: dir.path().join("x.qmp"),
-            pidfile_path: dir.path().join("x.pid"),
-            serial_log_path: dir.path().join("x.serial.log"),
-            boot_log_path: dir.path().join("x.boot.log"),
-            process: tokio::process::Command::new("true").spawn().unwrap(),
-        });
+        be.instances.lock().await.insert(
+            id,
+            QemuInstance {
+                info: VmInfo {
+                    id,
+                    name: "dup".into(),
+                    state: VmState::Running,
+                    pid: Some(1),
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    vsock_cid: 3,
+                },
+                qmp_path: dir.path().join("x.qmp"),
+                pidfile_path: dir.path().join("x.pid"),
+                serial_log_path: dir.path().join("x.serial.log"),
+                boot_log_path: dir.path().join("x.boot.log"),
+                process: tokio::process::Command::new("true").spawn().unwrap(),
+            },
+        );
         let mut cfg = sample_config();
         cfg.name = "dup".into();
         let err = be.create(cfg).await.unwrap_err();
@@ -496,13 +548,25 @@ mod tests {
         for p in [&qmp, &pid, &serial] {
             tokio::fs::write(p, b"").await.unwrap();
         }
-        be.instances.lock().await.insert(id, QemuInstance {
-            info: VmInfo { id, name: "x".into(), state: VmState::Running, pid: Some(1),
-                           vcpu_count: 1, mem_size_mib: 128, vsock_cid: 3 },
-            qmp_path: qmp.clone(), pidfile_path: pid.clone(), serial_log_path: serial.clone(),
-            boot_log_path: dir.path().join("a.boot.log"),
-            process: tokio::process::Command::new("true").spawn().unwrap(),
-        });
+        be.instances.lock().await.insert(
+            id,
+            QemuInstance {
+                info: VmInfo {
+                    id,
+                    name: "x".into(),
+                    state: VmState::Running,
+                    pid: Some(1),
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    vsock_cid: 3,
+                },
+                qmp_path: qmp.clone(),
+                pidfile_path: pid.clone(),
+                serial_log_path: serial.clone(),
+                boot_log_path: dir.path().join("a.boot.log"),
+                process: tokio::process::Command::new("true").spawn().unwrap(),
+            },
+        );
         be.destroy(id).await.unwrap();
         assert!(!qmp.exists() && !pid.exists() && !serial.exists());
     }
@@ -513,15 +577,25 @@ mod tests {
         let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
         let process = tokio::process::Command::new("true").spawn().unwrap();
-        be.instances.lock().await.insert(id, QemuInstance {
-            info: VmInfo { id, name: "d".into(), state: VmState::Running, pid: process.id(),
-                           vcpu_count: 1, mem_size_mib: 128, vsock_cid: 3 },
-            qmp_path: dir.path().join("d.qmp"),
-            pidfile_path: dir.path().join("d.pid"),
-            serial_log_path: dir.path().join("d.serial.log"),
-            boot_log_path: dir.path().join("d.boot.log"),
-            process,
-        });
+        be.instances.lock().await.insert(
+            id,
+            QemuInstance {
+                info: VmInfo {
+                    id,
+                    name: "d".into(),
+                    state: VmState::Running,
+                    pid: process.id(),
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    vsock_cid: 3,
+                },
+                qmp_path: dir.path().join("d.qmp"),
+                pidfile_path: dir.path().join("d.pid"),
+                serial_log_path: dir.path().join("d.serial.log"),
+                boot_log_path: dir.path().join("d.boot.log"),
+                process,
+            },
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let info = be.info(id).await.unwrap();
         assert_eq!(info.state, VmState::Stopped);
@@ -546,9 +620,18 @@ mod tests {
         let mut cfg = sample_config();
         cfg.kernel_args = Some("console=ttyS0 reboot=k panic=1 pci=off ip=192.0.2.2::192.0.2.1:255.255.255.252::eth0:off".into());
         let args = be.build_args(Uuid::nil(), &cfg);
-        let append = args.iter().find(|a| a.contains("root=/dev/vda")).expect("append present");
-        assert!(!append.contains("pci=off"), "pci=off must be stripped for QEMU: {append}");
-        assert!(append.contains("console=ttyS0"), "other args preserved: {append}");
+        let append = args
+            .iter()
+            .find(|a| a.contains("root=/dev/vda"))
+            .expect("append present");
+        assert!(
+            !append.contains("pci=off"),
+            "pci=off must be stripped for QEMU: {append}"
+        );
+        assert!(
+            append.contains("console=ttyS0"),
+            "other args preserved: {append}"
+        );
         assert!(append.contains("panic=1"), "other args preserved: {append}");
     }
 
@@ -569,7 +652,10 @@ mod tests {
         let args = be.build_args(id, &uefi_config());
 
         for flag in ["-kernel", "-initrd", "-append"] {
-            assert!(!args.iter().any(|a| a == flag), "UEFI must not emit {flag}: {args:?}");
+            assert!(
+                !args.iter().any(|a| a == flag),
+                "UEFI must not emit {flag}: {args:?}"
+            );
         }
         assert!(
             args.iter().any(|a| a.contains("if=pflash")
@@ -591,16 +677,28 @@ mod tests {
                 && a.contains("if=virtio")),
             "missing qcow2 virtio disk: {args:?}"
         );
-        assert!(args.iter().any(|a| a == "vhost-vsock-pci,guest-cid=7"), "vsock missing: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "vhost-vsock-pci,guest-cid=7"),
+            "vsock missing: {args:?}"
+        );
     }
 
     #[test]
     fn build_args_direct_kernel_still_has_kernel_and_raw_rootfs() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config());
-        assert!(args.iter().any(|a| a == "-kernel"), "direct boot must keep -kernel");
-        assert!(args.iter().any(|a| a.contains("format=raw") && a.contains("if=virtio")));
-        assert!(!args.iter().any(|a| a.contains("if=pflash")), "direct boot must not emit pflash");
+        assert!(
+            args.iter().any(|a| a == "-kernel"),
+            "direct boot must keep -kernel"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.contains("format=raw") && a.contains("if=virtio"))
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("if=pflash")),
+            "direct boot must not emit pflash"
+        );
     }
 
     #[test]
@@ -621,7 +719,10 @@ mod tests {
     fn build_args_uefi_omits_seed_when_absent() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
         let args = be.build_args(Uuid::nil(), &uefi_config()); // seed_path None
-        assert!(!args.iter().any(|a| a.contains("seed.img")), "unexpected seed: {args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains("seed.img")),
+            "unexpected seed: {args:?}"
+        );
     }
 
     #[tokio::test]
@@ -632,16 +733,29 @@ mod tests {
         // Simulate a booted UEFI VM: a VARS copy exists in the runtime dir.
         let vars = be.ovmf_vars_copy(id);
         tokio::fs::write(&vars, b"VARS").await.unwrap();
-        be.instances.lock().await.insert(id, QemuInstance {
-            info: VmInfo { id, name: "u".into(), state: VmState::Running, pid: Some(1),
-                           vcpu_count: 1, mem_size_mib: 128, vsock_cid: 3 },
-            qmp_path: dir.path().join("u.qmp"),
-            pidfile_path: dir.path().join("u.pid"),
-            serial_log_path: dir.path().join("u.serial.log"),
-            boot_log_path: dir.path().join("u.boot.log"),
-            process: tokio::process::Command::new("true").spawn().unwrap(),
-        });
+        be.instances.lock().await.insert(
+            id,
+            QemuInstance {
+                info: VmInfo {
+                    id,
+                    name: "u".into(),
+                    state: VmState::Running,
+                    pid: Some(1),
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    vsock_cid: 3,
+                },
+                qmp_path: dir.path().join("u.qmp"),
+                pidfile_path: dir.path().join("u.pid"),
+                serial_log_path: dir.path().join("u.serial.log"),
+                boot_log_path: dir.path().join("u.boot.log"),
+                process: tokio::process::Command::new("true").spawn().unwrap(),
+            },
+        );
         be.destroy(id).await.unwrap();
-        assert!(!vars.exists(), "destroy must remove the per-VM OVMF VARS copy");
+        assert!(
+            !vars.exists(),
+            "destroy must remove the per-VM OVMF VARS copy"
+        );
     }
 }

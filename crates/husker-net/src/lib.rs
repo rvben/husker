@@ -476,10 +476,19 @@ pub async fn add_port_forward(
     run_cmd(
         "nft",
         &[
-            "add", "rule", "ip", &table, "prerouting",
-            "tcp", "dport", &host_port.to_string(),
-            "dnat", "to", &dnat_target,
-            "comment", &comment,
+            "add",
+            "rule",
+            "ip",
+            &table,
+            "prerouting",
+            "tcp",
+            "dport",
+            &host_port.to_string(),
+            "dnat",
+            "to",
+            &dnat_target,
+            "comment",
+            &comment,
         ],
     )
     .await?;
@@ -511,7 +520,15 @@ pub async fn remove_port_forward(
         debug!(chain = %chain, handle, "deleting port forward rule");
         if let Err(e) = run_cmd(
             "nft",
-            &["delete", "rule", "ip", &table, &chain, "handle", &handle.to_string()],
+            &[
+                "delete",
+                "rule",
+                "ip",
+                &table,
+                &chain,
+                "handle",
+                &handle.to_string(),
+            ],
         )
         .await
         {
@@ -544,7 +561,15 @@ pub async fn remove_all_port_forwards(tap_name: &str, bridge_name: &str) -> Resu
         debug!(chain = %chain, handle, "deleting port forward rule");
         if let Err(e) = run_cmd(
             "nft",
-            &["delete", "rule", "ip", &table, &chain, "handle", &handle.to_string()],
+            &[
+                "delete",
+                "rule",
+                "ip",
+                &table,
+                &chain,
+                "handle",
+                &handle.to_string(),
+            ],
         )
         .await
         {

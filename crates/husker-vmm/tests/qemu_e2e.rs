@@ -55,8 +55,7 @@ async fn qemu_boots_and_vsock() {
 
     // Poll for vsock connectivity with backoff rather than a fixed sleep so
     // fast guests are not penalised and the overall deadline is bounded.
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_millis(200);
     let mut connected = false;
     while tokio::time::Instant::now() < deadline {
@@ -180,7 +179,8 @@ async fn qemu_uefi_boots_cloud_image() {
         .unwrap_or_default();
     backend.destroy(info.id).await.ok();
     assert!(
-        serial.contains("UEFI") || serial.to_lowercase().contains("grub")
+        serial.contains("UEFI")
+            || serial.to_lowercase().contains("grub")
             || serial.to_lowercase().contains("login:"),
         "serial log lacked UEFI/GRUB/login evidence:\n{serial}"
     );

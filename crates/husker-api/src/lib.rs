@@ -2196,7 +2196,10 @@ async fn get_logs<B: VmmBackend + 'static>(
     };
     let (log_path, log_label) = match effective {
         "boot" => (core.boot_log_path(&name).map_err(map_error)?, "boot"),
-        "userdata" => (core.userdata_log_path(&name).map_err(map_error)?, "userdata"),
+        "userdata" => (
+            core.userdata_log_path(&name).map_err(map_error)?,
+            "userdata",
+        ),
         _ => (core.serial_log_path(&name).map_err(map_error)?, "serial"),
     };
     // Only the live serial console is followable; boot/userdata are static files.

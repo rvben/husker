@@ -239,14 +239,17 @@ pub trait VmmBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{tail_lines, VmmKind};
+    use super::{VmmKind, tail_lines};
     use std::io::Write;
 
     #[test]
     fn vmm_kind_parse_and_display() {
         use std::str::FromStr;
         assert_eq!(VmmKind::from_str("qemu").unwrap(), VmmKind::Qemu);
-        assert_eq!(VmmKind::from_str("FireCracker").unwrap(), VmmKind::Firecracker);
+        assert_eq!(
+            VmmKind::from_str("FireCracker").unwrap(),
+            VmmKind::Firecracker
+        );
         assert!(VmmKind::from_str("xen").is_err());
         assert_eq!(VmmKind::Qemu.to_string(), "qemu");
     }

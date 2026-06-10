@@ -340,12 +340,7 @@ impl VmmBackend for FirecrackerBackend {
                 let _ = std::fs::remove_file(&socket_path);
                 let _ = std::fs::remove_file(&vsock_path);
                 let mut msg = format!("{e}");
-                crate::append_log_tails(
-                    &mut msg,
-                    serial_tail,
-                    boot_tail,
-                    "firecracker boot log",
-                );
+                crate::append_log_tails(&mut msg, serial_tail, boot_tail, "firecracker boot log");
                 Err(VmmError::ProcessError(msg))
             }
         }

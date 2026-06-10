@@ -43,14 +43,18 @@ struct QmpCommand<'a> {
 impl QmpClient {
     /// Connect to a QMP socket and complete the capabilities handshake.
     pub async fn connect(socket_path: &std::path::Path) -> Result<Self, VmmError> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| VmmError::ApiError(format!("QMP connect {}: {e}", socket_path.display())))?;
-        let mut client = Self { stream: BufReader::new(stream) };
+        let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+            VmmError::ApiError(format!("QMP connect {}: {e}", socket_path.display()))
+        })?;
+        let mut client = Self {
+            stream: BufReader::new(stream),
+        };
 
         let greeting = client.read_line().await?;
         if !greeting.contains("QMP") {
-            return Err(VmmError::ApiError(format!("unexpected QMP greeting: {greeting}")));
+            return Err(VmmError::ApiError(format!(
+                "unexpected QMP greeting: {greeting}"
+            )));
         }
         client.execute("qmp_capabilities", None).await?;
         Ok(client)
@@ -58,8 +62,11 @@ impl QmpClient {
 
     /// Send a command, skipping async events, returning its `return` value.
     pub async fn execute(&mut self, cmd: &str, args: Option<Value>) -> Result<Value, VmmError> {
-        let msg = serde_json::to_string(&QmpCommand { execute: cmd, arguments: args })
-            .map_err(|e| VmmError::ApiError(format!("QMP serialize: {e}")))?;
+        let msg = serde_json::to_string(&QmpCommand {
+            execute: cmd,
+            arguments: args,
+        })
+        .map_err(|e| VmmError::ApiError(format!("QMP serialize: {e}")))?;
         self.write_line(&msg).await?;
         loop {
             let line = self.read_line().await?;
@@ -69,7 +76,10 @@ impl QmpClient {
                 continue;
             }
             if let Some(err) = resp.error {
-                return Err(VmmError::ApiError(format!("QMP {}: {}", err.class, err.desc)));
+                return Err(VmmError::ApiError(format!(
+                    "QMP {}: {}",
+                    err.class, err.desc
+                )));
             }
             return Ok(resp.return_val.unwrap_or(json!({})));
         }
@@ -116,8 +126,7 @@ mod tests {
 
     #[test]
     fn parse_return_value() {
-        let resp: QmpResponse =
-            serde_json::from_str(r#"{"return":{"status":"running"}}"#).unwrap();
+        let resp: QmpResponse = serde_json::from_str(r#"{"return":{"status":"running"}}"#).unwrap();
         assert!(resp.error.is_none());
         assert!(resp.event.is_none());
         assert_eq!(resp.return_val.unwrap()["status"], "running");
@@ -134,8 +143,7 @@ mod tests {
 
     #[test]
     fn parse_event_is_skippable() {
-        let resp: QmpResponse =
-            serde_json::from_str(r#"{"event":"SHUTDOWN","data":{}}"#).unwrap();
+        let resp: QmpResponse = serde_json::from_str(r#"{"event":"SHUTDOWN","data":{}}"#).unwrap();
         assert!(resp.event.is_some());
         assert!(resp.return_val.is_none());
     }
@@ -152,7 +160,9 @@ mod tests {
                 .await
                 .unwrap();
             let mut buf = vec![0u8; 128];
-            let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await.unwrap();
+            let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf)
+                .await
+                .unwrap();
             tokio::io::AsyncWriteExt::write_all(&mut s, b"{\"return\":{}}\n")
                 .await
                 .unwrap();

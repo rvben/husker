@@ -234,7 +234,10 @@ async fn nftables_init_and_cleanup() {
         .await
         .expect("init_nat should succeed");
 
-    assert!(nft_table_exists(bridge), "husker nftables table should exist");
+    assert!(
+        nft_table_exists(bridge),
+        "husker nftables table should exist"
+    );
     assert!(ip_forward_enabled(), "init_nat should enable IP forwarding");
 
     let output = nft_table_output(bridge);
@@ -493,22 +496,43 @@ async fn two_bridges_do_not_clobber_each_others_nat() {
         .await
         .expect("init_nat B");
 
-    husker_net::add_port_forward(18080, Ipv4Addr::new(10, 99, 10, 2), 80, "huskercoexa", bridge_a)
-        .await
-        .expect("pf A");
-    husker_net::add_port_forward(18081, Ipv4Addr::new(10, 99, 11, 2), 80, "huskercoexb", bridge_b)
-        .await
-        .expect("pf B");
+    husker_net::add_port_forward(
+        18080,
+        Ipv4Addr::new(10, 99, 10, 2),
+        80,
+        "huskercoexa",
+        bridge_a,
+    )
+    .await
+    .expect("pf A");
+    husker_net::add_port_forward(
+        18081,
+        Ipv4Addr::new(10, 99, 11, 2),
+        80,
+        "huskercoexb",
+        bridge_b,
+    )
+    .await
+    .expect("pf B");
 
     assert!(nft_table_exists(bridge_a), "table A missing");
     assert!(nft_table_exists(bridge_b), "table B missing");
-    assert!(nft_table_output(bridge_a).contains("18080"), "A lost its DNAT");
-    assert!(nft_table_output(bridge_b).contains("18081"), "B lost its DNAT");
+    assert!(
+        nft_table_output(bridge_a).contains("18080"),
+        "A lost its DNAT"
+    );
+    assert!(
+        nft_table_output(bridge_b).contains("18081"),
+        "B lost its DNAT"
+    );
 
     husker_net::cleanup_nat(bridge_a).await.expect("cleanup A");
     assert!(!nft_table_exists(bridge_a), "table A should be gone");
     assert!(nft_table_exists(bridge_b), "table B must survive A cleanup");
-    assert!(nft_table_output(bridge_b).contains("18081"), "B's DNAT must survive");
+    assert!(
+        nft_table_output(bridge_b).contains("18081"),
+        "B's DNAT must survive"
+    );
 
     husker_net::cleanup_nat(bridge_b).await.expect("cleanup B");
 }

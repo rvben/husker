@@ -78,7 +78,8 @@ pub fn build_seed(spec: &SeedSpec) -> Result<Vec<u8>, CloudInitError> {
             let mut f = root
                 .create_file(name)
                 .map_err(|e| CloudInitError::Fat(e.to_string()))?;
-            f.truncate().map_err(|e| CloudInitError::Fat(e.to_string()))?;
+            f.truncate()
+                .map_err(|e| CloudInitError::Fat(e.to_string()))?;
             f.write_all(data)?;
             f.flush()?;
         }
@@ -202,12 +203,21 @@ mod tests {
         let agent = b"\x7fELF-not-really-but-bytes";
         let image = build_seed(&sample_spec(agent)).unwrap();
         let ud = String::from_utf8(read_seed_file(&image, "user-data")).unwrap();
-        assert!(ud.starts_with("#cloud-config"), "must be a cloud-config doc");
+        assert!(
+            ud.starts_with("#cloud-config"),
+            "must be a cloud-config doc"
+        );
         let b64 = husker_agent_proto::base64_encode(agent);
         assert!(ud.contains(&b64), "agent base64 not embedded");
-        assert!(ud.contains("/usr/local/bin/husker-agent"), "agent path missing");
+        assert!(
+            ud.contains("/usr/local/bin/husker-agent"),
+            "agent path missing"
+        );
         assert!(ud.contains("husker-agent.service"), "systemd unit missing");
-        assert!(ud.contains("systemctl enable --now husker-agent.service"), "agent not enabled");
+        assert!(
+            ud.contains("systemctl enable --now husker-agent.service"),
+            "agent not enabled"
+        );
     }
 
     #[test]
@@ -223,7 +233,10 @@ mod tests {
     fn ssh_keys_included_only_when_present() {
         let none = build_seed(&sample_spec(b"x")).unwrap();
         let ud = String::from_utf8(read_seed_file(&none, "user-data")).unwrap();
-        assert!(!ud.contains("ssh_authorized_keys"), "should omit ssh block when empty");
+        assert!(
+            !ud.contains("ssh_authorized_keys"),
+            "should omit ssh block when empty"
+        );
         let mut spec = sample_spec(b"x");
         spec.ssh_authorized_keys = vec!["ssh-ed25519 AAAA... user@host".into()];
         let img = build_seed(&spec).unwrap();

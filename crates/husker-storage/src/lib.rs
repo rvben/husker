@@ -362,10 +362,16 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let disk = dir.path().join("d.raw");
-        tokio::fs::write(&disk, vec![0u8; 1024 * 1024]).await.unwrap();
+        tokio::fs::write(&disk, vec![0u8; 1024 * 1024])
+            .await
+            .unwrap();
         resize_disk(&disk, 8 * 1024 * 1024).await.unwrap();
         let len = tokio::fs::metadata(&disk).await.unwrap().len();
-        assert_eq!(len, 8 * 1024 * 1024, "raw disk should grow to the requested size");
+        assert_eq!(
+            len,
+            8 * 1024 * 1024,
+            "raw disk should grow to the requested size"
+        );
     }
 
     #[tokio::test]

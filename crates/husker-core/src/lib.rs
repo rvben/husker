@@ -389,8 +389,7 @@ pub fn reap_orphaned_vmms(state: &husker_state::StateStore) -> usize {
         // /proc/<pid>/cmdline confirms liveness + identity; only a live
         // qemu-system process is killed (never a recycled non-qemu PID).
         let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        if cmdline.contains("qemu-system")
-            && unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0
+        if cmdline.contains("qemu-system") && unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0
         {
             reaped += 1;
             warn!(pid, vm = %vm.name, "reaped orphaned qemu process from a prior daemon");
@@ -727,8 +726,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: vmm_kind.map(|k| k.to_string()).unwrap_or_else(|| "firecracker".to_string()),
-            boot_mode: if is_cloud { "uefi".to_string() } else { "direct".to_string() },
+            vmm: vmm_kind
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "firecracker".to_string()),
+            boot_mode: if is_cloud {
+                "uefi".to_string()
+            } else {
+                "direct".to_string()
+            },
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1705,9 +1710,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                 Err(_) => debug!(%name, "agent ping attempt timed out, retrying"),
             }
             if tokio::time::Instant::now() + backoff >= deadline {
-                return Err(CoreError::Agent(
-                    crate::agent_client::AgentError::NotReady(timeout),
-                ));
+                return Err(CoreError::Agent(crate::agent_client::AgentError::NotReady(
+                    timeout,
+                )));
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(max_backoff);
@@ -1860,7 +1865,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             return Ok(());
         }
 
-        husker_net::add_port_forward(host_port, guest_ip, guest_port, tap_name, &self.bridge_name).await?;
+        husker_net::add_port_forward(host_port, guest_ip, guest_port, tap_name, &self.bridge_name)
+            .await?;
 
         let pf_record = husker_state::PortForwardRecord {
             id: 0,
@@ -1883,7 +1889,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                 other => CoreError::State(other),
             })
         {
-            if let Err(rollback_err) = husker_net::remove_port_forward(host_port, tap_name, &self.bridge_name).await {
+            if let Err(rollback_err) =
+                husker_net::remove_port_forward(host_port, tap_name, &self.bridge_name).await
+            {
                 warn!(
                     %name,
                     host_port,
@@ -1964,8 +1972,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             };
 
             for pf in forwards {
-                match husker_net::add_port_forward(pf.host_port, guest_ip, pf.guest_port, tap_name, &self.bridge_name)
-                    .await
+                match husker_net::add_port_forward(
+                    pf.host_port,
+                    guest_ip,
+                    pf.guest_port,
+                    tap_name,
+                    &self.bridge_name,
+                )
+                .await
                 {
                     Ok(()) => {
                         restored += 1;
@@ -2460,7 +2474,10 @@ mod tests {
         .await
         .unwrap();
         match boot {
-            husker_vmm::BootMode::Uefi { ovmf_code, ovmf_vars_template } => {
+            husker_vmm::BootMode::Uefi {
+                ovmf_code,
+                ovmf_vars_template,
+            } => {
                 assert_eq!(ovmf_code, code);
                 assert_eq!(ovmf_vars_template, vars);
             }
@@ -2489,7 +2506,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, super::CoreError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            matches!(err, super::CoreError::InvalidArgument(_)),
+            "got {err:?}"
+        );
     }
 
     #[cfg(feature = "linux-net")]
@@ -2509,7 +2529,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, super::CoreError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            matches!(err, super::CoreError::InvalidArgument(_)),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2796,7 +2819,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     }
 
     #[cfg(target_os = "linux")]
-    fn make_vm_record(name: &str, state: &str, pid: Option<u32>, vmm: &str) -> husker_state::VmRecord {
+    fn make_vm_record(
+        name: &str,
+        state: &str,
+        pid: Option<u32>,
+        vmm: &str,
+    ) -> husker_state::VmRecord {
         husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
@@ -2856,7 +2884,10 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
         let reaped = crate::reap_orphaned_vmms(&state);
 
-        assert_eq!(reaped, 0, "stopped VMs and dead/absent pids must not be counted as reaped");
+        assert_eq!(
+            reaped, 0,
+            "stopped VMs and dead/absent pids must not be counted as reaped"
+        );
         // We are still alive.
         assert!(std::process::id() > 0);
     }

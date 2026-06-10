@@ -987,7 +987,14 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
     );
     let output_fields: Vec<&'static str> = match path {
         "run" => vec!["status", "action", "vm", "userdata_queued"],
-        "list" => vec!["name", "state", "vcpu_count", "mem_size_mib", "guest_ip", "vmm"],
+        "list" => vec![
+            "name",
+            "state",
+            "vcpu_count",
+            "mem_size_mib",
+            "guest_ip",
+            "vmm",
+        ],
         "info" => vec![
             "name",
             "state",
@@ -1684,8 +1691,13 @@ async fn run(cli: Cli) -> Result<()> {
             if source.is_some() && userdata {
                 eprintln!("warning: --source overrides --userdata");
             }
-            let effective = source
-                .unwrap_or_else(|| if userdata { "userdata".into() } else { "serial".into() });
+            let effective = source.unwrap_or_else(|| {
+                if userdata {
+                    "userdata".into()
+                } else {
+                    "serial".into()
+                }
+            });
             // Only the live serial console is followable.
             let follow = follow && effective == "serial";
             let mut url = format!("{api_url}/v1/vms/{name}/logs");
@@ -3985,7 +3997,10 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
                     }
                 }
                 None => {
-                    println!("  qemu_bin ({}) ... FAIL (not found){qemu_env_hint}", qb.display());
+                    println!(
+                        "  qemu_bin ({}) ... FAIL (not found){qemu_env_hint}",
+                        qb.display()
+                    );
                     all_ok = false;
                 }
             }
@@ -4106,7 +4121,9 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     }
 
     #[cfg(feature = "linux-net")]
-    state.ensure_cid_base(config.cid_base).context("applying cid_base")?;
+    state
+        .ensure_cid_base(config.cid_base)
+        .context("applying cid_base")?;
 
     let storage = husker_storage::StorageConfig {
         data_dir: config.data_dir,
@@ -4147,7 +4164,9 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             if husker::agent_embedded() {
                 tracing::info!("cloud-image support enabled (guest agent embedded)");
             } else {
-                tracing::info!("cloud-image support disabled (no embedded agent; run make build-agent)");
+                tracing::info!(
+                    "cloud-image support disabled (no embedded agent; run make build-agent)"
+                );
             }
             Arc::new(
                 husker_core::HuskerCore::new(

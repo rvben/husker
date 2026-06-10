@@ -86,7 +86,11 @@ pub struct LinuxDispatchBackend {
 }
 
 impl LinuxDispatchBackend {
-    pub fn new(firecracker: FirecrackerBackend, qemu: QemuKvmBackend, default_kind: VmmKind) -> Self {
+    pub fn new(
+        firecracker: FirecrackerBackend,
+        qemu: QemuKvmBackend,
+        default_kind: VmmKind,
+    ) -> Self {
         Self {
             firecracker,
             qemu,
@@ -206,11 +210,29 @@ mod tests {
         let qemu = crate::qemu::QemuKvmBackend::new("qemu-system-x86_64", dir.path());
         let be = LinuxDispatchBackend::new(fc, qemu, crate::VmmKind::Firecracker);
         let id = uuid::Uuid::new_v4();
-        assert!(matches!(be.stop_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
-        assert!(matches!(be.vm_info(id).await, Err(crate::VmmError::VmNotFound(_))));
-        assert!(matches!(be.destroy_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
-        assert!(matches!(be.pause_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
-        assert!(matches!(be.resume_vm(id).await, Err(crate::VmmError::VmNotFound(_))));
-        assert!(matches!(be.vsock_connect(id, 52).await, Err(crate::VmmError::VmNotFound(_))));
+        assert!(matches!(
+            be.stop_vm(id).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            be.vm_info(id).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            be.destroy_vm(id).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            be.pause_vm(id).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            be.resume_vm(id).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            be.vsock_connect(id, 52).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
     }
 }

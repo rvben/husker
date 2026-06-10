@@ -1410,11 +1410,15 @@ mod tests {
                          '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
                          NULL, NULL, NULL, NULL, NULL)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let fetched = store.get_vm_by_name("legacy-vm").unwrap();
-        assert_eq!(fetched.vmm, "firecracker", "legacy row should default to firecracker");
+        assert_eq!(
+            fetched.vmm, "firecracker",
+            "legacy row should default to firecracker"
+        );
     }
 
     #[test]
@@ -1492,9 +1496,13 @@ mod tests {
         // A freed CID below the new base must not be handed out.
         let store3 = StateStore::open_memory().unwrap();
         let _ = store3.allocate_cid().unwrap(); // 3
-        store3.release_cid(3).unwrap();          // freed: {3}
+        store3.release_cid(3).unwrap(); // freed: {3}
         store3.ensure_cid_base(1000).unwrap();
-        assert_eq!(store3.allocate_cid().unwrap(), 1000, "freed CID below base must not be returned");
+        assert_eq!(
+            store3.allocate_cid().unwrap(),
+            1000,
+            "freed CID below base must not be returned"
+        );
     }
 
     #[test]
