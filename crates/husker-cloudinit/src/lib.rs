@@ -38,7 +38,10 @@ pub struct SeedSpec<'a> {
     pub instance_id: String,
     /// SSH public keys to authorize for the default user. Empty omits the block.
     pub ssh_authorized_keys: Vec<String>,
-    pub network: NetworkConfig,
+    /// Static network configuration. When `Some`, a `network-config` file is
+    /// written to the seed. When `None`, the file is omitted so cloud-init falls
+    /// back to DHCP on all interfaces (used for bridged-mode VMs).
+    pub network: Option<NetworkConfig>,
     /// When true, cloud-init mounts the persistent volume at `/data` via
     /// a `mounts:` entry in user-data. The `nofail` option ensures a missing
     /// disk never blocks boot.
@@ -68,9 +71,10 @@ pub fn build_seed(spec: &SeedSpec) -> Result<Vec<u8>, CloudInitError> {
         spec.instance_id, spec.hostname
     );
     let user_data = render_user_data(spec);
-    let network_config = render_network_config(&spec.network);
+    let network_config = spec.network.as_ref().map(render_network_config);
 
-    let payload = meta_data.len() + user_data.len() + network_config.len();
+    let payload =
+        meta_data.len() + user_data.len() + network_config.as_deref().map_or(0, |s| s.len());
     let size = ((payload + 1024 * 1024) as u64)
         .next_multiple_of(512)
         .max(1024 * 1024);
@@ -92,7 +96,6 @@ pub fn build_seed(spec: &SeedSpec) -> Result<Vec<u8>, CloudInitError> {
         for (name, data) in [
             ("meta-data", meta_data.as_bytes()),
             ("user-data", user_data.as_bytes()),
-            ("network-config", network_config.as_bytes()),
         ] {
             let mut f = root
                 .create_file(name)
@@ -100,6 +103,15 @@ pub fn build_seed(spec: &SeedSpec) -> Result<Vec<u8>, CloudInitError> {
             f.truncate()
                 .map_err(|e| CloudInitError::Fat(e.to_string()))?;
             f.write_all(data)?;
+            f.flush()?;
+        }
+        if let Some(nc) = &network_config {
+            let mut f = root
+                .create_file("network-config")
+                .map_err(|e| CloudInitError::Fat(e.to_string()))?;
+            f.truncate()
+                .map_err(|e| CloudInitError::Fat(e.to_string()))?;
+            f.write_all(nc.as_bytes())?;
             f.flush()?;
         }
     }
@@ -183,12 +195,12 @@ mod tests {
             hostname: "cloudvm".into(),
             instance_id: "cloudvm".into(),
             ssh_authorized_keys: vec![],
-            network: NetworkConfig {
+            network: Some(NetworkConfig {
                 ip: "192.0.2.2".parse().unwrap(),
                 prefix_len: 24,
                 gateway: "192.0.2.1".parse().unwrap(),
                 dns: vec!["192.0.2.1".into()],
-            },
+            }),
             mount_volume: false,
         }
     }
@@ -321,6 +333,44 @@ mod tests {
             !ud.contains("/dev/vdb"),
             "/dev/vdb must not appear when mount_volume is false: {ud}"
         );
+    }
+
+    #[test]
+    fn network_none_omits_network_config_file() {
+        // When network is None the seed must contain exactly meta-data and
+        // user-data; the network-config file must be absent.
+        let mut spec = sample_spec(b"fake-agent");
+        spec.network = None;
+        let image = build_seed(&spec).unwrap();
+        let cursor = std::io::Cursor::new(image.clone());
+        let fs = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()).unwrap();
+        let root = fs.root_dir();
+        assert!(
+            root.open_file("meta-data").is_ok(),
+            "meta-data must be present"
+        );
+        assert!(
+            root.open_file("user-data").is_ok(),
+            "user-data must be present"
+        );
+        assert!(
+            root.open_file("network-config").is_err(),
+            "network-config must be absent when network is None"
+        );
+    }
+
+    #[test]
+    fn network_some_writes_network_config_file() {
+        // When network is Some, network-config must be present with the static IP.
+        let image = build_seed(&sample_spec(b"fake-agent")).unwrap();
+        let cursor = std::io::Cursor::new(image.clone());
+        let fs = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()).unwrap();
+        assert!(
+            fs.root_dir().open_file("network-config").is_ok(),
+            "network-config must be present when network is Some"
+        );
+        let nc = String::from_utf8(read_seed_file(&image, "network-config")).unwrap();
+        assert!(nc.contains("192.0.2.2"), "static IP must be present: {nc}");
     }
 
     #[test]

@@ -766,12 +766,12 @@ impl<B: VmmBackend> HuskerCore<B> {
                 hostname: req.name.clone(),
                 instance_id: req.name.clone(),
                 ssh_authorized_keys: req.ssh_authorized_keys.clone(),
-                network: husker_cloudinit::NetworkConfig {
+                network: Some(husker_cloudinit::NetworkConfig {
                     ip: guest_ip,
                     prefix_len: self.ip_allocator.prefix_len(),
                     gateway,
                     dns: self.dns_servers.clone(),
-                },
+                }),
                 mount_volume,
             })
             .map_err(seed_error_to_core)?;
