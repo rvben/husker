@@ -1036,18 +1036,15 @@ pub struct VmCounts {
     )
 )]
 async fn metrics_handler<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> String {
-    let (total, running) = core
-        .list_vms()
-        .map(|vms| {
-            (
-                vms.len() as u64,
-                vms.iter().filter(|vm| vm.state == "running").count() as u64,
-            )
-        })
-        .unwrap_or((0, 0));
+    // Cheap unrefreshed read - metrics deliberately mirrors the /health path
+    // and does not trigger per-VM liveness checks.
+    let vms = core.list_vms().unwrap_or_default();
+    let total = vms.len() as u64;
+    let count = |state: &str| vms.iter().filter(|vm| vm.state == state).count() as u64;
+    let services = core.list_services().unwrap_or_default();
 
     let m = metrics();
-    format!(
+    let mut out = format!(
         "# TYPE husker_api_requests_total counter\n\
 husker_api_requests_total {}\n\
 # TYPE husker_api_errors_total counter\n\
@@ -1076,9 +1073,52 @@ husker_api_uptime_seconds {}\n",
         m.file_writes_total.load(Ordering::Relaxed),
         m.shell_sessions_total.load(Ordering::Relaxed),
         total,
-        running,
+        count("running"),
         m.start.elapsed().as_secs(),
-    )
+    );
+
+    // Build info and per-state gauges.
+    out.push_str(&format!(
+        "# TYPE husker_build_info gauge\n\
+husker_build_info{{version=\"{}\"}} 1\n\
+# TYPE husker_vms_stopped gauge\n\
+husker_vms_stopped {}\n\
+# TYPE husker_vms_failed gauge\n\
+husker_vms_failed {}\n",
+        env!("CARGO_PKG_VERSION"),
+        count("stopped"),
+        count("failed"),
+    ));
+
+    // Per-service gauges. Service names are husker-validated resource names
+    // (lowercase alphanumeric + hyphens, no special characters), so no
+    // Prometheus label escaping is needed. The exposition format requires all
+    // samples of a metric family to be contiguous, so each family is emitted
+    // as its own complete block.
+    if !services.is_empty() {
+        let mut sorted = services;
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        out.push_str("# TYPE husker_service_desired_instances gauge\n");
+        for svc in &sorted {
+            out.push_str(&format!(
+                "husker_service_desired_instances{{service=\"{}\"}} {}\n",
+                svc.name, svc.desired_instances,
+            ));
+        }
+        out.push_str("# TYPE husker_service_current_instances gauge\n");
+        for svc in &sorted {
+            let current = vms
+                .iter()
+                .filter(|vm| vm.service_id == Some(svc.id))
+                .count() as u64;
+            out.push_str(&format!(
+                "husker_service_current_instances{{service=\"{}\"}} {}\n",
+                svc.name, current,
+            ));
+        }
+    }
+
+    out
 }
 
 #[utoipa::path(
@@ -2819,6 +2859,99 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn response_text(response: axum::response::Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn seeded_core_for_metrics() -> Arc<HuskerCore<husker_vmm::firecracker::FirecrackerBackend>> {
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let now = chrono::Utc::now();
+
+        // Insert a service named "svc" with desired_instances = 2.
+        let svc_id = uuid::Uuid::new_v4();
+        state
+            .insert_service(&husker_state::ServiceRecord {
+                id: svc_id,
+                name: "svc".into(),
+                host_group_id: None,
+                desired_instances: 2,
+                image: None,
+                kernel_path: String::new(),
+                rootfs_path: String::new(),
+                initrd_path: None,
+                vcpu_count: None,
+                mem_size_mib: None,
+                userdata: None,
+                userdata_env: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        // 1 running VM owned by "svc".
+        state
+            .insert_vm(&husker_state::VmRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "vm-running".into(),
+                state: "running".into(),
+                pid: Some(1),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 100,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "/tmp/vmlinux".into(),
+                rootfs_path: "/tmp/rootfs.ext4".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+                service_id: Some(svc_id),
+                service_ordinal: Some(0),
+                vmm: "firecracker".into(),
+                boot_mode: "direct".into(),
+            })
+            .unwrap();
+
+        // 1 stopped VM not owned by any service.
+        state
+            .insert_vm(&husker_state::VmRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "vm-stopped".into(),
+                state: "stopped".into(),
+                pid: None,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 101,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "/tmp/vmlinux".into(),
+                rootfs_path: "/tmp/rootfs.ext4".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+                service_id: None,
+                service_ordinal: None,
+                vmm: "firecracker".into(),
+                boot_mode: "direct".into(),
+            })
+            .unwrap();
+
+        make_core(
+            state,
+            husker_storage::StorageConfig {
+                data_dir: std::path::PathBuf::from("/tmp/husker-test"),
+            },
+            std::path::PathBuf::from("/tmp/husker-test/run"),
+        )
+    }
+
     fn policy_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -4209,5 +4342,41 @@ mod tests {
             }
             other => panic!("expected start message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn metrics_include_build_state_and_service_gauges() {
+        // Core seeded with 1 running VM (owned by "svc"), 1 stopped VM, and a
+        // service "svc" with desired_instances = 2.
+        let app = router(seeded_core_for_metrics());
+        let response = app
+            .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert!(
+            text.contains(&format!(
+                "husker_build_info{{version=\"{}\"}} 1",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "missing husker_build_info in:\n{text}"
+        );
+        assert!(
+            text.contains("husker_vms_stopped 1"),
+            "missing husker_vms_stopped in:\n{text}"
+        );
+        assert!(
+            text.contains("husker_vms_failed 0"),
+            "missing husker_vms_failed in:\n{text}"
+        );
+        assert!(
+            text.contains("husker_service_desired_instances{service=\"svc\"} 2"),
+            "missing husker_service_desired_instances in:\n{text}"
+        );
+        assert!(
+            text.contains("husker_service_current_instances{service=\"svc\"} 1"),
+            "missing husker_service_current_instances in:\n{text}"
+        );
     }
 }
