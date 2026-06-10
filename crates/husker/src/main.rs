@@ -167,6 +167,75 @@ enum Commands {
         #[arg(long)]
         connect_timeout: Option<u64>,
 
+        /// Maximum seconds the command may run (server default: 30, clamped
+        /// to the daemon's exec_timeout_max_secs)
+        #[arg(long)]
+        timeout: Option<u64>,
+
+        /// Command and arguments (after --)
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
+    /// Boot a VM, run one command, destroy the VM, exit with its exit code
+    Job {
+        /// Path to rootfs ext4 image (defaults to the configured default_rootfs)
+        rootfs: Option<PathBuf>,
+
+        /// VM name (default: job-<random>)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Path to kernel (vmlinux)
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+
+        /// Path to initrd/initramfs (auto-detected if not specified)
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+
+        /// Number of vCPUs (default: 1)
+        #[arg(long)]
+        cpus: Option<u32>,
+
+        /// Memory in MiB (default: 128)
+        #[arg(long)]
+        memory: Option<u32>,
+
+        /// Environment variables for the command (KEY=VALUE), repeatable
+        #[arg(long, short = 'e')]
+        env: Vec<String>,
+
+        /// Backend to run this VM on
+        #[arg(long, value_parser = ["firecracker", "qemu"])]
+        vmm: Option<String>,
+
+        /// Boot a cloud image as a full UEFI VM via QEMU (Linux only): a
+        /// catalog image name or a qcow2 path
+        #[arg(long)]
+        cloud_image: Option<PathBuf>,
+
+        /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
+        #[arg(long)]
+        disk_size: Option<String>,
+
+        /// Authorize this SSH public key file in the cloud VM via cloud-init
+        /// (repeatable; cloud-image only)
+        #[arg(long = "ssh-key")]
+        ssh_key: Vec<PathBuf>,
+
+        /// Apply a named VM preset from config (explicit flags win)
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Maximum seconds the command may run (server-clamped)
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+
+        /// Keep the VM after the job instead of destroying it
+        #[arg(long)]
+        keep: bool,
+
         /// Command and arguments (after --)
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -1091,6 +1160,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
     );
     let output_fields: Vec<&'static str> = match path {
         "run" => vec!["status", "action", "vm", "userdata_queued"],
+        "job" => vec!["status", "action", "vm", "exit_code", "stdout", "stderr"],
         "list" => vec![
             "name",
             "state",
@@ -1673,6 +1743,7 @@ async fn run(cli: Cli) -> Result<()> {
             workdir,
             env,
             connect_timeout,
+            timeout,
             command,
         } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -1695,6 +1766,9 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if let Some(secs) = connect_timeout {
                 body["connect_timeout_secs"] = serde_json::json!(secs);
+            }
+            if let Some(secs) = timeout {
+                body["timeout_secs"] = serde_json::json!(secs);
             }
 
             let client = reqwest::Client::new();
@@ -1739,6 +1813,248 @@ async fn run(cli: Cli) -> Result<()> {
                 std::process::exit(exit_code);
             }
             Ok(())
+        }
+        Commands::Job {
+            rootfs,
+            name,
+            kernel,
+            initrd,
+            cpus,
+            memory,
+            env,
+            vmm,
+            cloud_image,
+            disk_size,
+            ssh_key,
+            profile,
+            timeout,
+            keep,
+            command,
+        } => {
+            let config = load_config(config_path.as_deref());
+            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
+            let name =
+                name.unwrap_or_else(|| format!("job-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+
+            // env goes to the EXEC request, not the create body; pass empty to the builder.
+            let args = VmRequestArgs {
+                rootfs,
+                kernel,
+                initrd,
+                cpus,
+                memory,
+                vmm,
+                cloud_image,
+                disk_size,
+                ssh_key,
+                env: Vec::new(),
+            };
+            let body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
+
+            let client = reqwest::Client::new();
+
+            // Best-effort cleanup: fire-and-forget DELETE so the VM is not left behind.
+            let do_cleanup = {
+                let client = client.clone();
+                let api_url = api_url.clone();
+                let api_token = api_token.clone();
+                let name = name.clone();
+                move || {
+                    let client = client.clone();
+                    let api_url = api_url.clone();
+                    let api_token = api_token.clone();
+                    let name = name.clone();
+                    async move {
+                        let _ = with_api_auth(
+                            client.delete(format!("{api_url}/v1/vms/{name}")),
+                            api_token.as_deref(),
+                        )
+                        .send()
+                        .await;
+                    }
+                }
+            };
+
+            let work = async {
+                // 1. Create the VM.
+                let resp = api_request(
+                    with_api_auth(
+                        client.post(format!("{api_url}/v1/vms")),
+                        api_token.as_deref(),
+                    )
+                    .json(&body),
+                )
+                .await?;
+                if !resp.status().is_success() {
+                    let msg = api_error(resp, &format!("VM '{name}'")).await;
+                    exit_with_error(output, msg);
+                }
+                if output == OutputFormat::Text {
+                    eprintln!("[job] vm {name} created, waiting for agent...");
+                }
+
+                // Old-daemon warning: if the requested timeout exceeds the historical
+                // 30-second exec default, check the daemon version. Daemons older than
+                // 0.4.2 ignore timeout_secs and cap execution at exec_timeout_secs.
+                if timeout > 30 {
+                    let health_client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(2))
+                        .build()
+                        .unwrap_or_default();
+                    if let Ok(resp) = health_client
+                        .get(format!("{api_url}/v1/health"))
+                        .send()
+                        .await
+                        && resp.status().is_success()
+                        && let Ok(health) = resp.json::<serde_json::Value>().await
+                        && let Some(ver_str) = health["version"].as_str()
+                    {
+                        let parts: Vec<u64> =
+                            ver_str.split('.').filter_map(|p| p.parse().ok()).collect();
+                        if let [major, minor, patch] = parts.as_slice() {
+                            if (*major, *minor, *patch) < (0, 4, 2) {
+                                eprintln!(
+                                    "[job] warning: daemon {ver_str} does not support \
+                                     --timeout; execution will be capped at the daemon's \
+                                     exec_timeout_secs setting"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // 2. Boot-mode-aware readiness wait (mirrors Commands::Wait logic).
+                let info_url = format!("{api_url}/v1/vms/{name}");
+                let resp =
+                    api_request(with_api_auth(client.get(&info_url), api_token.as_deref())).await?;
+                if !resp.status().is_success() {
+                    let msg = api_error(resp, &format!("VM '{name}'")).await;
+                    anyhow::bail!("{}", msg.message);
+                }
+                let vm: serde_json::Value = resp.json().await?;
+                let ready_timeout = if vm.get("boot_mode").and_then(|b| b.as_str()) == Some("uefi")
+                {
+                    husker_core::UEFI_READY_TIMEOUT_SECS
+                } else {
+                    husker_core::DEFAULT_READY_TIMEOUT_SECS
+                };
+                let ready_url = format!("{api_url}/v1/vms/{name}/ready");
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout);
+                let mut backoff = std::time::Duration::from_millis(200);
+                loop {
+                    let resp =
+                        api_request(with_api_auth(client.get(&ready_url), api_token.as_deref()))
+                            .await?;
+                    if !resp.status().is_success() {
+                        let msg = api_error(resp, &format!("VM '{name}'")).await;
+                        anyhow::bail!("{}", msg.message);
+                    }
+                    let rdy: serde_json::Value = resp.json().await?;
+                    if rdy.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
+                        break;
+                    }
+                    if std::time::Instant::now() + backoff >= deadline {
+                        anyhow::bail!("timed out waiting for VM '{name}' to become ready");
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                }
+
+                // 3. Run the command via exec.
+                if output == OutputFormat::Text {
+                    eprintln!("[job] running command");
+                }
+                let env_map: std::collections::HashMap<String, String> = env
+                    .iter()
+                    .filter_map(|s| {
+                        let (k, v) = s.split_once('=')?;
+                        Some((k.to_string(), v.to_string()))
+                    })
+                    .collect();
+                let exec_body = serde_json::json!({
+                    "command": command[0],
+                    "args": &command[1..],
+                    "env": env_map,
+                    "timeout_secs": timeout,
+                });
+                let resp = api_request(
+                    with_api_auth(
+                        client.post(format!("{api_url}/v1/vms/{name}/exec")),
+                        api_token.as_deref(),
+                    )
+                    .json(&exec_body),
+                )
+                .await?;
+                if !resp.status().is_success() {
+                    let msg = api_error(resp, &format!("VM '{name}'")).await;
+                    anyhow::bail!("{}", msg.message);
+                }
+                let result: serde_json::Value = resp.json().await?;
+                Ok::<serde_json::Value, anyhow::Error>(result)
+            };
+
+            // Ctrl-C destroys the VM (unless --keep) and exits 130.
+            let result = tokio::select! {
+                r = work => r,
+                _ = tokio::signal::ctrl_c() => {
+                    if !keep {
+                        eprintln!("[job] interrupted, destroying {name}");
+                        do_cleanup().await;
+                    } else {
+                        eprintln!("[job] interrupted, keeping {name}");
+                    }
+                    std::process::exit(130);
+                }
+            };
+
+            match result {
+                Ok(result) => {
+                    let exit_code = result["exit_code"].as_i64().unwrap_or(1);
+                    if output == OutputFormat::Json {
+                        print_output(
+                            output,
+                            &serde_json::json!({
+                                "status": "ok",
+                                "action": "job",
+                                "vm": name,
+                                "exit_code": exit_code,
+                                "stdout": result["stdout"],
+                                "stderr": result["stderr"],
+                            }),
+                            "",
+                        );
+                    } else {
+                        print!("{}", result["stdout"].as_str().unwrap_or(""));
+                        eprint!("{}", result["stderr"].as_str().unwrap_or(""));
+                    }
+                    if keep {
+                        if output == OutputFormat::Text {
+                            eprintln!(
+                                "[job] exit code {exit_code}, keeping {name} \
+                                 (husker shell {name} / husker destroy {name})"
+                            );
+                        }
+                    } else {
+                        if output == OutputFormat::Text {
+                            eprintln!("[job] exit code {exit_code}, destroying vm");
+                        }
+                        do_cleanup().await;
+                    }
+                    if exit_code != 0 {
+                        std::process::exit(exit_code.clamp(1, 255) as i32);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if keep {
+                        eprintln!("[job] failed, keeping {name}: {e}");
+                    } else {
+                        do_cleanup().await;
+                    }
+                    exit_with_error(output, e.to_string());
+                }
+            }
         }
         Commands::Cp { source, dest, mode } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
@@ -5773,5 +6089,44 @@ mod tests {
             expand_tilde(Path::new("/abs/x.pub")),
             PathBuf::from("/abs/x.pub")
         );
+    }
+
+    #[test]
+    fn job_requires_trailing_command() {
+        assert!(Cli::try_parse_from(["husker", "job", "--cloud-image", "x"]).is_err());
+        let cli = Cli::try_parse_from([
+            "husker",
+            "job",
+            "--cloud-image",
+            "x",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ])
+        .expect("job parses with trailing command");
+        match cli.command {
+            Commands::Job {
+                command,
+                timeout,
+                keep,
+                ..
+            } => {
+                assert_eq!(command, vec!["sh", "-c", "true"]);
+                assert_eq!(timeout, 3600);
+                assert!(!keep);
+            }
+            _ => panic!("expected Job"),
+        }
+    }
+
+    #[test]
+    fn exec_timeout_flag_parses() {
+        let cli = Cli::try_parse_from(["husker", "exec", "vm1", "--timeout", "600", "--", "true"])
+            .expect("exec parses with --timeout");
+        match cli.command {
+            Commands::Exec { timeout, .. } => assert_eq!(timeout, Some(600)),
+            _ => panic!("expected Exec"),
+        }
     }
 }
