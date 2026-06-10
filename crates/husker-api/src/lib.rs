@@ -2934,6 +2934,7 @@ mod tests {
                 cloud_image: None,
                 disk_size: None,
                 balloon: false,
+                volume: None,
             })
             .unwrap();
 
@@ -2962,6 +2963,7 @@ mod tests {
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
                 balloon: false,
+                volume: None,
             })
             .unwrap();
 
@@ -2990,6 +2992,7 @@ mod tests {
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
                 balloon: false,
+                volume: None,
             })
             .unwrap();
 
@@ -3287,6 +3290,7 @@ mod tests {
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
                 balloon: false,
+                volume: None,
             })
             .unwrap();
 
@@ -3655,6 +3659,7 @@ mod tests {
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
                 balloon: false,
+                volume: None,
             })
             .unwrap();
 
@@ -3777,6 +3782,7 @@ mod tests {
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
                 balloon: false,
+                volume: None,
             })
             .unwrap();
         let core = make_core(

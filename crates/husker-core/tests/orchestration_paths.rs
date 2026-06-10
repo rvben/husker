@@ -195,6 +195,7 @@ fn vm_record(
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     }
 }
 

@@ -858,6 +858,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "direct".to_string()
             },
             balloon: req.balloon,
+            volume: None,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -963,6 +964,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm: "apple_vz".to_string(),
             boot_mode: "direct".to_string(),
             balloon: req.balloon,
+            volume: None,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1358,6 +1360,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             cloud_image: req.cloud_image,
             disk_size: req.disk_size,
             balloon: req.balloon,
+            volume: None,
         };
         self.state.insert_service(&record).map_err(|e| match e {
             husker_state::StateError::ServiceAlreadyExists(name) => {
@@ -3181,6 +3184,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             vmm: vmm.into(),
             boot_mode: "direct".into(),
             balloon: false,
+            volume: None,
         }
     }
 
@@ -3268,6 +3272,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             cloud_image: None,
             disk_size: None,
             balloon: false,
+            volume: None,
         };
         let req = super::instance_request(&svc, "svc-0");
         assert_eq!(req.name, "svc-0");
@@ -3309,6 +3314,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             cloud_image: None,
             disk_size: None,
             balloon: true,
+            volume: None,
         };
         let req = super::instance_request(&svc, "svc-0");
         assert!(
@@ -3338,6 +3344,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             cloud_image: Some("ubuntu-2404".into()),
             disk_size: Some(10 * 1024 * 1024 * 1024),
             balloon: true,
+            volume: None,
         };
         let req = super::instance_request(&svc, "cloudsvc-0");
         assert_eq!(req.name, "cloudsvc-0");

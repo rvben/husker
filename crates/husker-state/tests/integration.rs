@@ -27,6 +27,7 @@ fn make_record(name: &str) -> VmRecord {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     }
 }
 

@@ -118,6 +118,7 @@ async fn health_counts_vms_correctly() {
             vmm: "firecracker".into(),
             boot_mode: "direct".into(),
             balloon: false,
+            volume: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -329,6 +330,7 @@ async fn snapshot_endpoints_roundtrip() {
             vmm: "firecracker".into(),
             boot_mode: "direct".into(),
             balloon: false,
+            volume: None,
         })
         .unwrap();
 
@@ -846,6 +848,7 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -999,6 +1002,7 @@ async fn vm_response_json_structure() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1080,6 +1084,7 @@ async fn list_vms_returns_all_records() {
             vmm: "firecracker".into(),
             boot_mode: "direct".into(),
             balloon: false,
+            volume: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -1316,6 +1321,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1369,6 +1375,7 @@ async fn vm_response_with_null_optional_fields() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1442,6 +1449,7 @@ async fn logs_returns_serial_output() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1499,6 +1507,7 @@ async fn logs_tail_returns_last_n_lines() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1556,6 +1565,7 @@ async fn logs_no_serial_file_returns_404() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1615,6 +1625,7 @@ fn logs_test_core(
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1855,6 +1866,7 @@ async fn logs_large_file_is_truncated() {
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
         balloon: false,
+        volume: None,
     };
     state.insert_vm(&record).unwrap();
 

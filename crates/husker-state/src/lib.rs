@@ -50,6 +50,12 @@ pub enum StateError {
     SecretNotFoundByName(String),
     #[error("secret already exists: {0}")]
     SecretAlreadyExists(String),
+    #[error("volume not found: {0}")]
+    VolumeNotFound(Uuid),
+    #[error("volume not found by name: {0}")]
+    VolumeNotFoundByName(String),
+    #[error("volume already exists: {0}")]
+    VolumeAlreadyExists(String),
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
     #[error("lock poisoned")]
@@ -94,6 +100,8 @@ pub struct VmRecord {
     pub boot_mode: String,
     /// Whether a virtio memory balloon device was installed at boot.
     pub balloon: bool,
+    /// Name of the persistent volume attached to this VM, or None.
+    pub volume: Option<String>,
 }
 
 /// Persistent port forward record.
@@ -144,6 +152,8 @@ pub struct ServiceRecord {
     pub disk_size: Option<u64>,
     /// Whether replacement instances for this service include a virtio balloon.
     pub balloon: bool,
+    /// Name of the persistent volume attached to instances of this service, or None.
+    pub volume: Option<String>,
 }
 
 /// Persistent snapshot record.
@@ -180,6 +190,16 @@ pub struct SecretRecord {
     pub nonce: Vec<u8>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Persistent volume catalog record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub file_path: String,
+    pub size_bytes: u64,
+    pub created_at: DateTime<Utc>,
 }
 
 /// SQLite-backed state store. Thread-safe via internal Mutex.
@@ -301,6 +321,14 @@ impl StateStore {
                 nonce BLOB NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS volumes (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                file_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             );",
         )?;
 
@@ -365,6 +393,11 @@ impl StateStore {
             [],
         );
 
+        // Migration: persistent volume attachment columns (idempotent).
+        // NULL means no volume is attached.
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN volume TEXT", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN volume TEXT", []);
+
         Ok(())
     }
 
@@ -377,8 +410,8 @@ impl StateStore {
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                               created_at, updated_at, userdata, userdata_status, userdata_env,
-                              service_id, service_ordinal, vmm, boot_mode, balloon)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                              service_id, service_ordinal, vmm, boot_mode, balloon, volume)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -402,6 +435,7 @@ impl StateStore {
                 record.vmm,
                 record.boot_mode,
                 record.balloon as i64,
+                record.volume,
             ],
         )
         .map_err(|e| match &e {
@@ -423,7 +457,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -441,7 +475,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -459,7 +493,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
              FROM vms ORDER BY created_at",
         )?;
 
@@ -477,7 +511,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode, balloon
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
              FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
         )?;
         let records = stmt
@@ -616,8 +650,8 @@ impl StateStore {
             "INSERT INTO services (id, name, host_group_id, desired_instances, image,
                                    kernel_path, rootfs_path, initrd_path, vcpu_count,
                                    mem_size_mib, userdata, userdata_env, created_at, updated_at,
-                                   cloud_image, disk_size, balloon)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                                   cloud_image, disk_size, balloon, volume)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -636,6 +670,7 @@ impl StateStore {
                 record.cloud_image,
                 disk_size_i64,
                 record.balloon as i64,
+                record.volume,
             ],
         )
         .map_err(|e| match &e {
@@ -655,7 +690,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
                     initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
-                    created_at, updated_at, cloud_image, disk_size, balloon
+                    created_at, updated_at, cloud_image, disk_size, balloon, volume
              FROM services WHERE id = ?1",
             params![id.to_string()],
             row_to_service_record,
@@ -672,7 +707,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
                     initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
-                    created_at, updated_at, cloud_image, disk_size, balloon
+                    created_at, updated_at, cloud_image, disk_size, balloon, volume
              FROM services WHERE name = ?1",
             params![name],
             row_to_service_record,
@@ -689,7 +724,7 @@ impl StateStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
                     initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
-                    created_at, updated_at, cloud_image, disk_size, balloon
+                    created_at, updated_at, cloud_image, disk_size, balloon, volume
              FROM services ORDER BY created_at",
         )?;
 
@@ -1201,6 +1236,100 @@ impl StateStore {
         )?;
         Ok(())
     }
+
+    // ── Volumes ───────────────────────────────────────────────────────
+
+    /// Insert a new volume record.
+    ///
+    /// Returns `StateError::VolumeAlreadyExists` if a volume with the same name exists.
+    pub fn insert_volume(&self, record: &VolumeRecord) -> Result<(), StateError> {
+        let size_bytes_i64 =
+            i64::try_from(record.size_bytes).map_err(|_| StateError::CorruptData {
+                column: "size_bytes",
+                message: format!("value {} exceeds SQLite INTEGER range", record.size_bytes),
+            })?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO volumes (id, name, file_path, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.id.to_string(),
+                record.name,
+                record.file_path,
+                size_bytes_i64,
+                record.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::VolumeAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Get a volume by name.
+    pub fn get_volume_by_name(&self, name: &str) -> Result<VolumeRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, file_path, size_bytes, created_at
+             FROM volumes WHERE name = ?1",
+            params![name],
+            row_to_volume_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::VolumeNotFoundByName(name.into()),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// List all volumes.
+    pub fn list_volumes(&self) -> Result<Vec<VolumeRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, file_path, size_bytes, created_at
+             FROM volumes ORDER BY created_at",
+        )?;
+        let records = stmt
+            .query_map([], row_to_volume_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Delete a volume record by ID.
+    pub fn delete_volume(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute("DELETE FROM volumes WHERE id = ?1", params![id.to_string()])?;
+        if deleted == 0 {
+            return Err(StateError::VolumeNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Find the first VM that currently has the named volume attached.
+    ///
+    /// Used to enforce single-attach exclusivity: a volume may be attached to
+    /// at most one VM at a time. Returns `None` when no VM references the volume.
+    pub fn find_vm_by_volume(&self, volume_name: &str) -> Result<Option<VmRecord>, StateError> {
+        let conn = self.lock()?;
+        let result = conn.query_row(
+            "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                    tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                    created_at, updated_at, userdata, userdata_status, userdata_env,
+                    service_id, service_ordinal, vmm, boot_mode, balloon, volume
+             FROM vms WHERE volume = ?1 LIMIT 1",
+            params![volume_name],
+            row_to_vm_record,
+        );
+        match result {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(other) => Err(StateError::Database(other)),
+        }
+    }
 }
 
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
@@ -1261,6 +1390,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
             let raw: i64 = row.get(21)?;
             raw != 0
         },
+        volume: row.get(22)?,
     })
 }
 
@@ -1315,6 +1445,7 @@ fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRec
             let raw: i64 = row.get(16)?;
             raw != 0
         },
+        volume: row.get(17)?,
     })
 }
 
@@ -1365,6 +1496,22 @@ fn row_to_secret_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretRecor
     })
 }
 
+fn row_to_volume_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VolumeRecord> {
+    let id_str: String = row.get(0)?;
+    let created_str: String = row.get(4)?;
+    let size_bytes: i64 = row.get(3)?;
+    let size_bytes = u64::try_from(size_bytes)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, size_bytes))?;
+
+    Ok(VolumeRecord {
+        id: parse_uuid(&id_str)?,
+        name: row.get(1)?,
+        file_path: row.get(2)?,
+        size_bytes,
+        created_at: parse_datetime(&created_str)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1393,6 +1540,7 @@ mod tests {
             vmm: "firecracker".into(),
             boot_mode: "direct".into(),
             balloon: false,
+            volume: None,
         }
     }
 
@@ -1425,6 +1573,7 @@ mod tests {
             cloud_image: None,
             disk_size: None,
             balloon: false,
+            volume: None,
         }
     }
 
@@ -2525,6 +2674,180 @@ mod tests {
         assert!(
             !rec.balloon,
             "legacy VM row without balloon column must default to false"
+        );
+    }
+
+    // ── Volumes ───────────────────────────────────────────────────────
+
+    fn make_volume(name: &str, size_bytes: u64) -> VolumeRecord {
+        VolumeRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            file_path: format!("/var/lib/husker/volumes/{name}.img"),
+            size_bytes,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn insert_and_get_volume_by_name() {
+        let store = StateStore::open_memory().unwrap();
+        let vol = make_volume("data", 1024 * 1024 * 1024);
+        store.insert_volume(&vol).unwrap();
+
+        let fetched = store.get_volume_by_name("data").unwrap();
+        assert_eq!(fetched.id, vol.id);
+        assert_eq!(fetched.name, "data");
+        assert_eq!(fetched.size_bytes, 1024 * 1024 * 1024);
+        assert_eq!(fetched.file_path, "/var/lib/husker/volumes/data.img");
+    }
+
+    #[test]
+    fn list_volumes_returns_all() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_volume(&make_volume("vol-a", 512)).unwrap();
+        store.insert_volume(&make_volume("vol-b", 1024)).unwrap();
+
+        let volumes = store.list_volumes().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0].name, "vol-a");
+        assert_eq!(volumes[1].name, "vol-b");
+    }
+
+    #[test]
+    fn duplicate_volume_name_rejected() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_volume(&make_volume("dup", 1024)).unwrap();
+
+        let err = store.insert_volume(&make_volume("dup", 2048)).unwrap_err();
+        assert!(
+            matches!(err, StateError::VolumeAlreadyExists(ref name) if name == "dup"),
+            "expected VolumeAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_volume_by_id() {
+        let store = StateStore::open_memory().unwrap();
+        let vol = make_volume("todel", 512);
+        store.insert_volume(&vol).unwrap();
+        store.delete_volume(vol.id).unwrap();
+
+        let err = store.get_volume_by_name("todel").unwrap_err();
+        assert!(matches!(err, StateError::VolumeNotFoundByName(_)));
+    }
+
+    #[test]
+    fn delete_nonexistent_volume() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store.delete_volume(Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StateError::VolumeNotFound(_)));
+    }
+
+    #[test]
+    fn get_volume_by_name_not_found() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store.get_volume_by_name("missing").unwrap_err();
+        assert!(matches!(err, StateError::VolumeNotFoundByName(_)));
+    }
+
+    #[test]
+    fn find_vm_by_volume_returns_attached_vm() {
+        let store = StateStore::open_memory().unwrap();
+
+        let mut vm = make_record("vm-with-vol");
+        vm.volume = Some("mydata".into());
+        store.insert_vm(&vm).unwrap();
+
+        // A standalone VM without the volume.
+        store.insert_vm(&make_record("other-vm")).unwrap();
+
+        let found = store.find_vm_by_volume("mydata").unwrap();
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.name, "vm-with-vol");
+        assert_eq!(found.volume.as_deref(), Some("mydata"));
+    }
+
+    #[test]
+    fn find_vm_by_volume_returns_none_when_unattached() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_vm(&make_record("standalone")).unwrap();
+
+        let found = store.find_vm_by_volume("nonexistent-volume").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn vm_volume_field_roundtrips() {
+        let store = StateStore::open_memory().unwrap();
+        let mut vm = make_record("vol-vm");
+        vm.volume = Some("persistent-data".into());
+        store.insert_vm(&vm).unwrap();
+
+        let fetched = store.get_vm_by_name("vol-vm").unwrap();
+        assert_eq!(fetched.volume.as_deref(), Some("persistent-data"));
+    }
+
+    #[test]
+    fn vm_volume_migration_default_applied() {
+        // A row inserted without the volume column must read back as None
+        // because the migration adds it as nullable.
+        let store = StateStore::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                                  tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                                  created_at, updated_at, userdata, userdata_status, userdata_env,
+                                  service_id, service_ordinal, vmm, boot_mode, balloon)
+                 VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', 'legacy-vol', 'stopped',
+                         NULL, 1, 128, 5, NULL, NULL, NULL, '/kernel', '/rootfs',
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                         NULL, NULL, NULL, NULL, NULL, 'firecracker', 'direct', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let rec = store.get_vm_by_name("legacy-vol").unwrap();
+        assert!(
+            rec.volume.is_none(),
+            "legacy VM row without volume column must default to None"
+        );
+    }
+
+    #[test]
+    fn service_volume_field_roundtrips() {
+        let store = StateStore::open_memory().unwrap();
+        let mut svc = make_service("vol-svc", None);
+        svc.volume = Some("svc-data".into());
+        store.insert_service(&svc).unwrap();
+
+        let fetched = store.get_service_by_name("vol-svc").unwrap();
+        assert_eq!(fetched.volume.as_deref(), Some("svc-data"));
+    }
+
+    #[test]
+    fn service_volume_migration_default_null() {
+        // A row inserted without the volume column must read back as None.
+        let store = StateStore::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO services
+                     (id, name, desired_instances, kernel_path, rootfs_path,
+                      created_at, updated_at)
+                 VALUES
+                     ('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', 'legacy-vol-svc', 1, '', '',
+                      '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let fetched = store.get_service_by_name("legacy-vol-svc").unwrap();
+        assert!(
+            fetched.volume.is_none(),
+            "legacy service row must have volume = None"
         );
     }
 }

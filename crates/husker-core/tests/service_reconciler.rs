@@ -174,6 +174,7 @@ fn make_service_record(
         cloud_image: None,
         disk_size: None,
         balloon: false,
+        volume: None,
     }
 }
 
@@ -583,6 +584,7 @@ async fn reconcile_empty_rootfs_returns_failed() {
         cloud_image: None,
         disk_size: None,
         balloon: false,
+        volume: None,
     };
 
     let outcome = core.reconcile_service(&svc).await;
