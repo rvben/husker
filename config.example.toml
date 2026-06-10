@@ -73,6 +73,8 @@
 # Exec policy controls.
 # Empty allowlist permits all commands not explicitly denied.
 # exec_timeout_secs = 30
+# Upper bound for per-request exec timeouts (husker exec/job --timeout).
+# exec_timeout_max_secs = 3600
 # exec_allowlist = ["echo", "ls", "cat"]
 # exec_denylist = ["rm", "mkfs", "dd"]
 # exec_env_allowlist = ["PATH", "HOME", "TERM"]
@@ -125,6 +127,8 @@
 #   HUSKER_DEFAULT_INITRD                    →  default_initrd
 #   HUSKER_DEFAULT_DISK_SIZE                 →  default_disk_size
 #   HUSKER_IMAGES_BASE_URL                   →  images_base_url
+#   HUSKER_EXEC_TIMEOUT_SECS                 →  exec_timeout_secs
+#   HUSKER_EXEC_TIMEOUT_MAX_SECS             →  exec_timeout_max_secs
 #   HUSKER_SERVICE_RECONCILE_INTERVAL        →  service_reconcile_interval_secs
 #   HUSKER_SERVICE_RECONCILE_ENABLED         →  service_reconcile_enabled (1/true/TRUE/yes)
 #   HUSKER_FIRECRACKER_BIN                   →  firecracker_bin    (Linux only)

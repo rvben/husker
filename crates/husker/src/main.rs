@@ -559,6 +559,8 @@ struct Config {
     allowed_write_paths: Vec<String>,
     #[serde(default = "default_exec_timeout_secs")]
     exec_timeout_secs: u64,
+    #[serde(default = "default_exec_timeout_max_secs")]
+    exec_timeout_max_secs: u64,
     #[serde(default)]
     exec_allowlist: Vec<String>,
     #[serde(default)]
@@ -650,6 +652,10 @@ fn default_api_sensitive_rate_limit_per_minute() -> u32 {
 
 fn default_exec_timeout_secs() -> u64 {
     30
+}
+
+fn default_exec_timeout_max_secs() -> u64 {
+    3600
 }
 
 fn default_service_reconcile_interval() -> u64 {
@@ -1078,6 +1084,7 @@ impl Default for Config {
             allowed_read_paths: Vec::new(),
             allowed_write_paths: Vec::new(),
             exec_timeout_secs: default_exec_timeout_secs(),
+            exec_timeout_max_secs: default_exec_timeout_max_secs(),
             exec_allowlist: Vec::new(),
             exec_denylist: Vec::new(),
             exec_env_allowlist: Vec::new(),
@@ -3640,6 +3647,11 @@ fn apply_env_overrides(config: &mut Config) {
     {
         config.exec_timeout_secs = parsed;
     }
+    if let Ok(val) = std::env::var("HUSKER_EXEC_TIMEOUT_MAX_SECS")
+        && let Ok(parsed) = val.parse::<u64>()
+    {
+        config.exec_timeout_max_secs = parsed;
+    }
     if let Ok(val) = std::env::var("HUSKER_EXEC_ALLOWLIST") {
         config.exec_allowlist = val
             .split(',')
@@ -4201,6 +4213,19 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
         }
     }
 
+    if config.exec_timeout_max_secs < config.exec_timeout_secs {
+        println!(
+            "  exec_timeout_max_secs ({}) ... FAIL (must be >= exec_timeout_secs ({}))",
+            config.exec_timeout_max_secs, config.exec_timeout_secs
+        );
+        all_ok = false;
+    } else {
+        println!(
+            "  exec_timeout_max_secs ({}) ... OK",
+            config.exec_timeout_max_secs
+        );
+    }
+
     if all_ok {
         Ok(())
     } else {
@@ -4241,7 +4266,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         allowed_read_paths: config.allowed_read_paths.clone(),
         allowed_write_paths: config.allowed_write_paths.clone(),
         exec_timeout_secs: config.exec_timeout_secs,
-        exec_timeout_max_secs: 3600,
+        exec_timeout_max_secs: config.exec_timeout_max_secs,
         exec_allowlist: config.exec_allowlist.clone(),
         exec_denylist: config.exec_denylist.clone(),
         exec_env_allowlist: config.exec_env_allowlist.clone(),
