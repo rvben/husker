@@ -357,6 +357,7 @@ async fn reconcile_foreign_running_collision() {
         ssh_authorized_keys: Vec::new(),
         balloon: false,
         volume: None,
+        network: None,
     })
     .await
     .unwrap();
@@ -408,6 +409,7 @@ async fn reconcile_foreign_stopped_collision() {
         ssh_authorized_keys: Vec::new(),
         balloon: false,
         volume: None,
+        network: None,
     })
     .await
     .unwrap();
@@ -469,6 +471,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
                 volume: None,
+                network: None,
             },
             Some(ServiceTag {
                 service_id: id,
@@ -497,6 +500,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
                 volume: None,
+                network: None,
             },
             Some(ServiceTag {
                 service_id: id,
@@ -867,6 +871,7 @@ async fn set_balloon_rejects_vm_without_balloon_device() {
         ssh_authorized_keys: Vec::new(),
         balloon: false,
         volume: None,
+        network: None,
     })
     .await
     .unwrap();
@@ -899,6 +904,7 @@ async fn set_balloon_rejects_stopped_vm() {
         ssh_authorized_keys: Vec::new(),
         balloon: true,
         volume: None,
+        network: None,
     })
     .await
     .unwrap();
@@ -947,6 +953,7 @@ async fn set_balloon_happy_path_forwards_to_vmm() {
             ssh_authorized_keys: Vec::new(),
             balloon: true,
             volume: None,
+            network: None,
         })
         .await
         .unwrap();

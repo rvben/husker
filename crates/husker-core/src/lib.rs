@@ -129,6 +129,11 @@ pub struct CreateVmRequest {
     /// Exactly one VM may hold a given volume at a time.
     #[serde(default)]
     pub volume: Option<String>,
+    /// Network mode: "nat" (default) or "bridged". Bridged requires a cloud image
+    /// and a configured `lan_bridge`; the VM's TAP is attached directly to the
+    /// host LAN bridge and DHCP assigns its address.
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 /// Parameters for creating a host group.
@@ -462,6 +467,8 @@ pub struct HuskerCore<B: VmmBackend> {
     #[cfg(feature = "linux-net")]
     bridge_name: String,
     #[cfg(feature = "linux-net")]
+    lan_bridge: Option<String>,
+    #[cfg(feature = "linux-net")]
     dns_servers: Vec<String>,
     runtime_dir: PathBuf,
     /// Per-VM-name locks guarding the create/destroy critical section.
@@ -515,6 +522,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             ovmf_vars_template_path: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
             embedded_agent: &[],
             bridge_name,
+            lan_bridge: None,
             dns_servers,
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -558,6 +566,17 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub fn with_uefi_firmware(mut self, code: PathBuf, vars_template: PathBuf) -> Self {
         self.ovmf_code_path = code;
         self.ovmf_vars_template_path = vars_template;
+        self
+    }
+
+    /// Set the host LAN bridge name for bridged networking.
+    ///
+    /// When set, VMs created with `network: "bridged"` have their TAP enslaved
+    /// to this bridge instead of the husker NAT bridge. The bridge must be
+    /// pre-created and have a DHCP server on the attached network segment.
+    #[cfg(feature = "linux-net")]
+    pub fn with_lan_bridge(mut self, bridge: Option<String>) -> Self {
+        self.lan_bridge = bridge;
         self
     }
 
@@ -651,22 +670,65 @@ impl<B: VmmBackend> HuskerCore<B> {
         tags: Option<ServiceTag>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
-        let guest_ip = self.ip_allocator.allocate()?;
-        resources.guest_ip = Some(guest_ip);
+        // Validate + default the network mode before touching any host resources.
+        let network_mode = validate_network_mode(req.network.as_deref())?;
+
+        // Bridged mode preconditions: must have a cloud image and a configured LAN bridge.
+        // These checks run before any resource allocation so tests can verify them in-memory.
+        if network_mode == "bridged" {
+            if req.cloud_image.is_none() {
+                return Err(CoreError::InvalidArgument(
+                    "bridged networking requires --cloud-image \
+                     (microVM guests have no DHCP client)"
+                        .into(),
+                ));
+            }
+            if self.lan_bridge.is_none() {
+                return Err(CoreError::InvalidArgument(
+                    "bridged networking requires the lan_bridge config option".into(),
+                ));
+            }
+        }
+
+        // NAT mode: allocate a static IP. Bridged mode: skip allocation; the LAN DHCP
+        // server assigns the address. The rollback field stays None so unwind skips it.
+        let guest_ip = if network_mode == "nat" {
+            let ip = self.ip_allocator.allocate()?;
+            resources.guest_ip = Some(ip);
+            Some(ip)
+        } else {
+            None
+        };
 
         let cid = self.state.allocate_cid()?;
         resources.cid = Some(cid);
 
         let tap_name = format!("husker{cid}");
         let mac = husker_net::generate_mac(cid);
+
+        // NAT-only values; only evaluated when network_mode == "nat".
         let gateway = self.ip_allocator.gateway();
         let netmask = husker_net::prefix_len_to_netmask(self.ip_allocator.prefix_len());
-        debug!(tap = %tap_name, %guest_ip, %gateway, cid, "resources allocated");
+
+        if let Some(ip) = guest_ip {
+            debug!(tap = %tap_name, %ip, %gateway, cid, "NAT resources allocated");
+        } else {
+            debug!(tap = %tap_name, cid, "bridged resources allocated (no IP)");
+        }
 
         husker_net::create_tap(&tap_name).await?;
         resources.tap_name = Some(tap_name.clone());
 
-        husker_net::attach_to_bridge(&tap_name, &self.bridge_name).await?;
+        // Attach the TAP to the appropriate bridge: the LAN bridge for bridged mode,
+        // or the husker NAT bridge for NAT mode.
+        let attach_bridge = if network_mode == "bridged" {
+            self.lan_bridge
+                .as_deref()
+                .expect("lan_bridge checked above")
+        } else {
+            &self.bridge_name
+        };
+        husker_net::attach_to_bridge(&tap_name, attach_bridge).await?;
 
         let vm_dir = self.storage.vm_dir(&req.name);
         if vm_dir.exists() {
@@ -757,21 +819,26 @@ impl<B: VmmBackend> HuskerCore<B> {
                 &self.ovmf_vars_template_path,
             )
             .await?;
-            // Build the NoCloud seed: install + start the embedded agent and apply a
-            // static network config (husker's allocated IP) so cloud-init does not
-            // stall on DHCP before the agent comes up. When a volume is attached,
-            // include a mounts entry so cloud-init mounts it at /data on first boot.
+            // Build the NoCloud seed. For NAT mode, inject a static network config so
+            // cloud-init does not stall waiting for DHCP before the agent comes up.
+            // For bridged mode, omit network-config entirely: cloud-init falls back to
+            // DHCP on all NICs, and the LAN DHCP server assigns the address.
+            let seed_network = if network_mode == "nat" {
+                Some(husker_cloudinit::NetworkConfig {
+                    ip: guest_ip.expect("NAT mode always has a guest_ip"),
+                    prefix_len: self.ip_allocator.prefix_len(),
+                    gateway,
+                    dns: self.dns_servers.clone(),
+                })
+            } else {
+                None
+            };
             let seed = husker_cloudinit::build_seed(&husker_cloudinit::SeedSpec {
                 agent: self.embedded_agent,
                 hostname: req.name.clone(),
                 instance_id: req.name.clone(),
                 ssh_authorized_keys: req.ssh_authorized_keys.clone(),
-                network: Some(husker_cloudinit::NetworkConfig {
-                    ip: guest_ip,
-                    prefix_len: self.ip_allocator.prefix_len(),
-                    gateway,
-                    dns: self.dns_servers.clone(),
-                }),
+                network: seed_network,
                 mount_volume,
             })
             .map_err(seed_error_to_core)?;
@@ -836,20 +903,27 @@ impl<B: VmmBackend> HuskerCore<B> {
         };
 
         let volume_path = volume_attachment.as_ref().map(|(_, p)| p.clone());
+
+        // NAT direct-kernel VMs pass the static IP as a kernel boot parameter.
+        // Cloud VMs (NAT and bridged) use cloud-init for network; kernel_args is None.
+        let kernel_args = if is_cloud {
+            None
+        } else {
+            // Direct-kernel boots are always NAT (bridged requires cloud image).
+            Some(format!(
+                "console=ttyS0 reboot=k panic=1 pci=off \
+                 ip={ip}::{gateway}:{netmask}::eth0:off",
+                ip = guest_ip.expect("direct-kernel boot is always NAT")
+            ))
+        };
+
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
             vcpu_count: req.vcpu_count.unwrap_or(1),
             mem_size_mib: req.mem_size_mib.unwrap_or(128),
             kernel_path: config_kernel_path,
             rootfs_path: disk_path,
-            kernel_args: if is_cloud {
-                None
-            } else {
-                Some(format!(
-                    "console=ttyS0 reboot=k panic=1 pci=off \
-                     ip={guest_ip}::{gateway}:{netmask}::eth0:off"
-                ))
-            },
+            kernel_args,
             initrd_path: req.initrd_path.clone(),
             vsock_cid: cid,
             tap_device: Some(tap_name.clone()),
@@ -866,6 +940,14 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
         let now = chrono::Utc::now();
+
+        // NAT: persist the allocated IP and gateway; bridged: both stay None (DHCP-assigned).
+        let (record_guest_ip, record_host_ip) = if network_mode == "nat" {
+            (guest_ip.map(|ip| ip.to_string()), Some(gateway.to_string()))
+        } else {
+            (None, None)
+        };
+
         let record = VmRecord {
             id: info.id,
             name: req.name,
@@ -875,10 +957,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             mem_size_mib: info.mem_size_mib,
             vsock_cid: cid,
             tap_device: Some(tap_name),
-            // host_ip stores the bridge gateway — the same for all VMs in the subnet.
-            // Kept for CLI display and API responses (shows the default gateway).
-            host_ip: Some(gateway.to_string()),
-            guest_ip: Some(guest_ip.to_string()),
+            host_ip: record_host_ip,
+            guest_ip: record_guest_ip,
             kernel_path: record_kernel_path,
             rootfs_path: record_rootfs_path,
             created_at: now,
@@ -902,7 +982,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
-            network: "nat".to_string(),
+            network: network_mode.to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -923,6 +1003,17 @@ impl<B: VmmBackend> HuskerCore<B> {
         tags: Option<ServiceTag>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
+        // Validate the network mode field even though only "nat" is meaningful here,
+        // so callers get a clear error for unknown values.
+        let network_mode = validate_network_mode(req.network.as_deref())?;
+
+        // Bridged mode is a Linux-only feature (requires TAP + host bridge management).
+        if network_mode == "bridged" {
+            return Err(CoreError::InvalidArgument(
+                "bridged networking is only supported on Linux".into(),
+            ));
+        }
+
         if req.cloud_image.is_some() {
             return Err(CoreError::InvalidArgument(
                 "cloud-image boot is only supported on Linux with the QEMU backend".into(),
@@ -1025,7 +1116,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot_mode: "direct".to_string(),
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
-            network: "nat".to_string(),
+            network: network_mode.to_string(),
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1607,6 +1698,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             ssh_authorized_keys: Vec::new(),
             balloon: false,
             volume: None,
+            network: None,
         })
         .await
     }
@@ -2132,6 +2224,15 @@ impl<B: VmmBackend> HuskerCore<B> {
         guest_port: u16,
     ) -> Result<(), CoreError> {
         let record = self.lookup_vm(name)?;
+
+        // Bridged VMs are directly on the LAN; NAT port-forwarding does not apply to them.
+        if record.network == "bridged" {
+            return Err(CoreError::InvalidArgument(format!(
+                "VM '{name}' uses bridged networking and is directly on the LAN; \
+                 port forwards apply to NAT VMs only"
+            )));
+        }
+
         let guest_ip: std::net::Ipv4Addr = record
             .guest_ip
             .as_deref()
@@ -2607,6 +2708,8 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             ssh_authorized_keys: Vec::new(),
             balloon: svc.balloon,
             volume: svc.volume.clone(),
+            // Services always use NAT; bridged networking is not supported for services.
+            network: None,
         }
     } else {
         CreateVmRequest {
@@ -2624,6 +2727,8 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             ssh_authorized_keys: Vec::new(),
             balloon: svc.balloon,
             volume: svc.volume.clone(),
+            // Services always use NAT; bridged networking is not supported for services.
+            network: None,
         }
     }
 }
@@ -2762,6 +2867,20 @@ fn infer_image_format(path: &Path) -> String {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .unwrap_or_else(|| "ext4".to_string())
+}
+
+/// Validate and normalize the network mode field.
+///
+/// Returns "nat" or "bridged". Unknown values are rejected with an
+/// `InvalidArgument` error listing the accepted values.
+pub fn validate_network_mode(n: Option<&str>) -> Result<&'static str, CoreError> {
+    match n {
+        None | Some("nat") => Ok("nat"),
+        Some("bridged") => Ok("bridged"),
+        Some(other) => Err(CoreError::InvalidArgument(format!(
+            "unknown network mode '{other}' (accepted: nat, bridged)"
+        ))),
+    }
 }
 
 /// Validate and default an image-import kind ("rootfs" when unset).
@@ -3926,6 +4045,242 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(
             services.is_empty(),
             "no service must be persisted when volume validation fails"
+        );
+    }
+
+    // ── Network mode validation ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_network_mode_defaults_to_nat() {
+        assert_eq!(validate_network_mode(None).unwrap(), "nat");
+    }
+
+    #[test]
+    fn validate_network_mode_accepts_nat() {
+        assert_eq!(validate_network_mode(Some("nat")).unwrap(), "nat");
+    }
+
+    #[test]
+    fn validate_network_mode_accepts_bridged() {
+        assert_eq!(validate_network_mode(Some("bridged")).unwrap(), "bridged");
+    }
+
+    #[test]
+    fn validate_network_mode_rejects_unknown() {
+        let err = validate_network_mode(Some("vxlan")).unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("vxlan")),
+            "expected InvalidArgument mentioning the unknown mode, got {err:?}"
+        );
+    }
+
+    /// Bridged mode without `--cloud-image` must be rejected before any resource is allocated.
+    /// Uses in-memory state so no TAP or IP allocation code is reached.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn bridged_rejects_without_cloud_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        // Provide a lan_bridge so that precondition doesn't fire first.
+        let core = HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        )
+        .with_lan_bridge(Some("br-lan".into()));
+
+        let req = CreateVmRequest {
+            name: "vm1".into(),
+            kernel_path: Some("/boot/vmlinux".into()),
+            rootfs_path: Some("/images/rootfs.ext4".into()),
+            cloud_image: None, // no cloud image - must be rejected
+            network: Some("bridged".into()),
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            volume: None,
+        };
+
+        let err = core.create_vm(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("cloud-image")),
+            "expected InvalidArgument mentioning cloud-image, got {err:?}"
+        );
+    }
+
+    /// Bridged mode without `lan_bridge` configured must be rejected before any resource is allocated.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn bridged_rejects_without_lan_bridge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        // No with_lan_bridge call -> lan_bridge stays None.
+        let core = HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        );
+
+        let req = CreateVmRequest {
+            name: "vm2".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            cloud_image: Some("/images/ubuntu.qcow2".into()),
+            network: Some("bridged".into()),
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            volume: None,
+        };
+
+        let err = core.create_vm(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("lan_bridge")),
+            "expected InvalidArgument mentioning lan_bridge, got {err:?}"
+        );
+    }
+
+    /// Port-forward add on a bridged VM must be rejected with a clear message.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn add_port_forward_rejects_bridged_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+
+        // Insert a bridged VM record directly (no need to actually create it).
+        let vm = husker_state::VmRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "bridged-vm".into(),
+            state: "running".into(),
+            pid: None,
+            vcpu_count: 1,
+            mem_size_mib: 512,
+            vsock_cid: 10,
+            tap_device: Some("husker10".into()),
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: String::new(),
+            rootfs_path: "/images/ubuntu.qcow2".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: "qemu".into(),
+            boot_mode: "uefi".into(),
+            balloon: false,
+            volume: None,
+            network: "bridged".into(),
+        };
+        state.insert_vm(&vm).unwrap();
+
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        let core = HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        );
+
+        let err = core
+            .add_port_forward("bridged-vm", 8080, 80)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("bridged")),
+            "expected InvalidArgument mentioning bridged, got {err:?}"
+        );
+    }
+
+    /// On non-linux-net builds, requesting bridged mode must fail with a
+    /// Linux-only message. Uses cloud_image to bypass the host-kernel validation
+    /// that runs before try_create_vm (cloud_image skips the kernel/rootfs checks).
+    /// The bridged rejection fires in try_create_vm before the cloud_image check.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn bridged_rejected_on_non_linux_net() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        let core = HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        );
+
+        // cloud_image is set so the kernel/rootfs host-path check is skipped in
+        // create_vm_record. The bridged rejection in try_create_vm fires first.
+        let req = CreateVmRequest {
+            name: "vm3".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            cloud_image: Some("/images/ubuntu.qcow2".into()),
+            network: Some("bridged".into()),
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            volume: None,
+        };
+
+        let err = core.create_vm(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("Linux")),
+            "expected InvalidArgument mentioning Linux, got {err:?}"
         );
     }
 }

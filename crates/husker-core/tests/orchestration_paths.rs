@@ -532,6 +532,7 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             ssh_authorized_keys: Vec::new(),
             balloon: false,
             volume: None,
+            network: None,
         })
         .await
         .unwrap_err();
@@ -568,6 +569,7 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             ssh_authorized_keys: Vec::new(),
             balloon: false,
             volume: None,
+            network: None,
         })
         .await
         .unwrap_err()
@@ -629,6 +631,7 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             ssh_authorized_keys: Vec::new(),
             balloon: false,
             volume: None,
+            network: None,
         })
         .await
         .unwrap_err()
@@ -1475,6 +1478,7 @@ async fn create_vm_rejects_unsafe_names() {
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
                 volume: None,
+                network: None,
             })
             .await
             .unwrap_err();
@@ -1807,6 +1811,7 @@ async fn create_vm_accepts_safe_names() {
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
                 volume: None,
+                network: None,
             })
             .await
             .unwrap_err();
@@ -1840,6 +1845,7 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
             ssh_authorized_keys: Vec::new(),
             balloon: false,
             volume: None,
+            network: None,
         })
         .await
         .unwrap_err();
@@ -1883,6 +1889,7 @@ async fn concurrent_create_same_name_one_winner() {
                 ssh_authorized_keys: Vec::new(),
                 balloon: false,
                 volume: None,
+                network: None,
             })
             .await
         })
