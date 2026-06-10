@@ -843,6 +843,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 "direct".to_string()
             },
+            balloon: false,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -946,6 +947,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_ordinal: tags.map(|t| t.ordinal),
             vmm: "apple_vz".to_string(),
             boot_mode: "direct".to_string(),
+            balloon: false,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1327,6 +1329,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             created_at: now,
             updated_at: now,
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
         };
         self.state.insert_service(&record).map_err(|e| match e {
             husker_state::StateError::ServiceAlreadyExists(name) => {
@@ -3096,6 +3101,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             service_ordinal: None,
             vmm: vmm.into(),
             boot_mode: "direct".into(),
+            balloon: false,
         }
     }
 

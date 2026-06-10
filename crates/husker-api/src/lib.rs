@@ -2886,6 +2886,9 @@ mod tests {
                 userdata_env: None,
                 created_at: now,
                 updated_at: now,
+                cloud_image: None,
+                disk_size: None,
+                balloon: false,
             })
             .unwrap();
 
@@ -2913,6 +2916,7 @@ mod tests {
                 service_ordinal: Some(0),
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
+                balloon: false,
             })
             .unwrap();
 
@@ -2940,6 +2944,7 @@ mod tests {
                 service_ordinal: None,
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
+                balloon: false,
             })
             .unwrap();
 
@@ -3236,6 +3241,7 @@ mod tests {
                 service_ordinal: None,
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
+                balloon: false,
             })
             .unwrap();
 
@@ -3603,6 +3609,7 @@ mod tests {
                 service_ordinal: None,
                 vmm: "firecracker".into(),
                 boot_mode: "direct".into(),
+                balloon: false,
             })
             .unwrap();
 

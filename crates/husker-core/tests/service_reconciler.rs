@@ -160,6 +160,9 @@ fn make_service_record(
         userdata_env: None,
         created_at: now,
         updated_at: now,
+        cloud_image: None,
+        disk_size: None,
+        balloon: false,
     }
 }
 
@@ -559,6 +562,9 @@ async fn reconcile_empty_rootfs_returns_failed() {
         userdata_env: None,
         created_at: now,
         updated_at: now,
+        cloud_image: None,
+        disk_size: None,
+        balloon: false,
     };
 
     let outcome = core.reconcile_service(&svc).await;

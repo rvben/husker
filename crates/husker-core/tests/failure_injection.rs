@@ -141,6 +141,7 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
         service_ordinal: None,
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
+        balloon: false,
     };
     state_store.insert_vm(&record).unwrap();
 

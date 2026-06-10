@@ -131,6 +131,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
         service_ordinal: None,
         vmm: "firecracker".into(),
         boot_mode: "direct".into(),
+        balloon: false,
     };
     state_store.insert_vm(&record).unwrap();
 

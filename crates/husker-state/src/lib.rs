@@ -92,6 +92,8 @@ pub struct VmRecord {
     pub vmm: String,
     /// How the VM boots: "direct" (host kernel) or "uefi" (OVMF + cloud image).
     pub boot_mode: String,
+    /// Whether a virtio memory balloon device was installed at boot.
+    pub balloon: bool,
 }
 
 /// Persistent port forward record.
@@ -135,6 +137,13 @@ pub struct ServiceRecord {
     pub userdata_env: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Cloud image name for UEFI-booted services (mutually exclusive with
+    /// rootfs+kernel direct-boot). None for direct-kernel services.
+    pub cloud_image: Option<String>,
+    /// Disk size in bytes for cloud-image services. None uses the image default.
+    pub disk_size: Option<u64>,
+    /// Whether replacement instances for this service include a virtio balloon.
+    pub balloon: bool,
 }
 
 /// Persistent snapshot record.
@@ -221,7 +230,8 @@ impl StateStore {
                 kernel_path TEXT NOT NULL,
                 rootfs_path TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                balloon INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS cid_allocator (
@@ -259,7 +269,10 @@ impl StateStore {
                 desired_instances INTEGER NOT NULL DEFAULT 1,
                 image TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                cloud_image TEXT,
+                disk_size INTEGER,
+                balloon INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -337,6 +350,21 @@ impl StateStore {
         let _ = conn.execute("ALTER TABLE services ADD COLUMN userdata TEXT", []);
         let _ = conn.execute("ALTER TABLE services ADD COLUMN userdata_env TEXT", []);
 
+        // Migration: cloud-image service columns (idempotent).
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN cloud_image TEXT", []);
+        let _ = conn.execute("ALTER TABLE services ADD COLUMN disk_size INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE services ADD COLUMN balloon INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        // Migration: balloon flag for VMs (idempotent). DEFAULT 0 backfills
+        // legacy rows so they read as false (no balloon device was installed).
+        let _ = conn.execute(
+            "ALTER TABLE vms ADD COLUMN balloon INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
         Ok(())
     }
 
@@ -349,8 +377,8 @@ impl StateStore {
             "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                               created_at, updated_at, userdata, userdata_status, userdata_env,
-                              service_id, service_ordinal, vmm, boot_mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                              service_id, service_ordinal, vmm, boot_mode, balloon)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -373,6 +401,7 @@ impl StateStore {
                 record.service_ordinal,
                 record.vmm,
                 record.boot_mode,
+                record.balloon as i64,
             ],
         )
         .map_err(|e| match &e {
@@ -394,7 +423,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode
+                    service_id, service_ordinal, vmm, boot_mode, balloon
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -412,7 +441,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode
+                    service_id, service_ordinal, vmm, boot_mode, balloon
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -430,7 +459,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode
+                    service_id, service_ordinal, vmm, boot_mode, balloon
              FROM vms ORDER BY created_at",
         )?;
 
@@ -448,7 +477,7 @@ impl StateStore {
             "SELECT id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
-                    service_id, service_ordinal, vmm, boot_mode
+                    service_id, service_ordinal, vmm, boot_mode, balloon
              FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
         )?;
         let records = stmt
@@ -572,11 +601,23 @@ impl StateStore {
     /// Insert a new service record.
     pub fn insert_service(&self, record: &ServiceRecord) -> Result<(), StateError> {
         let conn = self.lock()?;
+        let disk_size_i64 = record
+            .disk_size
+            .map(|v| i64::try_from(v))
+            .transpose()
+            .map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    "disk_size exceeds SQLite INTEGER range".into(),
+                )
+            })?;
         conn.execute(
             "INSERT INTO services (id, name, host_group_id, desired_instances, image,
                                    kernel_path, rootfs_path, initrd_path, vcpu_count,
-                                   mem_size_mib, userdata, userdata_env, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                   mem_size_mib, userdata, userdata_env, created_at, updated_at,
+                                   cloud_image, disk_size, balloon)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -592,6 +633,9 @@ impl StateStore {
                 record.userdata_env,
                 record.created_at.to_rfc3339(),
                 record.updated_at.to_rfc3339(),
+                record.cloud_image,
+                disk_size_i64,
+                record.balloon as i64,
             ],
         )
         .map_err(|e| match &e {
@@ -611,7 +655,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
                     initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
-                    created_at, updated_at
+                    created_at, updated_at, cloud_image, disk_size, balloon
              FROM services WHERE id = ?1",
             params![id.to_string()],
             row_to_service_record,
@@ -628,7 +672,7 @@ impl StateStore {
         conn.query_row(
             "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
                     initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
-                    created_at, updated_at
+                    created_at, updated_at, cloud_image, disk_size, balloon
              FROM services WHERE name = ?1",
             params![name],
             row_to_service_record,
@@ -645,7 +689,7 @@ impl StateStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, host_group_id, desired_instances, image, kernel_path, rootfs_path,
                     initrd_path, vcpu_count, mem_size_mib, userdata, userdata_env,
-                    created_at, updated_at
+                    created_at, updated_at, cloud_image, disk_size, balloon
              FROM services ORDER BY created_at",
         )?;
 
@@ -1213,6 +1257,10 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
         },
         vmm: row.get(19)?,
         boot_mode: row.get(20)?,
+        balloon: {
+            let raw: i64 = row.get(21)?;
+            raw != 0
+        },
     })
 }
 
@@ -1236,6 +1284,16 @@ fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRec
     let created_str: String = row.get(12)?;
     let updated_str: String = row.get(13)?;
 
+    let disk_size: Option<u64> = {
+        let raw: Option<i64> = row.get(15)?;
+        match raw {
+            None => None,
+            Some(v) => Some(
+                u64::try_from(v).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(15, v))?,
+            ),
+        }
+    };
+
     Ok(ServiceRecord {
         id: parse_uuid(&id_str)?,
         name: row.get(1)?,
@@ -1251,6 +1309,12 @@ fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRec
         userdata_env: row.get(11)?,
         created_at: parse_datetime(&created_str)?,
         updated_at: parse_datetime(&updated_str)?,
+        cloud_image: row.get(14)?,
+        disk_size,
+        balloon: {
+            let raw: i64 = row.get(16)?;
+            raw != 0
+        },
     })
 }
 
@@ -1328,6 +1392,7 @@ mod tests {
             service_ordinal: None,
             vmm: "firecracker".into(),
             boot_mode: "direct".into(),
+            balloon: false,
         }
     }
 
@@ -1357,6 +1422,9 @@ mod tests {
             userdata_env: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
         }
     }
 
@@ -2385,5 +2453,78 @@ mod tests {
         rec.boot_mode = "uefi".to_string();
         store.insert_vm(&rec).unwrap();
         assert_eq!(store.get_vm_by_name("uefi-vm").unwrap().boot_mode, "uefi");
+    }
+
+    // ── cloud-image service columns ───────────────────────────────────
+
+    #[test]
+    fn service_cloud_fields_roundtrip_and_default_null() {
+        let store = StateStore::open_memory().unwrap();
+
+        // Roundtrip: Some values survive insert + fetch.
+        let mut svc = make_service("cloudy", None);
+        svc.cloud_image = Some("ubuntu-2404".into());
+        svc.disk_size = Some(10 * 1024 * 1024 * 1024);
+        svc.balloon = true;
+        store.insert_service(&svc).unwrap();
+        let got = store.get_service_by_name("cloudy").unwrap();
+        assert_eq!(got.cloud_image.as_deref(), Some("ubuntu-2404"));
+        assert_eq!(got.disk_size, Some(10 * 1024 * 1024 * 1024));
+        assert!(got.balloon);
+
+        // Legacy row: a raw insert omitting cloud_image/disk_size/balloon reads
+        // back as None/None/false because of the migration DEFAULT values.
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO services
+                     (id, name, desired_instances, kernel_path, rootfs_path,
+                      created_at, updated_at)
+                 VALUES
+                     ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'legacy-svc', 1, '', '',
+                      '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let legacy = store.get_service_by_name("legacy-svc").unwrap();
+        assert_eq!(
+            legacy.cloud_image, None,
+            "legacy row must have cloud_image = None"
+        );
+        assert_eq!(
+            legacy.disk_size, None,
+            "legacy row must have disk_size = None"
+        );
+        assert!(!legacy.balloon, "legacy row must have balloon = false");
+    }
+
+    // ── vms.balloon migration default ────────────────────────────────
+
+    #[test]
+    fn vm_balloon_migration_default_applied() {
+        // A row inserted without the balloon column must read back as false
+        // because the migration DEFAULT 0 backfills it.
+        let store = StateStore::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                                  tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                                  created_at, updated_at, userdata, userdata_status, userdata_env,
+                                  service_id, service_ordinal, vmm, boot_mode)
+                 VALUES ('cccccccc-cccc-cccc-cccc-cccccccccccc', 'legacy-balloon', 'stopped',
+                         NULL, 1, 128, 5, NULL, NULL, NULL, '/kernel', '/rootfs',
+                         '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                         NULL, NULL, NULL, NULL, NULL, 'firecracker', 'direct')",
+                [],
+            )
+            .unwrap();
+        }
+        let rec = store.get_vm_by_name("legacy-balloon").unwrap();
+        assert!(
+            !rec.balloon,
+            "legacy VM row without balloon column must default to false"
+        );
     }
 }
