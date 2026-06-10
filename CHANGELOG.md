@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.2] - 2026-06-10
+
+### Added
+
+- **`husker job` - one-shot VM jobs.** Boot a VM, run a single command, print
+  its output, destroy the VM, and exit with the guest command's exit code:
+  `husker job --cloud-image ubuntu-2404 -- sh -c 'make test'`. Progress lines
+  go to stderr so stdout carries exactly the command's output; `--keep`
+  preserves the VM for debugging, Ctrl-C cleans up, and `--output json` emits
+  a single structured result.
+- **Named VM profiles.** `[profiles.<name>]` sections in the config file
+  (cloud_image/rootfs/kernel/initrd/cpus/memory/disk_size/ssh_keys/vmm/env)
+  applied with `--profile <name>` on `run` and `job`; explicit flags always
+  win. `husker config check` validates each profile.
+- **Per-request exec timeouts.** `husker exec --timeout <secs>` (and the job
+  default of 3600s) raise the command execution bound beyond the daemon's 30s
+  default, clamped by the new `exec_timeout_max_secs` config option (default
+  3600, env `HUSKER_EXEC_TIMEOUT_MAX_SECS`).
+- **More `/v1/metrics` gauges:** `husker_build_info{version}`,
+  `husker_vms_stopped`, `husker_vms_failed`, and per-service
+  `husker_service_desired_instances` / `husker_service_current_instances`.
+
 ## [0.4.1] - 2026-06-10
 
 ### Fixed
