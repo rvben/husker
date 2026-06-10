@@ -4075,11 +4075,17 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     }
 
     /// Bridged mode without `--cloud-image` must be rejected before any resource is allocated.
-    /// Uses in-memory state so no TAP or IP allocation code is reached.
+    /// Uses in-memory state so no TAP or IP allocation code is reached. The kernel and
+    /// rootfs are real temp files because `create_vm` validates their existence before
+    /// `try_create_vm` reaches the network-mode checks.
     #[cfg(feature = "linux-net")]
     #[tokio::test]
     async fn bridged_rejects_without_cloud_image() {
         let tmp = tempfile::tempdir().unwrap();
+        let kernel_file = tmp.path().join("vmlinux");
+        let rootfs_file = tmp.path().join("rootfs.ext4");
+        std::fs::write(&kernel_file, b"kernel").unwrap();
+        std::fs::write(&rootfs_file, b"rootfs").unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
@@ -4102,8 +4108,8 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
         let req = CreateVmRequest {
             name: "vm1".into(),
-            kernel_path: Some("/boot/vmlinux".into()),
-            rootfs_path: Some("/images/rootfs.ext4".into()),
+            kernel_path: Some(kernel_file),
+            rootfs_path: Some(rootfs_file),
             cloud_image: None, // no cloud image - must be rejected
             network: Some("bridged".into()),
             vcpu_count: None,
