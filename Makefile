@@ -144,6 +144,12 @@ test-net-e2e-gated:
 test-qemu-e2e-gated: ## Real QEMU boot + vsock e2e (needs Linux KVM + vhost-vsock + qemu + images)
 	HUSKER_RUN_IGNORED_E2E=1 cargo nextest run -p husker-vmm --run-ignored all qemu_boots_and_vsock
 
+# Gated Apple VZ cloud-image e2e (macOS only; needs qemu-img + a local Ubuntu arm64 image).
+# Usage: HUSKER_VZ_CLOUD_IMAGE=/tmp/noble-arm64.img make test-vz-cloud-e2e-gated
+test-vz-cloud-e2e-gated: ## Gated VZ cloud-image e2e (macOS only)
+	HUSKER_RUN_VZ_CLOUD_E2E=1 cargo nextest run -p husker --no-default-features \
+		--run-ignored all vz_cloud
+
 # API/CLI contract tests (OpenAPI + CLI output schema stability)
 test-contracts:
 	cargo test -p husker-api --test openapi_contract
