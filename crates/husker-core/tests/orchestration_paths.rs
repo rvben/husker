@@ -31,6 +31,8 @@ struct MockInner {
     stop_failures: Mutex<HashSet<Uuid>>,
     stop_calls: Mutex<Vec<Uuid>>,
     agent_socket: Mutex<Option<PathBuf>>,
+    // Only needed by the kernel_args_composition tests (not(linux-net) builds).
+    #[cfg(not(feature = "linux-net"))]
     last_config: Mutex<Option<VmConfig>>,
 }
 
@@ -47,6 +49,7 @@ impl MockVmm {
                 stop_failures: Mutex::new(HashSet::new()),
                 stop_calls: Mutex::new(Vec::new()),
                 agent_socket: Mutex::new(None),
+                #[cfg(not(feature = "linux-net"))]
                 last_config: Mutex::new(None),
             }),
         }
@@ -68,6 +71,7 @@ impl MockVmm {
         self.inner.stop_calls.lock().await.len()
     }
 
+    #[cfg(not(feature = "linux-net"))]
     async fn last_config(&self) -> Option<VmConfig> {
         self.inner.last_config.lock().await.clone()
     }
@@ -87,7 +91,12 @@ impl VmmBackend for MockVmm {
             mem_size_mib: config.mem_size_mib,
             vsock_cid: config.vsock_cid,
         };
-        *self.inner.last_config.lock().await = Some(config);
+        #[cfg(not(feature = "linux-net"))]
+        {
+            *self.inner.last_config.lock().await = Some(config);
+        }
+        #[cfg(feature = "linux-net")]
+        let _ = config;
         self.upsert_vm(info.clone()).await;
         Ok(info)
     }
