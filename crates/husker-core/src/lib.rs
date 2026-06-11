@@ -910,8 +910,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             None
         } else {
             // Direct-kernel boots are always NAT (bridged requires cloud image).
+            // Without an initrd the kernel must mount root itself; append root=/dev/vda rw.
+            let root = if req.initrd_path.is_none() {
+                " root=/dev/vda rw"
+            } else {
+                ""
+            };
             Some(format!(
-                "console=ttyS0 reboot=k panic=1 pci=off \
+                "console=ttyS0 reboot=k panic=1 pci=off{root} \
                  ip={ip}::{gateway}:{netmask}::eth0:off",
                 ip = guest_ip.expect("direct-kernel boot is always NAT")
             ))
