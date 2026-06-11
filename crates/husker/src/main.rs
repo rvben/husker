@@ -615,6 +615,11 @@ enum VolumeAction {
     },
     /// List volumes
     List,
+    /// Get volume details by name
+    Get {
+        /// Volume name
+        name: String,
+    },
     /// Delete a volume by name
     Delete {
         /// Volume name
@@ -1248,6 +1253,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "image list"
             | "image get"
             | "volume list"
+            | "volume get"
             | "secret list"
             | "secret get"
             | "secret reveal"
@@ -1288,7 +1294,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "service delete" => vec!["status", "action", "name", "outcome"],
         "service get" => vec!["status", "action", "service", "instances"],
         "service list" => vec!["status", "action", "services"],
-        "volume create" => vec!["status", "action", "volume"],
+        "volume create" | "volume get" => vec!["status", "action", "volume"],
         "volume delete" => vec!["status", "action", "name"],
         "volume list" => vec!["status", "action", "volumes"],
         _ => vec![],
@@ -3758,6 +3764,35 @@ async fn volume_command(
                 }
             }
         }
+        VolumeAction::Get { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/volumes/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("volume '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+
+            let volume: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "volume-get",
+                        "volume": volume,
+                    }),
+                    "",
+                );
+            } else {
+                println!("Name:     {}", volume["name"].as_str().unwrap_or("-"));
+                println!("Size:     {}", volume["size_bytes"].as_u64().unwrap_or(0));
+                println!("File:     {}", volume["file_path"].as_str().unwrap_or("-"));
+                println!("Created:  {}", volume["created_at"].as_str().unwrap_or("-"));
+            }
+        }
         VolumeAction::Delete { name } => {
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/volumes/{name}")),
@@ -6100,6 +6135,18 @@ mod tests {
         // Output fields annotated for core commands.
         let list_fields = cmds["list"]["output_fields"].as_array().unwrap();
         assert!(list_fields.contains(&serde_json::json!("guest_ip")));
+    }
+
+    #[test]
+    fn cli_schema_includes_volume_get() {
+        let schema = build_cli_schema();
+        let cmds = &schema["commands"];
+        assert!(cmds["volume get"].is_object());
+        assert_eq!(cmds["volume get"]["mutating"], false);
+        let fields = cmds["volume get"]["output_fields"].as_array().unwrap();
+        assert!(fields.contains(&serde_json::json!("volume")));
+        let args = cmds["volume get"]["args"].as_array().unwrap();
+        assert!(args.iter().any(|a| a["name"] == "name"));
     }
 
     #[test]
