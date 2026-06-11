@@ -6,6 +6,7 @@
 ::sysinit:/bin/mount -t devtmpfs devtmpfs /dev
 ::sysinit:/bin/mkdir -p /dev/pts
 ::sysinit:/bin/mount -t devpts devpts /dev/pts
+::sysinit:/bin/mount -t cgroup2 cgroup2 /sys/fs/cgroup
 
 # Load vsock modules
 ::sysinit:/sbin/insmod /lib/modules/vsock.ko
