@@ -487,10 +487,12 @@ pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 120;
 pub const UEFI_READY_TIMEOUT_SECS: u64 = 180;
 
 /// Boot-mode-aware default readiness timeout. `boot_mode` is the persisted
-/// `VmRecord.boot_mode` value ("direct" or "uefi"); unknown values use the
-/// direct-kernel default.
+/// `VmRecord.boot_mode` value ("direct", "uefi", or "efi"); unknown values
+/// use the direct-kernel default. Both "uefi" (Linux/QEMU cloud-image) and
+/// "efi" (macOS/VZ cloud-image) run full cloud-init on first boot and need
+/// the extended timeout.
 pub fn default_ready_timeout(boot_mode: &str) -> std::time::Duration {
-    let secs = if boot_mode == "uefi" {
+    let secs = if boot_mode == "uefi" || boot_mode == "efi" {
         UEFI_READY_TIMEOUT_SECS
     } else {
         DEFAULT_READY_TIMEOUT_SECS
@@ -3908,6 +3910,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         );
         assert_eq!(
             default_ready_timeout("uefi"),
+            std::time::Duration::from_secs(UEFI_READY_TIMEOUT_SECS)
+        );
+        // "efi" (Apple VZ cloud-image path) runs full cloud-init and needs the
+        // same extended timeout as "uefi".
+        assert_eq!(
+            default_ready_timeout("efi"),
             std::time::Duration::from_secs(UEFI_READY_TIMEOUT_SECS)
         );
         // Unknown values fall back to the conservative direct-kernel default.
