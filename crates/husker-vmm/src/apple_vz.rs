@@ -223,32 +223,10 @@ impl AppleVzBackend {
                         &disk_attachment,
                     )
                 };
+                // Block storage device order matches QEMU: vda=boot disk, vdb=volume, vdc=seed.
+                // husker-cloudinit automounts /dev/vdb as /data, so the volume must come
+                // before the seed when both are present.
                 let mut storage_devices = vec![rootfs_block.into_super()];
-
-                // Optional cloud-init seed disk (/dev/vdb from the guest's perspective
-                // when no volume is attached; cloud-init discovers it by filesystem label
-                // so device order is not a contract). Attached read-only.
-                if let Some(ref seed) = config.seed_path {
-                    let seed_str = seed.to_str().ok_or_else(|| {
-                        VmmError::InvalidConfig("seed path not valid UTF-8".into())
-                    })?;
-                    let seed_url = NSURL::fileURLWithPath(&NSString::from_str(seed_str));
-                    let seed_attachment = unsafe {
-                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
-                            VZDiskImageStorageDeviceAttachment::alloc(),
-                            &seed_url,
-                            true,
-                        )
-                        .map_err(|e| VmmError::InvalidConfig(format!("seed attachment: {e}")))?
-                    };
-                    let seed_block = unsafe {
-                        VZVirtioBlockDeviceConfiguration::initWithAttachment(
-                            VZVirtioBlockDeviceConfiguration::alloc(),
-                            &seed_attachment,
-                        )
-                    };
-                    storage_devices.push(seed_block.into_super());
-                }
 
                 if let Some(ref vol_path) = config.volume_path {
                     let vol_str = vol_path.to_str().ok_or_else(|| {
@@ -270,6 +248,28 @@ impl AppleVzBackend {
                         )
                     };
                     storage_devices.push(vol_block.into_super());
+                }
+
+                if let Some(ref seed) = config.seed_path {
+                    let seed_str = seed.to_str().ok_or_else(|| {
+                        VmmError::InvalidConfig("seed path not valid UTF-8".into())
+                    })?;
+                    let seed_url = NSURL::fileURLWithPath(&NSString::from_str(seed_str));
+                    let seed_attachment = unsafe {
+                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                            VZDiskImageStorageDeviceAttachment::alloc(),
+                            &seed_url,
+                            true,
+                        )
+                        .map_err(|e| VmmError::InvalidConfig(format!("seed attachment: {e}")))?
+                    };
+                    let seed_block = unsafe {
+                        VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                            VZVirtioBlockDeviceConfiguration::alloc(),
+                            &seed_attachment,
+                        )
+                    };
+                    storage_devices.push(seed_block.into_super());
                 }
 
                 unsafe {

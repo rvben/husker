@@ -185,7 +185,7 @@ impl QemuKvmBackend {
             }
             crate::BootMode::Efi { .. } => {
                 return Err(VmmError::InvalidConfig(
-                    "EFI boot is not supported by the QEMU backend".into(),
+                    "BootMode::Efi is not supported by the QEMU backend; use BootMode::Uefi with OVMF paths".into(),
                 ));
             }
         }
@@ -1067,8 +1067,8 @@ mod tests {
         };
         let err = be.build_args(Uuid::nil(), &cfg).unwrap_err();
         assert!(
-            matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("EFI")),
-            "expected InvalidConfig mentioning EFI, got: {err}"
+            matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("Efi") && msg.contains("QEMU")),
+            "expected InvalidConfig mentioning Efi and QEMU, got: {err}"
         );
     }
 }
