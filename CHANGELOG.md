@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.7] - 2026-06-11
+
+### Added
+
+- **CLI Spec v0.2 compliance (24/24).** New `schema` subcommand emitting the
+  clispec v0.2 contract (global args, typed command args, output fields,
+  error kinds with exit codes, mutation markers), a three-valued
+  `--output/-o` flag (auto/text/json) with auto-JSON when piped, structured
+  error envelopes as the last line of stderr, `--yes` confirmation gates for
+  destructive commands without a TTY, and `--limit/--offset/--fields` with
+  item-envelope pagination on list commands.
+
 ## [0.4.6] - 2026-06-11
 
 ### Added
