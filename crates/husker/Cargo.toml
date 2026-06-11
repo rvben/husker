@@ -47,3 +47,4 @@ libc = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 tempfile = "3"
+jsonschema = { version = "0.46", default-features = false }
