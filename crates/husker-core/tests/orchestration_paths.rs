@@ -95,6 +95,7 @@ impl VmmBackend for MockVmm {
         {
             *self.inner.last_config.lock().await = Some(config);
         }
+        // linux-net builds capture nothing; consume config to avoid an unused-variable warning.
         #[cfg(feature = "linux-net")]
         let _ = config;
         self.upsert_vm(info.clone()).await;
@@ -2062,11 +2063,11 @@ mod kernel_args_composition {
         );
     }
 
-    // For Apple VZ, root=/dev/vda rw is always present in kernel_args because
-    // the initrd provides kernel modules only and does not handle root mounting.
-    // This test verifies root= is retained even when an initrd is supplied.
+    // The VZ (not-linux-net) path hardcodes root=/dev/vda rw unconditionally in
+    // kernel_args; the initrd-conditional logic lives in the linux-net branch and
+    // is covered by CI's Linux suite. This test documents the VZ invariant.
     #[tokio::test]
-    async fn direct_kernel_with_initrd_retains_root_arg() {
+    async fn vz_direct_kernel_always_has_root_arg() {
         let tmp = tempfile::tempdir().unwrap();
         let kernel = tmp.path().join("vmlinux");
         std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
