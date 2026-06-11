@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -11,7 +11,7 @@ async fn main() -> Result<()> {
         std::path::Path::new("/sys/fs/cgroup"),
         husker_agent::AGENT_MEMORY_HIGH_BYTES,
     ) {
-        tracing::warn!("cgroup self-limit not applied: {e}");
+        warn!("cgroup self-limit not applied: {e}");
     }
 
     // Transport selection:

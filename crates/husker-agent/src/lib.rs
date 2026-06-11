@@ -189,6 +189,9 @@ pub const AGENT_MEMORY_HIGH_BYTES: u64 = 128 * 1024 * 1024;
 /// Places the calling process in a dedicated cgroup v2 leaf with a memory
 /// throttle, so the agent can never starve the workload of guest memory.
 /// `cgroup_root` is the mounted cgroup2 filesystem (normally /sys/fs/cgroup).
+/// On hosts where the process already lives in a non-root cgroup managed by
+/// another controller (for example systemd service cgroups), the cgroup.procs
+/// write fails and the caller should treat the limit as best-effort.
 pub fn configure_self_cgroup(cgroup_root: &Path, memory_high_bytes: u64) -> std::io::Result<()> {
     let leaf = cgroup_root.join("husker-agent");
     std::fs::create_dir_all(&leaf)?;
