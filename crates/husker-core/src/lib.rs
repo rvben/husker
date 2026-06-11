@@ -1508,7 +1508,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         let vms = self.state.list_vms()?;
         let mut out = Vec::with_capacity(vms.len());
         for vm in &vms {
-            out.push(self.refresh_vm_liveness(vm).await);
+            let mut refreshed = self.refresh_vm_liveness(vm).await;
+            self.discover_guest_ip(&mut refreshed).await;
+            out.push(refreshed);
         }
         Ok(out)
     }
@@ -1523,7 +1525,67 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Detects guest-initiated shutdowns. Prefer this for user-facing reads.
     pub async fn get_vm_refreshed(&self, name: &str) -> Result<VmRecord, CoreError> {
         let record = self.get_vm(name)?;
-        Ok(self.refresh_vm_liveness(&record).await)
+        let mut refreshed = self.refresh_vm_liveness(&record).await;
+        self.discover_guest_ip(&mut refreshed).await;
+        Ok(refreshed)
+    }
+
+    /// Fill guest_ip for a running EFI-boot VM that does not have one yet.
+    ///
+    /// One short-timeout attempt per read; persists on success. Never fails the
+    /// read — any error or timeout is silently swallowed (debug! at most).
+    /// Boot mode "efi" is used exclusively by macOS/VZ cloud-image VMs, where
+    /// the guest IP is DHCP-assigned and not known at creation time. On Linux,
+    /// boot_mode is always "direct" or "uefi", so this function is a no-op.
+    async fn discover_guest_ip(&self, vm: &mut VmRecord) {
+        if vm.guest_ip.is_some() || vm.state != "running" || vm.boot_mode != "efi" {
+            return;
+        }
+
+        let connect_result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.vmm
+                .vsock_connect(vm.id, husker_agent_proto::AGENT_VSOCK_PORT),
+        )
+        .await;
+
+        let stream = match connect_result {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                debug!(name = %vm.name, error = %e, "discover_guest_ip: vsock connect failed");
+                return;
+            }
+            Err(_) => {
+                debug!(name = %vm.name, "discover_guest_ip: vsock connect timed out");
+                return;
+            }
+        };
+
+        let mut conn = crate::agent_client::AgentConnection::new(stream);
+        let info_result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), conn.guest_info()).await;
+
+        let info = match info_result {
+            Ok(Ok(i)) => i,
+            Ok(Err(e)) => {
+                debug!(name = %vm.name, error = %e, "discover_guest_ip: GuestInfo request failed");
+                return;
+            }
+            Err(_) => {
+                debug!(name = %vm.name, "discover_guest_ip: GuestInfo request timed out");
+                return;
+            }
+        };
+
+        let Some(ip) = info.ipv4.into_iter().next() else {
+            debug!(name = %vm.name, "discover_guest_ip: agent returned no IPv4 addresses");
+            return;
+        };
+
+        if let Err(e) = self.state.update_vm_guest_ip(vm.id, &ip) {
+            warn!(name = %vm.name, error = %e, "discover_guest_ip: failed to persist guest IP");
+        }
+        vm.guest_ip = Some(ip);
     }
 
     /// Refresh a persisted VM record against the backend's live process view.

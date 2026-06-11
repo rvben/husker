@@ -1,6 +1,6 @@
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, ReadFileResponse, ShellExitResponse,
-    WriteFileResponse, base64_decode, read_message, write_message,
+    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, GuestInfoResponse, ReadFileResponse,
+    ShellExitResponse, WriteFileResponse, base64_decode, read_message, write_message,
 };
 use husker_core::agent_client::{AgentClient, AgentConnection, AgentError, ShellEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -623,5 +623,80 @@ async fn shell_resize_sends_dimensions() {
 
     let mut conn = AgentConnection::new(client);
     conn.shell_resize(132, 43).await.unwrap();
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn guest_info_returns_addresses() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let info = conn.guest_info().await.expect("guest_info");
+    // The host agent returns its own non-loopback IPv4 addresses.
+    // In CI there is always at least one.
+    for addr in &info.ipv4 {
+        let ip: std::net::Ipv4Addr = addr.parse().expect("valid IPv4");
+        assert!(!ip.is_loopback(), "loopback address returned: {ip}");
+    }
+}
+
+#[tokio::test]
+async fn guest_info_maps_agent_error_response() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::GuestInfo));
+        write_message(
+            &mut server,
+            &AgentResponse::Error(ErrorResponse {
+                message: "no network info".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.guest_info().await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg == "no network info"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn guest_info_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::GuestInfo));
+        write_message(&mut server, &AgentResponse::Pong)
+            .await
+            .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.guest_info().await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn guest_info_returns_info_with_addresses() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::GuestInfo));
+        write_message(
+            &mut server,
+            &AgentResponse::GuestInfo(GuestInfoResponse {
+                ipv4: vec!["192.0.2.7".into(), "198.51.100.1".into()],
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let info = conn.guest_info().await.unwrap();
+    assert_eq!(info.ipv4, vec!["192.0.2.7", "198.51.100.1"]);
     server_task.await.unwrap();
 }

@@ -123,6 +123,21 @@ where
         }
     }
 
+    /// Query the guest's network addresses.
+    pub async fn guest_info(
+        &mut self,
+    ) -> Result<husker_agent_proto::GuestInfoResponse, AgentError> {
+        write_message(&mut self.stream, &AgentRequest::GuestInfo).await?;
+        let response: AgentResponse = read_message(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?;
+        match response {
+            AgentResponse::GuestInfo(info) => Ok(info),
+            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
     /// Execute a command inside the VM.
     pub async fn exec(
         &mut self,
