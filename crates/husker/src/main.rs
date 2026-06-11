@@ -131,7 +131,8 @@ enum Commands {
         #[arg(long = "ssh-key")]
         ssh_key: Vec<PathBuf>,
 
-        /// Attach a virtio memory balloon (resize later with: husker balloon);
+        /// Attach a virtio memory balloon (resize later with: husker balloon)
+        ///
         /// macOS: explicit targets only, memory freed inside the guest is not
         /// automatically returned to the host
         #[arg(long)]
@@ -199,9 +200,10 @@ enum Commands {
         yes: bool,
     },
 
-    /// Resize a VM's memory balloon (MiB reclaimed from the guest).
-    /// On macOS (Apple VZ), explicit targets work but memory freed inside the
-    /// guest is not automatically returned to the host; restart to fully reclaim.
+    /// Resize a VM's memory balloon (MiB reclaimed from the guest)
+    ///
+    /// macOS: explicit targets only, memory freed inside the guest is not
+    /// automatically returned to the host
     Balloon {
         /// VM name
         name: String,
@@ -284,7 +286,8 @@ enum Commands {
         #[arg(long = "ssh-key")]
         ssh_key: Vec<PathBuf>,
 
-        /// Attach a virtio memory balloon (resize later with: husker balloon);
+        /// Attach a virtio memory balloon (resize later with: husker balloon)
+        ///
         /// macOS: explicit targets only, memory freed inside the guest is not
         /// automatically returned to the host
         #[arg(long)]
@@ -525,8 +528,10 @@ enum ServiceAction {
         /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
         #[arg(long)]
         disk_size: Option<String>,
-        /// Attach a virtio memory balloon to each instance; macOS: explicit targets
-        /// only, memory freed inside the guest is not automatically returned to the host
+        /// Attach a virtio memory balloon to each instance
+        ///
+        /// macOS: explicit targets only, memory freed inside the guest is not
+        /// automatically returned to the host
         #[arg(long)]
         balloon: bool,
         /// Attach a named persistent volume to each instance as the second disk

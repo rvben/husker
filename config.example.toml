@@ -122,7 +122,8 @@
 # platform design. Explicit targets via `husker balloon <vm> <mib>` reclaim
 # memory, but memory freed inside the guest is NOT automatically relinquished
 # to the host. Restart memory-heavy VMs to fully reclaim.
-# MicroVM guests need images-2026-06-11 or newer (virtio_balloon module).
+# MicroVM guests need virtio_balloon in the guest initramfs; run
+# 'husker images pull' to refresh the default images if ballooning fails.
 
 # ── Service Reconciler ───────────────────────────────────────────────
 
