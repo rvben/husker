@@ -3,6 +3,7 @@
 mod pty;
 
 use std::os::fd::AsRawFd;
+use std::path::Path;
 
 use anyhow::Result;
 use husker_agent_proto::{
@@ -179,6 +180,22 @@ const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 600;
 /// the agent's peak memory bounded even when the host asks for a large file.
 /// Overridable via `HUSKER_AGENT_MAX_READ_BYTES`.
 const DEFAULT_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Memory ceiling written to the agent's own cgroup leaf. `memory.high`
+/// throttles and reclaims above this threshold without OOM-killing, so a
+/// runaway exec buffer degrades gracefully instead of taking the agent down.
+pub const AGENT_MEMORY_HIGH_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Places the calling process in a dedicated cgroup v2 leaf with a memory
+/// throttle, so the agent can never starve the workload of guest memory.
+/// `cgroup_root` is the mounted cgroup2 filesystem (normally /sys/fs/cgroup).
+pub fn configure_self_cgroup(cgroup_root: &Path, memory_high_bytes: u64) -> std::io::Result<()> {
+    let leaf = cgroup_root.join("husker-agent");
+    std::fs::create_dir_all(&leaf)?;
+    std::fs::write(leaf.join("memory.high"), memory_high_bytes.to_string())?;
+    std::fs::write(leaf.join("cgroup.procs"), std::process::id().to_string())?;
+    Ok(())
+}
 
 fn exec_timeout() -> std::time::Duration {
     let secs = std::env::var("HUSKER_AGENT_EXEC_TIMEOUT_SECS")
