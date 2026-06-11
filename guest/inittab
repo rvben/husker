@@ -9,15 +9,15 @@
 ::sysinit:/bin/mount -t cgroup2 cgroup2 /sys/fs/cgroup
 
 # Load vsock modules
-::sysinit:/sbin/insmod /lib/modules/vsock.ko
-::sysinit:/sbin/insmod /lib/modules/vmw_vsock_virtio_transport_common.ko
-::sysinit:/sbin/insmod /lib/modules/vmw_vsock_virtio_transport.ko
+::sysinit:/bin/sh -c '[ ! -e /lib/modules/vsock.ko ] || /sbin/insmod /lib/modules/vsock.ko'
+::sysinit:/bin/sh -c '[ ! -e /lib/modules/vmw_vsock_virtio_transport_common.ko ] || /sbin/insmod /lib/modules/vmw_vsock_virtio_transport_common.ko'
+::sysinit:/bin/sh -c '[ ! -e /lib/modules/vmw_vsock_virtio_transport.ko ] || /sbin/insmod /lib/modules/vmw_vsock_virtio_transport.ko'
 
 # Load network modules
-::sysinit:/sbin/insmod /lib/modules/af_packet.ko
-::sysinit:/sbin/insmod /lib/modules/failover.ko
-::sysinit:/sbin/insmod /lib/modules/net_failover.ko
-::sysinit:/sbin/insmod /lib/modules/virtio_net.ko
+::sysinit:/bin/sh -c '[ ! -e /lib/modules/af_packet.ko ] || /sbin/insmod /lib/modules/af_packet.ko'
+::sysinit:/bin/sh -c '[ ! -e /lib/modules/failover.ko ] || /sbin/insmod /lib/modules/failover.ko'
+::sysinit:/bin/sh -c '[ ! -e /lib/modules/net_failover.ko ] || /sbin/insmod /lib/modules/net_failover.ko'
+::sysinit:/bin/sh -c '[ ! -e /lib/modules/virtio_net.ko ] || /sbin/insmod /lib/modules/virtio_net.ko'
 
 # Network: bring up loopback, then configure eth0.
 # husker-net.sh reads ip= from /proc/cmdline for static config (husker's
