@@ -6376,11 +6376,11 @@ mod tests {
         name: &str,
     ) -> Option<&'a serde_json::Value> {
         for cmd in commands {
-            if cmd.get("subcommands").is_some() {
-                if let Some(subs) = cmd["subcommands"].as_array() {
-                    if let Some(found) = find_leaf_command(subs, name) {
-                        return Some(found);
-                    }
+            if let Some(subs) = cmd.get("subcommands") {
+                if let Some(subs) = subs.as_array()
+                    && let Some(found) = find_leaf_command(subs, name)
+                {
+                    return Some(found);
                 }
             } else if cmd.get("name").and_then(|n| n.as_str()) == Some(name) {
                 return Some(cmd);
