@@ -109,6 +109,11 @@ impl AppleVzBackend {
         ),
         VmmError,
     > {
+        if matches!(config.boot, crate::BootMode::Efi { .. }) {
+            return Err(VmmError::InvalidConfig(
+                "EFI boot lands in the next commit".into(),
+            ));
+        }
         let vm = dispatch_sync_fallible(queue.clone(), {
             let config = config.clone();
             let queue_for_vm = queue.clone();

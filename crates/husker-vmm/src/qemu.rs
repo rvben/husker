@@ -183,6 +183,12 @@ impl QemuKvmBackend {
                     args.push(format!("file={},format=raw,if=virtio", seed.display()));
                 }
             }
+            crate::BootMode::Efi { .. } => {
+                // Efi boot is for Apple VZ only; QEMU uses BootMode::Uefi with
+                // explicit OVMF paths. This arm is unreachable because `create`
+                // rejects Efi before calling `build_args`.
+                unreachable!("BootMode::Efi is not supported by the QEMU backend");
+            }
         }
 
         // Networking: husker-core already created/attached `config.tap_device`.
@@ -203,6 +209,11 @@ impl QemuKvmBackend {
 
     /// Spawn a QEMU process and track it. (`VmmBackend::create_vm` delegates here.)
     pub async fn create(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        if matches!(config.boot, crate::BootMode::Efi { .. }) {
+            return Err(VmmError::InvalidConfig(
+                "BootMode::Efi is not supported by the QEMU backend; use BootMode::Uefi with OVMF paths".into(),
+            ));
+        }
         {
             let instances = self.instances.lock().await;
             if instances.values().any(|i| i.info.name == config.name) {

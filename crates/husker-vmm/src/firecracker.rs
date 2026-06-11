@@ -328,6 +328,11 @@ impl VmmBackend for FirecrackerBackend {
     type VsockStream = tokio::net::UnixStream;
 
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        if !matches!(config.boot, crate::BootMode::DirectKernel) {
+            return Err(VmmError::InvalidConfig(
+                "Firecracker only supports BootMode::DirectKernel".into(),
+            ));
+        }
         // Check for duplicate names
         {
             let instances = self.instances.lock().await;

@@ -105,7 +105,9 @@ impl std::str::FromStr for VmmKind {
 
 /// How the guest boots. `DirectKernel` is husker's microVM default (host-supplied
 /// kernel + initrd + appended cmdline). `Uefi` boots the disk's own bootloader via
-/// OVMF firmware and carries the firmware paths it needs.
+/// OVMF firmware and carries the firmware paths it needs. `Efi` is for Apple VZ
+/// where the Virtualization framework supplies the firmware and only a per-VM NVRAM
+/// file is needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum BootMode {
@@ -118,14 +120,18 @@ pub enum BootMode {
         /// OVMF variable-store template; the backend copies it per VM (writable).
         ovmf_vars_template: PathBuf,
     },
+    /// EFI boot with a per-VM variable store (Apple VZ; firmware comes from
+    /// the Virtualization framework, only the NVRAM file is ours).
+    Efi { variable_store: PathBuf },
 }
 
 impl BootMode {
-    /// Stable lowercase tag for persistence/display (`"direct"` / `"uefi"`).
+    /// Stable lowercase tag for persistence/display (`"direct"` / `"uefi"` / `"efi"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             BootMode::DirectKernel => "direct",
             BootMode::Uefi { .. } => "uefi",
+            BootMode::Efi { .. } => "efi",
         }
     }
 }
@@ -337,5 +343,26 @@ mod tests {
         })
         .unwrap();
         assert_eq!(uefi["mode"], "uefi");
+    }
+
+    #[test]
+    fn boot_mode_efi_serde_round_trip() {
+        use super::BootMode;
+        let mode = BootMode::Efi {
+            variable_store: std::path::PathBuf::from("/tmp/nvram.bin"),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(json.contains("\"efi\""), "tagged as efi: {json}");
+        let back: BootMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, mode);
+    }
+
+    #[test]
+    fn boot_mode_efi_as_str_is_efi() {
+        use super::BootMode;
+        let efi = BootMode::Efi {
+            variable_store: "/tmp/nvram.bin".into(),
+        };
+        assert_eq!(efi.as_str(), "efi");
     }
 }
