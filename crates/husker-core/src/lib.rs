@@ -993,7 +993,8 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Inner create logic without host networking.
     ///
-    /// Networking is handled by the VMM backend (e.g. VZ NAT).
+    /// Networking is handled by the VMM backend (e.g. VZ NAT). Supports both
+    /// direct-kernel boot and cloud-image (qcow2-to-raw + EFI) boot.
     #[cfg(not(feature = "linux-net"))]
     async fn try_create_vm(
         &self,
@@ -1012,12 +1013,6 @@ impl<B: VmmBackend> HuskerCore<B> {
             ));
         }
 
-        if req.cloud_image.is_some() {
-            return Err(CoreError::InvalidArgument(
-                "cloud-image boot is only supported on Linux with the QEMU backend".into(),
-            ));
-        }
-
         let cid = self.state.allocate_cid()?;
         resources.cid = Some(cid);
 
@@ -1030,6 +1025,182 @@ impl<B: VmmBackend> HuskerCore<B> {
                 warn!(dir = %vm_dir.display(), error = %e, "failed to remove stale VM directory");
             }
         }
+
+        if let Some(image) = req.cloud_image.as_ref() {
+            // --volume with --cloud-image is not yet supported on macOS.
+            if req.volume.is_some() {
+                return Err(CoreError::InvalidArgument(
+                    "--volume with --cloud-image is not yet supported on macOS".into(),
+                ));
+            }
+
+            // Resolve --cloud-image: an existing host path wins; otherwise it
+            // names a catalog image of kind "cloud-image".
+            let image_path = {
+                let as_path = std::path::Path::new(image);
+                if as_path.exists() {
+                    as_path.to_path_buf()
+                } else {
+                    let rec = self.state.get_image_by_name(image).map_err(|e| match e {
+                        husker_state::StateError::ImageNotFoundByName(_) => {
+                            CoreError::InvalidArgument(format!(
+                                "cloud image '{image}' is neither an existing file nor a \
+                                 catalog image (register one with `husker image import \
+                                 --kind cloud-image`)"
+                            ))
+                        }
+                        other => CoreError::State(other),
+                    })?;
+                    if rec.kind != "cloud-image" {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "catalog image '{image}' has kind '{}', not 'cloud-image'",
+                            rec.kind
+                        )));
+                    }
+                    PathBuf::from(rec.file_path)
+                }
+            };
+
+            // Validate the qcow2 magic before any disk I/O.
+            husker_storage::validate_cloud_image(&image_path)?;
+
+            // The seed delivers the guest agent; fail fast (before disk conversion)
+            // if this build has no embedded agent.
+            if self.embedded_agent.is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "cloud-image VMs need the embedded guest agent; this build has none \
+                     (Apple Silicon builds embed it; rebuild via make install)"
+                        .into(),
+                ));
+            }
+
+            // Guard against shrinking: if the caller requests a disk_size smaller
+            // than the image's virtual size, reject before starting the conversion.
+            if let Some(size) = req.disk_size {
+                let virtual_size = husker_storage::qcow2_virtual_size(&image_path)?;
+                if size < virtual_size {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "--disk-size {size} is smaller than the image's virtual size \
+                         {virtual_size}"
+                    )));
+                }
+            }
+
+            // Register the VM directory for rollback before creating any disk files,
+            // so a partial conversion is cleaned up on failure.
+            tokio::fs::create_dir_all(&vm_dir)
+                .await
+                .map_err(|e| CoreError::Storage(husker_storage::StorageError::Io(e)))?;
+            resources.vm_dir = Some(vm_dir.clone());
+
+            // Convert the source qcow2 to a raw disk image. Apple Virtualization.framework
+            // requires raw images; qemu-img convert is blocking (it reads GBs of data), so
+            // it runs on the blocking thread pool.
+            let disk = vm_dir.join("disk.raw");
+            let src = image_path.clone();
+            let dst = disk.clone();
+            tokio::task::spawn_blocking(move || husker_storage::convert_qcow2_to_raw(&src, &dst))
+                .await
+                .map_err(|e| {
+                    CoreError::Storage(husker_storage::StorageError::QemuImg(format!(
+                        "spawn_blocking join error: {e}"
+                    )))
+                })??;
+
+            if let Some(size) = req.disk_size {
+                husker_storage::resize_disk(&disk, size).await?;
+            }
+
+            // Build the NoCloud seed. VZ NAT assigns addresses via DHCP, so omit
+            // network-config and let cloud-init's fallback DHCP client handle it.
+            let seed = husker_cloudinit::build_seed(&husker_cloudinit::SeedSpec {
+                agent: self.embedded_agent,
+                hostname: req.name.clone(),
+                instance_id: req.name.clone(),
+                ssh_authorized_keys: req.ssh_authorized_keys.clone(),
+                network: None,
+                mount_volume: false,
+            })
+            .map_err(seed_error_to_core)?;
+            let seed_path = vm_dir.join("seed.img");
+            tokio::fs::write(&seed_path, &seed)
+                .await
+                .map_err(|e| CoreError::Storage(husker_storage::StorageError::Io(e)))?;
+
+            let boot = husker_vmm::BootMode::Efi {
+                variable_store: vm_dir.join("nvram.bin"),
+            };
+            let boot_mode_str = boot.as_str().to_string();
+
+            // For cloud VMs: kernel_path is unused by EFI boot; record it as empty
+            // (mirrors the Linux cloud path). rootfs_path records the source image
+            // for provenance (which catalog/host image backed this VM).
+            let record_rootfs_path = image_path.to_string_lossy().into_owned();
+
+            let vm_config = husker_vmm::VmConfig {
+                name: req.name.clone(),
+                vcpu_count: req.vcpu_count.unwrap_or(1),
+                mem_size_mib: req.mem_size_mib.unwrap_or(128),
+                kernel_path: PathBuf::new(),
+                rootfs_path: disk,
+                kernel_args: None,
+                initrd_path: None,
+                vsock_cid: cid,
+                tap_device: None,
+                guest_mac: None,
+                vmm: None,
+                boot,
+                seed_path: Some(seed_path),
+                balloon: req.balloon,
+                volume_path: None,
+            };
+
+            let info = self.vmm.create_vm(vm_config).await?;
+            resources.vm_id = Some(info.id);
+
+            let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
+            let now = chrono::Utc::now();
+            let record = VmRecord {
+                id: info.id,
+                name: req.name,
+                state: info.state.to_string(),
+                pid: info.pid,
+                vcpu_count: info.vcpu_count,
+                mem_size_mib: info.mem_size_mib,
+                vsock_cid: cid,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: String::new(),
+                rootfs_path: record_rootfs_path,
+                created_at: now,
+                updated_at: now,
+                userdata: req.userdata,
+                userdata_status,
+                userdata_env: if req.env.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&req.env).expect("env serializes to JSON"))
+                },
+                service_id: tags.map(|t| t.service_id),
+                service_ordinal: tags.map(|t| t.ordinal),
+                vmm: "apple_vz".to_string(),
+                boot_mode: boot_mode_str,
+                balloon: req.balloon,
+                volume: None,
+                network: network_mode.to_string(),
+            };
+
+            self.state.insert_vm(&record).map_err(|e| match e {
+                husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
+                other => CoreError::State(other),
+            })?;
+
+            return Ok(record);
+        }
+
+        // ── Direct-kernel boot ───────────────────────────────────────────────
+
         let kernel = req.kernel_path.as_deref().ok_or_else(|| {
             CoreError::InvalidArgument("kernel_path is required for direct-kernel boot".into())
         })?;
@@ -1461,6 +1632,15 @@ impl<B: VmmBackend> HuskerCore<B> {
                  volumes are exclusive-attach, so a volume-backed service is limited to 1 instance",
                 req.name,
             )));
+        }
+
+        // cloud-image services are not yet supported on macOS; reject before
+        // persisting the ServiceRecord so the error surfaces immediately.
+        #[cfg(not(feature = "linux-net"))]
+        if req.cloud_image.is_some() {
+            return Err(CoreError::InvalidArgument(
+                "cloud-image services are not yet supported on macOS".into(),
+            ));
         }
 
         let (rootfs, kernel) = if req.cloud_image.is_some() {
@@ -2958,12 +3138,7 @@ async fn prepare_cloud_disk(
     ovmf_code: &Path,
     ovmf_vars_template: &Path,
 ) -> Result<husker_vmm::BootMode, CoreError> {
-    if !image.exists() {
-        return Err(CoreError::InvalidArgument(format!(
-            "cloud image not found: {}",
-            image.display()
-        )));
-    }
+    husker_storage::validate_cloud_image(image)?;
     if !ovmf_code.exists() || !ovmf_vars_template.exists() {
         return Err(CoreError::InvalidArgument(format!(
             "OVMF firmware missing (need {} and {}); install the host OVMF package",
@@ -2984,7 +3159,6 @@ async fn prepare_cloud_disk(
 /// Convert a seed-build failure into a core error. Invalid SSH keys are the
 /// caller's input, not an internal fault, so they surface as InvalidArgument
 /// (HTTP 400) instead of an internal cloud-init error.
-#[cfg(any(feature = "linux-net", test))]
 fn seed_error_to_core(e: husker_cloudinit::CloudInitError) -> CoreError {
     match e {
         e @ husker_cloudinit::CloudInitError::InvalidSshKey(_) => {
@@ -4456,6 +4630,260 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(
             matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("Linux")),
             "expected InvalidArgument mentioning Linux, got {err:?}"
+        );
+    }
+
+    // ── macOS cloud-image path tests ─────────────────────────────────────────
+
+    /// Helper: write a file with valid qcow2 magic (4-byte header + padding).
+    #[cfg(not(feature = "linux-net"))]
+    fn write_qcow2_magic(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("test.qcow2");
+        let mut data = vec![0u8; 512];
+        data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
+        std::fs::write(&path, &data).unwrap();
+        path
+    }
+
+    /// Helper: build a HuskerCore for the non-linux-net (Apple VZ) path.
+    #[cfg(not(feature = "linux-net"))]
+    fn make_vz_core(
+        state: husker_state::StateStore,
+        tmp: &std::path::Path,
+    ) -> HuskerCore<husker_vmm::apple_vz::AppleVzBackend> {
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.to_path_buf(),
+        };
+        let runtime_dir = tmp.join("run");
+        HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        )
+    }
+
+    /// cloud-image + volume must be rejected before any disk I/O.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn cloud_image_with_volume_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = write_qcow2_magic(tmp.path());
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let core = make_vz_core(state, tmp.path());
+
+        let req = CreateVmRequest {
+            name: "vm-vol".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            cloud_image: Some(image_path.to_string_lossy().into_owned()),
+            volume: Some("data".into()),
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            network: None,
+        };
+
+        let err = core.create_vm(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("volume")),
+            "expected InvalidArgument mentioning volume, got {err:?}"
+        );
+        assert!(
+            core.list_vms().unwrap().is_empty(),
+            "no VM should be persisted on rejection"
+        );
+    }
+
+    /// cloud-image without the embedded agent must be rejected with a clear message.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn cloud_image_with_empty_agent_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = write_qcow2_magic(tmp.path());
+        let state = husker_state::StateStore::open_memory().unwrap();
+        // Core built WITHOUT with_embedded_agent -> embedded_agent is &[].
+        let core = make_vz_core(state, tmp.path());
+
+        let req = CreateVmRequest {
+            name: "vm-noagent".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            cloud_image: Some(image_path.to_string_lossy().into_owned()),
+            volume: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            network: None,
+        };
+
+        let err = core.create_vm(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("embedded guest agent")),
+            "expected InvalidArgument mentioning embedded guest agent, got {err:?}"
+        );
+        assert!(
+            core.list_vms().unwrap().is_empty(),
+            "no VM should be persisted on rejection"
+        );
+    }
+
+    /// A file without qcow2 magic must be rejected as InvalidCloudImage.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn cloud_image_bad_magic_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_path = tmp.path().join("bad.img");
+        std::fs::write(&bad_path, b"not a qcow").unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let core = make_vz_core(state, tmp.path()).with_embedded_agent(b"fake-agent");
+
+        let req = CreateVmRequest {
+            name: "vm-badmagic".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            cloud_image: Some(bad_path.to_string_lossy().into_owned()),
+            volume: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            network: None,
+        };
+
+        let err = core.create_vm(req).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Storage(husker_storage::StorageError::InvalidCloudImage(_))
+            ),
+            "expected Storage(InvalidCloudImage), got {err:?}"
+        );
+        assert!(
+            core.list_vms().unwrap().is_empty(),
+            "no VM should be persisted on rejection"
+        );
+    }
+
+    /// A failed qemu-img convert must roll back the vm_dir so no partial disk
+    /// is left on disk and no VM record is persisted.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn cloud_image_conversion_failure_rolls_back_vm_dir() {
+        // qemu-img is required; skip cleanly if unavailable (dev hosts without it).
+        fn qemu_img_available() -> bool {
+            std::process::Command::new("qemu-img")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !qemu_img_available() {
+            eprintln!(
+                "skipping cloud_image_conversion_failure_rolls_back_vm_dir: qemu-img not installed"
+            );
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a file with valid qcow2 magic but a truncated/garbage body so
+        // validate_cloud_image passes but qemu-img convert fails.
+        let bad_qcow2 = tmp.path().join("bad_body.qcow2");
+        let mut data = vec![0xffu8; 64]; // garbage body
+        data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]); // valid magic
+        std::fs::write(&bad_qcow2, &data).unwrap();
+
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let core = make_vz_core(state, tmp.path()).with_embedded_agent(b"fake-agent");
+
+        let vm_name = "vm-rollback";
+        let req = CreateVmRequest {
+            name: vm_name.into(),
+            kernel_path: None,
+            rootfs_path: None,
+            cloud_image: Some(bad_qcow2.to_string_lossy().into_owned()),
+            volume: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            network: None,
+        };
+
+        let err = core.create_vm(req).await;
+        assert!(err.is_err(), "expected error from corrupt qcow2");
+
+        // The vm_dir must not exist after rollback.
+        let vm_dir = tmp.path().join("vms").join(vm_name);
+        assert!(
+            !vm_dir.exists(),
+            "vm_dir should be removed by rollback, but it still exists at {}",
+            vm_dir.display()
+        );
+
+        // No VM record should be persisted.
+        assert!(
+            core.list_vms().unwrap().is_empty(),
+            "no VM should be persisted after a failed create"
+        );
+    }
+
+    /// create_service with cloud_image on macOS must be rejected eagerly.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn service_with_cloud_image_rejected_on_macos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let core = std::sync::Arc::new(make_vz_core(state, tmp.path()));
+
+        let req = CreateServiceRequest {
+            name: "svc-cloud".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            image: None,
+            cloud_image: Some("/images/ubuntu.qcow2".into()),
+            disk_size: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: vec![],
+            desired_instances: None,
+            balloon: false,
+            volume: None,
+            host_group: None,
+        };
+
+        let err = core.create_service(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("macOS")),
+            "expected InvalidArgument mentioning macOS, got {err:?}"
+        );
+        assert!(
+            core.list_services().unwrap().is_empty(),
+            "no service should be persisted on rejection"
         );
     }
 }
