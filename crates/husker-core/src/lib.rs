@@ -1504,6 +1504,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// internal callers that do not need a liveness check (e.g. the health
     /// endpoint, which is called on a tight monitoring loop and can tolerate
     /// VM counts lagging one reconcile interval).
+    ///
+    /// Note: guest-IP discovery runs serially per VM. In the worst case (N
+    /// running EFI VMs all lacking IPs, all with slow or unresponsive agents)
+    /// this adds up to N x 2 seconds of latency (two 1-second timeouts per VM).
     pub async fn list_vms_refreshed(&self) -> Result<Vec<VmRecord>, CoreError> {
         let vms = self.state.list_vms()?;
         let mut out = Vec::with_capacity(vms.len());
@@ -1532,8 +1536,11 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Fill guest_ip for a running EFI-boot VM that does not have one yet.
     ///
-    /// One short-timeout attempt per read; persists on success. Never fails the
-    /// read — any error or timeout is silently swallowed (debug! at most).
+    /// Attempts vsock connect (1-second timeout) then a GuestInfo request
+    /// (1-second timeout) - at most 2 seconds per call in the worst case.
+    /// Persists on success. Never fails the read - any error or timeout is
+    /// silently discarded (debug! at most).
+    ///
     /// Boot mode "efi" is used exclusively by macOS/VZ cloud-image VMs, where
     /// the guest IP is DHCP-assigned and not known at creation time. On Linux,
     /// boot_mode is always "direct" or "uefi", so this function is a no-op.

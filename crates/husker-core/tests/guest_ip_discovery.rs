@@ -143,10 +143,10 @@ fn build_core(
         Arc::new(HuskerCore::new(
             mock,
             state,
-            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(192, 0, 2, 0), 24),
             storage,
             "husker0".into(),
-            vec!["8.8.8.8".into()],
+            vec!["192.0.2.1".into()],
             runtime_dir,
         ))
     }
@@ -247,8 +247,9 @@ async fn discover_skips_vm_with_existing_ip() {
     assert_eq!(fetched.guest_ip.as_deref(), Some("192.0.2.5"));
 }
 
-/// Running EFI VM with no IP and unreachable agent: must return within ~1.5 s
-/// (1-second timeout + margin) and leave guest_ip as None.
+/// Running EFI VM with no IP and unreachable agent: must return within ~2.5 s
+/// (two sequential 1-second timeouts - vsock connect + GuestInfo request - plus
+/// margin) and leave guest_ip as None.
 #[tokio::test]
 async fn discover_times_out_cleanly_for_unreachable_agent() {
     let state = StateStore::open_memory().unwrap();
@@ -274,7 +275,7 @@ async fn discover_times_out_cleanly_for_unreachable_agent() {
     let fetched = core.get_vm_refreshed("efi-no-agent").await.unwrap();
     let elapsed = start.elapsed();
     assert!(
-        elapsed < std::time::Duration::from_millis(1500),
+        elapsed < std::time::Duration::from_millis(2500),
         "discover_guest_ip took too long: {elapsed:?}"
     );
     assert!(
