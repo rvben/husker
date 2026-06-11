@@ -132,6 +132,9 @@ enum Commands {
         ssh_key: Vec<PathBuf>,
 
         /// Attach a virtio memory balloon (resize later with: husker balloon)
+        ///
+        /// macOS: explicit targets only, memory freed inside the guest is not
+        /// automatically returned to the host
         #[arg(long)]
         balloon: bool,
 
@@ -198,6 +201,9 @@ enum Commands {
     },
 
     /// Resize a VM's memory balloon (MiB reclaimed from the guest)
+    ///
+    /// macOS: explicit targets only, memory freed inside the guest is not
+    /// automatically returned to the host
     Balloon {
         /// VM name
         name: String,
@@ -281,6 +287,9 @@ enum Commands {
         ssh_key: Vec<PathBuf>,
 
         /// Attach a virtio memory balloon (resize later with: husker balloon)
+        ///
+        /// macOS: explicit targets only, memory freed inside the guest is not
+        /// automatically returned to the host
         #[arg(long)]
         balloon: bool,
 
@@ -520,6 +529,9 @@ enum ServiceAction {
         #[arg(long)]
         disk_size: Option<String>,
         /// Attach a virtio memory balloon to each instance
+        ///
+        /// macOS: explicit targets only, memory freed inside the guest is not
+        /// automatically returned to the host
         #[arg(long)]
         balloon: bool,
         /// Attach a named persistent volume to each instance as the second disk

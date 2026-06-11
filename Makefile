@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -125,6 +125,15 @@ test-e2e:
 	cargo nextest run --package husker --test e2e -- --ignored 2>/dev/null || cargo test --package husker --test e2e -- --ignored
 
 # Run ignored husker e2e tests only when explicitly enabled.
+#
+# Required env vars (Linux):
+#   HUSKER_RUN_IGNORED_E2E=1
+#   HUSKER_E2E_KERNEL   path to vmlinux  (default: /var/lib/husker/kernels/vmlinux)
+#   HUSKER_E2E_ROOTFS   path to rootfs   (default: /var/lib/husker/images/alpine-x86_64.ext4)
+#   HUSKER_E2E_INITRD   path to initrd   (default: /var/lib/husker/kernels/initramfs-x86_64-virt.gz)
+#
+# Defaults point at images installed by `husker images pull`.
+# A running `husker daemon` on 127.0.0.1:7777 is also required.
 test-e2e-gated:
 	@if [ "$${HUSKER_RUN_IGNORED_E2E:-0}" = "1" ]; then \
 		cargo test --package husker --test e2e -- --ignored; \
@@ -192,21 +201,19 @@ GUEST_INITTAB = guest/inittab
 update-rootfs: build-agent-aarch64
 	@test -f "$(ROOTFS_IMAGE)" || { echo "Error: rootfs not found at $(ROOTFS_IMAGE)"; exit 1; }
 	@test -n "$(DEBUGFS)" || { echo "Error: debugfs not found. Install e2fsprogs: brew install e2fsprogs"; exit 1; }
-	@echo "Injecting agent binary into $(ROOTFS_IMAGE)..."
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "rm /usr/local/bin/husker-agent" 2>/dev/null; true
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "write $(AGENT_BIN) /usr/local/bin/husker-agent"
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "set_inode_field /usr/local/bin/husker-agent mode 0100755"
-	@echo "Injecting inittab into $(ROOTFS_IMAGE)..."
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "rm /etc/inittab" 2>/dev/null; true
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "write $(GUEST_INITTAB) /etc/inittab"
-	@echo "Rootfs updated. Verify with:"
-	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/husker-agent' $(ROOTFS_IMAGE)"
-	@echo "  $(DEBUGFS) -R 'cat /etc/inittab' $(ROOTFS_IMAGE)"
+	@echo "Injecting agent and inittab into $(ROOTFS_IMAGE) (single debugfs session)..."
+	@printf 'rm /usr/local/bin/husker-agent\nwrite %s /usr/local/bin/husker-agent\nset_inode_field /usr/local/bin/husker-agent mode 0100755\nrm /etc/inittab\nwrite %s /etc/inittab\n' \
+		"$(AGENT_BIN)" "$(GUEST_INITTAB)" | $(DEBUGFS) -w "$(ROOTFS_IMAGE)"
+	@echo "Verifying injected files..."
+	@$(DEBUGFS) -R "dump /etc/inittab /tmp/husker-inittab-verify" "$(ROOTFS_IMAGE)" 2>/dev/null && \
+		cmp -s "$(GUEST_INITTAB)" /tmp/husker-inittab-verify && \
+		rm -f /tmp/husker-inittab-verify || \
+		{ echo "Error: /etc/inittab in image does not match $(GUEST_INITTAB) -- injection failed"; rm -f /tmp/husker-inittab-verify; exit 1; }
+	@$(DEBUGFS) -R "dump /usr/local/bin/husker-agent /tmp/husker-agent-verify" "$(ROOTFS_IMAGE)" 2>/dev/null && \
+		cmp -s "$(AGENT_BIN)" /tmp/husker-agent-verify && \
+		rm -f /tmp/husker-agent-verify || \
+		{ echo "Error: /usr/local/bin/husker-agent in image does not match $(AGENT_BIN) -- injection failed"; rm -f /tmp/husker-agent-verify; exit 1; }
+	@echo "Rootfs updated and verified."
 
 # Build initramfs for Alpine-based husker VMs.
 # ARCH defaults to aarch64; pass ARCH=x86_64 for Firecracker.
@@ -241,6 +248,13 @@ build-k3s-rootfs: build-agent
 K3S_KERNEL ?= /mnt/husker/vmlinux-k3s
 build-k3s-kernel:
 	sudo guest/build-k3s-kernel.sh $(K3S_KERNEL)
+
+# Build the modules-free microVM kernel from source (CONFIG_MODULES=n, all drivers built in).
+# Deps (Debian/Ubuntu): build-essential bc bison flex libelf-dev libssl-dev
+# Output: ~/.local/share/husker/kernels/vmlinux (x86_64) or Image-virt (aarch64).
+# Override output dir: HUSKER_KERNEL_OUT=/path bash guest/build-microvm-kernel.sh
+build-microvm-kernel: ## Build the modules-free microVM kernel from source
+	bash guest/build-microvm-kernel.sh
 
 # Run k3s E2E cluster test (requires running daemon, k3s rootfs + kernel)
 K3S_ROOTFS ?= k3s-rootfs.ext4

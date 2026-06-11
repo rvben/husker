@@ -19,8 +19,9 @@ use objc2_virtualization::{
     VZGenericPlatformConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
-    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
-    VZVirtualMachineState,
+    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDevice,
+    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -70,6 +71,10 @@ struct VzInstance {
     serial_log_path: PathBuf,
     /// Kept alive so the file descriptor remains valid for the VZ serial attachment.
     _serial_file: std::fs::File,
+    /// Whether a virtio memory balloon device was attached at create time.
+    balloon: bool,
+    /// Guest memory size in bytes, used to compute the absolute balloon target.
+    mem_size_bytes: u64,
 }
 
 /// VZ operations that use completion handlers.
@@ -115,6 +120,7 @@ impl AppleVzBackend {
                 "OVMF boot is a Linux/QEMU mode; macOS uses EFI boot".into(),
             ));
         }
+        let mem_size_bytes = u64::from(config.mem_size_mib) * 1024 * 1024;
         let vm = dispatch_sync_fallible(queue.clone(), {
             let config = config.clone();
             let queue_for_vm = queue.clone();
@@ -195,7 +201,7 @@ impl AppleVzBackend {
                 let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
                 unsafe {
                     vz_config.setCPUCount(config.vcpu_count as usize);
-                    vz_config.setMemorySize(u64::from(config.mem_size_mib) * 1024 * 1024);
+                    vz_config.setMemorySize(mem_size_bytes);
                     vz_config.setBootLoader(Some(&*boot_loader));
                 }
 
@@ -304,6 +310,18 @@ impl AppleVzBackend {
                 unsafe {
                     vz_config
                         .setSocketDevices(&NSArray::from_retained_slice(&[socket_config]));
+                }
+
+                // Memory balloon (opt-in via VmConfig.balloon)
+                if config.balloon {
+                    let balloon_cfg =
+                        unsafe { VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new() };
+                    let balloon_cfg = balloon_cfg.into_super();
+                    unsafe {
+                        vz_config.setMemoryBalloonDevices(&NSArray::from_retained_slice(&[
+                            balloon_cfg,
+                        ]));
+                    }
                 }
 
                 // Platform (required for Linux on ARM64)
@@ -509,6 +527,7 @@ impl VmmBackend for AppleVzBackend {
             }
         };
 
+        let mem_size_bytes = u64::from(config.mem_size_mib) * 1024 * 1024;
         let info = VmInfo {
             id,
             name: config.name,
@@ -527,6 +546,8 @@ impl VmmBackend for AppleVzBackend {
                 vm,
                 serial_log_path,
                 _serial_file: serial_file,
+                balloon: config.balloon,
+                mem_size_bytes,
             },
         );
 
@@ -661,10 +682,44 @@ impl VmmBackend for AppleVzBackend {
         Ok(())
     }
 
-    async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
-        Err(VmmError::ProcessError(
-            "memory balloon is not supported on the Apple VZ backend".into(),
-        ))
+    async fn set_balloon(&self, id: Uuid, amount_mib: u32) -> Result<(), VmmError> {
+        let (vm, queue, balloon_enabled, mem_size_bytes) = {
+            let instances = self.instances.lock().await;
+            let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            (
+                QueueConfined(inst.vm.0.clone()),
+                inst.queue.clone(),
+                inst.balloon,
+                inst.mem_size_bytes,
+            )
+        };
+        if !balloon_enabled {
+            return Err(VmmError::InvalidConfig(
+                "VM was created without a balloon device; rebuild with VmConfig.balloon = true"
+                    .into(),
+            ));
+        }
+        let target = balloon_target_bytes(mem_size_bytes, amount_mib)?;
+        dispatch_sync_fallible(queue, move || -> Result<(), VmmError> {
+            let _capture_whole = &vm;
+            // Safety: Called on the VM's serial dispatch queue. memoryBalloonDevices
+            // returns a live NSArray valid for the duration of this closure.
+            let devices = unsafe { vm.0.memoryBalloonDevices() };
+            let device = devices
+                .firstObject()
+                .ok_or_else(|| VmmError::ProcessError("no balloon device found on VM".into()))?;
+            let device = device
+                .downcast::<VZVirtioTraditionalMemoryBalloonDevice>()
+                .map_err(|_| {
+                    VmmError::ProcessError(
+                        "balloon device is not a VZVirtioTraditionalMemoryBalloonDevice".into(),
+                    )
+                })?;
+            // Safety: Called on the VM's serial dispatch queue.
+            unsafe { device.setTargetVirtualMachineMemorySize(target) };
+            Ok(())
+        })
+        .await
     }
 
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
@@ -764,6 +819,20 @@ impl VmmBackend for AppleVzBackend {
             })
         }
     }
+}
+
+/// Converts a reclaim amount in MiB into the absolute guest memory target
+/// VZVirtioTraditionalMemoryBalloonDevice expects. Matches the QEMU backend's
+/// semantics: amount_mib is taken FROM the guest.
+fn balloon_target_bytes(mem_size_bytes: u64, amount_mib: u32) -> Result<u64, VmmError> {
+    let reclaim = u64::from(amount_mib) * 1024 * 1024;
+    if reclaim >= mem_size_bytes {
+        return Err(VmmError::InvalidConfig(format!(
+            "balloon amount {amount_mib} MiB must be less than VM memory {} MiB",
+            mem_size_bytes / (1024 * 1024)
+        )));
+    }
+    Ok(mem_size_bytes - reclaim)
 }
 
 #[cfg(test)]
@@ -880,6 +949,48 @@ mod tests {
             balloon: false,
             volume_path: None,
         }
+    }
+
+    // ── set_balloon ──────────────────────────────────────────────────────
+    // The `balloon: false -> InvalidConfig` branch has no dedicated unit test
+    // because constructing a VzInstance requires a live VZVirtualMachine, which
+    // requires the com.apple.security.virtualization entitlement. Coverage for
+    // that branch comes from real-hardware verification.
+
+    #[tokio::test]
+    async fn set_balloon_unknown_id_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
+        let id = Uuid::new_v4();
+        let err = backend.set_balloon(id, 64).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::VmNotFound(_)),
+            "expected VmNotFound, got: {err:?}"
+        );
+    }
+
+    // ── balloon_target_bytes ─────────────────────────────────────────────
+
+    #[test]
+    fn balloon_target_bytes_normal_case() {
+        let target = balloon_target_bytes(1024 * 1024 * 1024, 256).unwrap();
+        assert_eq!(target, 768 * 1024 * 1024);
+    }
+
+    #[test]
+    fn balloon_target_bytes_zero_reclaim_is_full_memory() {
+        let target = balloon_target_bytes(1024 * 1024 * 1024, 0).unwrap();
+        assert_eq!(target, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn balloon_target_bytes_equal_to_mem_is_invalid() {
+        assert!(balloon_target_bytes(1024 * 1024 * 1024, 1024).is_err());
+    }
+
+    #[test]
+    fn balloon_target_bytes_exceeding_mem_is_invalid() {
+        assert!(balloon_target_bytes(1024 * 1024 * 1024, 2048).is_err());
     }
 
     /// `BootMode::Uefi` is rejected before any VZ framework call is made.

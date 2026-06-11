@@ -3,14 +3,193 @@
 //! These tests require a running daemon and a booted VM. They are gated
 //! behind `#[ignore]` and serve as documentation of the expected E2E flow.
 //!
-//! Platform notes:
-//! - Tests marked `#[cfg(target_os = "linux")]` require KVM + Firecracker.
-//! - Tests marked `#[cfg(target_os = "macos")]` require Apple VZ entitlements.
-//! - Unmarked tests work on any platform with a running daemon.
+//! # Preconditions
 //!
-//! Run with: `cargo test -p husker --test e2e -- --ignored`
+//! ## Linux + macOS (Firecracker / Apple VZ)
+//!
+//! Required:
+//! - `HUSKER_RUN_IGNORED_E2E=1`
+//! - Running `husker daemon` on 127.0.0.1:7777
+//!
+//! Asset env vars (each has a default produced by the same path helpers the
+//! production CLI uses, so `husker images pull` is enough to satisfy them):
+//! - `HUSKER_E2E_KERNEL`  kernel image (default: `default_kernel_path()`)
+//! - `HUSKER_E2E_ROOTFS`  rootfs ext4  (default: `default_rootfs_path()`)
+//! - `HUSKER_E2E_INITRD`  initramfs (default: `default_initrd_path()`; set to empty string to skip)
+//!
+//! Linux: also needs `/dev/kvm` + Firecracker binary in PATH.
+//! macOS: also needs a codesigned daemon binary with the VZ entitlement.
+//!
+//! The suite assumes a single invocation at a time against a given daemon.
+//! VM names are fixed (no PID suffix) so that interrupted or failed runs
+//! self-heal on the next invocation via `predelete_vm()`.
+//!
+//! Run with:
+//!   HUSKER_RUN_IGNORED_E2E=1 cargo test -p husker --test e2e -- --ignored
+//!
+//! On macOS without linux-net:
+//!   HUSKER_RUN_IGNORED_E2E=1 cargo test -p husker --no-default-features --test e2e -- --ignored
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+use husker::default_initrd_path;
+use husker::default_kernel_path;
+use husker::default_rootfs_path;
+
+/// Guard that this test is explicitly enabled.
+///
+/// Returns early (test is a no-op) when `HUSKER_RUN_IGNORED_E2E` is not `"1"`.
+/// The `#[ignore]` attribute already prevents the test from running under plain
+/// `cargo test`; this guard makes the behaviour explicit when `-- --ignored` is
+/// passed without the env var.
+macro_rules! require_e2e {
+    () => {
+        if std::env::var("HUSKER_RUN_IGNORED_E2E").as_deref() != Ok("1") {
+            eprintln!("skipping: set HUSKER_RUN_IGNORED_E2E=1 to run this test");
+            return;
+        }
+    };
+}
+
+/// Resolve the kernel path for e2e tests.
+///
+/// Reads `HUSKER_E2E_KERNEL` or falls back to `default_kernel_path()`, the same
+/// helper the production CLI uses. Panics with an actionable message when the
+/// resolved path does not exist.
+fn e2e_kernel() -> String {
+    let path = std::env::var("HUSKER_E2E_KERNEL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| default_kernel_path());
+    if !path.exists() {
+        panic!(
+            "e2e kernel not found at {path:?}. \
+             Run `husker images pull` or set HUSKER_E2E_KERNEL to a valid path."
+        );
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Resolve the rootfs path for e2e tests.
+///
+/// Reads `HUSKER_E2E_ROOTFS` or falls back to `default_rootfs_path()`, the same
+/// helper the production CLI uses (arch-aware: aarch64 vs x86_64). Panics with
+/// an actionable message when the resolved path does not exist.
+fn e2e_rootfs() -> String {
+    let path = std::env::var("HUSKER_E2E_ROOTFS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| default_rootfs_path());
+    if !path.exists() {
+        panic!(
+            "e2e rootfs not found at {path:?}. \
+             Run `husker images pull` or set HUSKER_E2E_ROOTFS to a valid path."
+        );
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Resolve the optional initramfs path for e2e tests.
+///
+/// Reads `HUSKER_E2E_INITRD` or falls back to `default_initrd_path()`, the same
+/// helper the production CLI uses (arch-aware). Returns `None` only if
+/// `HUSKER_E2E_INITRD` is explicitly set to an empty string. Panics with an
+/// actionable message when the resolved file is missing.
+fn e2e_initrd() -> Option<String> {
+    let path = match std::env::var("HUSKER_E2E_INITRD") {
+        Ok(v) if v.is_empty() => return None,
+        Ok(v) => std::path::PathBuf::from(v),
+        Err(_) => default_initrd_path(),
+    };
+    if !path.exists() {
+        panic!(
+            "e2e initrd not found at {path:?}. \
+             Run `husker images pull`, set HUSKER_E2E_INITRD to a valid path, \
+             or set HUSKER_E2E_INITRD='' to skip the initrd."
+        );
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Best-effort delete a VM that may already exist.
+///
+/// Called before every VM create so that a stale leftover from a previous
+/// failed run is silently removed rather than causing a 409 Conflict.
+/// Tests use fixed names (no PID suffix) so the pre-delete targets exactly
+/// the VM a prior run would have left behind. The gated suite never runs
+/// concurrently on one host, so fixed names are safe and make self-healing
+/// across failed runs reliable.
+async fn predelete_vm(client: &reqwest::Client, base_url: &str, name: &str) {
+    let _ = client
+        .delete(format!("{base_url}/v1/vms/{name}"))
+        .send()
+        .await;
+}
+
+/// Poll until the agent inside a VM responds to a ping exec.
+///
+/// Panics after 30 seconds if the agent remains unreachable.
+async fn poll_until_agent_ready(client: &reqwest::Client, base_url: &str, vm_name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let ping = serde_json::json!({"command": "echo", "args": ["ping"]});
+        if let Ok(r) = client
+            .post(format!("{base_url}/v1/vms/{vm_name}/exec"))
+            .json(&ping)
+            .send()
+            .await
+            && r.status() == 200
+        {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("agent in VM {vm_name} did not become reachable within 30 s");
+        }
+    }
+}
+
+/// Create a VM via the REST API and wait for it to boot (agent reachable).
+///
+/// The VM name is pre-deleted first so stale leftovers do not cause 409.
+/// The caller is responsible for destroying the VM when done.
+async fn create_and_wait_for_vm(
+    client: &reqwest::Client,
+    base_url: &str,
+    vm_name: &str,
+) -> serde_json::Value {
+    predelete_vm(client, base_url, vm_name).await;
+
+    let create_body = serde_json::json!({
+        "name": vm_name,
+        "kernel_path": e2e_kernel(),
+        "rootfs_path": e2e_rootfs(),
+        "initrd_path": e2e_initrd(),
+        "vcpu_count": 1,
+        "mem_size_mib": 256,
+    });
+    let resp = client
+        .post(format!("{base_url}/v1/vms"))
+        .json(&create_body)
+        .send()
+        .await
+        .expect("create should reach daemon");
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 201, "VM creation failed with {status}: {body_text}");
+    let vm: serde_json::Value =
+        serde_json::from_str(&body_text).expect("response should be valid JSON");
+
+    poll_until_agent_ready(client, base_url, vm_name).await;
+
+    vm
+}
+
+/// Destroy a VM via the REST API, ignoring errors (best-effort cleanup).
+async fn destroy_vm(client: &reqwest::Client, base_url: &str, vm_name: &str) {
+    let _ = client
+        .delete(format!("{base_url}/v1/vms/{vm_name}"))
+        .send()
+        .await;
+}
 
 /// Spawn `husker shell <vm_name>` wrapped in a platform-appropriate PTY via `script`.
 ///
@@ -81,15 +260,16 @@ async fn read_until_match(
 /// Full VM lifecycle: create, info, exec, copy file, stop, destroy.
 ///
 /// Requires:
+/// - HUSKER_RUN_IGNORED_E2E=1
 /// - Running `husker daemon` on localhost:7777
-/// - Valid kernel at /var/lib/husker/kernels/vmlinux
-/// - Valid rootfs image
 /// - Linux host with KVM enabled
 /// - Firecracker binary in PATH or configured
+/// - Standard pulled images (or HUSKER_E2E_KERNEL / HUSKER_E2E_ROOTFS overrides)
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore]
 async fn vm_lifecycle() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
 
@@ -102,49 +282,33 @@ async fn vm_lifecycle() {
     assert_eq!(resp.status(), 200);
 
     // 2. Create a VM
-    let create_body = serde_json::json!({
-        "name": "e2e-test",
-        "kernel_path": "/var/lib/husker/kernels/vmlinux",
-        "rootfs_path": "/var/lib/husker/images/ubuntu-22.04.ext4",
-        "vcpu_count": 1,
-        "mem_size_mib": 128,
-    });
-    let resp = client
-        .post(format!("{base}/v1/vms"))
-        .json(&create_body)
-        .send()
-        .await
-        .expect("create should succeed");
-    assert_eq!(resp.status(), 201);
-    let vm: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(vm["name"], "e2e-test");
+    let name = "e2e-lifecycle";
+    let vm = create_and_wait_for_vm(&client, base, name).await;
+    assert_eq!(vm["name"], name);
     assert!(vm["id"].as_str().is_some());
 
     // 3. List VMs (should contain our VM)
     let resp = client.get(format!("{base}/v1/vms")).send().await.unwrap();
     let vms: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert!(vms.iter().any(|v| v["name"] == "e2e-test"));
+    assert!(vms.iter().any(|v| v["name"] == name));
 
     // 4. Get VM info
     let resp = client
-        .get(format!("{base}/v1/vms/e2e-test"))
+        .get(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let info: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(info["name"], "e2e-test");
+    assert_eq!(info["name"], name);
 
-    // 5. Wait for agent to be ready (the guest needs time to boot)
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    // 6. Execute a command inside the VM
+    // 5. Execute a command inside the VM (agent already confirmed reachable)
     let exec_body = serde_json::json!({
         "command": "echo",
         "args": ["hello from VM"],
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-test/exec"))
+        .post(format!("{base}/v1/vms/{name}/exec"))
         .json(&exec_body)
         .send()
         .await
@@ -154,25 +318,25 @@ async fn vm_lifecycle() {
     assert_eq!(result["exit_code"], 0);
     assert!(result["stdout"].as_str().unwrap().contains("hello from VM"));
 
-    // 7. Write a file to the VM
+    // 6. Write a file to the VM
     let write_body = serde_json::json!({
         "path": "/tmp/e2e-test.txt",
         "data": husker_agent_proto::base64_encode(b"e2e test data"),
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-test/files/write"))
+        .post(format!("{base}/v1/vms/{name}/files/write"))
         .json(&write_body)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // 8. Read the file back
+    // 7. Read the file back
     let read_body = serde_json::json!({
         "path": "/tmp/e2e-test.txt",
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-test/files/read"))
+        .post(format!("{base}/v1/vms/{name}/files/read"))
         .json(&read_body)
         .send()
         .await
@@ -182,25 +346,25 @@ async fn vm_lifecycle() {
     let decoded = husker_agent_proto::base64_decode(file_data["data"].as_str().unwrap()).unwrap();
     assert_eq!(decoded, b"e2e test data");
 
-    // 9. Stop the VM
+    // 8. Stop the VM
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-test/stop"))
+        .post(format!("{base}/v1/vms/{name}/stop"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
-    // 10. Destroy the VM
+    // 9. Destroy the VM
     let resp = client
-        .delete(format!("{base}/v1/vms/e2e-test"))
+        .delete(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
-    // 11. Verify it's gone
+    // 10. Verify it's gone
     let resp = client
-        .get(format!("{base}/v1/vms/e2e-test"))
+        .get(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
@@ -209,19 +373,26 @@ async fn vm_lifecycle() {
 
 /// Verify that creating a VM with a duplicate name returns 409 Conflict.
 ///
-/// Requires a running daemon with the ability to create VMs.
-/// Uses Firecracker paths — Linux only.
+/// Requires:
+/// - HUSKER_RUN_IGNORED_E2E=1
+/// - Running daemon.
+/// - Standard pulled images (or HUSKER_E2E_KERNEL / HUSKER_E2E_ROOTFS overrides)
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore]
 async fn duplicate_vm_name_returns_conflict() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
 
+    let name = "e2e-dup";
+    predelete_vm(&client, base, name).await;
+
     let body = serde_json::json!({
-        "name": "e2e-dup-test",
-        "kernel_path": "/var/lib/husker/kernels/vmlinux",
-        "rootfs_path": "/var/lib/husker/images/ubuntu-22.04.ext4",
+        "name": name,
+        "kernel_path": e2e_kernel(),
+        "rootfs_path": e2e_rootfs(),
+        "initrd_path": e2e_initrd(),
     });
 
     // Create first VM
@@ -233,7 +404,7 @@ async fn duplicate_vm_name_returns_conflict() {
         .expect("first create should reach daemon");
     assert_eq!(resp.status(), 201);
 
-    // Attempt duplicate
+    // Attempt duplicate - should conflict
     let resp = client
         .post(format!("{base}/v1/vms"))
         .json(&body)
@@ -243,30 +414,37 @@ async fn duplicate_vm_name_returns_conflict() {
     assert_eq!(resp.status(), 409);
 
     // Cleanup
-    let _ = client
-        .delete(format!("{base}/v1/vms/e2e-dup-test"))
-        .send()
-        .await;
+    destroy_vm(&client, base, name).await;
 }
 
 // ── Cross-platform API tests ─────────────────────────────────────────────
 //
-// These test the REST API and work with any backend (Firecracker or Apple VZ).
-// They require a running daemon with a booted VM named "e2e-exec-test".
+// These test the REST API against the agent and are backend-agnostic: exec,
+// env injection, and file transfer work identically on Firecracker (Linux)
+// and Apple VZ (macOS). Each test creates its own VM and tears it down.
+//
+// Preconditions:
+// - HUSKER_RUN_IGNORED_E2E=1
+// - Running husker daemon on 127.0.0.1:7777
+// - Standard pulled images (or HUSKER_E2E_KERNEL / HUSKER_E2E_ROOTFS overrides)
 
 /// Verify exec with a non-zero exit code propagates correctly.
 #[tokio::test]
 #[ignore]
 async fn exec_nonzero_exit_code() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
+    let name = "e2e-exec-nonzero";
+
+    create_and_wait_for_vm(&client, base, name).await;
 
     let body = serde_json::json!({
         "command": "sh",
         "args": ["-c", "exit 42"],
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-exec-test/exec"))
+        .post(format!("{base}/v1/vms/{name}/exec"))
         .json(&body)
         .send()
         .await
@@ -275,14 +453,20 @@ async fn exec_nonzero_exit_code() {
     assert_eq!(resp.status(), 200);
     let result: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(result["exit_code"], 42);
+
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that exec with environment variables works through the full stack.
 #[tokio::test]
 #[ignore]
 async fn exec_with_env_through_api() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
+    let name = "e2e-exec-env";
+
+    create_and_wait_for_vm(&client, base, name).await;
 
     let body = serde_json::json!({
         "command": "sh",
@@ -290,7 +474,7 @@ async fn exec_with_env_through_api() {
         "env": {"MY_VAR": "from-api"},
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-exec-test/exec"))
+        .post(format!("{base}/v1/vms/{name}/exec"))
         .json(&body)
         .send()
         .await
@@ -299,14 +483,20 @@ async fn exec_with_env_through_api() {
     assert_eq!(resp.status(), 200);
     let result: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(result["stdout"].as_str().unwrap().trim(), "from-api");
+
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify large file transfer through the API (1 MiB).
 #[tokio::test]
 #[ignore]
 async fn large_file_transfer_through_api() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
+    let name = "e2e-large-file";
+
+    create_and_wait_for_vm(&client, base, name).await;
 
     // 1 MiB of pattern data
     let data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
@@ -317,7 +507,7 @@ async fn large_file_transfer_through_api() {
         "data": encoded,
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-exec-test/files/write"))
+        .post(format!("{base}/v1/vms/{name}/files/write"))
         .json(&write_body)
         .send()
         .await
@@ -330,7 +520,7 @@ async fn large_file_transfer_through_api() {
         "path": "/tmp/large-e2e.bin",
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-exec-test/files/read"))
+        .post(format!("{base}/v1/vms/{name}/files/read"))
         .json(&read_body)
         .send()
         .await
@@ -340,20 +530,36 @@ async fn large_file_transfer_through_api() {
     let decoded = husker_agent_proto::base64_decode(file_data["data"].as_str().unwrap()).unwrap();
     assert_eq!(decoded.len(), data.len());
     assert_eq!(decoded, data);
+
+    destroy_vm(&client, base, name).await;
 }
 
 // ── Cross-platform shell E2E tests ───────────────────────────────────────
 //
-// These use `script` for PTY wrapping, with platform-specific invocation.
-// They require a running daemon with a booted VM named "e2e-shell-test".
+// These use `script` for PTY wrapping (platform-specific invocation). The
+// husker agent's shell feature is backend-agnostic, so these tests run on
+// both Firecracker (Linux) and Apple VZ (macOS). Each creates its own VM.
+//
+// Preconditions:
+// - HUSKER_RUN_IGNORED_E2E=1
+// - Running husker daemon on 127.0.0.1:7777
+// - `script` utility available
+// - Standard pulled images (or HUSKER_E2E_KERNEL / HUSKER_E2E_ROOTFS overrides)
 
 /// Verify interactive shell: prompt appears, echo works, TERM is set, devpts is mounted.
 #[tokio::test]
 #[ignore]
 async fn shell_interactive_session() {
+    require_e2e!();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut child = spawn_shell_with_pty("e2e-shell-test");
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:7777";
+    let name = "e2e-shell-interactive";
+
+    create_and_wait_for_vm(&client, base, name).await;
+
+    let mut child = spawn_shell_with_pty(name);
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
@@ -408,15 +614,24 @@ async fn shell_interactive_session() {
         .expect("failed to wait on child");
 
     assert!(status.success(), "shell exited with: {status}");
+
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that the shell propagates the guest's exit code.
 #[tokio::test]
 #[ignore]
 async fn shell_exit_code_propagation() {
+    require_e2e!();
     use tokio::io::AsyncWriteExt;
 
-    let mut child = spawn_shell_with_pty("e2e-shell-test");
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:7777";
+    let name = "e2e-shell-exitcode";
+
+    create_and_wait_for_vm(&client, base, name).await;
+
+    let mut child = spawn_shell_with_pty(name);
     let mut stdin = child.stdin.take().unwrap();
 
     // Wait for the shell to initialize, then send exit 42
@@ -430,14 +645,17 @@ async fn shell_exit_code_propagation() {
         .expect("failed to wait");
 
     assert!(!status.success(), "expected non-zero exit, got: {status}");
+
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that shell to a non-existent VM returns an error quickly.
 ///
-/// Does not require a PTY — just tests CLI error handling.
+/// Does not require a running VM - just tests CLI error handling.
 #[tokio::test]
 #[ignore]
 async fn shell_nonexistent_vm_fails() {
+    require_e2e!();
     use tokio::process::Command;
 
     let output = Command::new("husker")
@@ -456,7 +674,7 @@ async fn shell_nonexistent_vm_fails() {
 
 // ── macOS-specific: pause/resume E2E ─────────────────────────────────────
 
-/// Verify pause → resume → exec cycle works end-to-end on Apple VZ.
+/// Verify pause -> resume -> exec cycle works end-to-end on Apple VZ.
 ///
 /// Apple VZ supports true pause/resume (Firecracker uses ACPI which
 /// is less deterministic), so this test validates the VZ-specific path.
@@ -464,12 +682,16 @@ async fn shell_nonexistent_vm_fails() {
 #[tokio::test]
 #[ignore]
 async fn pause_resume_cycle_macos() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
+    let name = "e2e-pause-resume";
+
+    create_and_wait_for_vm(&client, base, name).await;
 
     // Pause
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-shell-test/pause"))
+        .post(format!("{base}/v1/vms/{name}/pause"))
         .send()
         .await
         .unwrap();
@@ -477,7 +699,7 @@ async fn pause_resume_cycle_macos() {
 
     // Verify state
     let resp = client
-        .get(format!("{base}/v1/vms/e2e-shell-test"))
+        .get(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
@@ -486,19 +708,20 @@ async fn pause_resume_cycle_macos() {
 
     // Resume
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-shell-test/resume"))
+        .post(format!("{base}/v1/vms/{name}/resume"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
     // Verify VM is functional after resume
+    poll_until_agent_ready(&client, base, name).await;
     let exec_body = serde_json::json!({
         "command": "echo",
         "args": ["survived-pause"],
     });
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-shell-test/exec"))
+        .post(format!("{base}/v1/vms/{name}/exec"))
         .json(&exec_body)
         .send()
         .await
@@ -512,6 +735,8 @@ async fn pause_resume_cycle_macos() {
             .unwrap()
             .contains("survived-pause")
     );
+
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that shell works after a pause/resume cycle on Apple VZ.
@@ -519,28 +744,32 @@ async fn pause_resume_cycle_macos() {
 #[tokio::test]
 #[ignore]
 async fn shell_after_pause_resume_macos() {
+    require_e2e!();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
+    let name = "e2e-shell-pause-resume";
+
+    create_and_wait_for_vm(&client, base, name).await;
 
     // Pause and resume the VM
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-shell-test/pause"))
+        .post(format!("{base}/v1/vms/{name}/pause"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
     let resp = client
-        .post(format!("{base}/v1/vms/e2e-shell-test/resume"))
+        .post(format!("{base}/v1/vms/{name}/resume"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
     // Shell should still work
-    let mut child = spawn_shell_with_pty("e2e-shell-test");
+    let mut child = spawn_shell_with_pty(name);
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
@@ -577,6 +806,8 @@ async fn shell_after_pause_resume_macos() {
         .expect("failed to wait");
 
     assert!(status.success(), "shell exited with: {status}");
+
+    destroy_vm(&client, base, name).await;
 }
 
 // ── Logs E2E tests ─────────────────────────────────────────────────────
@@ -586,18 +817,16 @@ async fn shell_after_pause_resume_macos() {
 ///
 /// Requires:
 /// - Running `husker daemon` on localhost:7777
-/// - Valid kernel at ~/.local/share/husker/kernels/Image-virt
-/// - Valid aarch64 rootfs image
 /// - macOS host with Virtualization.framework
+/// - Standard pulled images (or HUSKER_E2E_KERNEL / HUSKER_E2E_ROOTFS overrides)
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore]
 async fn vm_lifecycle_macos() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-
-    let home = std::env::var("HOME").expect("HOME not set");
-    let data_dir = format!("{home}/.local/share/husker");
+    let name = "e2e-lifecycle-macos";
 
     // 1. Health check
     let resp = client
@@ -608,50 +837,32 @@ async fn vm_lifecycle_macos() {
     assert_eq!(resp.status(), 200);
 
     // 2. Create a VM
-    let vm_name = "e2e-lifecycle-macos";
-    let create_body = serde_json::json!({
-        "name": vm_name,
-        "kernel_path": format!("{data_dir}/kernels/Image-virt"),
-        "rootfs_path": format!("{data_dir}/images/alpine-aarch64.ext4"),
-        "vcpu_count": 1,
-        "mem_size_mib": 128,
-    });
-    let resp = client
-        .post(format!("{base}/v1/vms"))
-        .json(&create_body)
-        .send()
-        .await
-        .expect("create should succeed");
-    assert_eq!(resp.status(), 201);
-    let vm: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(vm["name"], vm_name);
+    let vm = create_and_wait_for_vm(&client, base, name).await;
+    assert_eq!(vm["name"], name);
     assert!(vm["id"].as_str().is_some());
 
     // 3. List VMs (should contain our VM)
     let resp = client.get(format!("{base}/v1/vms")).send().await.unwrap();
     let vms: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert!(vms.iter().any(|v| v["name"] == vm_name));
+    assert!(vms.iter().any(|v| v["name"] == name));
 
     // 4. Get VM info
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}"))
+        .get(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let info: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(info["name"], vm_name);
+    assert_eq!(info["name"], name);
 
-    // 5. Wait for agent to be ready
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    // 6. Execute a command inside the VM
+    // 5. Execute a command inside the VM (agent already confirmed reachable)
     let exec_body = serde_json::json!({
         "command": "echo",
         "args": ["hello from VZ"],
     });
     let resp = client
-        .post(format!("{base}/v1/vms/{vm_name}/exec"))
+        .post(format!("{base}/v1/vms/{name}/exec"))
         .json(&exec_body)
         .send()
         .await
@@ -661,37 +872,38 @@ async fn vm_lifecycle_macos() {
     assert_eq!(result["exit_code"], 0);
     assert!(result["stdout"].as_str().unwrap().contains("hello from VZ"));
 
-    // 7. Pause the VM
+    // 6. Pause the VM
     let resp = client
-        .post(format!("{base}/v1/vms/{vm_name}/pause"))
+        .post(format!("{base}/v1/vms/{name}/pause"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}"))
+        .get(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
     let info: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(info["state"], "paused");
 
-    // 8. Resume the VM
+    // 7. Resume the VM
     let resp = client
-        .post(format!("{base}/v1/vms/{vm_name}/resume"))
+        .post(format!("{base}/v1/vms/{name}/resume"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
-    // 9. Verify VM is functional after resume
+    // 8. Verify VM is functional after resume
+    poll_until_agent_ready(&client, base, name).await;
     let exec_body = serde_json::json!({
         "command": "echo",
         "args": ["post-resume"],
     });
     let resp = client
-        .post(format!("{base}/v1/vms/{vm_name}/exec"))
+        .post(format!("{base}/v1/vms/{name}/exec"))
         .json(&exec_body)
         .send()
         .await
@@ -700,25 +912,25 @@ async fn vm_lifecycle_macos() {
     let result: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(result["exit_code"], 0);
 
-    // 10. Stop the VM
+    // 9. Stop the VM
     let resp = client
-        .post(format!("{base}/v1/vms/{vm_name}/stop"))
+        .post(format!("{base}/v1/vms/{name}/stop"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
-    // 11. Destroy the VM
+    // 10. Destroy the VM
     let resp = client
-        .delete(format!("{base}/v1/vms/{vm_name}"))
+        .delete(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
 
-    // 12. Verify it's gone
+    // 11. Verify it's gone
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}"))
+        .get(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
@@ -728,24 +940,29 @@ async fn vm_lifecycle_macos() {
 /// Verify serial log output: full logs contain kernel markers, tail limits
 /// line count, and logs return 404 after VM is destroyed.
 ///
-/// Requires a running daemon. Uses a dedicated VM to avoid interfering
-/// with other tests.
+/// Requires:
+/// - HUSKER_RUN_IGNORED_E2E=1
+/// - Running daemon.
+/// - Standard pulled images (or HUSKER_E2E_KERNEL / HUSKER_E2E_ROOTFS overrides)
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore]
 async fn logs_serial_output() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let vm_name = "e2e-logs-test";
+    let name = "e2e-logs";
 
     // 1. Create a VM
     let create_body = serde_json::json!({
-        "name": vm_name,
-        "kernel_path": "/var/lib/husker/kernels/vmlinux",
-        "rootfs_path": "/var/lib/husker/images/ubuntu-22.04.ext4",
+        "name": name,
+        "kernel_path": e2e_kernel(),
+        "rootfs_path": e2e_rootfs(),
+        "initrd_path": e2e_initrd(),
         "vcpu_count": 1,
-        "mem_size_mib": 128,
+        "mem_size_mib": 256,
     });
+    predelete_vm(&client, base, name).await;
     let resp = client
         .post(format!("{base}/v1/vms"))
         .json(&create_body)
@@ -754,26 +971,31 @@ async fn logs_serial_output() {
         .expect("create should succeed");
     assert_eq!(resp.status(), 201);
 
-    // 2. Wait for the VM to boot and produce serial output
+    // 2. Wait for the VM to boot and produce serial output.
+    //    Apple VZ serial attaches after early boot so "Linux version" is absent;
+    //    virtio_blk and EXT4-fs appear within the first second of VZ output.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    // 3. Full logs should contain kernel boot markers
+    // 3. Full logs should contain kernel boot markers.
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .get(format!("{base}/v1/vms/{name}/logs"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("Linux version") || body.contains("Booting"),
+        body.contains("Linux version")
+            || body.contains("Booting")
+            || body.contains("virtio_blk")
+            || body.contains("EXT4-fs"),
         "expected kernel boot marker in logs, got: {}",
         &body[..body.len().min(200)]
     );
 
     // 4. Tail should limit output
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}/logs?tail=5"))
+        .get(format!("{base}/v1/vms/{name}/logs?tail=5"))
         .send()
         .await
         .unwrap();
@@ -787,7 +1009,7 @@ async fn logs_serial_output() {
 
     // 5. Destroy the VM
     let resp = client
-        .delete(format!("{base}/v1/vms/{vm_name}"))
+        .delete(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
@@ -795,7 +1017,7 @@ async fn logs_serial_output() {
 
     // 6. Logs should return 404 after destroy
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .get(format!("{base}/v1/vms/{name}/logs"))
         .send()
         .await
         .unwrap();
@@ -805,28 +1027,28 @@ async fn logs_serial_output() {
 /// macOS equivalent of `logs_serial_output`, using Apple VZ paths.
 ///
 /// Requires:
+/// - HUSKER_RUN_IGNORED_E2E=1
 /// - Running `husker daemon` on localhost:7777
-/// - Valid kernel at ~/.local/share/husker/kernels/Image-virt
-/// - Valid aarch64 rootfs image
+/// - Standard pulled images (or HUSKER_E2E_KERNEL / HUSKER_E2E_ROOTFS overrides)
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore]
 async fn logs_serial_output_macos() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let vm_name = "e2e-logs-macos";
-
-    let home = std::env::var("HOME").expect("HOME not set");
-    let data_dir = format!("{home}/.local/share/husker");
+    let name = "e2e-logs-macos";
 
     // 1. Create a VM
     let create_body = serde_json::json!({
-        "name": vm_name,
-        "kernel_path": format!("{data_dir}/kernels/Image-virt"),
-        "rootfs_path": format!("{data_dir}/images/alpine-aarch64.ext4"),
+        "name": name,
+        "kernel_path": e2e_kernel(),
+        "rootfs_path": e2e_rootfs(),
+        "initrd_path": e2e_initrd(),
         "vcpu_count": 1,
         "mem_size_mib": 128,
     });
+    predelete_vm(&client, base, name).await;
     let resp = client
         .post(format!("{base}/v1/vms"))
         .json(&create_body)
@@ -835,26 +1057,31 @@ async fn logs_serial_output_macos() {
         .expect("create should succeed");
     assert_eq!(resp.status(), 201);
 
-    // 2. Wait for the VM to boot and produce serial output
+    // 2. Wait for the VM to boot and produce serial output.
+    //    Apple VZ serial attaches after early boot so "Linux version" is absent;
+    //    virtio_blk and EXT4-fs appear within the first second of VZ output.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    // 3. Full logs should contain kernel boot markers
+    // 3. Full logs should contain kernel boot markers.
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .get(format!("{base}/v1/vms/{name}/logs"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("Linux version") || body.contains("Booting"),
+        body.contains("Linux version")
+            || body.contains("Booting")
+            || body.contains("virtio_blk")
+            || body.contains("EXT4-fs"),
         "expected kernel boot marker in logs, got: {}",
         &body[..body.len().min(200)]
     );
 
     // 4. Tail should limit output
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}/logs?tail=5"))
+        .get(format!("{base}/v1/vms/{name}/logs?tail=5"))
         .send()
         .await
         .unwrap();
@@ -868,7 +1095,7 @@ async fn logs_serial_output_macos() {
 
     // 5. Destroy the VM
     let resp = client
-        .delete(format!("{base}/v1/vms/{vm_name}"))
+        .delete(format!("{base}/v1/vms/{name}"))
         .send()
         .await
         .unwrap();
@@ -876,7 +1103,7 @@ async fn logs_serial_output_macos() {
 
     // 6. Logs should return 404 after destroy
     let resp = client
-        .get(format!("{base}/v1/vms/{vm_name}/logs"))
+        .get(format!("{base}/v1/vms/{name}/logs"))
         .send()
         .await
         .unwrap();

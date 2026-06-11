@@ -3,6 +3,7 @@
 mod pty;
 
 use std::os::fd::AsRawFd;
+use std::path::Path;
 
 use anyhow::Result;
 use husker_agent_proto::{
@@ -67,12 +68,15 @@ where
     cmd.stderr(std::process::Stdio::from(slave));
 
     // Safety: pre_exec runs after fork() but before exec() in the child.
+    // escape_agent_cgroup() moves the child to the root cgroup so it does
+    // not inherit the agent's memory.high throttle.
     // setsid() creates a new session, TIOCSCTTY makes the PTY slave the
     // controlling terminal. slave_raw is valid because fds are inherited
     // across fork. We close master_raw so it doesn't leak into the child
     // (openpty doesn't set FD_CLOEXEC).
     unsafe {
         cmd.pre_exec(move || {
+            escape_agent_cgroup();
             libc::close(master_raw);
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -180,6 +184,40 @@ const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 600;
 /// Overridable via `HUSKER_AGENT_MAX_READ_BYTES`.
 const DEFAULT_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Memory ceiling written to the agent's own cgroup leaf. `memory.high`
+/// throttles and reclaims above this threshold without OOM-killing, so a
+/// runaway exec buffer degrades gracefully instead of taking the agent down.
+pub const AGENT_MEMORY_HIGH_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Places the calling process in a dedicated cgroup v2 leaf with a memory
+/// throttle, so the agent can never starve the workload of guest memory.
+/// `cgroup_root` is the mounted cgroup2 filesystem (normally /sys/fs/cgroup).
+/// On hosts where the process already lives in a non-root cgroup managed by
+/// another controller (for example systemd service cgroups), the cgroup.procs
+/// write fails and the caller should treat the limit as best-effort.
+///
+/// cgroup v2 requires the `memory` controller to be listed in the parent's
+/// `cgroup.subtree_control` before a child cgroup exposes `memory.high`.
+/// We enable it on the root cgroup first (idempotent: writing `+memory` when
+/// it is already enabled is a no-op).
+pub fn configure_self_cgroup(cgroup_root: &Path, memory_high_bytes: u64) -> std::io::Result<()> {
+    std::fs::write(cgroup_root.join("cgroup.subtree_control"), "+memory")?;
+    let leaf = cgroup_root.join("husker-agent");
+    std::fs::create_dir_all(&leaf)?;
+    std::fs::write(leaf.join("memory.high"), memory_high_bytes.to_string())?;
+    std::fs::write(leaf.join("cgroup.procs"), std::process::id().to_string())?;
+    Ok(())
+}
+
+/// Moves the calling process out of the agent's throttled cgroup leaf and
+/// back to the root cgroup, so workload children never inherit the agent's
+/// memory limit. Writing "0" to cgroup.procs moves the current process.
+fn escape_agent_cgroup() {
+    // /sys/fs/cgroup is the production guest mount point; the path is intentionally
+    // hardcoded. This function is best-effort and is not unit-tested through an injected root.
+    let _ = std::fs::write("/sys/fs/cgroup/cgroup.procs", "0");
+}
+
 fn exec_timeout() -> std::time::Duration {
     let secs = std::env::var("HUSKER_AGENT_EXEC_TIMEOUT_SECS")
         .ok()
@@ -217,12 +255,22 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::Exec(req) => {
             let timeout = exec_timeout();
-            let fut = tokio::process::Command::new(&req.command)
-                .args(&req.args)
+            let mut cmd = tokio::process::Command::new(&req.command);
+            cmd.args(&req.args)
                 .envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .current_dir(req.working_dir.as_deref().unwrap_or("/"))
-                .kill_on_drop(true)
-                .output();
+                .kill_on_drop(true);
+            // Safety: pre_exec runs after fork() but before exec() in the child.
+            // escape_agent_cgroup() moves the child to the root cgroup so it does
+            // not inherit the agent's memory.high throttle. The write is
+            // best-effort: on hosts without /sys/fs/cgroup it fails silently.
+            unsafe {
+                cmd.pre_exec(|| {
+                    escape_agent_cgroup();
+                    Ok(())
+                });
+            }
+            let fut = cmd.output();
 
             match tokio::time::timeout(timeout, fut).await {
                 Ok(Ok(output)) => AgentResponse::Exec(ExecResponse {

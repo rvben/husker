@@ -33,6 +33,10 @@ objc2-virtualization = { version = "0.3", features = [
     "VZBootLoader",
     "VZEFIBootLoader",
     "VZEFIVariableStore",
+    "VZMemoryBalloonDeviceConfiguration",
+    "VZMemoryBalloonDevice",
+    "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
+    "VZVirtioTraditionalMemoryBalloonDevice",
 ] }
 objc2-foundation = "0.3"
 block2 = "0.6"

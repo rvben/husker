@@ -142,27 +142,40 @@ cat > "$INITRAMFS/init" << 'INIT_EOF'
 MDIR=/lib/modules/KVER_PLACEHOLDER
 
 # Load block device modules
-/bin/insmod $MDIR/virtio_blk.ko
+if [ -f $MDIR/virtio_blk.ko ]; then
+    /bin/insmod $MDIR/virtio_blk.ko 2>/dev/null || echo "husker-init: WARNING virtio_blk present but failed to load (kernel/module mismatch?)"
+else
+    echo "husker-init: skipped virtio_blk (built-in)"
+fi
 
 # Memory balloon (optional device; only active when the VM enables it)
-/bin/insmod $MDIR/virtio_balloon.ko
+/bin/insmod $MDIR/virtio_balloon.ko 2>/dev/null || echo "husker-init: skipped virtio_balloon (built-in or absent)"
 
 # Load filesystem dependency modules
-/bin/insmod $MDIR/crc16.ko
-/bin/insmod $MDIR/crc32_generic.ko
-/bin/insmod $MDIR/crc32c_generic.ko
-/bin/insmod $MDIR/mbcache.ko
-/bin/insmod $MDIR/jbd2.ko
-/bin/insmod $MDIR/ext4.ko
+/bin/insmod $MDIR/crc16.ko 2>/dev/null || echo "husker-init: skipped crc16 (built-in or absent)"
+/bin/insmod $MDIR/crc32_generic.ko 2>/dev/null || echo "husker-init: skipped crc32_generic (built-in or absent)"
+/bin/insmod $MDIR/crc32c_generic.ko 2>/dev/null || echo "husker-init: skipped crc32c_generic (built-in or absent)"
+/bin/insmod $MDIR/mbcache.ko 2>/dev/null || echo "husker-init: skipped mbcache (built-in or absent)"
+if [ -f $MDIR/jbd2.ko ]; then
+    /bin/insmod $MDIR/jbd2.ko 2>/dev/null || echo "husker-init: WARNING jbd2 present but failed to load (kernel/module mismatch?)"
+else
+    echo "husker-init: skipped jbd2 (built-in)"
+fi
+if [ -f $MDIR/ext4.ko ]; then
+    /bin/insmod $MDIR/ext4.ko 2>/dev/null || echo "husker-init: WARNING ext4 present but failed to load (kernel/module mismatch?)"
+else
+    echo "husker-init: skipped ext4 (built-in)"
+fi
 
-# Wait for /dev/vda to appear
+# Wait for /dev/vda to appear (up to 5s: 50 x 100ms)
 i=0
 while [ ! -b /dev/vda ] && [ $i -lt 50 ]; do
+    /bin/busybox usleep 100000
     i=$((i + 1))
 done
 
 if [ ! -b /dev/vda ]; then
-    echo "FATAL: /dev/vda not found"
+    echo "FATAL: /dev/vda not found (virtio_blk missing? check earlier husker-init messages)"
     exec /bin/sh
 fi
 
@@ -177,7 +190,7 @@ fi
 # Copy modules to rootfs for use after switch_root
 /bin/mkdir -p /mnt/root/lib/modules
 for m in $MDIR/*.ko; do
-    /bin/busybox cp "$m" /mnt/root/lib/modules/
+    /bin/busybox cp "$m" /mnt/root/lib/modules/ 2>/dev/null || true
 done
 
 # Clean up

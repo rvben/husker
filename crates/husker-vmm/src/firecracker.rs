@@ -125,6 +125,17 @@ impl FirecrackerBackend {
             .ok_or_else(|| VmmError::InvalidConfig(format!("{label} is not valid UTF-8")))
     }
 
+    /// Default kernel command line used when the caller does not supply `kernel_args`.
+    ///
+    /// When booting without an initrd the kernel must mount the root filesystem
+    /// itself, so `root=/dev/vda rw` is appended after `pci=off`. With an
+    /// initrd present the initrd handles root mounting and the argument is omitted.
+    fn default_boot_args(has_initrd: bool) -> String {
+        let base = "console=ttyS0 reboot=k panic=1 pci=off";
+        let root = if has_initrd { "" } else { " root=/dev/vda rw" };
+        format!("{base}{root} ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off")
+    }
+
     fn boot_source_payload(
         kernel_image_path: &str,
         boot_args: &str,
@@ -186,11 +197,10 @@ impl FirecrackerBackend {
         }
 
         // Configure the VM via the Firecracker API
-        let kernel_args = config.kernel_args.clone().unwrap_or_else(|| {
-            "console=ttyS0 reboot=k panic=1 pci=off \
-             ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off"
-                .to_string()
-        });
+        let kernel_args = config
+            .kernel_args
+            .clone()
+            .unwrap_or_else(|| Self::default_boot_args(config.initrd_path.is_some()));
 
         let kernel_path_str = Self::path_to_str(&config.kernel_path, "kernel_path")?;
         let rootfs_path_str = Self::path_to_str(&config.rootfs_path, "rootfs_path")?;
@@ -637,6 +647,34 @@ mod tests {
         assert_eq!(payload["kernel_image_path"], "/tmp/vmlinux");
         assert_eq!(payload["boot_args"], "console=ttyS0");
         assert_eq!(payload["initrd_path"], "/tmp/initrd.img");
+    }
+
+    #[test]
+    fn default_boot_args_add_root_when_no_initrd() {
+        let args = FirecrackerBackend::default_boot_args(false);
+        assert!(
+            args.contains("root=/dev/vda rw"),
+            "expected root=/dev/vda rw when no initrd: {args}"
+        );
+        assert!(
+            args.contains("console=ttyS0"),
+            "console arg missing: {args}"
+        );
+        assert!(args.contains("pci=off"), "pci=off missing: {args}");
+    }
+
+    #[test]
+    fn default_boot_args_omit_root_when_initrd_set() {
+        let args = FirecrackerBackend::default_boot_args(true);
+        assert!(
+            !args.contains("root=/dev/vda"),
+            "root= must be absent when initrd is set: {args}"
+        );
+        assert!(
+            args.contains("console=ttyS0"),
+            "console arg missing: {args}"
+        );
+        assert!(args.contains("pci=off"), "pci=off missing: {args}");
     }
 
     #[tokio::test]

@@ -31,6 +31,9 @@ struct MockInner {
     stop_failures: Mutex<HashSet<Uuid>>,
     stop_calls: Mutex<Vec<Uuid>>,
     agent_socket: Mutex<Option<PathBuf>>,
+    // Only needed by the kernel_args_composition tests (not(linux-net) builds).
+    #[cfg(not(feature = "linux-net"))]
+    last_config: Mutex<Option<VmConfig>>,
 }
 
 #[derive(Clone)]
@@ -46,6 +49,8 @@ impl MockVmm {
                 stop_failures: Mutex::new(HashSet::new()),
                 stop_calls: Mutex::new(Vec::new()),
                 agent_socket: Mutex::new(None),
+                #[cfg(not(feature = "linux-net"))]
+                last_config: Mutex::new(None),
             }),
         }
     }
@@ -65,6 +70,11 @@ impl MockVmm {
     async fn stop_call_count(&self) -> usize {
         self.inner.stop_calls.lock().await.len()
     }
+
+    #[cfg(not(feature = "linux-net"))]
+    async fn last_config(&self) -> Option<VmConfig> {
+        self.inner.last_config.lock().await.clone()
+    }
 }
 
 impl VmmBackend for MockVmm {
@@ -74,13 +84,20 @@ impl VmmBackend for MockVmm {
         let id = Uuid::new_v4();
         let info = VmInfo {
             id,
-            name: config.name,
+            name: config.name.clone(),
             state: VmState::Running,
             pid: Some(9999),
             vcpu_count: config.vcpu_count,
             mem_size_mib: config.mem_size_mib,
             vsock_cid: config.vsock_cid,
         };
+        #[cfg(not(feature = "linux-net"))]
+        {
+            *self.inner.last_config.lock().await = Some(config);
+        }
+        // linux-net builds capture nothing; consume config to avoid an unused-variable warning.
+        #[cfg(feature = "linux-net")]
+        let _ = config;
         self.upsert_vm(info.clone()).await;
         Ok(info)
     }
@@ -1964,4 +1981,134 @@ async fn run_userdata_spawn_userdata_drives_to_completed() {
         Some("completed"),
         "spawn_userdata should drive userdata_status to completed"
     );
+}
+
+// These tests verify boot-arg composition for the macOS/VZ direct-kernel path.
+// On the linux-net path the composition is gated behind a TAP device creation
+// that cannot run in a unit-test environment; CI covers it via the e2e suite.
+//
+// VZ note: Apple Virtualization.framework always passes kernel_args to the
+// kernel and the initrd (when present) provides modules only, not root
+// mounting. Therefore root=/dev/vda rw is always present in VZ kernel_args,
+// regardless of whether an initrd is used.
+#[cfg(not(feature = "linux-net"))]
+mod kernel_args_composition {
+    use super::*;
+
+    fn kernel_stub_bytes() -> Vec<u8> {
+        // ARM64 Image magic at offset 56 so validate_kernel_format passes.
+        let mut b = vec![0u8; 64];
+        b[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+        b
+    }
+
+    fn make_capturing_core(tmp: &tempfile::TempDir) -> (Arc<HuskerCore<MockVmm>>, MockVmm) {
+        let runtime_dir = tmp.path().join("run");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mock = MockVmm::new();
+        let core = Arc::new(HuskerCore::new(
+            mock.clone(),
+            StateStore::open_memory().unwrap(),
+            StorageConfig {
+                data_dir: data_dir.to_path_buf(),
+            },
+            runtime_dir,
+        ));
+        (core, mock)
+    }
+
+    #[tokio::test]
+    async fn direct_kernel_without_initrd_has_root_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("vmlinux");
+        std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
+        let rootfs = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+
+        let (core, mock) = make_capturing_core(&tmp);
+        core.create_vm(CreateVmRequest {
+            name: "no-initrd".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            initrd_path: None,
+            userdata: None,
+            env: Vec::new(),
+            vmm: None,
+            cloud_image: None,
+            disk_size: None,
+            ssh_authorized_keys: Vec::new(),
+            balloon: false,
+            volume: None,
+            network: None,
+        })
+        .await
+        .expect("create_vm should succeed");
+
+        let cfg = mock.last_config().await.expect("VmConfig was captured");
+        let args = cfg
+            .kernel_args
+            .as_deref()
+            .expect("kernel_args must be Some for direct-kernel boot");
+        assert!(
+            args.contains("root=/dev/vda rw"),
+            "kernel_args must contain root=/dev/vda rw when no initrd: {args}"
+        );
+        assert!(
+            args.contains("console=hvc0"),
+            "kernel_args must contain console=hvc0 for VZ: {args}"
+        );
+    }
+
+    // The VZ (not-linux-net) path hardcodes root=/dev/vda rw unconditionally in
+    // kernel_args; the initrd-conditional logic lives in the linux-net branch and
+    // is covered by CI's Linux suite. This test documents the VZ invariant.
+    #[tokio::test]
+    async fn vz_direct_kernel_always_has_root_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("vmlinux");
+        std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
+        let rootfs = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+        let initrd = tmp.path().join("initramfs.gz");
+        std::fs::write(&initrd, b"initrd").unwrap();
+
+        let (core, mock) = make_capturing_core(&tmp);
+        core.create_vm(CreateVmRequest {
+            name: "with-initrd".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            initrd_path: Some(initrd),
+            userdata: None,
+            env: Vec::new(),
+            vmm: None,
+            cloud_image: None,
+            disk_size: None,
+            ssh_authorized_keys: Vec::new(),
+            balloon: false,
+            volume: None,
+            network: None,
+        })
+        .await
+        .expect("create_vm should succeed");
+
+        let cfg = mock.last_config().await.expect("VmConfig was captured");
+        let args = cfg
+            .kernel_args
+            .as_deref()
+            .expect("kernel_args must be Some for direct-kernel boot");
+        assert!(
+            args.contains("root=/dev/vda rw"),
+            "VZ kernel_args must retain root=/dev/vda rw even with initrd: {args}"
+        );
+        assert!(
+            cfg.initrd_path.is_some(),
+            "initrd_path must be propagated to VmConfig"
+        );
+    }
 }

@@ -25,23 +25,28 @@ jobs:
           - arch: x86_64
             musl-target: x86_64-unknown-linux-musl
             agent-make: build-agent
+            runner: ubuntu-latest
           - arch: aarch64
             musl-target: aarch64-unknown-linux-musl
             agent-make: build-agent-aarch64
-    runs-on: ubuntu-latest
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install e2fsprogs + musl cross
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs musl-tools
+          # e2fsprogs: debugfs for rootfs baking
+          # musl-tools: x86_64-linux-musl-gcc for x86_64 agent cross
+          # build-essential bc bison flex libelf-dev libssl-dev: kernel build
+          sudo apt-get install -y e2fsprogs musl-tools \
+            build-essential bc bison flex libelf-dev libssl-dev
           if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
-            # GitHub-hosted runners can't reliably reach musl.cc (intermittent
-            # connect timeouts from Azure egress), so use apt's aarch64 gcc
-            # cross as the musl target's linker instead. Rust's musl sysroot
-            # from rustup still provides static libc.a, so gnu-cross is only
-            # invoked as the bare linker.
+            # Set the musl linker to the apt gcc cross/native wrapper.
+            # musl-tools alone does not ship aarch64-linux-musl-gcc (the
+            # Makefile default), but gcc-aarch64-linux-gnu provides the
+            # linker on both x86_64 runners (cross) and ARM runners (native).
             sudo apt-get install -y gcc-aarch64-linux-gnu
             echo "AARCH64_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           fi
@@ -55,8 +60,8 @@ jobs:
       - name: Build agent
         run: make ${{ matrix.agent-make }}
 
-      - name: Build kernel image
-        run: make build-kernel-image ARCH=${{ matrix.arch }}
+      - name: Build modules-free microVM kernel from source
+        run: make build-microvm-kernel ARCH=${{ matrix.arch }}
 
       - name: Build initramfs
         run: make build-initramfs ARCH=${{ matrix.arch }}
