@@ -192,21 +192,19 @@ GUEST_INITTAB = guest/inittab
 update-rootfs: build-agent-aarch64
 	@test -f "$(ROOTFS_IMAGE)" || { echo "Error: rootfs not found at $(ROOTFS_IMAGE)"; exit 1; }
 	@test -n "$(DEBUGFS)" || { echo "Error: debugfs not found. Install e2fsprogs: brew install e2fsprogs"; exit 1; }
-	@echo "Injecting agent binary into $(ROOTFS_IMAGE)..."
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "rm /usr/local/bin/husker-agent" 2>/dev/null; true
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "write $(AGENT_BIN) /usr/local/bin/husker-agent"
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "set_inode_field /usr/local/bin/husker-agent mode 0100755"
-	@echo "Injecting inittab into $(ROOTFS_IMAGE)..."
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "rm /etc/inittab" 2>/dev/null; true
-	$(DEBUGFS) -w "$(ROOTFS_IMAGE)" \
-		-R "write $(GUEST_INITTAB) /etc/inittab"
-	@echo "Rootfs updated. Verify with:"
-	@echo "  $(DEBUGFS) -R 'stat /usr/local/bin/husker-agent' $(ROOTFS_IMAGE)"
-	@echo "  $(DEBUGFS) -R 'cat /etc/inittab' $(ROOTFS_IMAGE)"
+	@echo "Injecting agent and inittab into $(ROOTFS_IMAGE) (single debugfs session)..."
+	@printf 'rm /usr/local/bin/husker-agent\nwrite %s /usr/local/bin/husker-agent\nset_inode_field /usr/local/bin/husker-agent mode 0100755\nrm /etc/inittab\nwrite %s /etc/inittab\n' \
+		"$(AGENT_BIN)" "$(GUEST_INITTAB)" | $(DEBUGFS) -w "$(ROOTFS_IMAGE)"
+	@echo "Verifying injected files..."
+	@$(DEBUGFS) -R "dump /etc/inittab /tmp/husker-inittab-verify" "$(ROOTFS_IMAGE)" 2>/dev/null && \
+		cmp -s "$(GUEST_INITTAB)" /tmp/husker-inittab-verify && \
+		rm -f /tmp/husker-inittab-verify || \
+		{ echo "Error: /etc/inittab in image does not match $(GUEST_INITTAB) -- injection failed"; rm -f /tmp/husker-inittab-verify; exit 1; }
+	@$(DEBUGFS) -R "dump /usr/local/bin/husker-agent /tmp/husker-agent-verify" "$(ROOTFS_IMAGE)" 2>/dev/null && \
+		cmp -s "$(AGENT_BIN)" /tmp/husker-agent-verify && \
+		rm -f /tmp/husker-agent-verify || \
+		{ echo "Error: /usr/local/bin/husker-agent in image does not match $(AGENT_BIN) -- injection failed"; rm -f /tmp/husker-agent-verify; exit 1; }
+	@echo "Rootfs updated and verified."
 
 # Build initramfs for Alpine-based husker VMs.
 # ARCH defaults to aarch64; pass ARCH=x86_64 for Firecracker.
