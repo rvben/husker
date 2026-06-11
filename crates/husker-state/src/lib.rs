@@ -548,6 +548,22 @@ impl StateStore {
         Ok(())
     }
 
+    /// Persist the DHCP-assigned guest IP for a VM.
+    ///
+    /// Used by the lazy guest-IP discovery path for cloud (EFI-boot) VMs whose
+    /// IP is not known at creation time.
+    pub fn update_vm_guest_ip(&self, id: Uuid, ip: &str) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE vms SET guest_ip = ?1, updated_at = ?2 WHERE id = ?3",
+            params![ip, Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        if updated == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Delete a VM record.
     pub fn delete_vm(&self, id: Uuid) -> Result<(), StateError> {
         let conn = self.lock()?;
@@ -1711,6 +1727,17 @@ mod tests {
         store.update_vm_state(rec.id, "stopped").unwrap();
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.state, "stopped");
+    }
+
+    #[test]
+    fn update_vm_guest_ip_persists() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("ip-test");
+        store.insert_vm(&rec).unwrap();
+
+        store.update_vm_guest_ip(rec.id, "192.0.2.9").unwrap();
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(fetched.guest_ip.as_deref(), Some("192.0.2.9"));
     }
 
     #[test]
