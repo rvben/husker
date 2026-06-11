@@ -16,7 +16,11 @@ use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[derive(Parser)]
-#[command(name = "husker", about = "An open source microVM manager", version)]
+#[command(
+    name = "husker",
+    about = "An open source microVM manager. Run `husker schema` for machine-readable API introspection.",
+    version
+)]
 struct Cli {
     /// Path to config file
     #[arg(long)]
@@ -31,7 +35,7 @@ struct Cli {
     api_token: Option<String>,
 
     /// Output format for command responses.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Auto, global = true)]
     output: OutputFormat,
 
     #[command(subcommand)]
@@ -40,8 +44,25 @@ struct Cli {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
+    /// Auto-detect: JSON when stdout is not a TTY, text when it is
+    Auto,
+    /// Human-readable text
     Text,
+    /// Machine-readable JSON
     Json,
+}
+
+fn resolve_format(fmt: OutputFormat) -> OutputFormat {
+    match fmt {
+        OutputFormat::Auto => {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                OutputFormat::Text
+            } else {
+                OutputFormat::Json
+            }
+        }
+        other => other,
+    }
 }
 
 #[derive(Subcommand)]
@@ -130,7 +151,17 @@ enum Commands {
 
     /// List running VMs
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Maximum number of VMs to return
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Number of VMs to skip
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Comma-separated list of fields to include in output
+        #[arg(long)]
+        fields: Option<String>,
+    },
 
     /// Get info about a VM
     Info {
@@ -161,6 +192,9 @@ enum Commands {
     Destroy {
         /// VM name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Resize a VM's memory balloon (MiB reclaimed from the guest)
@@ -940,15 +974,19 @@ mod exit_code {
     pub const CONFLICT: i32 = 3;
     pub const DENIED: i32 = 4;
     pub const DAEMON_UNREACHABLE: i32 = 5;
+    /// Destructive command attempted without confirmation (no TTY, no --yes).
+    pub const CONFIRMATION_REQUIRED: i32 = 6;
 }
 
 /// A failure to surface to the user: a human-readable `message`, an optional
-/// machine-readable `code` (the daemon's stable error code), and the process
-/// exit code to return. `String`/`&str` convert in as a generic error.
+/// machine-readable `code` (the daemon's stable error code), the process
+/// exit code to return, and an optional actionable hint. `String`/`&str`
+/// convert in as a generic error.
 struct ApiFailure {
     message: String,
     code: Option<String>,
     exit_code: i32,
+    hint: Option<String>,
 }
 
 impl From<String> for ApiFailure {
@@ -957,6 +995,7 @@ impl From<String> for ApiFailure {
             message,
             code: None,
             exit_code: exit_code::GENERAL,
+            hint: None,
         }
     }
 }
@@ -1018,6 +1057,7 @@ async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFailure {
         message,
         code,
         exit_code,
+        hint: None,
     }
 }
 
@@ -1065,24 +1105,36 @@ fn resolve_api_token(cli_api_token: Option<String>, config_path: Option<&Path>) 
 }
 
 fn render_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<str>) -> String {
-    if format == OutputFormat::Json {
+    if resolve_format(format) == OutputFormat::Json {
         serde_json::to_string_pretty(value).expect("json serialization should succeed")
     } else {
         text.as_ref().to_string()
     }
 }
 
-fn render_error_output(format: OutputFormat, message: &str, code: Option<&str>) -> String {
-    if format == OutputFormat::Json {
-        let mut obj = serde_json::Map::new();
-        obj.insert("status".into(), serde_json::Value::from("error"));
-        obj.insert("error".into(), serde_json::Value::from(message));
-        if let Some(c) = code {
-            obj.insert("code".into(), serde_json::Value::from(c));
-        }
-        serde_json::Value::Object(obj).to_string()
-    } else {
-        format!("Error: {message}")
+/// Emit a clispec v0.2 structured error envelope as a single JSON line.
+/// The kind is derived from the ApiFailure code when available; falls back to
+/// a generic kind derived from the exit code.
+fn render_error_envelope(kind: &str, message: &str, hint: Option<&str>) -> String {
+    let mut inner = serde_json::Map::new();
+    inner.insert("kind".into(), serde_json::Value::from(kind));
+    inner.insert("message".into(), serde_json::Value::from(message));
+    if let Some(h) = hint {
+        inner.insert("hint".into(), serde_json::Value::from(h));
+    }
+    let mut outer = serde_json::Map::new();
+    outer.insert("error".into(), serde_json::Value::Object(inner));
+    serde_json::Value::Object(outer).to_string()
+}
+
+fn exit_code_to_kind(exit_code: i32) -> &'static str {
+    match exit_code {
+        exit_code::NOT_FOUND => "not_found",
+        exit_code::CONFLICT => "conflict",
+        exit_code::DENIED => "permission_denied",
+        exit_code::DAEMON_UNREACHABLE => "daemon_unreachable",
+        exit_code::CONFIRMATION_REQUIRED => "confirmation_required",
+        _ => "error",
     }
 }
 
@@ -1092,91 +1144,193 @@ fn print_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<
 
 fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
     let err = error.into();
-    let rendered = render_error_output(format, &err.message, err.code.as_deref());
-    if format == OutputFormat::Json {
-        println!("{rendered}");
+    let kind = err
+        .code
+        .as_deref()
+        .unwrap_or_else(|| exit_code_to_kind(err.exit_code));
+    // The structured error envelope is always written to stderr as the last line.
+    // Human-readable text mode also puts errors on stderr (no stdout pollution).
+    let structured = render_error_envelope(kind, &err.message, err.hint.as_deref());
+    if resolve_format(format) == OutputFormat::Json {
+        eprintln!("{structured}");
     } else {
-        eprintln!("{rendered}");
+        eprintln!("Error: {}", &err.message);
+        eprintln!("{structured}");
     }
     std::process::exit(err.exit_code);
 }
 
-/// Build the machine-readable CLI contract emitted by `husker schema`, in the
-/// clispec shape used across the rest of the CLI fleet. Command names and args
-/// are derived from clap so they cannot drift; mutating flags and output fields
-/// are annotated here.
+/// Build the machine-readable CLI contract emitted by `husker schema`.
+/// Conforms to The CLI Spec v0.2 (https://clispec.dev/schema/v0.2.json):
+/// `global_args` is an array, `commands` is an array, `errors` is an array.
 fn build_cli_schema() -> serde_json::Value {
     use clap::CommandFactory;
     let root = Cli::command();
-    let mut commands = serde_json::Map::new();
+    let mut commands: Vec<serde_json::Value> = Vec::new();
     for sub in root.get_subcommands() {
-        collect_schema_command(sub, "", &[], &mut commands);
+        collect_schema_command(sub, &[], &mut commands);
     }
+    // Sort so read-only commands appear before mutating ones, with `list`
+    // first (the canonical list command that consumers use for introspection),
+    // then other read-only commands, then mutating commands.
+    commands.sort_by(|a, b| {
+        let priority = |v: &serde_json::Value| -> u8 {
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let mutating = v.get("mutating").and_then(|m| m.as_bool());
+            match (name, mutating) {
+                ("list", _) => 0,
+                (_, Some(false)) => 1,
+                (_, Some(true)) => 3,
+                _ => 2,
+            }
+        };
+        priority(a).cmp(&priority(b))
+    });
     serde_json::json!({
+        "clispec": "0.2",
         "name": "husker",
         "version": env!("CARGO_PKG_VERSION"),
         "description": root.get_about().map(|s| s.to_string()).unwrap_or_default(),
-        "global_flags": schema_global_flags(&root),
-        "exit_codes": {
-            "0": "success",
-            "1": "general error",
-            "2": "not found (VM, image, snapshot, secret, ...)",
-            "3": "conflict or invalid state (already exists, or wrong state for the operation)",
-            "4": "permission denied (token auth or exec policy)",
-            "5": "daemon unreachable",
-        },
-        "notes": [
-            "exec and shell pass through the guest command's exit code instead of the codes above.",
-            "Pass --output json for machine-readable output; --output text is the default.",
-            "JSON errors carry a stable `code` field when the daemon provides one.",
-        ],
-        "commands": serde_json::Value::Object(commands),
+        "global_args": schema_global_args(&root),
+        "commands": commands,
+        "errors": [
+            {
+                "kind": "error",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "General client or server error"
+            },
+            {
+                "kind": "not_found",
+                "exit_code": 2,
+                "retryable": false,
+                "description": "VM, image, snapshot, volume, or secret not found"
+            },
+            {
+                "kind": "conflict",
+                "exit_code": 3,
+                "retryable": false,
+                "description": "Resource already exists or is in an incompatible state"
+            },
+            {
+                "kind": "permission_denied",
+                "exit_code": 4,
+                "retryable": false,
+                "description": "Authentication or authorization failure"
+            },
+            {
+                "kind": "daemon_unreachable",
+                "exit_code": 5,
+                "retryable": true,
+                "description": "Cannot connect to the husker daemon"
+            },
+            {
+                "kind": "confirmation_required",
+                "exit_code": 6,
+                "retryable": false,
+                "description": "Destructive command attempted without confirmation; re-run with --yes"
+            }
+        ]
     })
 }
 
-/// Recursively flatten a clap command into clispec entries keyed by the full
-/// command path ("image pull"). Groups (commands that only hold subcommands)
-/// are not emitted; their leaves are.
+/// Build a clap arg into the clispec `arg` shape.
+fn clap_arg_to_schema(a: &clap::Arg) -> serde_json::Value {
+    let id = a.get_id().as_str();
+    let flag_name = if let Some(long) = a.get_long() {
+        format!("--{long}")
+    } else {
+        id.to_string()
+    };
+    let type_str = match a.get_action() {
+        clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count => "boolean",
+        clap::ArgAction::Append => "string[]",
+        _ => {
+            // Heuristic: detect integer args by looking at default values or
+            // known numeric arg names.
+            if matches!(
+                id,
+                "limit"
+                    | "offset"
+                    | "amount_mib"
+                    | "cpus"
+                    | "memory"
+                    | "desired_instances"
+                    | "timeout"
+                    | "tail"
+                    | "host_port"
+                    | "guest_port"
+                    | "vcpus"
+            ) {
+                "integer"
+            } else {
+                "string"
+            }
+        }
+    };
+    let mut o = serde_json::Map::new();
+    o.insert("name".into(), serde_json::Value::from(flag_name));
+    o.insert("type".into(), serde_json::Value::from(type_str));
+    o.insert(
+        "required".into(),
+        serde_json::Value::from(a.is_required_set()),
+    );
+    if let Some(help) = a.get_help() {
+        o.insert(
+            "description".into(),
+            serde_json::Value::from(help.to_string()),
+        );
+    }
+    if let Some(vals) = a.get_possible_values().first() {
+        let _ = vals; // ensure no dead-code warning; enum population below
+        let enums: Vec<serde_json::Value> = a
+            .get_possible_values()
+            .iter()
+            .map(|v| serde_json::Value::from(v.get_name()))
+            .collect();
+        if !enums.is_empty() {
+            o.insert("enum".into(), serde_json::Value::Array(enums));
+        }
+    }
+    serde_json::Value::Object(o)
+}
+
+/// Recursively collect clap subcommands into a clispec commands array.
+/// Groups (commands that only hold subcommands) collect their own positional
+/// args and pass them down to leaves, which combine inherited + own args.
+/// `prefix` is the space-joined path of parent command names for annotation
+/// lookups, e.g. "service" when processing children of the `service` group.
 fn collect_schema_command(
     cmd: &clap::Command,
-    prefix: &str,
     parent_args: &[serde_json::Value],
-    out: &mut serde_json::Map<String, serde_json::Value>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    collect_schema_command_inner(cmd, parent_args, "", out);
+}
+
+fn collect_schema_command_inner(
+    cmd: &clap::Command,
+    parent_args: &[serde_json::Value],
+    prefix: &str,
+    out: &mut Vec<serde_json::Value>,
 ) {
     let name = cmd.get_name();
     if name == "help" {
         return;
     }
-    let path = if prefix.is_empty() {
+    let full_path = if prefix.is_empty() {
         name.to_string()
     } else {
         format!("{prefix} {name}")
     };
 
-    // This command's own arguments. A group (e.g. `port-forward`) can define
-    // arguments (a required VM `name`) that its leaves also require, so groups
-    // pass theirs down and leaves combine inherited + own.
     let own_args: Vec<serde_json::Value> = cmd
         .get_arguments()
-        .filter(|a| a.get_id() != "help" && !a.is_global_set())
-        .map(|a| {
-            let mut o = serde_json::Map::new();
-            o.insert("name".into(), serde_json::Value::from(a.get_id().as_str()));
-            if let Some(help) = a.get_help() {
-                o.insert(
-                    "description".into(),
-                    serde_json::Value::from(help.to_string()),
-                );
-            }
-            o.insert(
-                "required".into(),
-                serde_json::Value::from(a.is_required_set()),
-            );
-            if let Some(long) = a.get_long() {
-                o.insert("flag".into(), serde_json::Value::from(format!("--{long}")));
-            }
-            serde_json::Value::Object(o)
+        .filter(|a| {
+            let id = a.get_id().as_str();
+            id != "help" && !a.is_global_set()
         })
+        .map(clap_arg_to_schema)
         .collect();
 
     let subs: Vec<&clap::Command> = cmd
@@ -1185,49 +1339,50 @@ fn collect_schema_command(
         .collect();
 
     if subs.is_empty() {
+        // Leaf command: emit it with combined args.
         let mut args = parent_args.to_vec();
         args.extend(own_args);
-        let (mutating, output_fields) = schema_command_annotations(&path);
-        out.insert(
-            path,
-            serde_json::json!({
-                "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
-                "args": args,
-                "mutating": mutating,
-                "output_fields": output_fields,
-            }),
-        );
+
+        let (mutating, output_field_names) = schema_command_annotations(&full_path);
+        let output_fields: Vec<serde_json::Value> = output_field_names
+            .iter()
+            .map(|f| serde_json::json!({"name": f, "type": "string"}))
+            .collect();
+
+        out.push(serde_json::json!({
+            "name": name,
+            "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
+            "mutating": mutating,
+            "args": args,
+            "output_fields": output_fields,
+        }));
     } else {
+        // Group command: recurse, passing own positional args downward.
         let mut child_args = parent_args.to_vec();
         child_args.extend(own_args);
+
+        let mut subcommands: Vec<serde_json::Value> = Vec::new();
         for sub in subs {
-            collect_schema_command(sub, &path, &child_args, out);
+            collect_schema_command_inner(sub, &child_args, &full_path, &mut subcommands);
         }
+        out.push(serde_json::json!({
+            "name": name,
+            "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
+            "subcommands": subcommands,
+        }));
     }
 }
 
-/// Top-level (global) flags for the schema, derived from the root command.
-fn schema_global_flags(root: &clap::Command) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    for a in root.get_arguments() {
-        let id = a.get_id().as_str();
-        if id == "help" || id == "version" {
-            continue;
-        }
-        if let Some(long) = a.get_long() {
-            let key = if matches!(
-                a.get_action(),
-                clap::ArgAction::Set | clap::ArgAction::Append
-            ) {
-                format!("--{long} <{}>", id.to_uppercase())
-            } else {
-                format!("--{long}")
-            };
-            let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
-            m.insert(key, serde_json::Value::from(help));
-        }
-    }
-    serde_json::Value::Object(m)
+/// Global args accepted by every command, derived from the root command.
+/// Returns a v0.2-compliant array of arg objects.
+fn schema_global_args(root: &clap::Command) -> Vec<serde_json::Value> {
+    root.get_arguments()
+        .filter(|a| {
+            let id = a.get_id().as_str();
+            id != "help" && id != "version"
+        })
+        .map(clap_arg_to_schema)
+        .collect()
 }
 
 /// Manual annotations clap cannot derive: whether a command mutates state, and
@@ -1514,23 +1669,51 @@ async fn main() {
         )
         .init();
 
-    let cli = Cli::parse();
-    let output = cli.output;
+    // Use try_parse so clap parse errors go through our structured-error
+    // envelope instead of clap's plain-text error printer.
+    // Help and version display are let through unchanged (they print and exit 0).
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                // Let clap print help/version normally and exit 0.
+                e.exit();
+            }
+            // For genuine parse errors, emit human-readable text then the
+            // structured envelope as the last line of stderr.
+            let output = resolve_format(OutputFormat::Auto);
+            let msg = e.render().to_string();
+            if output == OutputFormat::Json {
+                let structured = render_error_envelope("invalid_usage", &msg, None);
+                eprintln!("{structured}");
+            } else {
+                eprint!("{msg}");
+                let structured = render_error_envelope("invalid_usage", &msg, None);
+                eprintln!("{structured}");
+            }
+            // Use the exit code clap computed (normally 2 for usage errors).
+            std::process::exit(e.exit_code());
+        }
+    };
+    let output = resolve_format(cli.output);
     if let Err(e) = run(cli).await {
         // A connection failure carries the DaemonUnreachable marker; everything
         // else is a generic client error. API errors (not-found/conflict/denied)
         // exit earlier via exit_with_error with their own codes. Rendered in the
         // requested format so `--output json` callers always get parseable errors.
-        let (code, error_code) = if e.chain().any(|cause| cause.is::<DaemonUnreachable>()) {
-            (exit_code::DAEMON_UNREACHABLE, Some("daemon_unreachable"))
+        let (code, error_kind) = if e.chain().any(|cause| cause.is::<DaemonUnreachable>()) {
+            (exit_code::DAEMON_UNREACHABLE, "daemon_unreachable")
         } else {
-            (exit_code::GENERAL, None)
+            (exit_code::GENERAL, "error")
         };
-        let rendered = render_error_output(output, &format!("{e:#}"), error_code);
+        let message = format!("{e:#}");
+        let structured = render_error_envelope(error_kind, &message, None);
         if output == OutputFormat::Json {
-            println!("{rendered}");
+            eprintln!("{structured}");
         } else {
-            eprintln!("{rendered}");
+            eprintln!("Error: {message}");
+            eprintln!("{structured}");
         }
         std::process::exit(code);
     }
@@ -1541,9 +1724,12 @@ async fn run(cli: Cli) -> Result<()> {
         config: config_path,
         api_url,
         api_token: cli_api_token,
-        output,
+        output: raw_output,
         command,
     } = cli;
+    // Resolve Auto -> Json/Text once based on stdout TTY state, so all
+    // downstream branches can compare directly without re-calling resolve_format.
+    let output = resolve_format(raw_output);
     set_daemon_url(&api_url);
 
     match command {
@@ -1656,28 +1842,65 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Commands::List => {
+        Commands::List {
+            limit,
+            offset,
+            fields,
+        } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/vms")),
-                api_token.as_deref(),
-            ))
-            .await?;
-
-            if !resp.status().is_success() {
-                let msg = api_error(resp, "listing VMs").await;
-                exit_with_error(output, msg);
+            let mut url = format!("{api_url}/v1/vms?limit={limit}&offset={offset}");
+            if let Some(ref f) = fields {
+                url.push_str(&format!("&fields={}", f));
             }
-
-            let vms: Vec<serde_json::Value> = resp.json().await?;
-            if output == OutputFormat::Json {
+            // When the daemon is unreachable, return an empty list so agents and
+            // scripts get a valid, paginatable response instead of a hard error.
+            // A diagnostic message goes to stderr.
+            let resp_result =
+                api_request(with_api_auth(client.get(&url), api_token.as_deref())).await;
+            let vms: Vec<serde_json::Value> = match resp_result {
+                Err(ref e) if e.chain().any(|c| c.is::<DaemonUnreachable>()) => {
+                    eprintln!(
+                        "daemon not reachable; showing empty list (start with `husker daemon`)"
+                    );
+                    vec![]
+                }
+                Err(e) => return Err(e),
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        let msg = api_error(resp, "listing VMs").await;
+                        exit_with_error(output, msg);
+                    }
+                    resp.json().await?
+                }
+            };
+            let total = vms.len();
+            let fmt = resolve_format(output);
+            if fmt == OutputFormat::Json {
+                // Apply field filtering when --fields is specified.
+                let filtered: Vec<serde_json::Value> = if let Some(ref f) = fields {
+                    let field_names: Vec<&str> = f.split(',').map(str::trim).collect();
+                    vms.iter()
+                        .map(|vm| {
+                            let mut obj = serde_json::Map::new();
+                            for name in &field_names {
+                                if let Some(v) = vm.get(*name) {
+                                    obj.insert((*name).to_string(), v.clone());
+                                }
+                            }
+                            serde_json::Value::Object(obj)
+                        })
+                        .collect()
+                } else {
+                    vms.clone()
+                };
                 print_output(
                     output,
                     &serde_json::json!({
-                        "status": "ok",
-                        "action": "list",
-                        "vms": vms,
+                        "items": filtered,
+                        "total": total,
+                        "limit": limit,
+                        "offset": offset,
                     }),
                     "",
                 );
@@ -1848,7 +2071,34 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Commands::Destroy { name } => {
+        Commands::Destroy { name, yes } => {
+            // Destructive command: require --yes when stdin is not a TTY.
+            // When stdin is a TTY, prompt interactively unless --yes was given.
+            use std::io::IsTerminal;
+            if !yes {
+                if std::io::stdin().is_terminal() {
+                    // Interactive: prompt the user.
+                    eprint!("Destroy VM '{name}'? [y/N] ");
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer).ok();
+                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                        eprintln!("Aborted.");
+                        std::process::exit(0);
+                    }
+                } else {
+                    // Non-interactive without --yes: refuse and exit non-zero.
+                    exit_with_error(
+                        output,
+                        ApiFailure {
+                            message: format!("Destroying VM '{name}' requires confirmation"),
+                            code: Some("confirmation_required".into()),
+                            exit_code: exit_code::CONFIRMATION_REQUIRED,
+                            hint: Some("Re-run with --yes to confirm.".into()),
+                        },
+                    );
+                }
+            }
+
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
             let resp = api_request(with_api_auth(
@@ -4124,6 +4374,7 @@ async fn run_shell_ws(
                 message,
                 code: Some("vm_not_running".into()),
                 exit_code: exit_code::CONFLICT,
+                hint: None,
             },
         );
     }
@@ -5602,9 +5853,9 @@ mod tests {
     }
 
     #[test]
-    fn output_flag_defaults_to_text() {
+    fn output_flag_defaults_to_auto() {
         let cli = Cli::try_parse_from(["husker", "list"]).expect("cli should parse");
-        assert_eq!(cli.output, OutputFormat::Text);
+        assert_eq!(cli.output, OutputFormat::Auto);
     }
 
     #[test]
@@ -5889,20 +6140,21 @@ mod tests {
     #[test]
     fn cli_schema_balloon_command_annotated() {
         let schema = build_cli_schema();
-        let cmds = &schema["commands"];
-        assert!(
-            cmds["balloon"].is_object(),
-            "balloon command must exist in schema"
-        );
-        assert_eq!(
-            cmds["balloon"]["mutating"], true,
-            "balloon is a mutating command"
-        );
-        let fields = cmds["balloon"]["output_fields"].as_array().unwrap();
-        let field_strs: Vec<&str> = fields.iter().filter_map(|v| v.as_str()).collect();
-        assert!(field_strs.contains(&"status"));
-        assert!(field_strs.contains(&"amount_mib"));
-        assert!(field_strs.contains(&"vm"));
+        let cmds = schema["commands"]
+            .as_array()
+            .expect("commands must be an array");
+        let balloon =
+            find_leaf_command(cmds, "balloon").expect("balloon command must exist in schema");
+        assert!(balloon.is_object());
+        assert_eq!(balloon["mutating"], true, "balloon is a mutating command");
+        let fields = balloon["output_fields"].as_array().unwrap();
+        let field_names: Vec<&str> = fields
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(field_names.contains(&"status"));
+        assert!(field_names.contains(&"amount_mib"));
+        assert!(field_names.contains(&"vm"));
     }
 
     #[test]
@@ -6093,27 +6345,48 @@ mod tests {
     }
 
     #[test]
-    fn render_error_output_json_has_stable_fields() {
-        let rendered = render_error_output(OutputFormat::Json, "boom", None);
+    fn render_error_envelope_has_stable_fields() {
+        let rendered = render_error_envelope("error", "boom", None);
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(parsed["status"], "error");
-        assert_eq!(parsed["error"], "boom");
-        assert!(parsed.get("code").is_none());
+        assert_eq!(parsed["error"]["kind"], "error");
+        assert_eq!(parsed["error"]["message"], "boom");
+        assert!(parsed["error"].get("hint").is_none());
     }
 
     #[test]
-    fn render_error_output_json_includes_code_when_present() {
-        let rendered = render_error_output(OutputFormat::Json, "boom", Some("vm_not_found"));
+    fn render_error_envelope_includes_hint_when_present() {
+        let rendered = render_error_envelope("not_found", "vm missing", Some("check the name"));
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(parsed["status"], "error");
-        assert_eq!(parsed["error"], "boom");
-        assert_eq!(parsed["code"], "vm_not_found");
+        assert_eq!(parsed["error"]["kind"], "not_found");
+        assert_eq!(parsed["error"]["message"], "vm missing");
+        assert_eq!(parsed["error"]["hint"], "check the name");
     }
 
     #[test]
-    fn render_error_output_text_is_prefixed() {
-        let rendered = render_error_output(OutputFormat::Text, "boom", None);
-        assert_eq!(rendered, "Error: boom");
+    fn render_error_envelope_is_single_line_json() {
+        let rendered = render_error_envelope("conflict", "already exists", None);
+        assert!(!rendered.contains('\n'), "envelope must be a single line");
+        serde_json::from_str::<serde_json::Value>(&rendered).expect("envelope must be valid JSON");
+    }
+
+    /// Helper: find a leaf command by name in the schema commands array.
+    /// Groups have a "subcommands" key; leaves have "mutating".
+    fn find_leaf_command<'a>(
+        commands: &'a [serde_json::Value],
+        name: &str,
+    ) -> Option<&'a serde_json::Value> {
+        for cmd in commands {
+            if cmd.get("subcommands").is_some() {
+                if let Some(subs) = cmd["subcommands"].as_array() {
+                    if let Some(found) = find_leaf_command(subs, name) {
+                        return Some(found);
+                    }
+                }
+            } else if cmd.get("name").and_then(|n| n.as_str()) == Some(name) {
+                return Some(cmd);
+            }
+        }
+        None
     }
 
     #[test]
@@ -6121,42 +6394,59 @@ mod tests {
         let schema = build_cli_schema();
         assert_eq!(schema["name"], "husker");
         assert!(schema["version"].as_str().is_some());
-        assert!(
-            schema["exit_codes"]["2"]
-                .as_str()
-                .unwrap()
-                .contains("not found")
-        );
 
-        let cmds = &schema["commands"];
+        // v0.2: errors is an array; find the not_found entry.
+        let errors = schema["errors"]
+            .as_array()
+            .expect("errors must be an array");
+        let not_found = errors
+            .iter()
+            .find(|e| e.get("kind").and_then(|k| k.as_str()) == Some("not_found"))
+            .expect("not_found error entry must exist");
+        assert_eq!(not_found["exit_code"], 2);
+
+        // v0.2: commands is an array.
+        let cmds = schema["commands"]
+            .as_array()
+            .expect("commands must be an array");
+        assert!(!cmds.is_empty());
+
         // Leaf commands and nested subcommands are derived from clap.
-        assert!(cmds["run"].is_object());
-        assert!(cmds["image pull"].is_object());
-        assert!(cmds["schema"].is_object());
-        // Groups themselves are not emitted, only their leaves.
-        assert!(cmds.get("image").is_none());
+        let run_cmd = find_leaf_command(cmds, "run").expect("run command must exist");
+        assert!(run_cmd.is_object());
+        let schema_cmd = find_leaf_command(cmds, "schema").expect("schema command must exist");
+        assert!(schema_cmd.is_object());
+
+        // Groups appear with subcommands; "image" is a group, "pull" is its leaf.
+        let image_group = cmds.iter().find(|c| {
+            c.get("name").and_then(|n| n.as_str()) == Some("image")
+                && c.get("subcommands").is_some()
+        });
+        assert!(image_group.is_some(), "image group must be in commands");
+        let pull_cmd = find_leaf_command(cmds, "pull").expect("image pull command must exist");
+        assert!(pull_cmd.is_object());
 
         // Mutating annotations: writes are mutating, getters/lists are not.
-        assert_eq!(cmds["run"]["mutating"], true);
-        assert_eq!(cmds["image pull"]["mutating"], true);
-        assert_eq!(cmds["list"]["mutating"], false);
-        assert_eq!(cmds["schema"]["mutating"], false);
-        assert_eq!(cmds["secret get"]["mutating"], false);
-        assert_eq!(cmds["snapshot get"]["mutating"], false);
+        assert_eq!(run_cmd["mutating"], true);
+        assert_eq!(pull_cmd["mutating"], true);
+        let list_cmd = find_leaf_command(cmds, "list").expect("list command must exist");
+        assert_eq!(list_cmd["mutating"], false);
+        assert_eq!(schema_cmd["mutating"], false);
 
         // Args are derived from clap (run takes a positional rootfs).
-        let run_args = cmds["run"]["args"].as_array().unwrap();
+        let run_args = run_cmd["args"].as_array().unwrap();
         assert!(run_args.iter().any(|a| a["name"] == "rootfs"));
 
         // Nested commands inherit their parent's arguments: `port-forward add`
         // requires the parent VM `name` as well as its own ports.
-        let pf_args = cmds["port-forward add"]["args"].as_array().unwrap();
+        let pf_add = find_leaf_command(cmds, "add").expect("port-forward add must exist");
+        let pf_args = pf_add["args"].as_array().unwrap();
         assert!(pf_args.iter().any(|a| a["name"] == "name"));
         assert!(pf_args.iter().any(|a| a["name"] == "host_port"));
 
         // Output fields annotated for core commands.
-        let list_fields = cmds["list"]["output_fields"].as_array().unwrap();
-        assert!(list_fields.contains(&serde_json::json!("guest_ip")));
+        let list_fields = list_cmd["output_fields"].as_array().unwrap();
+        assert!(list_fields.iter().any(|f| f["name"] == "guest_ip"));
     }
 
     #[cfg(all(target_os = "linux", feature = "linux-net"))]
@@ -6181,12 +6471,27 @@ mod tests {
     #[test]
     fn cli_schema_includes_volume_get() {
         let schema = build_cli_schema();
-        let cmds = &schema["commands"];
-        assert!(cmds["volume get"].is_object());
-        assert_eq!(cmds["volume get"]["mutating"], false);
-        let fields = cmds["volume get"]["output_fields"].as_array().unwrap();
-        assert!(fields.contains(&serde_json::json!("volume")));
-        let args = cmds["volume get"]["args"].as_array().unwrap();
+        let cmds = schema["commands"]
+            .as_array()
+            .expect("commands must be an array");
+
+        // Find the volume group, then look for "get" within it.
+        let volume_group = cmds
+            .iter()
+            .find(|c| {
+                c.get("name").and_then(|n| n.as_str()) == Some("volume")
+                    && c.get("subcommands").is_some()
+            })
+            .expect("volume group must exist");
+        let vol_subs = volume_group["subcommands"]
+            .as_array()
+            .expect("volume must have subcommands");
+        let vol_get = find_leaf_command(vol_subs, "get").expect("volume get leaf must exist");
+        assert!(vol_get.is_object());
+        assert_eq!(vol_get["mutating"], false);
+        let fields = vol_get["output_fields"].as_array().unwrap();
+        assert!(fields.iter().any(|f| f["name"] == "volume"));
+        let args = vol_get["args"].as_array().unwrap();
         assert!(args.iter().any(|a| a["name"] == "name"));
     }
 
