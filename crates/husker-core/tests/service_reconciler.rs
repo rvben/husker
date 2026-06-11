@@ -7,7 +7,9 @@ use std::sync::Arc;
 use husker_core::{CoreError, CreateServiceRequest, CreateVmRequest, HuskerCore, ServiceTag};
 use husker_state::{ServiceRecord, StateStore};
 use husker_storage::StorageConfig;
-use husker_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
+use husker_vmm::{
+    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -104,6 +106,18 @@ impl VmmBackend for MockVmm {
             }
             None => Err(VmmError::VmNotFound(id)),
         }
+    }
+
+    async fn snapshot_vm(&self, _id: Uuid, _dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
+        Err(VmmError::Unsupported("mock".into()))
+    }
+
+    async fn restore_vm(
+        &self,
+        _src: &SnapshotPaths,
+        _target: RestoreTarget,
+    ) -> Result<VmInfo, VmmError> {
+        Err(VmmError::Unsupported("mock".into()))
     }
 
     async fn vsock_connect(&self, _id: Uuid, _port: u32) -> Result<Self::VsockStream, VmmError> {

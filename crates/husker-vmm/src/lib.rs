@@ -172,6 +172,8 @@ pub enum VmmError {
     InvalidConfig(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
 }
 
 /// Return the last `max_lines` lines of a file (trailing whitespace trimmed),
@@ -201,6 +203,59 @@ pub(crate) fn append_log_tails(
     if let Some(b) = boot_tail {
         msg.push_str(&format!("\n--- {boot_label} (tail) ---\n{b}"));
     }
+}
+
+/// Runtime-only filesystem layout of a full-state snapshot's artifacts.
+///
+/// Derived on demand from a directory; not serialized (the manifest is written
+/// separately as JSON by the core orchestration layer).
+#[derive(Debug, Clone)]
+pub struct SnapshotPaths {
+    /// Directory holding the artifacts.
+    pub dir: PathBuf,
+    /// Guest RAM image.
+    pub memory: PathBuf,
+    /// vCPU + device state.
+    pub vmstate: PathBuf,
+    /// Backend/version metadata for restore compatibility checks.
+    pub manifest: PathBuf,
+}
+
+impl SnapshotPaths {
+    /// Derive the standard artifact paths inside `dir`.
+    pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        Self {
+            memory: dir.join("memory"),
+            vmstate: dir.join("vmstate"),
+            manifest: dir.join("manifest.json"),
+            dir,
+        }
+    }
+}
+
+/// Backend-specific metadata captured at snapshot time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    /// Backend that produced the snapshot, e.g. `"firecracker"`.
+    pub backend: String,
+    /// VMM version string, for restore compatibility checks.
+    pub vmm_version: String,
+}
+
+/// Identity under which `restore_vm` brings a VM back up.
+///
+/// `Resume` restores the original VM in place (same id/name/CID).
+#[derive(Debug, Clone)]
+pub enum RestoreTarget {
+    /// Restore the original VM under its existing identity.
+    Resume {
+        id: Uuid,
+        name: String,
+        vcpu_count: u32,
+        mem_size_mib: u32,
+        vsock_cid: u32,
+    },
 }
 
 /// Trait abstracting over different VMM implementations.
@@ -239,6 +294,23 @@ pub trait VmmBackend: Send + Sync {
     /// Resume a paused VM (if supported).
     fn resume_vm(&self, id: Uuid)
     -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
+
+    /// Capture full guest state (RAM + vCPU + devices) to `dst`.
+    ///
+    /// The caller MUST pause the VM first (`pause_vm`); backends do not pause
+    /// implicitly. Returns backend metadata for the manifest.
+    fn snapshot_vm(
+        &self,
+        id: Uuid,
+        dst: &SnapshotPaths,
+    ) -> impl std::future::Future<Output = Result<SnapshotMeta, VmmError>> + Send;
+
+    /// Restore a VM from a full-state snapshot.
+    fn restore_vm(
+        &self,
+        src: &SnapshotPaths,
+        target: RestoreTarget,
+    ) -> impl std::future::Future<Output = Result<VmInfo, VmmError>> + Send;
 
     /// Connect to a VM's vsock at the given port.
     ///
@@ -364,5 +436,24 @@ mod tests {
             variable_store: "/tmp/nvram.bin".into(),
         };
         assert_eq!(efi.as_str(), "efi");
+    }
+
+    #[test]
+    fn snapshot_paths_derives_standard_names() {
+        use super::SnapshotPaths;
+        let p = SnapshotPaths::in_dir("/data/suspend/abc");
+        assert_eq!(p.dir, std::path::PathBuf::from("/data/suspend/abc"));
+        assert_eq!(
+            p.memory,
+            std::path::PathBuf::from("/data/suspend/abc/memory")
+        );
+        assert_eq!(
+            p.vmstate,
+            std::path::PathBuf::from("/data/suspend/abc/vmstate")
+        );
+        assert_eq!(
+            p.manifest,
+            std::path::PathBuf::from("/data/suspend/abc/manifest.json")
+        );
     }
 }

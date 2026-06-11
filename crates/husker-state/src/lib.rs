@@ -2108,6 +2108,28 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[test]
+    fn suspended_vms_survive_stale_reconcile() {
+        let store = StateStore::open_memory().unwrap();
+
+        let running = make_record("vm-run");
+        store.insert_vm(&running).unwrap();
+
+        let mut suspended = make_record("vm-susp");
+        suspended.state = "suspended".into();
+        store.insert_vm(&suspended).unwrap();
+
+        let marked = store.mark_stale_vms_stopped().unwrap();
+        assert_eq!(marked, 1, "only the running VM is marked stopped");
+
+        assert_eq!(store.get_vm(running.id).unwrap().state, "stopped");
+        assert_eq!(
+            store.get_vm(suspended.id).unwrap().state,
+            "suspended",
+            "suspend slot must survive daemon restart"
+        );
+    }
+
     // ── Userdata ──────────────────────────────────────────────────────
 
     #[test]

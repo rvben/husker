@@ -10,7 +10,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
+use crate::{
+    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+};
 
 /// Tracks a running Firecracker VM instance.
 struct FcInstance {
@@ -118,6 +120,17 @@ impl FirecrackerBackend {
     ) -> Result<(), VmmError> {
         Self::fc_request(socket_path, "PATCH", path, Some(body)).await?;
         Ok(())
+    }
+
+    /// Read the running Firecracker's reported version via `GET /`.
+    async fn fc_instance_version(socket_path: &Path) -> Result<String, VmmError> {
+        let bytes = Self::fc_request(socket_path, "GET", "/", None).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| VmmError::ApiError(format!("parse instance info: {e}")))?;
+        Ok(v.get("vmm_version")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string())
     }
 
     fn path_to_str<'a>(path: &'a Path, label: &str) -> Result<&'a str, VmmError> {
@@ -503,6 +516,151 @@ impl VmmBackend for FirecrackerBackend {
             instance.info.state = VmState::Running;
         }
         Ok(())
+    }
+
+    async fn snapshot_vm(&self, id: Uuid, dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
+        let socket_path = {
+            let instances = self.instances.lock().await;
+            let instance = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            if instance.info.state != VmState::Paused {
+                return Err(VmmError::InvalidConfig(
+                    "snapshot_vm requires the VM to be paused first".into(),
+                ));
+            }
+            instance.socket_path.clone()
+        };
+
+        tokio::fs::create_dir_all(&dst.dir).await?;
+        let vmstate = Self::path_to_str(&dst.vmstate, "vmstate")?.to_string();
+        let memory = Self::path_to_str(&dst.memory, "memory")?.to_string();
+
+        Self::fc_put(
+            &socket_path,
+            "/snapshot/create",
+            &serde_json::json!({
+                "snapshot_type": "Full",
+                "snapshot_path": vmstate,
+                "mem_file_path": memory,
+            }),
+        )
+        .await?;
+
+        let vmm_version = Self::fc_instance_version(&socket_path)
+            .await
+            .unwrap_or_default();
+
+        Ok(SnapshotMeta {
+            backend: "firecracker".into(),
+            vmm_version,
+        })
+    }
+
+    async fn restore_vm(
+        &self,
+        src: &SnapshotPaths,
+        target: RestoreTarget,
+    ) -> Result<VmInfo, VmmError> {
+        let RestoreTarget::Resume {
+            id,
+            name,
+            vcpu_count,
+            mem_size_mib,
+            vsock_cid,
+        } = target;
+
+        let socket_path = self.runtime_dir.join(format!("{id}.sock"));
+        let boot_log_path = self.runtime_dir.join(format!("{id}.boot.log"));
+        let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
+        let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
+
+        tokio::fs::create_dir_all(&self.runtime_dir).await?;
+        // Clear any stale socket so Firecracker can bind a fresh one.
+        let _ = tokio::fs::remove_file(&socket_path).await;
+        tokio::fs::write(&boot_log_path, b"").await?;
+
+        let serial_file = std::fs::File::create(&serial_log_path)
+            .map_err(|e| VmmError::ProcessError(format!("create serial log: {e}")))?;
+        let stderr_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&boot_log_path)
+            .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
+
+        let process = tokio::process::Command::new(&self.firecracker_bin)
+            .arg("--api-sock")
+            .arg(&socket_path)
+            .arg("--log-path")
+            .arg(&boot_log_path)
+            .arg("--level")
+            .arg("Info")
+            .stdout(serial_file)
+            .stderr(stderr_file)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| VmmError::ProcessError(format!("spawn firecracker: {e}")))?;
+        let pid = process.id();
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !socket_path.exists() {
+            return Err(VmmError::ProcessError(
+                "Firecracker socket did not appear within 5s".into(),
+            ));
+        }
+
+        let snapshot = Self::path_to_str(&src.vmstate, "vmstate")?;
+        let mem = Self::path_to_str(&src.memory, "memory")?;
+        // Resume reattaches the guest's network interface to the host TAP named in
+        // the snapshot. For same-identity resume that TAP still exists (suspend keeps
+        // host networking), so Firecracker reconnects it on load without overrides.
+        if let Err(e) = Self::fc_put(
+            &socket_path,
+            "/snapshot/load",
+            &serde_json::json!({
+                "snapshot_path": snapshot,
+                "mem_file_path": mem,
+                "resume_vm": true,
+            }),
+        )
+        .await
+        {
+            // Capture diagnostics before removing the artifacts.
+            let serial_tail = crate::tail_lines(&serial_log_path, 20);
+            let boot_tail = crate::tail_lines(&boot_log_path, 20);
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            let _ = tokio::fs::remove_file(&serial_log_path).await;
+            let _ = tokio::fs::remove_file(&boot_log_path).await;
+            let mut msg = format!("{e}");
+            crate::append_log_tails(&mut msg, serial_tail, boot_tail, "firecracker boot log");
+            return Err(VmmError::ProcessError(msg));
+        }
+
+        let info = VmInfo {
+            id,
+            name,
+            state: VmState::Running,
+            pid,
+            vcpu_count,
+            mem_size_mib,
+            vsock_cid,
+        };
+        let instance = FcInstance {
+            info: info.clone(),
+            socket_path,
+            vsock_path,
+            boot_log_path,
+            serial_log_path,
+            process,
+            // A resumed VM is not tracked as balloon-enabled; the snapshot restores
+            // whatever device set it had, and the balloon op is opt-in per VM.
+            balloon: false,
+        };
+        self.instances.lock().await.insert(id, instance);
+        Ok(info)
     }
 
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {

@@ -535,6 +535,7 @@ pub enum WsShellOutput {
         stop_vm,
         pause_vm,
         resume_vm,
+        suspend_vm,
         destroy_vm,
         set_balloon,
         exec_vm,
@@ -805,6 +806,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/pause", post(pause_vm::<B>))
         .route("/v1/vms/{name}/resume", post(resume_vm::<B>))
         .route("/v1/vms/{name}/balloon", put(set_balloon::<B>))
+        .route("/v1/vms/{name}/suspend", post(suspend_vm::<B>))
         .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
@@ -1924,6 +1926,25 @@ async fn set_balloon<B: VmmBackend + 'static>(
 }
 
 #[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/suspend",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 204, description = "VM suspended"),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "Invalid VM state", body = ErrorResponse)
+    )
+)]
+async fn suspend_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    core.suspend_vm(&name).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
     delete,
     path = "/v1/vms/{name}",
     tag = "vms",
@@ -2821,6 +2842,11 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "agent_not_ready",
             err.to_string(),
         ),
+        CoreError::Io(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "io_error",
+            err.to_string(),
+        ),
         CoreError::Storage(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "storage_error",
@@ -2831,6 +2857,9 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "state_error",
             err.to_string(),
         ),
+        CoreError::Vmm(husker_vmm::VmmError::Unsupported(_)) => {
+            (StatusCode::NOT_IMPLEMENTED, "unsupported", err.to_string())
+        }
         CoreError::Vmm(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "vmm_error",
@@ -3765,6 +3794,20 @@ mod tests {
         let response = app
             .oneshot(
                 Request::post("/v1/vms/nonexistent/pause")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn suspend_vm_not_found() {
+        let app = router(test_core());
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/ghost/suspend")
                     .body(Body::empty())
                     .unwrap(),
             )

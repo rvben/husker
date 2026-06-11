@@ -190,6 +190,12 @@ enum Commands {
         name: String,
     },
 
+    /// Suspend a VM to disk (full-state snapshot, frees memory; resume to restore)
+    Suspend {
+        /// VM name
+        name: String,
+    },
+
     /// Destroy a VM and clean up resources
     #[command(alias = "rm")]
     Destroy {
@@ -1455,7 +1461,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "network",
         ],
         "wait" => vec!["status", "action", "vm", "ready"],
-        "stop" | "pause" | "resume" | "destroy" => vec!["status", "action", "vm"],
+        "stop" | "pause" | "resume" | "suspend" | "destroy" => vec!["status", "action", "vm"],
         "exec" => vec!["exit_code", "stdout", "stderr"],
         "version" => vec!["client_version", "server_version"],
         "service create" | "service scale" => vec!["status", "action", "service", "outcome"],
@@ -1823,7 +1829,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let mut full = api_error(resp, &format!("VM '{name}'")).await;
                 if full.message.contains("already exists") {
                     full.message.push_str(&format!(
-                        " (hint: stop or destroy it first with `husker destroy {name}`)"
+                        " (hint: if it is suspended, resume it with `husker resume {name}`; otherwise stop or destroy it first with `husker destroy {name}`)"
                     ));
                 }
                 exit_with_error(output, full);
@@ -2078,6 +2084,35 @@ async fn run(cli: Cli) -> Result<()> {
                 } else if msg.message.contains("running") {
                     msg.message
                         .push_str(" (hint: VM is already running, nothing to resume)");
+                }
+                exit_with_error(output, msg);
+            }
+            Ok(())
+        }
+        Commands::Suspend { name } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            let client = reqwest::Client::new();
+            let resp = api_request(with_api_auth(
+                client.post(format!("{api_url}/v1/vms/{name}/suspend")),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if resp.status().is_success() {
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "suspend",
+                        "vm": name,
+                    }),
+                    format!("Suspended VM: {name}"),
+                );
+            } else {
+                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
+                if msg.message.contains("stopped") {
+                    msg.message
+                        .push_str(" (hint: VM must be running to suspend)");
                 }
                 exit_with_error(output, msg);
             }
@@ -6505,6 +6540,29 @@ mod tests {
         assert!(fields.iter().any(|f| f["name"] == "volume"));
         let args = vol_get["args"].as_array().unwrap();
         assert!(args.iter().any(|a| a["name"] == "name"));
+    }
+
+    #[test]
+    fn schema_includes_mutating_suspend() {
+        let schema = build_cli_schema();
+        let cmds = schema["commands"]
+            .as_array()
+            .expect("commands must be an array");
+        // suspend must be present as a leaf command
+        let suspend =
+            find_leaf_command(cmds, "suspend").expect("suspend command must exist in schema");
+        assert!(suspend.is_object());
+        // suspend is a state-changing operation and must be marked mutating
+        assert_eq!(suspend["mutating"], true, "suspend must be mutating");
+        // suspend shares the same output_fields shape as pause/resume/stop
+        let fields = suspend["output_fields"].as_array().unwrap();
+        let field_names: Vec<&str> = fields
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(field_names.contains(&"status"));
+        assert!(field_names.contains(&"action"));
+        assert!(field_names.contains(&"vm"));
     }
 
     #[test]

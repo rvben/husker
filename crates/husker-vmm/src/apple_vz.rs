@@ -27,7 +27,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::fd_stream::FdStream;
-use crate::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
+use crate::{
+    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+};
 
 // ── Send/Sync wrappers ──────────────────────────────────────────────────
 
@@ -720,6 +722,22 @@ impl VmmBackend for AppleVzBackend {
             Ok(())
         })
         .await
+    }
+
+    async fn snapshot_vm(&self, _id: Uuid, _dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
+        Err(VmmError::Unsupported(
+            "snapshot_vm not supported by this backend".into(),
+        ))
+    }
+
+    async fn restore_vm(
+        &self,
+        _src: &SnapshotPaths,
+        _target: RestoreTarget,
+    ) -> Result<VmInfo, VmmError> {
+        Err(VmmError::Unsupported(
+            "restore_vm not supported by this backend".into(),
+        ))
     }
 
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {

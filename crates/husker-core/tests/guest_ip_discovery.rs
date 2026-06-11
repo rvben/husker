@@ -8,7 +8,9 @@ use chrono::Utc;
 use husker_core::HuskerCore;
 use husker_state::{StateStore, VmRecord};
 use husker_storage::StorageConfig;
-use husker_vmm::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
+use husker_vmm::{
+    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -90,6 +92,18 @@ impl VmmBackend for UnreachableVsockVmm {
 
     async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
         Ok(())
+    }
+
+    async fn snapshot_vm(&self, _id: Uuid, _dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
+        Err(VmmError::Unsupported("mock".into()))
+    }
+
+    async fn restore_vm(
+        &self,
+        _src: &SnapshotPaths,
+        _target: RestoreTarget,
+    ) -> Result<VmInfo, VmmError> {
+        Err(VmmError::Unsupported("mock".into()))
     }
 }
 

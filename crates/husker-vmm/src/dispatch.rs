@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::firecracker::FirecrackerBackend;
 use crate::qemu::QemuKvmBackend;
-use crate::{VmConfig, VmInfo, VmmBackend, VmmError, VmmKind};
+use crate::{
+    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmmBackend, VmmError, VmmKind,
+};
 
 /// Unified vsock stream over the two backends' concrete stream types. Both
 /// inner types are `Unpin`, so delegation needs no pin-projection.
@@ -162,6 +164,30 @@ impl VmmBackend for LinuxDispatchBackend {
         }
     }
 
+    async fn snapshot_vm(&self, id: Uuid, dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
+        match self.kind_of(id).await? {
+            VmmKind::Firecracker => self.firecracker.snapshot_vm(id, dst).await,
+            VmmKind::Qemu => self.qemu.snapshot_vm(id, dst).await,
+        }
+    }
+
+    async fn restore_vm(
+        &self,
+        src: &SnapshotPaths,
+        target: RestoreTarget,
+    ) -> Result<VmInfo, VmmError> {
+        // restore_vm deliberately does NOT consult the route map: a VM is restored
+        // after its route was cleared (on suspend), so there is nothing to look up.
+        // This layer owns backend selection for restores (currently Firecracker) and
+        // (re-)registers the route after a successful restore.
+        let info = self.firecracker.restore_vm(src, target).await?;
+        self.routes
+            .lock()
+            .await
+            .insert(info.id, VmmKind::Firecracker);
+        Ok(info)
+    }
+
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
         match self.kind_of(id).await? {
             VmmKind::Firecracker => Ok(LinuxVsockStream::Firecracker(
@@ -243,6 +269,11 @@ mod tests {
         ));
         assert!(matches!(
             be.set_balloon(id, 64).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        let dst = crate::SnapshotPaths::in_dir(dir.path());
+        assert!(matches!(
+            be.snapshot_vm(id, &dst).await,
             Err(crate::VmmError::VmNotFound(_))
         ));
     }

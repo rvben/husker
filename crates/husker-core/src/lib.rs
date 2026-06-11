@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use husker_vmm::VmmBackend;
+use husker_vmm::{RestoreTarget, SnapshotPaths, VmmBackend};
 use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -63,6 +63,8 @@ pub enum CoreError {
     SecretCrypto(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("I/O error: {0}")]
+    Io(String),
     #[error("service operation failed: {0}")]
     ServiceOperationFailed(String),
     #[error("VMM error: {0}")]
@@ -1355,6 +1357,12 @@ impl<B: VmmBackend> HuskerCore<B> {
                 debug!(%name, "VM already stopped; stop is a no-op");
                 return Ok(());
             }
+            "suspended" => {
+                // The process is already gone; discard the slot and mark stopped.
+                let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(record.id)).await;
+                self.state.update_vm_state(record.id, "stopped")?;
+                return Ok(());
+            }
             _ => {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
@@ -1393,28 +1401,148 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(())
     }
 
-    /// Resume a paused VM.
+    /// Durable per-VM suspend slot: `<data_dir>/suspend/<vm_id>/`.
+    fn suspend_slot_dir(&self, id: Uuid) -> PathBuf {
+        self.storage.data_dir.join("suspend").join(id.to_string())
+    }
+
+    /// Suspend a VM to disk: pause, capture full state, terminate the process.
     ///
-    /// Idempotent: resuming an already running VM is a no-op.
-    pub async fn resume_vm(&self, name: &str) -> Result<(), CoreError> {
-        info!(%name, "resuming VM");
+    /// Networking (TAP/IP/CID) and the VM's rootfs are intentionally preserved so
+    /// `resume_vm` can restore the same identity in place. Idempotent.
+    pub async fn suspend_vm(&self, name: &str) -> Result<(), CoreError> {
+        info!(%name, "suspending VM");
         let record = self.lookup_vm(name)?;
         match record.state.as_str() {
-            "paused" => {}
-            "running" => {
-                debug!(%name, "VM already running; resume is a no-op");
+            "running" | "paused" => {}
+            "suspended" => {
+                debug!(%name, "VM already suspended; suspend is a no-op");
                 return Ok(());
             }
             _ => {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
                     actual: record.state,
-                    expected: "paused".into(),
+                    expected: "running or paused".into(),
                 });
             }
         }
-        self.vmm.resume_vm(record.id).await?;
+
+        let paused_by_us = record.state == "running";
+        if paused_by_us {
+            self.vmm.pause_vm(record.id).await?;
+        }
+
+        let slot = self.suspend_slot_dir(record.id);
+        tokio::fs::create_dir_all(&slot)
+            .await
+            .map_err(|e| CoreError::Io(format!("create suspend slot: {e}")))?;
+        let paths = SnapshotPaths::in_dir(&slot);
+
+        let meta = match self.vmm.snapshot_vm(record.id, &paths).await {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&slot).await;
+                if paused_by_us {
+                    let _ = self.vmm.resume_vm(record.id).await;
+                }
+                return Err(e.into());
+            }
+        };
+
+        let manifest = serde_json::json!({
+            "kind": "full",
+            "backend": meta.backend,
+            "vmm_version": meta.vmm_version,
+            "vcpu_count": record.vcpu_count,
+            "mem_size_mib": record.mem_size_mib,
+            "vsock_cid": record.vsock_cid,
+            "rootfs_path": record.rootfs_path,
+        });
+        if let Err(e) = tokio::fs::write(
+            &paths.manifest,
+            serde_json::to_vec_pretty(&manifest).expect("manifest serializes"),
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_dir_all(&slot).await;
+            if paused_by_us {
+                let _ = self.vmm.resume_vm(record.id).await;
+            }
+            return Err(CoreError::Io(format!("write suspend manifest: {e}")));
+        }
+
+        // NOTE: the process is terminated before the state write. If the state
+        // update fails, the record stays "running" with no live process; recovery
+        // is via destroy. This matches the partial-failure tradeoff in create paths.
+        self.vmm.destroy_vm(record.id).await?;
+        self.state.update_vm_state(record.id, "suspended")?;
+        info!(%name, "VM suspended");
+        Ok(())
+    }
+
+    /// Restore a suspended VM in place (same id/IP/CID/MAC).
+    async fn restore_from_suspend(&self, record: &VmRecord) -> Result<(), CoreError> {
+        let slot = self.suspend_slot_dir(record.id);
+        let paths = SnapshotPaths::in_dir(&slot);
+
+        let manifest_bytes = tokio::fs::read(&paths.manifest)
+            .await
+            .map_err(|e| CoreError::Io(format!("suspend slot missing manifest: {e}")))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| CoreError::InvalidArgument(format!("invalid suspend manifest: {e}")))?;
+        let backend = manifest
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if backend != record.vmm {
+            return Err(CoreError::InvalidArgument(format!(
+                "suspend snapshot backend '{backend}' does not match VM backend '{}'",
+                record.vmm
+            )));
+        }
+
+        let target = RestoreTarget::Resume {
+            id: record.id,
+            name: record.name.clone(),
+            vcpu_count: record.vcpu_count,
+            mem_size_mib: record.mem_size_mib,
+            vsock_cid: record.vsock_cid,
+        };
+        self.vmm.restore_vm(&paths, target).await?;
         self.state.update_vm_state(record.id, "running")?;
+
+        let _ = tokio::fs::remove_dir_all(&slot).await;
+        Ok(())
+    }
+
+    /// Resume a paused or suspended VM.
+    ///
+    /// - `paused`: un-pauses the running VMM process.
+    /// - `suspended`: restores full VM state from the suspend slot on disk.
+    /// - `running`: idempotent no-op.
+    pub async fn resume_vm(&self, name: &str) -> Result<(), CoreError> {
+        info!(%name, "resuming VM");
+        let record = self.lookup_vm(name)?;
+        match record.state.as_str() {
+            "paused" => {
+                self.vmm.resume_vm(record.id).await?;
+                self.state.update_vm_state(record.id, "running")?;
+            }
+            "suspended" => {
+                self.restore_from_suspend(&record).await?;
+            }
+            "running" => {
+                debug!(%name, "VM already running; resume is a no-op");
+            }
+            _ => {
+                return Err(CoreError::InvalidState {
+                    name: name.into(),
+                    actual: record.state,
+                    expected: "paused or suspended".into(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1491,6 +1619,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         let boot_log = self.runtime_dir.join(format!("{}.boot.log", record.id));
         if let Err(e) = remove_file_best_effort(&boot_log).await {
             warn!(%name, path = %boot_log.display(), error = %e, "failed to remove boot log during destroy");
+        }
+
+        let suspend_slot = self.suspend_slot_dir(record.id);
+        if let Err(e) = tokio::fs::remove_dir_all(&suspend_slot).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%name, dir = %suspend_slot.display(), error = %e, "failed to remove suspend slot during destroy");
         }
 
         self.state.delete_vm(record.id)?;

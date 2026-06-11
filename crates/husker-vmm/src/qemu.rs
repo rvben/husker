@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+use crate::{RestoreTarget, SnapshotMeta, SnapshotPaths};
 use crate::{VmConfig, VmInfo, VmState, VmmError};
 
 /// A running QEMU VM tracked by the backend.
@@ -477,6 +479,22 @@ impl crate::VmmBackend for QemuKvmBackend {
 
     async fn resume_vm(&self, id: Uuid) -> Result<(), VmmError> {
         self.resume(id).await
+    }
+
+    async fn snapshot_vm(&self, _id: Uuid, _dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
+        Err(VmmError::Unsupported(
+            "snapshot_vm not supported by this backend".into(),
+        ))
+    }
+
+    async fn restore_vm(
+        &self,
+        _src: &SnapshotPaths,
+        _target: RestoreTarget,
+    ) -> Result<VmInfo, VmmError> {
+        Err(VmmError::Unsupported(
+            "restore_vm not supported by this backend".into(),
+        ))
     }
 
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {

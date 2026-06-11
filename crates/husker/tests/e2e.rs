@@ -371,6 +371,143 @@ async fn vm_lifecycle() {
     assert_eq!(resp.status(), 404);
 }
 
+/// Suspend a running VM to disk and resume it, verifying state transitions and
+/// that the guest is alive after resume. Firecracker snapshot/restore path.
+///
+/// Requires:
+/// - Running `husker daemon` on localhost:7777
+/// - Valid kernel at /var/lib/husker/kernels/vmlinux
+/// - Valid rootfs image
+/// - Linux host with KVM enabled and Firecracker binary in PATH
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn vm_suspend_resume() {
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:7777";
+
+    // 1. Create a VM
+    let create_body = serde_json::json!({
+        "name": "e2e-suspend",
+        "kernel_path": "/var/lib/husker/kernels/vmlinux",
+        "rootfs_path": "/var/lib/husker/images/ubuntu-22.04.ext4",
+        "vcpu_count": 1,
+        "mem_size_mib": 128,
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms"))
+        .json(&create_body)
+        .send()
+        .await
+        .expect("create should succeed");
+    assert_eq!(resp.status(), 201);
+    let vm: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(vm["name"], "e2e-suspend");
+    assert!(vm["id"].as_str().is_some());
+
+    // 2. Wait for the guest to boot and the agent to become ready
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // 3. Suspend -> state transitions to "suspended"
+    let resp = client
+        .post(format!("{base}/v1/vms/e2e-suspend/suspend"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let resp = client
+        .get(format!("{base}/v1/vms/e2e-suspend"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let info: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(info["state"], "suspended");
+
+    // 4. Resume -> state transitions back to "running"
+    let resp = client
+        .post(format!("{base}/v1/vms/e2e-suspend/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let resp = client
+        .get(format!("{base}/v1/vms/e2e-suspend"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let info: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(info["state"], "running");
+
+    // 5. Give the restored guest a moment before sending exec
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // 6. Guest is alive after resume: exec a command
+    let exec_body = serde_json::json!({
+        "command": "echo",
+        "args": ["alive after resume"],
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms/e2e-suspend/exec"))
+        .json(&exec_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert!(
+        result["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("alive after resume")
+    );
+
+    // Networking must survive the resume: the guest's eth0 still has an IPv4.
+    let exec_body = serde_json::json!({
+        "command": "sh",
+        "args": ["-c", "ip addr show eth0 | grep -q 'inet '"],
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms/e2e-suspend/exec"))
+        .json(&exec_body)
+        .send()
+        .await
+        .unwrap();
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        result["exit_code"], 0,
+        "guest eth0 must still have an IPv4 after resume"
+    );
+
+    // 7. Stop the VM
+    let resp = client
+        .post(format!("{base}/v1/vms/e2e-suspend/stop"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // 8. Destroy the VM
+    let resp = client
+        .delete(format!("{base}/v1/vms/e2e-suspend"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // 9. Verify it's gone
+    let resp = client
+        .get(format!("{base}/v1/vms/e2e-suspend"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
 /// Verify that creating a VM with a duplicate name returns 409 Conflict.
 ///
 /// Requires:
