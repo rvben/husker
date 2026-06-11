@@ -142,18 +142,18 @@ cat > "$INITRAMFS/init" << 'INIT_EOF'
 MDIR=/lib/modules/KVER_PLACEHOLDER
 
 # Load block device modules
-/bin/insmod $MDIR/virtio_blk.ko
+/bin/insmod $MDIR/virtio_blk.ko 2>/dev/null || echo "husker-init: skipped virtio_blk (built-in or absent)"
 
 # Memory balloon (optional device; only active when the VM enables it)
-/bin/insmod $MDIR/virtio_balloon.ko
+/bin/insmod $MDIR/virtio_balloon.ko 2>/dev/null || echo "husker-init: skipped virtio_balloon (built-in or absent)"
 
 # Load filesystem dependency modules
-/bin/insmod $MDIR/crc16.ko
-/bin/insmod $MDIR/crc32_generic.ko
-/bin/insmod $MDIR/crc32c_generic.ko
-/bin/insmod $MDIR/mbcache.ko
-/bin/insmod $MDIR/jbd2.ko
-/bin/insmod $MDIR/ext4.ko
+/bin/insmod $MDIR/crc16.ko 2>/dev/null || echo "husker-init: skipped crc16 (built-in or absent)"
+/bin/insmod $MDIR/crc32_generic.ko 2>/dev/null || echo "husker-init: skipped crc32_generic (built-in or absent)"
+/bin/insmod $MDIR/crc32c_generic.ko 2>/dev/null || echo "husker-init: skipped crc32c_generic (built-in or absent)"
+/bin/insmod $MDIR/mbcache.ko 2>/dev/null || echo "husker-init: skipped mbcache (built-in or absent)"
+/bin/insmod $MDIR/jbd2.ko 2>/dev/null || echo "husker-init: skipped jbd2 (built-in or absent)"
+/bin/insmod $MDIR/ext4.ko 2>/dev/null || echo "husker-init: skipped ext4 (built-in or absent)"
 
 # Wait for /dev/vda to appear
 i=0
@@ -177,7 +177,7 @@ fi
 # Copy modules to rootfs for use after switch_root
 /bin/mkdir -p /mnt/root/lib/modules
 for m in $MDIR/*.ko; do
-    /bin/busybox cp "$m" /mnt/root/lib/modules/
+    /bin/busybox cp "$m" /mnt/root/lib/modules/ 2>/dev/null || true
 done
 
 # Clean up
