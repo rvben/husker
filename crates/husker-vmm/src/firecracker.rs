@@ -133,9 +133,7 @@ impl FirecrackerBackend {
     fn default_boot_args(has_initrd: bool) -> String {
         let base = "console=ttyS0 reboot=k panic=1 pci=off";
         let root = if has_initrd { "" } else { " root=/dev/vda rw" };
-        format!(
-            "{base}{root} ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off"
-        )
+        format!("{base}{root} ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off")
     }
 
     fn boot_source_payload(
@@ -658,7 +656,10 @@ mod tests {
             args.contains("root=/dev/vda rw"),
             "expected root=/dev/vda rw when no initrd: {args}"
         );
-        assert!(args.contains("console=ttyS0"), "console arg missing: {args}");
+        assert!(
+            args.contains("console=ttyS0"),
+            "console arg missing: {args}"
+        );
         assert!(args.contains("pci=off"), "pci=off missing: {args}");
     }
 
@@ -669,7 +670,10 @@ mod tests {
             !args.contains("root=/dev/vda"),
             "root= must be absent when initrd is set: {args}"
         );
-        assert!(args.contains("console=ttyS0"), "console arg missing: {args}");
+        assert!(
+            args.contains("console=ttyS0"),
+            "console arg missing: {args}"
+        );
         assert!(args.contains("pci=off"), "pci=off missing: {args}");
     }
 
