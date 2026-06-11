@@ -15,11 +15,12 @@ use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZEFIBootLoader, VZEFIVariableStore,
-    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
-    VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
+    VZEFIVariableStoreInitializationOptions, VZFileHandleSerialPortAttachment,
+    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
+    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtualMachineState,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -109,9 +110,9 @@ impl AppleVzBackend {
         ),
         VmmError,
     > {
-        if matches!(config.boot, crate::BootMode::Efi { .. }) {
+        if matches!(config.boot, crate::BootMode::Uefi { .. }) {
             return Err(VmmError::InvalidConfig(
-                "EFI boot lands in the next commit".into(),
+                "OVMF boot is a Linux/QEMU mode; macOS uses EFI boot".into(),
             ));
         }
         let vm = dispatch_sync_fallible(queue.clone(), {
@@ -122,25 +123,74 @@ impl AppleVzBackend {
             // are `unsafe` because they call into Objective-C; the VZ framework
             // guarantees thread-safety when called from the correct queue.
             move || -> Result<QueueConfined<Retained<VZVirtualMachine>>, VmmError> {
-                // Boot loader
-                let kernel_path = config
-                    .kernel_path
-                    .to_str()
-                    .ok_or_else(|| VmmError::InvalidConfig("kernel path not valid UTF-8".into()))?;
-                let kernel_url = NSURL::fileURLWithPath(&NSString::from_str(kernel_path));
-                let boot_loader = unsafe {
-                    VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
-                };
-                if let Some(ref args) = config.kernel_args {
-                    unsafe { boot_loader.setCommandLine(&NSString::from_str(args)) };
-                }
-                if let Some(ref initrd) = config.initrd_path {
-                    let initrd_str = initrd.to_str().ok_or_else(|| {
-                        VmmError::InvalidConfig("initrd path not valid UTF-8".into())
-                    })?;
-                    let initrd_url = NSURL::fileURLWithPath(&NSString::from_str(initrd_str));
-                    unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
-                }
+                // Boot loader — varies by boot mode.
+                let boot_loader: objc2::rc::Retained<objc2_virtualization::VZBootLoader> =
+                    match &config.boot {
+                        crate::BootMode::DirectKernel => {
+                            let kernel_path = config.kernel_path.to_str().ok_or_else(|| {
+                                VmmError::InvalidConfig("kernel path not valid UTF-8".into())
+                            })?;
+                            let kernel_url =
+                                NSURL::fileURLWithPath(&NSString::from_str(kernel_path));
+                            let loader = unsafe {
+                                VZLinuxBootLoader::initWithKernelURL(
+                                    VZLinuxBootLoader::alloc(),
+                                    &kernel_url,
+                                )
+                            };
+                            if let Some(ref args) = config.kernel_args {
+                                unsafe { loader.setCommandLine(&NSString::from_str(args)) };
+                            }
+                            if let Some(ref initrd) = config.initrd_path {
+                                let initrd_str = initrd.to_str().ok_or_else(|| {
+                                    VmmError::InvalidConfig("initrd path not valid UTF-8".into())
+                                })?;
+                                let initrd_url =
+                                    NSURL::fileURLWithPath(&NSString::from_str(initrd_str));
+                                unsafe { loader.setInitialRamdiskURL(Some(&initrd_url)) };
+                            }
+                            objc2::rc::Retained::into_super(loader)
+                        }
+                        crate::BootMode::Efi { variable_store } => {
+                            let vs_str = variable_store.to_str().ok_or_else(|| {
+                                VmmError::InvalidConfig(
+                                    "EFI variable store path not valid UTF-8".into(),
+                                )
+                            })?;
+                            let vs_url = NSURL::fileURLWithPath(&NSString::from_str(vs_str));
+                            let store = if variable_store.exists() {
+                                unsafe {
+                                    VZEFIVariableStore::initWithURL(
+                                        VZEFIVariableStore::alloc(),
+                                        &vs_url,
+                                    )
+                                }
+                            } else {
+                                unsafe {
+                                    VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
+                                        VZEFIVariableStore::alloc(),
+                                        &vs_url,
+                                        VZEFIVariableStoreInitializationOptions::empty(),
+                                    )
+                                    .map_err(|e| {
+                                        VmmError::InvalidConfig(format!(
+                                            "EFI variable store creation failed: {e}"
+                                        ))
+                                    })?
+                                }
+                            };
+                            let efi_loader = unsafe { VZEFIBootLoader::new() };
+                            unsafe { efi_loader.setVariableStore(Some(&store)) };
+                            objc2::rc::Retained::into_super(efi_loader)
+                        }
+                        crate::BootMode::Uefi { .. } => {
+                            // Filtered out before entering the dispatch closure; this
+                            // arm is unreachable but required for exhaustive matching.
+                            return Err(VmmError::InvalidConfig(
+                                "OVMF boot is a Linux/QEMU mode; macOS uses EFI boot".into(),
+                            ));
+                        }
+                    };
 
                 let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
                 unsafe {
@@ -174,6 +224,31 @@ impl AppleVzBackend {
                     )
                 };
                 let mut storage_devices = vec![rootfs_block.into_super()];
+
+                // Optional cloud-init seed disk (/dev/vdb from the guest's perspective
+                // when no volume is attached; cloud-init discovers it by filesystem label
+                // so device order is not a contract). Attached read-only.
+                if let Some(ref seed) = config.seed_path {
+                    let seed_str = seed.to_str().ok_or_else(|| {
+                        VmmError::InvalidConfig("seed path not valid UTF-8".into())
+                    })?;
+                    let seed_url = NSURL::fileURLWithPath(&NSString::from_str(seed_str));
+                    let seed_attachment = unsafe {
+                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                            VZDiskImageStorageDeviceAttachment::alloc(),
+                            &seed_url,
+                            true,
+                        )
+                        .map_err(|e| VmmError::InvalidConfig(format!("seed attachment: {e}")))?
+                    };
+                    let seed_block = unsafe {
+                        VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                            VZVirtioBlockDeviceConfiguration::alloc(),
+                            &seed_attachment,
+                        )
+                    };
+                    storage_devices.push(seed_block.into_super());
+                }
 
                 if let Some(ref vol_path) = config.volume_path {
                     let vol_str = vol_path.to_str().ok_or_else(|| {
@@ -773,22 +848,44 @@ mod tests {
         drop(backend);
         // No panic = pass
     }
-}
 
-/// Compile-time spike: proves the EFI binding surface exists in
-/// objc2-virtualization 0.3. Removed when EFI boot lands for real.
-/// #[allow(unused)] is acceptable only because this function is temporary.
-#[allow(unused)]
-fn _efi_bindings_spike() {
-    let _ = |url: &objc2_foundation::NSURL| unsafe {
-        let loader = VZEFIBootLoader::new();
-        loader.setVariableStore(None);
-        let opts = objc2_virtualization::VZEFIVariableStoreInitializationOptions::empty();
-        let _store = VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
-            VZEFIVariableStore::alloc(),
-            url,
-            opts,
+    /// Minimal VmConfig for boot-mode rejection tests. VZ object construction is
+    /// not reached when the boot mode is rejected before the dispatch closure.
+    fn minimal_config_with_boot(boot: crate::BootMode) -> crate::VmConfig {
+        crate::VmConfig {
+            name: "test-vm".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_path: "/nonexistent/kernel".into(),
+            rootfs_path: "/nonexistent/rootfs.img".into(),
+            kernel_args: None,
+            initrd_path: None,
+            vsock_cid: 3,
+            tap_device: None,
+            guest_mac: None,
+            vmm: None,
+            boot,
+            seed_path: None,
+            balloon: false,
+            volume_path: None,
+        }
+    }
+
+    /// `BootMode::Uefi` is rejected before any VZ framework call is made.
+    /// The check happens in `create_and_start_vm` before entering the dispatch
+    /// closure, so no Virtualization entitlement is required to run this test.
+    #[tokio::test]
+    async fn uefi_boot_mode_is_rejected_with_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
+        let config = minimal_config_with_boot(crate::BootMode::Uefi {
+            ovmf_code: "/nonexistent/OVMF_CODE.fd".into(),
+            ovmf_vars_template: "/nonexistent/OVMF_VARS.fd".into(),
+        });
+        let result = backend.create_vm(config).await;
+        assert!(
+            matches!(&result, Err(VmmError::InvalidConfig(msg)) if msg.contains("OVMF boot")),
+            "expected InvalidConfig with OVMF hint, got {result:?}"
         );
-        let _existing = VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), url);
-    };
+    }
 }
