@@ -20,6 +20,10 @@
 //! Linux: also needs `/dev/kvm` + Firecracker binary in PATH.
 //! macOS: also needs a codesigned daemon binary with the VZ entitlement.
 //!
+//! The suite assumes a single invocation at a time against a given daemon.
+//! VM names are fixed (no PID suffix) so that interrupted or failed runs
+//! self-heal on the next invocation via `predelete_vm()`.
+//!
 //! Run with:
 //!   HUSKER_RUN_IGNORED_E2E=1 cargo test -p husker --test e2e -- --ignored
 //!
@@ -105,19 +109,14 @@ fn e2e_initrd() -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
-/// Return a VM name that is unique to this test process.
-///
-/// Using the process ID prevents name collisions when:
-/// - a previous test run leaked a VM (pre-delete below cleans it up), or
-/// - concurrent test processes run the same test.
-fn vm_name(base: &str) -> String {
-    format!("{base}-{}", std::process::id())
-}
-
 /// Best-effort delete a VM that may already exist.
 ///
-/// Called before creating a VM so a leaked leftover from a previous run does
-/// not cause a 409 Conflict. Ignores all errors (the VM may not exist).
+/// Called before every VM create so that a stale leftover from a previous
+/// failed run is silently removed rather than causing a 409 Conflict.
+/// Tests use fixed names (no PID suffix) so the pre-delete targets exactly
+/// the VM a prior run would have left behind. The gated suite never runs
+/// concurrently on one host, so fixed names are safe and make self-healing
+/// across failed runs reliable.
 async fn predelete_vm(client: &reqwest::Client, base_url: &str, name: &str) {
     let _ = client
         .delete(format!("{base_url}/v1/vms/{name}"))
@@ -282,16 +281,16 @@ async fn vm_lifecycle() {
         .expect("daemon should be reachable");
     assert_eq!(resp.status(), 200);
 
-    // 2. Create a VM (unique name to avoid collisions on re-runs)
-    let name = vm_name("e2e-lifecycle");
-    let vm = create_and_wait_for_vm(&client, base, &name).await;
-    assert_eq!(vm["name"], name.as_str());
+    // 2. Create a VM
+    let name = "e2e-lifecycle";
+    let vm = create_and_wait_for_vm(&client, base, name).await;
+    assert_eq!(vm["name"], name);
     assert!(vm["id"].as_str().is_some());
 
     // 3. List VMs (should contain our VM)
     let resp = client.get(format!("{base}/v1/vms")).send().await.unwrap();
     let vms: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert!(vms.iter().any(|v| v["name"] == name.as_str()));
+    assert!(vms.iter().any(|v| v["name"] == name));
 
     // 4. Get VM info
     let resp = client
@@ -301,7 +300,7 @@ async fn vm_lifecycle() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let info: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(info["name"], name.as_str());
+    assert_eq!(info["name"], name);
 
     // 5. Execute a command inside the VM (agent already confirmed reachable)
     let exec_body = serde_json::json!({
@@ -386,8 +385,8 @@ async fn duplicate_vm_name_returns_conflict() {
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
 
-    let name = vm_name("e2e-dup");
-    predelete_vm(&client, base, &name).await;
+    let name = "e2e-dup";
+    predelete_vm(&client, base, name).await;
 
     let body = serde_json::json!({
         "name": name,
@@ -415,7 +414,7 @@ async fn duplicate_vm_name_returns_conflict() {
     assert_eq!(resp.status(), 409);
 
     // Cleanup
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 // ── Cross-platform API tests ─────────────────────────────────────────────
@@ -436,9 +435,9 @@ async fn exec_nonzero_exit_code() {
     require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-exec-nonzero");
+    let name = "e2e-exec-nonzero";
 
-    create_and_wait_for_vm(&client, base, &name).await;
+    create_and_wait_for_vm(&client, base, name).await;
 
     let body = serde_json::json!({
         "command": "sh",
@@ -455,7 +454,7 @@ async fn exec_nonzero_exit_code() {
     let result: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(result["exit_code"], 42);
 
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that exec with environment variables works through the full stack.
@@ -465,9 +464,9 @@ async fn exec_with_env_through_api() {
     require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-exec-env");
+    let name = "e2e-exec-env";
 
-    create_and_wait_for_vm(&client, base, &name).await;
+    create_and_wait_for_vm(&client, base, name).await;
 
     let body = serde_json::json!({
         "command": "sh",
@@ -485,7 +484,7 @@ async fn exec_with_env_through_api() {
     let result: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(result["stdout"].as_str().unwrap().trim(), "from-api");
 
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify large file transfer through the API (1 MiB).
@@ -495,9 +494,9 @@ async fn large_file_transfer_through_api() {
     require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-large-file");
+    let name = "e2e-large-file";
 
-    create_and_wait_for_vm(&client, base, &name).await;
+    create_and_wait_for_vm(&client, base, name).await;
 
     // 1 MiB of pattern data
     let data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
@@ -532,7 +531,7 @@ async fn large_file_transfer_through_api() {
     assert_eq!(decoded.len(), data.len());
     assert_eq!(decoded, data);
 
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 // ── Cross-platform shell E2E tests ───────────────────────────────────────
@@ -556,11 +555,11 @@ async fn shell_interactive_session() {
 
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-shell-interactive");
+    let name = "e2e-shell-interactive";
 
-    create_and_wait_for_vm(&client, base, &name).await;
+    create_and_wait_for_vm(&client, base, name).await;
 
-    let mut child = spawn_shell_with_pty(&name);
+    let mut child = spawn_shell_with_pty(name);
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
@@ -616,7 +615,7 @@ async fn shell_interactive_session() {
 
     assert!(status.success(), "shell exited with: {status}");
 
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that the shell propagates the guest's exit code.
@@ -628,11 +627,11 @@ async fn shell_exit_code_propagation() {
 
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-shell-exitcode");
+    let name = "e2e-shell-exitcode";
 
-    create_and_wait_for_vm(&client, base, &name).await;
+    create_and_wait_for_vm(&client, base, name).await;
 
-    let mut child = spawn_shell_with_pty(&name);
+    let mut child = spawn_shell_with_pty(name);
     let mut stdin = child.stdin.take().unwrap();
 
     // Wait for the shell to initialize, then send exit 42
@@ -647,7 +646,7 @@ async fn shell_exit_code_propagation() {
 
     assert!(!status.success(), "expected non-zero exit, got: {status}");
 
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that shell to a non-existent VM returns an error quickly.
@@ -686,9 +685,9 @@ async fn pause_resume_cycle_macos() {
     require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-pause-resume");
+    let name = "e2e-pause-resume";
 
-    create_and_wait_for_vm(&client, base, &name).await;
+    create_and_wait_for_vm(&client, base, name).await;
 
     // Pause
     let resp = client
@@ -716,7 +715,7 @@ async fn pause_resume_cycle_macos() {
     assert_eq!(resp.status(), 204);
 
     // Verify VM is functional after resume
-    poll_until_agent_ready(&client, base, &name).await;
+    poll_until_agent_ready(&client, base, name).await;
     let exec_body = serde_json::json!({
         "command": "echo",
         "args": ["survived-pause"],
@@ -737,7 +736,7 @@ async fn pause_resume_cycle_macos() {
             .contains("survived-pause")
     );
 
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 /// Verify that shell works after a pause/resume cycle on Apple VZ.
@@ -750,9 +749,9 @@ async fn shell_after_pause_resume_macos() {
 
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-shell-pause-resume");
+    let name = "e2e-shell-pause-resume";
 
-    create_and_wait_for_vm(&client, base, &name).await;
+    create_and_wait_for_vm(&client, base, name).await;
 
     // Pause and resume the VM
     let resp = client
@@ -770,7 +769,7 @@ async fn shell_after_pause_resume_macos() {
     assert_eq!(resp.status(), 204);
 
     // Shell should still work
-    let mut child = spawn_shell_with_pty(&name);
+    let mut child = spawn_shell_with_pty(name);
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
@@ -808,7 +807,7 @@ async fn shell_after_pause_resume_macos() {
 
     assert!(status.success(), "shell exited with: {status}");
 
-    destroy_vm(&client, base, &name).await;
+    destroy_vm(&client, base, name).await;
 }
 
 // ── Logs E2E tests ─────────────────────────────────────────────────────
@@ -827,7 +826,7 @@ async fn vm_lifecycle_macos() {
     require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-lifecycle-macos");
+    let name = "e2e-lifecycle-macos";
 
     // 1. Health check
     let resp = client
@@ -838,14 +837,14 @@ async fn vm_lifecycle_macos() {
     assert_eq!(resp.status(), 200);
 
     // 2. Create a VM
-    let vm = create_and_wait_for_vm(&client, base, &name).await;
-    assert_eq!(vm["name"], name.as_str());
+    let vm = create_and_wait_for_vm(&client, base, name).await;
+    assert_eq!(vm["name"], name);
     assert!(vm["id"].as_str().is_some());
 
     // 3. List VMs (should contain our VM)
     let resp = client.get(format!("{base}/v1/vms")).send().await.unwrap();
     let vms: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert!(vms.iter().any(|v| v["name"] == name.as_str()));
+    assert!(vms.iter().any(|v| v["name"] == name));
 
     // 4. Get VM info
     let resp = client
@@ -855,7 +854,7 @@ async fn vm_lifecycle_macos() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let info: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(info["name"], name.as_str());
+    assert_eq!(info["name"], name);
 
     // 5. Execute a command inside the VM (agent already confirmed reachable)
     let exec_body = serde_json::json!({
@@ -898,7 +897,7 @@ async fn vm_lifecycle_macos() {
     assert_eq!(resp.status(), 204);
 
     // 8. Verify VM is functional after resume
-    poll_until_agent_ready(&client, base, &name).await;
+    poll_until_agent_ready(&client, base, name).await;
     let exec_body = serde_json::json!({
         "command": "echo",
         "args": ["post-resume"],
@@ -952,7 +951,7 @@ async fn logs_serial_output() {
     require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-logs");
+    let name = "e2e-logs";
 
     // 1. Create a VM
     let create_body = serde_json::json!({
@@ -963,7 +962,7 @@ async fn logs_serial_output() {
         "vcpu_count": 1,
         "mem_size_mib": 256,
     });
-    predelete_vm(&client, base, &name).await;
+    predelete_vm(&client, base, name).await;
     let resp = client
         .post(format!("{base}/v1/vms"))
         .json(&create_body)
@@ -1038,17 +1037,18 @@ async fn logs_serial_output_macos() {
     require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
-    let name = vm_name("e2e-logs-macos");
+    let name = "e2e-logs-macos";
 
     // 1. Create a VM
     let create_body = serde_json::json!({
         "name": name,
         "kernel_path": e2e_kernel(),
         "rootfs_path": e2e_rootfs(),
+        "initrd_path": e2e_initrd(),
         "vcpu_count": 1,
         "mem_size_mib": 128,
     });
-    predelete_vm(&client, base, &name).await;
+    predelete_vm(&client, base, name).await;
     let resp = client
         .post(format!("{base}/v1/vms"))
         .json(&create_body)
