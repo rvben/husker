@@ -116,6 +116,14 @@
 # bridged mode is unavailable and any --net bridged request is rejected.
 # lan_bridge = "br0"
 
+# ── Memory Balloon ───────────────────────────────────────────────────
+#
+# Memory balloon (--balloon): on macOS (Apple VZ), ballooning is partial by
+# platform design. Explicit targets via `husker balloon <vm> <mib>` reclaim
+# memory, but memory freed inside the guest is NOT automatically relinquished
+# to the host. Restart memory-heavy VMs to fully reclaim.
+# MicroVM guests need images-2026-06-11 or newer (virtio_balloon module).
+
 # ── Service Reconciler ───────────────────────────────────────────────
 
 # Background reconciler for service workloads.
