@@ -167,14 +167,15 @@ else
     echo "husker-init: skipped ext4 (built-in)"
 fi
 
-# Wait for /dev/vda to appear
+# Wait for /dev/vda to appear (up to 5s: 50 x 100ms)
 i=0
 while [ ! -b /dev/vda ] && [ $i -lt 50 ]; do
+    /bin/busybox usleep 100000
     i=$((i + 1))
 done
 
 if [ ! -b /dev/vda ]; then
-    echo "FATAL: /dev/vda not found"
+    echo "FATAL: /dev/vda not found (virtio_blk missing? check earlier husker-init messages)"
     exec /bin/sh
 fi
 
