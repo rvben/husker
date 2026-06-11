@@ -25,6 +25,8 @@ pub enum StorageError {
     CommandFailed(String),
     #[error("volume image error: {0}")]
     VolumeImage(String),
+    #[error("qemu-img error: {0}")]
+    QemuImg(String),
 }
 
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -174,6 +176,67 @@ pub async fn resize_disk(path: &Path, new_size_bytes: u64) -> Result<(), Storage
             "qemu-img resize {} {new_size_bytes} failed: {}",
             path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Virtual size of a qcow2 image in bytes, via `qemu-img info`.
+///
+/// Returns the number of bytes the guest OS sees as the disk's capacity,
+/// regardless of how much host space the qcow2 file actually occupies.
+pub fn qcow2_virtual_size(path: &Path) -> Result<u64, StorageError> {
+    if !path.exists() {
+        return Err(StorageError::InvalidCloudImage(format!(
+            "cloud image not found: {}",
+            path.display()
+        )));
+    }
+    let out = std::process::Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(path)
+        .output()
+        .map_err(|e| StorageError::QemuImg(format!("qemu-img spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(StorageError::QemuImg(format!(
+            "qemu-img info failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| StorageError::QemuImg(format!("qemu-img info parse: {e}")))?;
+    v["virtual-size"]
+        .as_u64()
+        .ok_or_else(|| StorageError::QemuImg("qemu-img info: no virtual-size".into()))
+}
+
+/// Convert a qcow2 image to a sparse raw file.
+///
+/// Apple Virtualization.framework attaches raw disk images only; this is the
+/// clone step for macOS cloud-image VMs. A partial output file is removed on
+/// failure so no corrupt image is left on disk.
+pub fn convert_qcow2_to_raw(src: &Path, dest: &Path) -> Result<(), StorageError> {
+    if !src.exists() {
+        return Err(StorageError::InvalidCloudImage(format!(
+            "cloud image not found: {}",
+            src.display()
+        )));
+    }
+    let out = std::process::Command::new("qemu-img")
+        .args(["convert", "-f", "qcow2", "-O", "raw"])
+        .arg(src)
+        .arg(dest)
+        .output()
+        .map_err(|e| {
+            StorageError::QemuImg(format!(
+                "qemu-img spawn failed: {e} (install with: brew install qemu)"
+            ))
+        })?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(dest);
+        return Err(StorageError::QemuImg(format!(
+            "qemu-img convert failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
     Ok(())
@@ -572,5 +635,49 @@ mod tests {
             matches!(err, StorageError::VolumeImage(_)),
             "expected VolumeImage error, got: {err:?}"
         );
+    }
+
+    // ── qemu-img helpers ─────────────────────────────────────────────
+
+    #[test]
+    fn qcow2_virtual_size_reads_size() {
+        if !qemu_img_available() {
+            eprintln!("skipping: qemu-img not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("t.qcow2");
+        let status = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", img.to_str().unwrap(), "64M"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let size = qcow2_virtual_size(&img).unwrap();
+        assert_eq!(size, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn convert_qcow2_to_raw_produces_raw() {
+        if !qemu_img_available() {
+            eprintln!("skipping: qemu-img not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("s.qcow2");
+        std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", src.to_str().unwrap(), "8M"])
+            .status()
+            .unwrap();
+        let dest = dir.path().join("d.raw");
+        convert_qcow2_to_raw(&src, &dest).unwrap();
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert_eq!(meta.len(), 8 * 1024 * 1024, "raw file has virtual size");
+    }
+
+    #[test]
+    fn convert_qcow2_to_raw_missing_source_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = convert_qcow2_to_raw(&dir.path().join("absent.qcow2"), &dir.path().join("d.raw"));
+        assert!(err.is_err());
     }
 }

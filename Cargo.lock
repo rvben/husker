@@ -956,6 +956,7 @@ version = "0.4.6"
 dependencies = [
  "reflink-copy",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
