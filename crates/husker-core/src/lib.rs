@@ -70,7 +70,6 @@ pub enum CoreError {
     #[cfg(feature = "linux-net")]
     #[error("network error: {0}")]
     Network(#[from] husker_net::NetError),
-    #[cfg(feature = "linux-net")]
     #[error("cloud-init seed error: {0}")]
     CloudInit(#[from] husker_cloudinit::CloudInitError),
     #[error("storage error: {0}")]
@@ -462,7 +461,6 @@ pub struct HuskerCore<B: VmmBackend> {
     ovmf_code_path: PathBuf,
     #[cfg(feature = "linux-net")]
     ovmf_vars_template_path: PathBuf,
-    #[cfg(feature = "linux-net")]
     embedded_agent: &'static [u8],
     #[cfg(feature = "linux-net")]
     bridge_name: String,
@@ -546,6 +544,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             state,
             storage,
             storage_driver: husker_storage::default_storage_driver(),
+            embedded_agent: &[],
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -554,7 +553,6 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Provide the embedded guest agent used to build cloud-init seeds. Empty (the
     /// default) disables cloud-image support with a clear error at create time.
-    #[cfg(feature = "linux-net")]
     pub fn with_embedded_agent(mut self, agent: &'static [u8]) -> Self {
         self.embedded_agent = agent;
         self
@@ -2986,7 +2984,7 @@ async fn prepare_cloud_disk(
 /// Convert a seed-build failure into a core error. Invalid SSH keys are the
 /// caller's input, not an internal fault, so they surface as InvalidArgument
 /// (HTTP 400) instead of an internal cloud-init error.
-#[cfg(feature = "linux-net")]
+#[cfg(any(feature = "linux-net", test))]
 fn seed_error_to_core(e: husker_cloudinit::CloudInitError) -> CoreError {
     match e {
         e @ husker_cloudinit::CloudInitError::InvalidSshKey(_) => {
@@ -3180,7 +3178,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "linux-net")]
     #[test]
     fn invalid_ssh_key_seed_error_is_invalid_argument() {
         let e = husker_cloudinit::CloudInitError::InvalidSshKey("bad".into());
@@ -3193,6 +3190,25 @@ mod tests {
             super::seed_error_to_core(other),
             super::CoreError::CloudInit(_)
         ));
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[test]
+    fn with_embedded_agent_available_without_linux_net() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        let core = HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        )
+        .with_embedded_agent(b"fake-agent");
+        assert_eq!(core.embedded_agent, b"fake-agent");
     }
 
     #[tokio::test]

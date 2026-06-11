@@ -5268,12 +5268,10 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     {
         let vmm = husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
 
-        let core = Arc::new(husker_core::HuskerCore::new(
-            vmm,
-            state,
-            storage,
-            runtime_dir.clone(),
-        ));
+        let core = Arc::new(
+            husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
+                .with_embedded_agent(husker::EMBEDDED_AGENT),
+        );
 
         run_initial_service_reconcile(&core).await;
         spawn_service_reconcile_loop(
@@ -5297,12 +5295,10 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             &runtime_dir,
         );
 
-        let core = Arc::new(husker_core::HuskerCore::new(
-            vmm,
-            state,
-            storage,
-            runtime_dir.clone(),
-        ));
+        let core = Arc::new(
+            husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
+                .with_embedded_agent(husker::EMBEDDED_AGENT),
+        );
 
         run_initial_service_reconcile(&core).await;
         spawn_service_reconcile_loop(

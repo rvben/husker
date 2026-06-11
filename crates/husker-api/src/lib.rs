@@ -2839,7 +2839,6 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "network_error",
             err.to_string(),
         ),
-        #[cfg(feature = "linux-net")]
         CoreError::CloudInit(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "cloud_init_error",
