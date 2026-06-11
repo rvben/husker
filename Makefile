@@ -125,6 +125,15 @@ test-e2e:
 	cargo nextest run --package husker --test e2e -- --ignored 2>/dev/null || cargo test --package husker --test e2e -- --ignored
 
 # Run ignored husker e2e tests only when explicitly enabled.
+#
+# Required env vars (Linux):
+#   HUSKER_RUN_IGNORED_E2E=1
+#   HUSKER_E2E_KERNEL   path to vmlinux  (default: /var/lib/husker/kernels/vmlinux)
+#   HUSKER_E2E_ROOTFS   path to rootfs   (default: /var/lib/husker/images/alpine-x86_64.ext4)
+#   HUSKER_E2E_INITRD   path to initrd   (default: /var/lib/husker/kernels/initramfs-x86_64-virt.gz)
+#
+# Defaults point at images installed by `husker images pull`.
+# A running `husker daemon` on 127.0.0.1:7777 is also required.
 test-e2e-gated:
 	@if [ "$${HUSKER_RUN_IGNORED_E2E:-0}" = "1" ]; then \
 		cargo test --package husker --test e2e -- --ignored; \
