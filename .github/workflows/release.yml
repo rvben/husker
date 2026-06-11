@@ -88,9 +88,7 @@ jobs:
           uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" maturin wheel
           echo "${RUNNER_TEMP}/build-venv/bin" >> "$GITHUB_PATH"
 
-      # Cloud-image is x86_64 Linux only (OVMF is x86_64; aarch64 cloud images
-      # are not supported). Only the x86_64-unknown-linux-gnu target embeds the
-      # guest agent; aarch64 Linux and both macOS targets skip this step.
+      # x86_64 Linux embeds the x86_64-musl agent (QEMU/Firecracker cloud images).
       - name: Build + stage guest agent for embedding (x86_64 Linux only)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
@@ -98,6 +96,17 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           cargo build --package husker-agent --profile agent --target x86_64-unknown-linux-musl
           echo "HUSKER_EMBED_AGENT_BIN=${GITHUB_WORKSPACE}/target/x86_64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
+
+      # Apple Silicon embeds the aarch64-musl agent (VZ cloud images).
+      # aarch64 Linux and Intel macOS ship without an embedded agent.
+      - name: Build + stage guest agent for embedding (aarch64 macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          brew list zig >/dev/null 2>&1 || brew install zig
+          command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild
+          rustup target add aarch64-unknown-linux-musl
+          make build-agent-aarch64
+          echo "HUSKER_EMBED_AGENT_BIN=$PWD/target/aarch64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
 
       - name: Build binary (Linux, cross via zigbuild for manylinux_2_28)
         if: runner.os == 'Linux'
