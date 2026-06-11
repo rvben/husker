@@ -120,6 +120,7 @@ impl AppleVzBackend {
                 "OVMF boot is a Linux/QEMU mode; macOS uses EFI boot".into(),
             ));
         }
+        let mem_size_bytes = u64::from(config.mem_size_mib) * 1024 * 1024;
         let vm = dispatch_sync_fallible(queue.clone(), {
             let config = config.clone();
             let queue_for_vm = queue.clone();
@@ -200,7 +201,7 @@ impl AppleVzBackend {
                 let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
                 unsafe {
                     vz_config.setCPUCount(config.vcpu_count as usize);
-                    vz_config.setMemorySize(u64::from(config.mem_size_mib) * 1024 * 1024);
+                    vz_config.setMemorySize(mem_size_bytes);
                     vz_config.setBootLoader(Some(&*boot_loader));
                 }
 
@@ -526,6 +527,7 @@ impl VmmBackend for AppleVzBackend {
             }
         };
 
+        let mem_size_bytes = u64::from(config.mem_size_mib) * 1024 * 1024;
         let info = VmInfo {
             id,
             name: config.name,
@@ -545,7 +547,7 @@ impl VmmBackend for AppleVzBackend {
                 serial_log_path,
                 _serial_file: serial_file,
                 balloon: config.balloon,
-                mem_size_bytes: u64::from(config.mem_size_mib) * 1024 * 1024,
+                mem_size_bytes,
             },
         );
 
@@ -826,7 +828,8 @@ fn balloon_target_bytes(mem_size_bytes: u64, amount_mib: u32) -> Result<u64, Vmm
     let reclaim = u64::from(amount_mib) * 1024 * 1024;
     if reclaim >= mem_size_bytes {
         return Err(VmmError::InvalidConfig(format!(
-            "balloon amount {amount_mib} MiB must be smaller than VM memory"
+            "balloon amount {amount_mib} MiB must be less than VM memory {} MiB",
+            mem_size_bytes / (1024 * 1024)
         )));
     }
     Ok(mem_size_bytes - reclaim)
@@ -949,6 +952,10 @@ mod tests {
     }
 
     // ── set_balloon ──────────────────────────────────────────────────────
+    // The `balloon: false -> InvalidConfig` branch has no dedicated unit test
+    // because constructing a VzInstance requires a live VZVirtualMachine, which
+    // requires the com.apple.security.virtualization entitlement. Coverage for
+    // that branch comes from real-hardware verification.
 
     #[tokio::test]
     async fn set_balloon_unknown_id_is_not_found() {
