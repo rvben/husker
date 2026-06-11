@@ -7,6 +7,13 @@ async fn main() -> Result<()> {
 
     info!("husker-agent starting");
 
+    if let Err(e) = husker_agent::configure_self_cgroup(
+        std::path::Path::new("/sys/fs/cgroup"),
+        husker_agent::AGENT_MEMORY_HIGH_BYTES,
+    ) {
+        tracing::warn!("cgroup self-limit not applied: {e}");
+    }
+
     // Transport selection:
     // 1. HUSKER_AGENT_SOCKET env var → Unix socket (dev/testing)
     // 2. Linux → vsock port 52 (production)
