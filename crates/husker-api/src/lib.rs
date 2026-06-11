@@ -333,8 +333,8 @@ pub struct ExecRequest {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// Seconds to wait for the guest agent to become reachable. Defaults to
-    /// `DEFAULT_EXEC_CONNECT_TIMEOUT_SECS` (or the UEFI readiness timeout for
-    /// cloud VMs, which boot slower) and is clamped to a sane range.
+    /// `DEFAULT_EXEC_CONNECT_TIMEOUT_SECS` (or the extended cloud-image timeout
+    /// for EFI/UEFI VMs, which boot slower) and is clamped to a sane range.
     pub connect_timeout_secs: Option<u64>,
     /// Maximum seconds the command may run. Defaults to the daemon's
     /// `exec_timeout_secs` and is clamped to `exec_timeout_max_secs`.
@@ -350,8 +350,11 @@ const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
 /// Resolve the exec agent-connect timeout: boot-mode-aware default when
 /// unset (UEFI/cloud VMs boot far slower than microVMs), clamped to
 /// `[1, MAX_EXEC_CONNECT_TIMEOUT_SECS]` otherwise.
+///
+/// Both "uefi" (Linux/QEMU cloud-image) and "efi" (macOS/VZ cloud-image) need
+/// the extended timeout because both run cloud-init on first boot.
 fn resolve_exec_connect_timeout(requested: Option<u64>, boot_mode: &str) -> Duration {
-    let default = if boot_mode == "uefi" {
+    let default = if boot_mode == "uefi" || boot_mode == "efi" {
         husker_core::UEFI_READY_TIMEOUT_SECS
     } else {
         DEFAULT_EXEC_CONNECT_TIMEOUT_SECS
@@ -4310,6 +4313,11 @@ mod tests {
             resolve_exec_connect_timeout(None, "uefi"),
             Duration::from_secs(husker_core::UEFI_READY_TIMEOUT_SECS)
         );
+        // EFI (macOS/VZ cloud-image) needs the same extended timeout as UEFI.
+        assert_eq!(
+            resolve_exec_connect_timeout(None, "efi"),
+            Duration::from_secs(husker_core::UEFI_READY_TIMEOUT_SECS)
+        );
         assert_eq!(
             resolve_exec_connect_timeout(Some(5), "direct"),
             Duration::from_secs(5)
@@ -4317,6 +4325,10 @@ mod tests {
         // An explicit timeout wins regardless of boot mode.
         assert_eq!(
             resolve_exec_connect_timeout(Some(5), "uefi"),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            resolve_exec_connect_timeout(Some(5), "efi"),
             Duration::from_secs(5)
         );
         assert_eq!(
