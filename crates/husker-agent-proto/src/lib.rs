@@ -21,6 +21,9 @@ pub enum AgentRequest {
     /// Check if the agent is alive.
     Ping,
 
+    /// Report guest network info (non-loopback IPv4 addresses).
+    GuestInfo,
+
     /// Start an interactive shell session.
     ShellStart(ShellStartRequest),
 
@@ -49,6 +52,9 @@ pub enum AgentResponse {
 
     /// An error occurred processing the request.
     Error(ErrorResponse),
+
+    /// Guest network information.
+    GuestInfo(GuestInfoResponse),
 
     /// Shell session started successfully.
     ShellStarted,
@@ -103,6 +109,13 @@ pub struct WriteFileResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub message: String,
+}
+
+/// Guest network information reported by the agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestInfoResponse {
+    /// Non-loopback IPv4 addresses, primary first.
+    pub ipv4: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +393,24 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn guest_info_round_trip() {
+        let req = AgentRequest::GuestInfo;
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let back: AgentRequest = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(back, AgentRequest::GuestInfo));
+
+        let resp = AgentResponse::GuestInfo(GuestInfoResponse {
+            ipv4: vec!["192.0.2.7".into()],
+        });
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let back: AgentResponse = serde_json::from_slice(&bytes).unwrap();
+        match back {
+            AgentResponse::GuestInfo(g) => assert_eq!(g.ipv4, vec!["192.0.2.7".to_string()]),
+            other => panic!("expected GuestInfo, got {other:?}"),
+        }
+    }
 
     #[test]
     fn roundtrip_exec_request() {
