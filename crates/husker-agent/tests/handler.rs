@@ -924,6 +924,26 @@ async fn shell_invalid_base64_input_is_ignored() {
     );
 }
 
+#[tokio::test]
+async fn guest_info_reports_ipv4_addresses() {
+    let mut stream = spawn_agent().await;
+
+    write_message(&mut stream, &AgentRequest::GuestInfo)
+        .await
+        .unwrap();
+
+    let resp: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match resp {
+        AgentResponse::GuestInfo(info) => {
+            for addr in &info.ipv4 {
+                let ip: std::net::Ipv4Addr = addr.parse().expect("valid IPv4");
+                assert!(!ip.is_loopback(), "loopback must be filtered: {ip}");
+            }
+        }
+        other => panic!("expected GuestInfo, got {other:?}"),
+    }
+}
+
 /// Verify that shell data flows correctly after an idle period.
 ///
 /// Regression test for connection lifetime: if the transport is torn down

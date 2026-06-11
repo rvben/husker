@@ -6,9 +6,9 @@ use std::os::fd::AsRawFd;
 
 use anyhow::Result;
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, ReadFileResponse, ShellDataResponse,
-    ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode, base64_encode,
-    read_message, write_message,
+    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, GuestInfoResponse, ReadFileResponse,
+    ShellDataResponse, ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode,
+    base64_encode, read_message, write_message,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
@@ -198,6 +198,22 @@ fn max_read_bytes() -> u64 {
 async fn handle_request(request: AgentRequest) -> AgentResponse {
     match request {
         AgentRequest::Ping => AgentResponse::Pong,
+
+        AgentRequest::GuestInfo => match if_addrs::get_if_addrs() {
+            Ok(addrs) => {
+                let ipv4: Vec<String> = addrs
+                    .into_iter()
+                    .filter_map(|ifaddr| match ifaddr.addr {
+                        if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(v4.ip.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                AgentResponse::GuestInfo(GuestInfoResponse { ipv4 })
+            }
+            Err(e) => AgentResponse::Error(ErrorResponse {
+                message: format!("get_if_addrs failed: {e}"),
+            }),
+        },
 
         AgentRequest::Exec(req) => {
             let timeout = exec_timeout();
