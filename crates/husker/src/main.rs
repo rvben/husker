@@ -5037,6 +5037,20 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
             _ => println!("  mkfs.ext4 ... MISSING (volumes unavailable)"),
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let ok = std::process::Command::new("qemu-img")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            println!("  qemu-img ... OK (cloud-image conversion available)");
+        } else {
+            println!("  qemu-img ... MISSING (cloud images need it: brew install qemu)");
+        }
+    }
     if let Some(ref size) = config.default_disk_size {
         match husker::parse_disk_size(size) {
             Ok(_) => println!("  default_disk_size ({size}) ... OK"),

@@ -1,8 +1,14 @@
 //! Stage the guest agent for embedding into the daemon.
 //!
-//! The agent (x86_64-musl, built by `make build-agent`) is copied to
-//! `OUT_DIR/agent.bin` so `src/lib.rs` can `include_bytes!` it for cloud-image
-//! seeds. If the agent is absent, an empty blob is staged so normal builds (the
+//! The agent binary is copied to `OUT_DIR/agent.bin` so `src/lib.rs` can
+//! `include_bytes!` it for cloud-image seeds. The target architecture is
+//! inferred from the build target: Apple Silicon (`aarch64-apple-darwin`) daemons
+//! embed the aarch64-musl agent (Apple VZ cloud images); all other targets default
+//! to the x86_64-musl agent (Firecracker/QEMU cloud images). Intel macOS builds
+//! will not find a pre-built x86_64-musl agent on a Mac, staging an empty blob
+//! and producing a runtime error if cloud-image is attempted - which is expected.
+//!
+//! If the agent is absent, an empty blob is staged so normal builds (the
 //! microVM path) still compile; cloud-image then errors clearly at runtime.
 
 use std::path::PathBuf;
@@ -18,8 +24,15 @@ fn main() {
             let manifest = PathBuf::from(
                 std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
             );
-            // crates/husker -> workspace root -> conventional musl agent output.
-            manifest.join("../../target/x86_64-unknown-linux-musl/agent/husker-agent")
+            // Target-aware conventional agent path: Apple Silicon daemons embed the
+            // aarch64-musl agent (VZ cloud images), all other targets embed x86_64-musl.
+            let target = std::env::var("TARGET").unwrap_or_default();
+            let rel = if target == "aarch64-apple-darwin" {
+                "../../target/aarch64-unknown-linux-musl/agent/husker-agent"
+            } else {
+                "../../target/x86_64-unknown-linux-musl/agent/husker-agent"
+            };
+            manifest.join(rel)
         }
     };
 
@@ -27,9 +40,8 @@ fn main() {
         std::fs::copy(&candidate, &dest).expect("copy embedded agent");
         println!("cargo:rerun-if-changed={}", candidate.display());
     } else {
-        // Stage an empty blob so normal builds compile. Stay silent for the common
-        // "did not run make build-agent" case; cloud-image is opt-in and Linux-only.
-        // Warn only when the agent path was explicitly requested but does not exist.
+        // Stage an empty blob so normal builds compile. Cloud-image is opt-in;
+        // warn only when the agent path was explicitly requested but does not exist.
         std::fs::write(&dest, b"").expect("write empty agent placeholder");
         if let Some(p) = &env_path {
             println!(

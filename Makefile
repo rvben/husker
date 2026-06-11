@@ -40,14 +40,21 @@ build-release-with-agent: build-agent
 	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/x86_64-unknown-linux-musl/agent/husker-agent \
 		cargo build --release -p husker
 
-# Build guest agent for ARM64 (for macOS/VZ guests)
+# Build guest agent for ARM64 (for macOS/VZ guests and VZ cloud-image seeds).
+# On macOS, zig provides the musl cross linker (brew install zig; cargo install cargo-zigbuild).
 build-agent-aarch64:
+ifeq ($(shell uname -s),Darwin)
+	cargo zigbuild --package husker-agent --profile agent --target aarch64-unknown-linux-musl
+else
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$(AARCH64_MUSL_LINKER) \
 	cargo build --package husker-agent --profile agent --target aarch64-unknown-linux-musl
+endif
 
-# Build release for macOS (no linux-net, with entitlement signing)
-build-release-macos:
-	cargo build --workspace --release --no-default-features
+# Build release for macOS (no linux-net, with entitlement signing).
+# Embeds the aarch64-musl guest agent so Apple Silicon builds support VZ cloud images.
+build-release-macos: build-agent-aarch64
+	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/aarch64-unknown-linux-musl/agent/husker-agent \
+		cargo build --workspace --release --no-default-features
 	$(MAKE) sign-macos
 
 # Sign macOS binary with virtualization entitlement
@@ -94,10 +101,13 @@ check:
 clean:
 	cargo clean
 
-# Install husker binary (auto-detects macOS to disable linux-net and sign)
+# Install husker binary (auto-detects macOS to disable linux-net and sign).
+# On macOS, builds the aarch64-musl agent first and embeds it for VZ cloud-image support.
 install:
 ifeq ($(shell uname -s),Darwin)
-	cargo install --path crates/husker --no-default-features
+	$(MAKE) build-agent-aarch64
+	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/aarch64-unknown-linux-musl/agent/husker-agent \
+		cargo install --path crates/husker --no-default-features
 	codesign --entitlements husker.entitlements --force --sign - "$$(which husker)"
 else
 	cargo install --path crates/husker
