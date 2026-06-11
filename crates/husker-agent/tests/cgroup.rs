@@ -15,6 +15,10 @@ fn configure_self_cgroup_creates_leaf_and_writes_limits() {
         std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap(),
         std::process::id().to_string()
     );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("cgroup.subtree_control")).unwrap(),
+        "+memory"
+    );
 }
 
 #[test]
