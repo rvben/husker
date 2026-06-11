@@ -45,10 +45,40 @@ cd "linux-${KERNEL_VERSION}"
 
 make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} defconfig
 
+# Two sources of bloat removed here: defconfig enables large subsystems
+# (USB, sound, DRM, wireless, media...) as =y directly, and CONFIG_MODULES=n
+# causes olddefconfig to clamp every remaining =m driver to =y as well. The
+# sed pass neutralises the =m entries before olddefconfig runs; the explicit
+# cfg --disable calls below remove the directly-=y subsystems. Together they
+# cut kernel size roughly in half and allow boot inside a 128 MiB guest.
+sed -i 's/^\(CONFIG_.*\)=m$/# \1 is not set/' .config
+
 cfg() { scripts/config "$@"; }
 
 # Everything below is built in: no loadable modules, ever.
 cfg --disable MODULES
+
+# Disable large subsystems that defconfig enables but microVMs do not need.
+# These consume significant kernel memory at boot inside a 128 MiB guest.
+cfg --disable USB_SUPPORT
+cfg --disable SOUND
+cfg --disable DRM
+cfg --disable MEDIA_SUPPORT
+cfg --disable INPUT
+cfg --disable HID
+cfg --disable HID_SUPPORT
+cfg --disable WIRELESS
+cfg --disable WLAN
+cfg --disable BLUETOOTH
+cfg --disable RFKILL
+cfg --disable NFC
+cfg --disable I2C
+cfg --disable SPI
+cfg --disable HWMON
+cfg --disable REGULATOR
+cfg --disable IOMMU_SUPPORT
+cfg --disable VFIO
+cfg --disable MTD
 
 # virtio core + both transports (Firecracker: MMIO; QEMU and Apple VZ: PCI)
 cfg --enable VIRTIO
