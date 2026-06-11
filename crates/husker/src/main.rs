@@ -1606,7 +1606,9 @@ async fn run(cli: Cli) -> Result<()> {
             }
 
             #[cfg(all(target_os = "linux", feature = "linux-net"))]
-            ensure_firecracker(&config).await?;
+            if needs_firecracker_preflight(&body) {
+                ensure_firecracker(&config).await?;
+            }
 
             let client = reqwest::Client::new();
             let resp = api_request(
@@ -4570,6 +4572,15 @@ fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
     Ok((base, prefix_len))
 }
 
+/// Whether a VM create request will boot via Firecracker and therefore needs
+/// the client-side Firecracker binary preflight. Cloud-image and explicit
+/// `--vmm qemu` requests are served by QEMU, where the preflight would block
+/// hosts that have QEMU but no Firecracker installed.
+#[cfg(all(target_os = "linux", feature = "linux-net"))]
+fn needs_firecracker_preflight(body: &serde_json::Value) -> bool {
+    body.get("cloud_image").is_none() && body["vmm"].as_str() != Some("qemu")
+}
+
 /// Ensure Firecracker is available. If the binary can't be found, auto-install
 /// when `HUSKER_AUTO_INSTALL_FIRECRACKER=1` is set, prompt interactively on a
 /// TTY, or bail with a hint otherwise.
@@ -6135,6 +6146,25 @@ mod tests {
         // Output fields annotated for core commands.
         let list_fields = cmds["list"]["output_fields"].as_array().unwrap();
         assert!(list_fields.contains(&serde_json::json!("guest_ip")));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-net"))]
+    #[test]
+    fn firecracker_preflight_only_for_firecracker_bound_requests() {
+        use serde_json::json;
+        assert!(needs_firecracker_preflight(&json!({"name": "a"})));
+        assert!(needs_firecracker_preflight(
+            &json!({"name": "a", "vmm": "firecracker"})
+        ));
+        assert!(!needs_firecracker_preflight(
+            &json!({"name": "a", "vmm": "qemu"})
+        ));
+        assert!(!needs_firecracker_preflight(
+            &json!({"name": "a", "cloud_image": "/img.qcow2"})
+        ));
+        assert!(!needs_firecracker_preflight(
+            &json!({"name": "a", "vmm": "qemu", "cloud_image": "/img.qcow2"})
+        ));
     }
 
     #[test]

@@ -1455,6 +1455,15 @@ impl<B: VmmBackend> HuskerCore<B> {
         validate_resource_name("service", &req.name)?;
         let desired_instances = req.desired_instances.unwrap_or(1);
         validate_service_instance_names(&req.name, desired_instances)?;
+        if let Some(ref volume) = req.volume
+            && desired_instances > 1
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "service '{}' requests {desired_instances} instances with volume '{volume}': \
+                 volumes are exclusive-attach, so a volume-backed service is limited to 1 instance",
+                req.name,
+            )));
+        }
 
         let (rootfs, kernel) = if req.cloud_image.is_some() {
             (
@@ -1555,6 +1564,15 @@ impl<B: VmmBackend> HuskerCore<B> {
     {
         let record = self.get_service(name)?;
         validate_service_instance_names(name, desired_instances)?;
+        if let Some(ref volume) = record.volume
+            && desired_instances > 1
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "cannot scale service '{name}' to {desired_instances} instances with volume \
+                 '{volume}': volumes are exclusive-attach, so a volume-backed service is \
+                 limited to 1 instance",
+            )));
+        }
         self.state
             .update_service_desired_instances(record.id, desired_instances)
             .map_err(|e| match e {
@@ -4045,6 +4063,141 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(
             services.is_empty(),
             "no service must be persisted when volume validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_service_volume_with_multiple_instances_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        #[cfg(not(feature = "linux-net"))]
+        let core = std::sync::Arc::new(HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        ));
+        #[cfg(feature = "linux-net")]
+        let core = std::sync::Arc::new(HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        ));
+
+        let req = CreateServiceRequest {
+            name: "svc-vol-multi".into(),
+            host_group: None,
+            desired_instances: Some(2),
+            image: None,
+            rootfs_path: Some("/tmp/rootfs.ext4".into()),
+            kernel_path: Some("/tmp/vmlinux".into()),
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            env: vec![],
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
+            volume: Some("data".into()),
+        };
+
+        let err = core.create_service(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "volume + multiple instances must be InvalidArgument, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("exclusive"),
+            "error must explain volumes are exclusive-attach, got: {err}"
+        );
+        let services = core.list_services().unwrap();
+        assert!(
+            services.is_empty(),
+            "no service must be persisted when the volume/instances combination is invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn scale_service_with_volume_beyond_one_instance_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        std::fs::write(tmp.path().join("data.img"), b"").unwrap();
+        state
+            .insert_volume(&husker_state::VolumeRecord {
+                id: Uuid::new_v4(),
+                name: "data".into(),
+                file_path: tmp.path().join("data.img").to_string_lossy().into_owned(),
+                size_bytes: 1024 * 1024,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        #[cfg(not(feature = "linux-net"))]
+        let core = std::sync::Arc::new(HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        ));
+        #[cfg(feature = "linux-net")]
+        let core = std::sync::Arc::new(HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        ));
+
+        let req = CreateServiceRequest {
+            name: "svc-vol-scale".into(),
+            host_group: None,
+            desired_instances: Some(1),
+            image: None,
+            rootfs_path: Some("/tmp/rootfs.ext4".into()),
+            kernel_path: Some("/tmp/vmlinux".into()),
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            env: vec![],
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
+            volume: Some("data".into()),
+        };
+        // Instance spawn may fail (no real VMM in tests); only the record matters.
+        let (record, _outcome) = core.create_service(req).await.unwrap();
+        assert_eq!(record.desired_instances, 1);
+
+        let err = core.scale_service("svc-vol-scale", 2).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "scaling a volume-backed service beyond 1 must be InvalidArgument, got: {err:?}"
+        );
+        let record = core.get_service("svc-vol-scale").unwrap();
+        assert_eq!(
+            record.desired_instances, 1,
+            "desired_instances must be unchanged after a rejected scale"
         );
     }
 
