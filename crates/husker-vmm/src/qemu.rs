@@ -62,7 +62,7 @@ impl QemuKvmBackend {
 
     /// Build the full `qemu-system-*` argument vector. Pure function of
     /// (id, config, runtime paths) so it is unit-testable without spawning QEMU.
-    pub fn build_args(&self, id: Uuid, config: &VmConfig) -> Vec<String> {
+    pub fn build_args(&self, id: Uuid, config: &VmConfig) -> Result<Vec<String>, VmmError> {
         #[cfg(target_arch = "aarch64")]
         let machine = "virt";
         #[cfg(not(target_arch = "aarch64"))]
@@ -184,10 +184,9 @@ impl QemuKvmBackend {
                 }
             }
             crate::BootMode::Efi { .. } => {
-                // Efi boot is for Apple VZ only; QEMU uses BootMode::Uefi with
-                // explicit OVMF paths. This arm is unreachable because `create`
-                // rejects Efi before calling `build_args`.
-                unreachable!("BootMode::Efi is not supported by the QEMU backend");
+                return Err(VmmError::InvalidConfig(
+                    "EFI boot is not supported by the QEMU backend".into(),
+                ));
             }
         }
 
@@ -204,7 +203,7 @@ impl QemuKvmBackend {
             args.push(format!("virtio-net-pci,netdev=net0,mac={mac}"));
         }
 
-        args
+        Ok(args)
     }
 
     /// Spawn a QEMU process and track it. (`VmmBackend::create_vm` delegates here.)
@@ -223,7 +222,7 @@ impl QemuKvmBackend {
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
 
         let id = Uuid::new_v4();
-        let args = self.build_args(id, &config);
+        let args = self.build_args(id, &config)?;
 
         // UEFI VMs need their own writable OVMF variable store. Copy the firmware
         // template into the runtime dir; build_args points pflash unit=1 at it.
@@ -530,7 +529,7 @@ mod tests {
     #[test]
     fn build_args_has_core_flags() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
-        let args = be.build_args(Uuid::nil(), &sample_config());
+        let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         for flag in [
             "-machine",
             "-nographic",
@@ -550,7 +549,7 @@ mod tests {
     #[test]
     fn build_args_wires_vsock_cid() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
-        let args = be.build_args(Uuid::nil(), &sample_config());
+        let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter().any(|a| a == "vhost-vsock-pci,guest-cid=7"),
             "vsock device missing or wrong cid: {args:?}"
@@ -560,7 +559,7 @@ mod tests {
     #[test]
     fn build_args_attaches_raw_rootfs_and_root_device() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
-        let args = be.build_args(Uuid::nil(), &sample_config());
+        let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter()
                 .any(|a| a.contains("format=raw") && a.contains("if=virtio")),
@@ -579,7 +578,7 @@ mod tests {
     #[test]
     fn build_args_includes_tap_when_present() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
-        let args = be.build_args(Uuid::nil(), &sample_config());
+        let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter().any(|a| a.contains("ifname=husker7")),
             "tap netdev missing: {args:?}"
@@ -705,7 +704,7 @@ mod tests {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.kernel_args = Some("console=ttyS0 reboot=k panic=1 pci=off ip=192.0.2.2::192.0.2.1:255.255.255.252::eth0:off".into());
-        let args = be.build_args(Uuid::nil(), &cfg);
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
         let append = args
             .iter()
             .find(|a| a.contains("root=/dev/vda"))
@@ -735,7 +734,7 @@ mod tests {
     fn build_args_uefi_uses_pflash_and_qcow2_no_kernel() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
         let id = Uuid::nil();
-        let args = be.build_args(id, &uefi_config());
+        let args = be.build_args(id, &uefi_config()).unwrap();
 
         for flag in ["-kernel", "-initrd", "-append"] {
             assert!(
@@ -772,7 +771,7 @@ mod tests {
     #[test]
     fn build_args_direct_kernel_still_has_kernel_and_raw_rootfs() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
-        let args = be.build_args(Uuid::nil(), &sample_config());
+        let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter().any(|a| a == "-kernel"),
             "direct boot must keep -kernel"
@@ -792,7 +791,7 @@ mod tests {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
         let mut cfg = uefi_config();
         cfg.seed_path = Some("/var/lib/husker/vms/qvm/seed.img".into());
-        let args = be.build_args(Uuid::nil(), &cfg);
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
         assert!(
             args.iter().any(|a| a.contains("seed.img")
                 && a.contains("format=raw")
@@ -804,7 +803,7 @@ mod tests {
     #[test]
     fn build_args_uefi_omits_seed_when_absent() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
-        let args = be.build_args(Uuid::nil(), &uefi_config()); // seed_path None
+        let args = be.build_args(Uuid::nil(), &uefi_config()).unwrap(); // seed_path None
         assert!(
             !args.iter().any(|a| a.contains("seed.img")),
             "unexpected seed: {args:?}"
@@ -888,7 +887,7 @@ mod tests {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.balloon = true;
-        let args = be.build_args(Uuid::nil(), &cfg);
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
         assert!(
             args.iter().any(|a| a == "virtio-balloon-pci"),
             "balloon device missing: {args:?}"
@@ -898,7 +897,7 @@ mod tests {
     #[test]
     fn build_args_omits_balloon_device_by_default() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
-        let args = be.build_args(Uuid::nil(), &sample_config());
+        let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             !args.iter().any(|a| a == "virtio-balloon-pci"),
             "balloon device present when not requested: {args:?}"
@@ -910,7 +909,7 @@ mod tests {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
         let mut cfg = uefi_config();
         cfg.balloon = true;
-        let args = be.build_args(Uuid::nil(), &cfg);
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
         assert!(
             args.iter().any(|a| a == "virtio-balloon-pci"),
             "balloon device missing in UEFI boot: {args:?}"
@@ -963,7 +962,7 @@ mod tests {
         let mut cfg = uefi_config();
         cfg.volume_path = Some("/var/lib/husker/volumes/data.img".into());
         cfg.seed_path = Some("/var/lib/husker/vms/qvm/seed.img".into());
-        let args = be.build_args(Uuid::nil(), &cfg);
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
 
         // Collect the values that follow each `-drive` flag.
         let drives: Vec<&str> = args
@@ -1011,7 +1010,7 @@ mod tests {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.volume_path = Some("/var/lib/husker/volumes/data.img".into());
-        let args = be.build_args(Uuid::nil(), &cfg);
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
 
         let drives: Vec<&str> = args
             .windows(2)
@@ -1046,16 +1045,30 @@ mod tests {
     fn build_args_no_volume_drive_when_absent() {
         let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
         // Direct-kernel, no volume
-        let args_direct = be.build_args(Uuid::nil(), &sample_config());
+        let args_direct = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             !args_direct.iter().any(|a| a.contains("data.img")),
             "unexpected volume drive in direct-kernel args: {args_direct:?}"
         );
         // UEFI, no volume
-        let args_uefi = be.build_args(Uuid::nil(), &uefi_config());
+        let args_uefi = be.build_args(Uuid::nil(), &uefi_config()).unwrap();
         assert!(
             !args_uefi.iter().any(|a| a.contains("data.img")),
             "unexpected volume drive in uefi args: {args_uefi:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_efi_returns_invalid_config_error() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.boot = crate::BootMode::Efi {
+            variable_store: "/tmp/nvram.bin".into(),
+        };
+        let err = be.build_args(Uuid::nil(), &cfg).unwrap_err();
+        assert!(
+            matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("EFI")),
+            "expected InvalidConfig mentioning EFI, got: {err}"
         );
     }
 }
