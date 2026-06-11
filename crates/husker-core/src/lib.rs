@@ -3281,7 +3281,11 @@ mod tests {
         let image = tmp.path().join("base.qcow2");
         let code = tmp.path().join("CODE.fd");
         let vars = tmp.path().join("VARS.fd");
-        for p in [&image, &code, &vars] {
+        // image must have valid qcow2 magic so validate_cloud_image passes.
+        let mut qcow2_data = vec![0u8; 512];
+        qcow2_data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
+        std::fs::write(&image, &qcow2_data).unwrap();
+        for p in [&code, &vars] {
             std::fs::write(p, b"x").unwrap();
         }
         let dest = tmp.path().join("vm/disk.qcow2");
@@ -3323,8 +3327,12 @@ mod tests {
         )
         .await
         .unwrap_err();
+        // validate_cloud_image reports missing files as Storage(InvalidCloudImage).
         assert!(
-            matches!(err, super::CoreError::InvalidArgument(_)),
+            matches!(
+                err,
+                super::CoreError::Storage(husker_storage::StorageError::InvalidCloudImage(_))
+            ),
             "got {err:?}"
         );
     }
@@ -3334,7 +3342,10 @@ mod tests {
     async fn prepare_cloud_disk_errors_on_missing_ovmf() {
         let tmp = tempfile::tempdir().unwrap();
         let image = tmp.path().join("base.qcow2");
-        std::fs::write(&image, b"x").unwrap();
+        // image must have valid qcow2 magic so validate_cloud_image passes.
+        let mut qcow2_data = vec![0u8; 512];
+        qcow2_data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
+        std::fs::write(&image, &qcow2_data).unwrap();
         let driver = husker_storage::default_storage_driver();
         let err = super::prepare_cloud_disk(
             driver.as_ref(),
@@ -4427,7 +4438,11 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let kernel_file = tmp.path().join("vmlinux");
         let rootfs_file = tmp.path().join("rootfs.ext4");
-        std::fs::write(&kernel_file, b"kernel").unwrap();
+        // Write a kernel stub with the ARM64 Image magic at offset 56 so that
+        // validate_kernel_format (macOS-only) passes before the network check.
+        let mut kernel_stub = vec![0u8; 64];
+        kernel_stub[56..60].copy_from_slice(&[0x41, 0x52, 0x4d, 0x64]); // "ARMd" LE = 0x644d5241
+        std::fs::write(&kernel_file, &kernel_stub).unwrap();
         std::fs::write(&rootfs_file, b"rootfs").unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
