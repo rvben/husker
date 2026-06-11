@@ -8,10 +8,21 @@
 set -euo pipefail
 
 KERNEL_VERSION="${KERNEL_VERSION:-6.12.93}"
+# SHA256 for linux-6.12.93.tar.xz. Override with KERNEL_SHA256 when changing
+# KERNEL_VERSION, or set to "skip" to bypass verification.
+KERNEL_SHA256_DEFAULT="492648a87c0b69c5ac7f43be64792b9000e3439550d4e82e4a14710c49094fa3"
+KERNEL_SHA256="${KERNEL_SHA256:-$KERNEL_SHA256_DEFAULT}"
 ARCH="${ARCH:-$(uname -m)}"
 JOBS="${JOBS:-$(nproc)}"
 OUT_DIR="${HUSKER_KERNEL_OUT:-$HOME/.local/share/husker/kernels}"
-WORK_DIR="${WORK_DIR:-$(mktemp -d /tmp/husker-kernel-build.XXXXXX)}"
+
+_OWN_WORK_DIR=0
+if [ -z "${WORK_DIR:-}" ]; then
+  WORK_DIR="$(mktemp -d /tmp/husker-kernel-build.XXXXXX)"
+  _OWN_WORK_DIR=1
+fi
+cleanup() { [ "$_OWN_WORK_DIR" = 1 ] && rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
 
 case "$ARCH" in
   x86_64)  KARCH=x86_64; KTARGET=vmlinux; OUT_NAME=vmlinux ;;
@@ -22,11 +33,17 @@ esac
 cd "$WORK_DIR"
 MAJOR="${KERNEL_VERSION%%.*}"
 echo "==> Fetching linux-${KERNEL_VERSION} (${KARCH})"
-curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz"
-tar xf "linux-${KERNEL_VERSION}.tar.xz"
+[ -f "linux-${KERNEL_VERSION}.tar.xz" ] || \
+  curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz"
+
+if [ "$KERNEL_SHA256" != "skip" ]; then
+  echo "$KERNEL_SHA256  linux-${KERNEL_VERSION}.tar.xz" | sha256sum -c
+fi
+
+[ -d "linux-${KERNEL_VERSION}" ] || tar xf "linux-${KERNEL_VERSION}.tar.xz"
 cd "linux-${KERNEL_VERSION}"
 
-make ARCH="$KARCH" defconfig
+make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} defconfig
 
 cfg() { scripts/config "$@"; }
 
@@ -79,19 +96,30 @@ else
   cfg --enable SERIAL_AMBA_PL011_CONSOLE
 fi
 
-make ARCH="$KARCH" olddefconfig
+make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} olddefconfig
 
 # olddefconfig silently drops options with unmet dependencies; fail loudly.
-for opt in VIRTIO VIRTIO_PCI VIRTIO_MMIO VIRTIO_BLK VIRTIO_NET VIRTIO_BALLOON \
-           VIRTIO_CONSOLE VSOCKETS VIRTIO_VSOCKETS EXT4_FS OVERLAY_FS FUSE_FS \
-           VIRTIO_FS PACKET CGROUPS MEMCG DEVTMPFS DEVTMPFS_MOUNT; do
+for opt in VIRTIO VIRTIO_PCI VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES \
+           VIRTIO_BLK VIRTIO_NET VIRTIO_BALLOON VIRTIO_CONSOLE \
+           VSOCKETS VIRTIO_VSOCKETS EXT4_FS OVERLAY_FS FUSE_FS VIRTIO_FS \
+           PACKET CGROUPS MEMCG TMPFS DEVTMPFS DEVTMPFS_MOUNT; do
   grep -q "^CONFIG_${opt}=y" .config || { echo "FATAL: CONFIG_${opt} is not =y" >&2; exit 1; }
 done
 grep -q "^# CONFIG_MODULES is not set" .config \
   || { echo "FATAL: CONFIG_MODULES is still enabled" >&2; exit 1; }
 
+if [ "$KARCH" = "x86_64" ]; then
+  for opt in KVM_GUEST SERIAL_8250 SERIAL_8250_CONSOLE; do
+    grep -q "^CONFIG_${opt}=y" .config || { echo "FATAL: CONFIG_${opt} is not =y" >&2; exit 1; }
+  done
+else
+  for opt in SERIAL_AMBA_PL011 SERIAL_AMBA_PL011_CONSOLE; do
+    grep -q "^CONFIG_${opt}=y" .config || { echo "FATAL: CONFIG_${opt} is not =y" >&2; exit 1; }
+  done
+fi
+
 echo "==> Building (this takes a while)"
-make ARCH="$KARCH" -j"$JOBS" "$KTARGET"
+make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} -j"$JOBS" "$KTARGET"
 
 mkdir -p "$OUT_DIR"
 if [ "$KARCH" = "x86_64" ]; then
