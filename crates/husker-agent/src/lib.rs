@@ -192,7 +192,13 @@ pub const AGENT_MEMORY_HIGH_BYTES: u64 = 128 * 1024 * 1024;
 /// On hosts where the process already lives in a non-root cgroup managed by
 /// another controller (for example systemd service cgroups), the cgroup.procs
 /// write fails and the caller should treat the limit as best-effort.
+///
+/// cgroup v2 requires the `memory` controller to be listed in the parent's
+/// `cgroup.subtree_control` before a child cgroup exposes `memory.high`.
+/// We enable it on the root cgroup first (idempotent: writing `+memory` when
+/// it is already enabled is a no-op).
 pub fn configure_self_cgroup(cgroup_root: &Path, memory_high_bytes: u64) -> std::io::Result<()> {
+    std::fs::write(cgroup_root.join("cgroup.subtree_control"), "+memory")?;
     let leaf = cgroup_root.join("husker-agent");
     std::fs::create_dir_all(&leaf)?;
     std::fs::write(leaf.join("memory.high"), memory_high_bytes.to_string())?;
