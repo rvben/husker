@@ -213,6 +213,8 @@ pub fn configure_self_cgroup(cgroup_root: &Path, memory_high_bytes: u64) -> std:
 /// back to the root cgroup, so workload children never inherit the agent's
 /// memory limit. Writing "0" to cgroup.procs moves the current process.
 fn escape_agent_cgroup() {
+    // /sys/fs/cgroup is the production guest mount point; the path is intentionally
+    // hardcoded. This function is best-effort and is not unit-tested through an injected root.
     let _ = std::fs::write("/sys/fs/cgroup/cgroup.procs", "0");
 }
 

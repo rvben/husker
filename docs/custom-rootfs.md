@@ -19,7 +19,13 @@ The reference implementations are `guest/build-rootfs.sh` (Alpine/BusyBox) and `
 
 ## 1. Kernel modules
 
-The default husker kernel (`linux-virt` from Alpine) ships vsock and virtio-net as **loadable modules**, not built-in. The modules live in the initramfs at `lib/modules/<kver>/*.ko`. After `switch_root`, the initramfs init script copies them flat into `/lib/modules/` on the rootfs. The rootfs init must load them before anything that depends on them.
+The default husker kernel is a from-source build with all virtio and vsock drivers compiled in (not loadable modules). No `insmod` steps are needed when booting the default kernel: vsock, virtio-net, virtio-blk, and virtio-balloon are all available at boot without an initramfs.
+
+The checklist items above (`vsock modules loaded`, `virtio-net modules loaded`) still apply if you boot a **legacy modular kernel** such as Alpine's `linux-virt` package - see the legacy path below.
+
+### Legacy path: modular kernel (e.g. Alpine linux-virt)
+
+If you use a modular kernel, vsock and virtio-net are loadable modules. The modules live in the initramfs at `lib/modules/<kver>/*.ko`. After `switch_root`, the initramfs init script copies them flat into `/lib/modules/` on the rootfs. The rootfs init must load them before anything that depends on them.
 
 **Required load order:**
 
@@ -149,4 +155,4 @@ When the fallback occurs, husker logs a **one-time warning** (at most once per d
 
 On macOS, husker uses `VZNATNetworkDeviceAttachment` for networking - the guest gets DHCP from VZ directly, no TAP device or bridge. The `ip=` cmdline token is not set. The kernel args are `console=hvc0 root=/dev/vda rw init=/sbin/init`. The module loading and static IP requirements above do not apply to macOS/VZ guests.
 
-For macOS/VZ, an initramfs is loaded automatically from `~/.local/share/husker/kernels/initramfs-virt.gz` when present. That initramfs handles block and filesystem module loading before switching to the rootfs.
+For macOS/VZ, an initramfs is loaded automatically from `~/.local/share/husker/kernels/initramfs-virt.gz` when present. With the default husker kernel (all drivers built in) no initramfs is required. The initramfs is only needed when booting a legacy modular kernel such as Alpine `linux-virt`.

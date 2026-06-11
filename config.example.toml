@@ -30,9 +30,10 @@
 #   x86_64 default:  <data_dir>/images/alpine-x86_64.ext4
 # default_rootfs = "/var/lib/husker/images/alpine-x86_64.ext4"
 
-# Optional initrd/initramfs path used alongside the default kernel.
-# Apple VZ requires one for Alpine linux-virt (virtio_blk is a module,
-# not built-in) - build with `make build-initramfs`.
+# Initrd/initramfs path loaded alongside the kernel at boot. Not required for
+# the default husker kernel (all drivers built in); only needed for legacy
+# modular kernels such as Alpine linux-virt, where virtio_blk is a loadable
+# module. Build with `make build-initramfs` if you use a modular kernel.
 # default_initrd = "/var/lib/husker/kernels/initramfs-virt.gz"
 
 # Default disk size for cloud-image VMs when --disk-size is omitted (e.g. "10G").
