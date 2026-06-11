@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.6] - 2026-06-11
+
+### Added
+
+- **`husker volume get <name>`.** Volume details (name, size, backing file,
+  creation time) as text or JSON, mirroring `secret get`. The CLI schema
+  annotates it read-only with `status`/`action`/`volume` output fields.
+
+### Fixed
+
+- **Cloud-image and QEMU runs no longer require Firecracker on the client.**
+  `husker run --cloud-image ...` (or `--vmm qemu`) failed client-side when the
+  Firecracker binary was missing, even though the request is served by QEMU.
+  The preflight now only runs for Firecracker-bound requests.
+- **Volume-backed services are limited to one instance.** Creating or scaling
+  a service with `--volume` and more than one instance is now rejected with a
+  clear error. Volumes are exclusive-attach, so previously only the first
+  replica could start while the reconciler retried the rest forever.
+
 ## [0.4.5] - 2026-06-10
 
 ### Added
