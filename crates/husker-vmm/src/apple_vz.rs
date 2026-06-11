@@ -14,12 +14,12 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
-    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
-    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
-    VZVirtualMachineState,
+    VZDiskImageStorageDeviceAttachment, VZEFIBootLoader, VZEFIVariableStore,
+    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
+    VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -768,4 +768,22 @@ mod tests {
         drop(backend);
         // No panic = pass
     }
+}
+
+/// Compile-time spike: proves the EFI binding surface exists in
+/// objc2-virtualization 0.3. Removed when EFI boot lands for real.
+/// #[allow(unused)] is acceptable only because this function is temporary.
+#[allow(unused)]
+fn _efi_bindings_spike() {
+    let _ = |url: &objc2_foundation::NSURL| unsafe {
+        let loader = VZEFIBootLoader::new();
+        loader.setVariableStore(None);
+        let opts = objc2_virtualization::VZEFIVariableStoreInitializationOptions::empty();
+        let _store = VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
+            VZEFIVariableStore::alloc(),
+            url,
+            opts,
+        );
+        let _existing = VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), url);
+    };
 }

@@ -30,6 +30,9 @@ objc2-virtualization = { version = "0.3", features = [
     "VZSerialPortConfiguration",
     "VZSerialPortAttachment",
     "VZFileHandleSerialPortAttachment",
+    "VZBootLoader",
+    "VZEFIBootLoader",
+    "VZEFIVariableStore",
 ] }
 objc2-foundation = "0.3"
 block2 = "0.6"
