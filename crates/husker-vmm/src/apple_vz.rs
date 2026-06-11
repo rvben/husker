@@ -209,11 +209,18 @@ impl AppleVzBackend {
                         VmmError::InvalidConfig("rootfs path not valid UTF-8".into())
                     })?;
                 let rootfs_url = NSURL::fileURLWithPath(&NSString::from_str(rootfs_path));
+                // Explicit cached + fsync modes: the default attachment modes
+                // corrupt re-reads of sparse raw images on APFS (pages read
+                // back as zeros once evicted), progressively breaking the
+                // guest. Cached I/O goes through the host's unified buffer
+                // cache and stays coherent.
                 let disk_attachment = unsafe {
-                    VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                    VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                         VZDiskImageStorageDeviceAttachment::alloc(),
                         &rootfs_url,
                         false,
+                        objc2_virtualization::VZDiskImageCachingMode::Cached,
+                        objc2_virtualization::VZDiskImageSynchronizationMode::Fsync,
                     )
                     .map_err(|e| VmmError::InvalidConfig(format!("disk attachment: {e}")))?
                 };
@@ -234,10 +241,12 @@ impl AppleVzBackend {
                     })?;
                     let vol_url = NSURL::fileURLWithPath(&NSString::from_str(vol_str));
                     let vol_attachment = unsafe {
-                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                             VZDiskImageStorageDeviceAttachment::alloc(),
                             &vol_url,
                             false,
+                            objc2_virtualization::VZDiskImageCachingMode::Cached,
+                            objc2_virtualization::VZDiskImageSynchronizationMode::Fsync,
                         )
                         .map_err(|e| VmmError::InvalidConfig(format!("volume attachment: {e}")))?
                     };
@@ -256,10 +265,12 @@ impl AppleVzBackend {
                     })?;
                     let seed_url = NSURL::fileURLWithPath(&NSString::from_str(seed_str));
                     let seed_attachment = unsafe {
-                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                             VZDiskImageStorageDeviceAttachment::alloc(),
                             &seed_url,
                             true,
+                            objc2_virtualization::VZDiskImageCachingMode::Cached,
+                            objc2_virtualization::VZDiskImageSynchronizationMode::Fsync,
                         )
                         .map_err(|e| VmmError::InvalidConfig(format!("seed attachment: {e}")))?
                     };
