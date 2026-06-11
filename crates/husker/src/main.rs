@@ -96,7 +96,8 @@ enum Commands {
         #[arg(long, value_parser = ["firecracker", "qemu"])]
         vmm: Option<String>,
 
-        /// Boot a cloud image as a full UEFI VM via QEMU (Linux only): a catalog image name or a qcow2 path
+        /// Boot a cloud image: a catalog image name or a qcow2/img path. Uses QEMU/OVMF on
+        /// Linux and Apple Virtualization.framework (EFI) on macOS (Apple Silicon).
         #[arg(long)]
         cloud_image: Option<PathBuf>,
 
@@ -231,8 +232,8 @@ enum Commands {
         #[arg(long, value_parser = ["firecracker", "qemu"])]
         vmm: Option<String>,
 
-        /// Boot a cloud image as a full UEFI VM via QEMU (Linux only): a
-        /// catalog image name or a qcow2 path
+        /// Boot a cloud image: a catalog image name or a qcow2/img path. Uses QEMU/OVMF on
+        /// Linux and Apple Virtualization.framework (EFI) on macOS (Apple Silicon).
         #[arg(long)]
         cloud_image: Option<PathBuf>,
 

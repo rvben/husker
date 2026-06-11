@@ -134,11 +134,10 @@ fn render_user_data(spec: &SeedSpec) -> String {
     for line in [
         "[Unit]",
         "Description=husker guest agent",
-        "After=network.target",
         "[Service]",
         "ExecStart=/usr/local/bin/husker-agent",
         "Restart=always",
-        "RestartSec=1",
+        "RestartSec=2",
         "[Install]",
         "WantedBy=multi-user.target",
     ] {

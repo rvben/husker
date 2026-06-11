@@ -106,8 +106,8 @@ with `vmm = "qemu"` in the config file or `HUSKER_VMM=qemu`. Requires `/dev/kvm`
 on `PATH` (override with `HUSKER_QEMU_BIN`).
 
 Current scope is direct-kernel boot (same kernel + rootfs model as the Firecracker
-backend), with the guest agent reachable over vsock. Booting stock cloud images via
-UEFI/OVMF is not yet supported.
+backend), with the guest agent reachable over vsock. Cloud-image boot via UEFI/OVMF
+is also supported - see the Cloud Images section below.
 
 **Guest kernel requirement:** the QEMU backend uses the `q35` machine, which puts the
 root disk, NIC, and vsock device on the PCI bus, so the guest kernel must have
@@ -115,6 +115,38 @@ root disk, NIC, and vsock device on the PCI bus, so the guest kernel must have
 images satisfy this. Firecracker's own kernels are built for virtio-MMIO only and will
 panic under QEMU with `Cannot open root device "vda"`. The husker default images and
 most distro kernels work as-is.
+
+### Cloud Images
+
+husker can boot stock cloud images (Ubuntu, Debian, etc.) on both platforms:
+
+- **Linux:** QEMU/OVMF (UEFI boot). Requires `ovmf_code` and `ovmf_vars` in config.
+- **macOS (Apple Silicon):** Apple Virtualization.framework with built-in EFI.
+
+#### macOS prerequisites
+
+```bash
+brew install qemu   # qemu-img is used for qcow2-to-raw conversion
+```
+
+#### Example (macOS)
+
+```bash
+# Download a cloud image (ARM64 for Apple Silicon)
+curl -LO https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
+
+husker run --name ubuntu \
+  --cloud-image ubuntu-24.04-server-cloudimg-arm64.img \
+  --ssh-key ~/.ssh/id_ed25519.pub
+```
+
+Networking uses VZ shared NAT; the guest gets a DHCP address in the `192.168.64.x`
+range. The guest IP appears in `husker info ubuntu` once the agent reports it (typically
+within 20-30 seconds of first boot). Connect with `husker shell ubuntu` or via SSH once
+the IP is known.
+
+**Not yet supported on macOS with cloud images:** `--volume`, `--balloon`, and services
+(`husker service`). Bridged networking (`--net bridged`) is Linux-only.
 
 ## Alternatives
 
