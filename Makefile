@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -241,6 +241,13 @@ build-k3s-rootfs: build-agent
 K3S_KERNEL ?= /mnt/husker/vmlinux-k3s
 build-k3s-kernel:
 	sudo guest/build-k3s-kernel.sh $(K3S_KERNEL)
+
+# Build the modules-free microVM kernel from source (CONFIG_MODULES=n, all drivers built in).
+# Deps (Debian/Ubuntu): build-essential bc bison flex libelf-dev libssl-dev
+# Output: ~/.local/share/husker/kernels/vmlinux (x86_64) or Image-virt (aarch64).
+# Override output dir: HUSKER_KERNEL_OUT=/path bash guest/build-microvm-kernel.sh
+build-microvm-kernel: ## Build the modules-free microVM kernel from source
+	bash guest/build-microvm-kernel.sh
 
 # Run k3s E2E cluster test (requires running daemon, k3s rootfs + kernel)
 K3S_ROOTFS ?= k3s-rootfs.ext4
