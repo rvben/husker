@@ -102,10 +102,10 @@ jobs:
       - name: Build + stage guest agent for embedding (aarch64 macOS)
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
-          # Self-hosted runner shells are non-login: Homebrew is not on PATH.
-          export PATH="/opt/homebrew/bin:$PATH"
-          brew list zig >/dev/null 2>&1 || brew install zig
-          command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild
+          # zig and cargo-zigbuild come from pip wheels in the build venv,
+          # mirroring the Linux jobs; the self-hosted runner user owns neither
+          # Homebrew nor a writable system toolchain location.
+          uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" ziglang cargo-zigbuild
           rustup target add aarch64-unknown-linux-musl
           make build-agent-aarch64
           echo "HUSKER_EMBED_AGENT_BIN=$PWD/target/aarch64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
