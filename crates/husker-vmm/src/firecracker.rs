@@ -483,7 +483,7 @@ impl VmmBackend for FirecrackerBackend {
             instance.socket_path.clone()
         };
 
-        Self::fc_put(
+        Self::fc_patch(
             &socket_path,
             "/vm",
             &serde_json::json!({ "state": "Paused" }),
@@ -504,7 +504,7 @@ impl VmmBackend for FirecrackerBackend {
             instance.socket_path.clone()
         };
 
-        Self::fc_put(
+        Self::fc_patch(
             &socket_path,
             "/vm",
             &serde_json::json!({ "state": "Resumed" }),
