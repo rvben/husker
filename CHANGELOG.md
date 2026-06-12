@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.8] - 2026-06-12
+
+### Added
+
+- **Cloud-image VMs on macOS (Apple Silicon).** `husker run --cloud-image
+  ubuntu.img` now works on the Apple VZ backend: EFI boot with a per-VM
+  variable store, automatic qcow2-to-raw conversion via `qemu-img`, a
+  cloud-init seed with the embedded aarch64 agent and SSH keys, DHCP via the
+  VZ NAT NIC, and agent-reported guest IPs. `--volume`, services, and
+  `--balloon` with cloud images are rejected on macOS for now; Intel Macs are
+  unsupported.
+- **Memory balloon on Apple VZ.** `--balloon` attaches a virtio balloon
+  device on macOS and `husker balloon <vm> <mib>` resizes it, at parity with
+  the Firecracker and QEMU backends. Platform caveat: explicit targets
+  reclaim memory, but memory freed inside the guest is not automatically
+  returned to the host.
+- **Modules-free microVM kernel.** Default images now ship a from-source
+  Linux 6.12 kernel with every required driver built in (no loadable
+  modules), built by `guest/build-microvm-kernel.sh`. Kernel/initramfs
+  version pairing can no longer break, guests boot with or without an
+  initramfs (`root=/dev/vda` is added automatically when no initrd is used),
+  and agent-ready boot time on Firecracker drops about 3.5x (19.7s to 5.6s
+  measured). The 128 MiB default VM memory is sufficient on all boot paths.
+- **Guest agent memory self-limit.** The agent confines itself to a cgroup
+  v2 leaf with a 128 MiB `memory.high` throttle at startup; exec, job, and
+  userdata workloads are moved out of the leaf so they never inherit the
+  limit.
+
+### Fixed
+
+- **Apple VZ disk attachments no longer corrupt sparse raw images on APFS.**
+  All VZ disk images attach with explicit cached + fsync modes; the default
+  modes returned zeros for evicted page re-reads, causing random guest
+  failures 30-150s after boot.
+- **`make update-rootfs` no longer fails silently.** The debugfs injection
+  runs as a single session and verifies the injected files by reading them
+  back and comparing against the sources.
+- **Gated e2e suite runs on standard hosts.** `HUSKER_RUN_IGNORED_E2E=1`
+  tests resolve fixtures via the production default-image paths (arch and
+  data-dir aware, env-overridable), create and clean up their own VMs with
+  self-healing pre-delete, and now exercise both Firecracker and Apple VZ.
+- **The initramfs device wait is a real timeout.** The `/dev/vda` poll
+  sleeps between iterations (5s budget) instead of busy-spinning, and a
+  boot-critical module that is present but fails to load produces an
+  explicit kernel/module mismatch warning.
+
 ## [0.4.7] - 2026-06-11
 
 ### Added
