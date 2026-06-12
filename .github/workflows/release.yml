@@ -102,6 +102,8 @@ jobs:
       - name: Build + stage guest agent for embedding (aarch64 macOS)
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
+          # Self-hosted runner shells are non-login: Homebrew is not on PATH.
+          export PATH="/opt/homebrew/bin:$PATH"
           brew list zig >/dev/null 2>&1 || brew install zig
           command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild
           rustup target add aarch64-unknown-linux-musl
