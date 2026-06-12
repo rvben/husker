@@ -32,7 +32,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build dependencies
         run: |
@@ -80,7 +80,7 @@ jobs:
              "stage/rootfs-${{ matrix.arch }}.ext4"
           ( cd stage && sha256sum kernel-* initramfs-* rootfs-* > "SHA256SUMS-${{ matrix.arch }}" )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: images-${{ matrix.arch }}
           path: stage/*
@@ -90,9 +90,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -115,17 +115,18 @@ jobs:
       # On workflow_dispatch: honours the dry_run input (default true).
       - name: Create release
         if: ${{ inputs.dry_run != true }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Default images ${{ steps.tag.outputs.tag }}
           body: |
-            Default kernel, initramfs, and rootfs images for husker. Built from Alpine 3.21
-            minirootfs + linux-virt apk. Verify downloads against SHA256SUMS.
+            Default kernel, initramfs, and rootfs images for husker. The kernel is a
+            modules-free build from kernel.org source (all virtio drivers built in);
+            the rootfs is Alpine 3.21 minirootfs. Verify downloads against SHA256SUMS.
 
             File naming:
-              kernel-<arch>            (uncompressed Linux Image / vmlinux)
-              initramfs-<arch>.gz      (gzipped cpio, loads virtio_blk before root mount)
+              kernel-<arch>            (uncompressed Linux Image / vmlinux, no modules)
+              initramfs-<arch>.gz      (gzipped cpio, only needed by legacy modular kernels)
               rootfs-<arch>.ext4       (Alpine + husker-agent baked in)
           files: release/*
 
