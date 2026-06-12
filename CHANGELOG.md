@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.9] - 2026-06-12
+
+### Added
+
+- **Firecracker suspend/resume.** `husker suspend <vm>` captures a VM's full
+  state (guest RAM + vCPU + devices) to a per-VM slot
+  (`<data_dir>/suspend/<id>/{memory,vmstate,manifest.json}`) and frees the
+  process; `husker resume <vm>` restores it in place with the same identity,
+  networking, IP, and CID. Exposed via `POST /v1/vms/{name}/suspend` and the
+  new `VmmBackend::snapshot_vm`/`restore_vm` methods (Firecracker `/snapshot/
+  create` and `/snapshot/load`; QEMU and Apple VZ report unsupported). Adds a
+  `suspended` VM state that survives daemon restarts; the rootfs and host
+  networking are preserved across suspend so resume needs no disk copy or
+  re-IP.
+
+### Fixed
+
+- **pause/resume against real Firecracker.** Firecracker's runtime VM-state
+  endpoint is `PATCH /vm`, not `PUT /vm`; the previous `PUT` was rejected with
+  HTTP 400, which broke `husker pause`/`husker resume` (and the new suspend,
+  which pauses first) on real Firecracker.
+
 ## [0.4.8] - 2026-06-12
 
 ### Added
