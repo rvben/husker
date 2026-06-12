@@ -35,8 +35,10 @@ echo ""
 
 echo "--- Module presence ---"
 
-# Extract module basenames from inittab insmod lines
-INITTAB_MODULES=$(grep '/sbin/insmod /lib/modules/' "$INITTAB" | sed 's|.*/lib/modules/||' | tr -d '\r')
+# Extract module basenames from inittab insmod lines. The lines are wrapped
+# in sh -c '...' existence guards, so cut the token at .ko to drop trailing
+# quoting.
+INITTAB_MODULES=$(grep '/sbin/insmod /lib/modules/' "$INITTAB" | sed 's|.*/lib/modules/||; s|\.ko.*|.ko|' | tr -d '\r')
 
 # Extract module basenames from build script MODULES array
 BUILD_MODULES=$(grep -E '^\s+"kernel/' "$BUILD_SCRIPT" | sed 's|.*/||; s|".*||' | tr -d '\r')
