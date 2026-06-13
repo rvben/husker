@@ -470,6 +470,11 @@ pub struct HuskerCore<B: VmmBackend> {
     lan_bridge: Option<String>,
     #[cfg(feature = "linux-net")]
     dns_servers: Vec<String>,
+    /// Backend kind to persist when a create request omits `--vmm`. Mirrors the
+    /// dispatcher's configured default so the record reflects the backend that
+    /// actually runs the VM. Defaults to Firecracker.
+    #[cfg(feature = "linux-net")]
+    default_vmm_kind: husker_vmm::VmmKind,
     runtime_dir: PathBuf,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -502,6 +507,29 @@ pub fn default_ready_timeout(boot_mode: &str) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Resolve the backend kind to persist for a new VM.
+///
+/// husker's Linux dispatcher resolves an omitted `--vmm` to the daemon's
+/// configured default, so the persisted `VmRecord.vmm` must reflect that same
+/// resolution rather than a hardcoded assumption. Otherwise capability gating
+/// (suspend) and restore backend-matching read the wrong kind for a VM created
+/// without `--vmm` on a QEMU-default daemon. Cloud-image boot is QEMU-only and
+/// overrides the default.
+#[cfg(feature = "linux-net")]
+fn resolve_vmm_kind(
+    req_vmm: Option<&str>,
+    is_cloud: bool,
+    default: husker_vmm::VmmKind,
+) -> Result<husker_vmm::VmmKind, CoreError> {
+    if is_cloud {
+        return Ok(husker_vmm::VmmKind::Qemu);
+    }
+    match req_vmm {
+        Some(s) => s.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm),
+        None => Ok(default),
+    }
+}
+
 impl<B: VmmBackend> HuskerCore<B> {
     /// Create a new HuskerCore with Linux networking (bridge + TAP + nftables).
     #[cfg(feature = "linux-net")]
@@ -526,6 +554,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             bridge_name,
             lan_bridge: None,
             dns_servers,
+            default_vmm_kind: husker_vmm::VmmKind::Firecracker,
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -559,6 +588,15 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// default) disables cloud-image support with a clear error at create time.
     pub fn with_embedded_agent(mut self, agent: &'static [u8]) -> Self {
         self.embedded_agent = agent;
+        self
+    }
+
+    /// Set the default backend kind used when a create request omits `--vmm`.
+    /// Wire this from the same daemon config value the dispatcher uses so the
+    /// persisted record matches the backend that runs the VM.
+    #[cfg(feature = "linux-net")]
+    pub fn with_default_vmm_kind(mut self, kind: husker_vmm::VmmKind) -> Self {
+        self.default_vmm_kind = kind;
         self
     }
 
@@ -870,14 +908,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             inject_resolv_conf(&disk_path, &self.dns_servers).await?;
         }
 
-        let vmm_kind = if is_cloud {
-            Some(husker_vmm::VmmKind::Qemu)
-        } else {
-            match req.vmm.as_deref() {
-                Some(s) => Some(s.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm)?),
-                None => None,
-            }
-        };
+        // Resolve the backend kind once and persist it, so the record reflects the
+        // backend the dispatcher actually runs (an omitted `--vmm` resolves to the
+        // daemon default, not a hardcoded Firecracker).
+        let resolved_vmm_kind =
+            resolve_vmm_kind(req.vmm.as_deref(), is_cloud, self.default_vmm_kind)?;
 
         // For direct-kernel boot: resolve the kernel now (validation already ran in
         // create_vm_record; try_create_vm may also be called from tests that skip it).
@@ -936,7 +971,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vsock_cid: cid,
             tap_device: Some(tap_name.clone()),
             guest_mac: Some(mac),
-            vmm: vmm_kind,
+            vmm: Some(resolved_vmm_kind),
             boot,
             seed_path,
             balloon: req.balloon,
@@ -980,9 +1015,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: vmm_kind
-                .map(|k| k.to_string())
-                .unwrap_or_else(|| "firecracker".to_string()),
+            vmm: resolved_vmm_kind.to_string(),
             boot_mode: if is_cloud {
                 "uefi".to_string()
             } else {
@@ -3467,6 +3500,46 @@ async fn remove_file_best_effort(path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn resolve_vmm_kind_uses_daemon_default_when_unspecified() {
+        use husker_vmm::VmmKind;
+        // No explicit --vmm: a QEMU-default daemon must resolve to QEMU, so the
+        // persisted record matches the backend the dispatcher actually runs.
+        // (Previously this was hardcoded to Firecracker, mislabeling the VM.)
+        assert_eq!(
+            resolve_vmm_kind(None, false, VmmKind::Qemu).unwrap(),
+            VmmKind::Qemu
+        );
+        assert_eq!(
+            resolve_vmm_kind(None, false, VmmKind::Firecracker).unwrap(),
+            VmmKind::Firecracker
+        );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn resolve_vmm_kind_explicit_request_overrides_default() {
+        use husker_vmm::VmmKind;
+        assert_eq!(
+            resolve_vmm_kind(Some("firecracker"), false, VmmKind::Qemu).unwrap(),
+            VmmKind::Firecracker
+        );
+        // An unparseable backend string is rejected, not silently defaulted.
+        assert!(resolve_vmm_kind(Some("xen"), false, VmmKind::Qemu).is_err());
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn resolve_vmm_kind_cloud_is_always_qemu() {
+        use husker_vmm::VmmKind;
+        // Cloud-image boot is QEMU-only regardless of the daemon default.
+        assert_eq!(
+            resolve_vmm_kind(None, true, VmmKind::Firecracker).unwrap(),
+            VmmKind::Qemu
+        );
+    }
 
     #[cfg(feature = "linux-net")]
     #[test]
