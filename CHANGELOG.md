@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.10] - 2026-06-13
+
+### Fixed
+
+- **`ssh://` daemon transport now works.** The tunnel set `ControlPersist`, which
+  makes ssh background its master connection and exit the foreground process as
+  soon as the forward is up; the readiness check read that exit as a failure and
+  always aborted with "exited before it was ready", so `ssh://` (and any context
+  pointing at one) never connected. The tunnel is now a dedicated foreground
+  `ssh -N -L` that lives for the connection's lifetime, with its stdio quieted so
+  a login banner/MOTD cannot corrupt command output.
+
 ## [0.4.9] - 2026-06-13
 
 ### Added
