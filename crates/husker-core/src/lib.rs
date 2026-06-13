@@ -2518,6 +2518,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             file_path: image_path.to_string_lossy().into_owned(),
             format,
             kind,
+            boot_init: None,
             size_bytes: metadata.len(),
             created_at: chrono::Utc::now(),
         };
@@ -2613,6 +2614,10 @@ impl<B: VmmBackend> HuskerCore<B> {
             file_path: image_path.to_string_lossy().into_owned(),
             format: "ext4".into(),
             kind: "rootfs".into(),
+            // boot_init is set to the agent (PID-1 supervisor) once the agent
+            // supports that mode (Phase 2); until then imported images keep the
+            // existing busybox-init boot path.
+            boot_init: None,
             size_bytes: metadata.len(),
             created_at: chrono::Utc::now(),
         };

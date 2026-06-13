@@ -179,6 +179,9 @@ pub struct ImageRecord {
     /// Image kind: "rootfs" (raw ext4 for direct-kernel boot, the default)
     /// or "cloud-image" (qcow2 booted via UEFI/OVMF).
     pub kind: String,
+    /// Kernel `init=` to boot this image with. Set by `import-oci` to the guest
+    /// agent (agent-supervisor mode); `None` uses the default boot path.
+    pub boot_init: Option<String>,
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
 }
@@ -363,6 +366,11 @@ impl StateStore {
             "ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'rootfs'",
             [],
         );
+
+        // Migration: kernel init= for the image (agent-supervisor boot for
+        // imported OCI images). Nullable; legacy rows default to NULL (default
+        // boot path).
+        let _ = conn.execute("ALTER TABLE images ADD COLUMN boot_init TEXT", []);
 
         // Migration: service VM template columns (idempotent).
         // NOT NULL with DEFAULT '' so ADD COLUMN succeeds on tables with rows.
@@ -893,8 +901,8 @@ impl StateStore {
 
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO images (id, name, source_path, file_path, format, kind, size_bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO images (id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -904,6 +912,7 @@ impl StateStore {
                 record.kind,
                 size_bytes_i64,
                 record.created_at.to_rfc3339(),
+                record.boot_init,
             ],
         )
         .map_err(|e| match &e {
@@ -921,7 +930,7 @@ impl StateStore {
     pub fn get_image(&self, id: Uuid) -> Result<ImageRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init
              FROM images WHERE id = ?1",
             params![id.to_string()],
             row_to_image_record,
@@ -936,7 +945,7 @@ impl StateStore {
     pub fn get_image_by_name(&self, name: &str) -> Result<ImageRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init
              FROM images WHERE name = ?1",
             params![name],
             row_to_image_record,
@@ -951,7 +960,7 @@ impl StateStore {
     pub fn list_images(&self) -> Result<Vec<ImageRecord>, StateError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init
              FROM images ORDER BY created_at",
         )?;
         let records = stmt
@@ -1509,6 +1518,7 @@ fn row_to_image_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord>
         file_path: row.get(3)?,
         format: row.get(4)?,
         kind: row.get(5)?,
+        boot_init: row.get(8)?,
         size_bytes,
         created_at: parse_datetime(&created_str)?,
     })
@@ -1629,9 +1639,23 @@ mod tests {
             file_path: format!("/tmp/husker-images/{name}.ext4"),
             format: "ext4".into(),
             kind: "rootfs".into(),
+            boot_init: None,
             size_bytes: 1024,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn image_boot_init_round_trips() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_image("rust-sandbox");
+        rec.boot_init = Some("/usr/local/bin/husker-agent".into());
+        store.insert_image(&rec).unwrap();
+        let got = store.get_image_by_name("rust-sandbox").unwrap();
+        assert_eq!(
+            got.boot_init.as_deref(),
+            Some("/usr/local/bin/husker-agent")
+        );
     }
 
     fn make_secret(name: &str, payload: &[u8]) -> SecretRecord {
