@@ -340,6 +340,18 @@ enum Commands {
         #[arg(long = "sync-cwd")]
         sync_cwd: bool,
 
+        /// Copy a path (file or dir, relative to the synced tree) back to the host
+        /// after the command, at the same relative location. Repeatable.
+        /// Requires --sync-cwd. Build artifacts you do not name never come back.
+        #[arg(long = "out", requires = "sync_cwd")]
+        out: Vec<PathBuf>,
+
+        /// Apply the command's changes to the synced files back onto the host
+        /// working tree (e.g. `cargo fmt`). Only files that were synced in are
+        /// written back; new build artifacts are not. Requires --sync-cwd.
+        #[arg(long = "write-back", requires = "sync_cwd")]
+        write_back: bool,
+
         /// Command and arguments (after --)
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -2402,6 +2414,8 @@ async fn run(cli: Cli) -> Result<()> {
             timeout,
             keep,
             sync_cwd,
+            out,
+            write_back,
             command,
         } => {
             let config = load_config(config_path.as_deref());
@@ -2539,7 +2553,10 @@ async fn run(cli: Cli) -> Result<()> {
 
                 // 2.5 Optionally sync the working tree into the VM (git-aware, clean-room):
                 // upload a tar.gz of the cwd and wrap the command to extract and run it
-                // inside the guest. The host filesystem is never modified.
+                // inside the guest. The host filesystem is never modified unless the
+                // command's results are explicitly pulled back (--out / --write-back).
+                let mut retrieve_paths: Vec<PathBuf> = Vec::new();
+                let mut sync_cwd_dir: Option<PathBuf> = None;
                 let (exec_command, exec_args): (String, Vec<String>) = if sync_cwd {
                     let cwd = std::env::current_dir()
                         .context("resolving current directory for --sync-cwd")?;
@@ -2563,7 +2580,23 @@ async fn run(cli: Cli) -> Result<()> {
                         let msg = api_error(write_resp, &format!("VM '{name}'")).await;
                         anyhow::bail!("{}", msg.message);
                     }
-                    wrap_sync_command(SYNC_ARCHIVE_GUEST_PATH, SYNC_WORKDIR, &command)
+                    // --write-back returns the synced files as the command left them
+                    // (modifications only; new build artifacts are never pulled back).
+                    if write_back {
+                        retrieve_paths.extend(collect_sync_paths(&cwd)?);
+                    }
+                    // --out returns the named paths (files or dirs).
+                    retrieve_paths.extend(out.iter().cloned());
+                    retrieve_paths.sort();
+                    retrieve_paths.dedup();
+                    sync_cwd_dir = Some(cwd);
+                    wrap_sync_command(
+                        SYNC_ARCHIVE_GUEST_PATH,
+                        SYNC_WORKDIR,
+                        &command,
+                        SYNC_OUTPUT_GUEST_PATH,
+                        &retrieve_paths,
+                    )
                 } else {
                     (command[0].clone(), command[1..].to_vec())
                 };
@@ -2598,6 +2631,41 @@ async fn run(cli: Cli) -> Result<()> {
                     anyhow::bail!("{}", msg.message);
                 }
                 let result: serde_json::Value = resp.json().await?;
+
+                // 3.5 Pull requested results back to the host (--out / --write-back).
+                if let Some(cwd) = &sync_cwd_dir
+                    && !retrieve_paths.is_empty()
+                {
+                    let read_resp = api_request(
+                        with_api_auth(
+                            client.post(format!("{api_url}/v1/vms/{name}/files/read")),
+                            api_token.as_deref(),
+                        )
+                        .json(&serde_json::json!({ "path": SYNC_OUTPUT_GUEST_PATH })),
+                    )
+                    .await?;
+                    if read_resp.status().is_success() {
+                        let body: serde_json::Value = read_resp.json().await?;
+                        if let Some(b64) = body["data"].as_str()
+                            && let Ok(bytes) = husker_agent_proto::base64_decode(b64)
+                            && !bytes.is_empty()
+                        {
+                            let written = extract_archive_over(&bytes, cwd)?;
+                            if output == OutputFormat::Text {
+                                if written.is_empty() {
+                                    eprintln!("[job] nothing matched --out/--write-back");
+                                } else {
+                                    eprintln!("[job] retrieved {} file(s) to host:", written.len());
+                                    for f in &written {
+                                        eprintln!("  {f}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // A missing output archive means the command produced none of the
+                    // requested paths; that is not an error.
+                }
                 Ok::<serde_json::Value, anyhow::Error>(result)
             };
 
@@ -5943,6 +6011,8 @@ async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(core: &husker_core::Hu
 const SYNC_ARCHIVE_GUEST_PATH: &str = "/tmp/.husker-sync.tgz";
 /// Default guest directory the working tree is extracted into for `--sync-cwd`.
 const SYNC_WORKDIR: &str = "/work";
+/// Guest path the retrieval archive (`--out`/`--write-back`) is built at.
+const SYNC_OUTPUT_GUEST_PATH: &str = "/tmp/.husker-out.tgz";
 
 /// Collect the set of files to sync into a `--sync-cwd` sandbox, relative to `dir`.
 ///
@@ -6021,23 +6091,79 @@ fn build_sync_archive(dir: &Path) -> Result<Vec<u8>> {
     enc.finish().context("finalizing sync gzip")
 }
 
+/// Single-quote a string for safe inclusion in a POSIX shell script, so a path
+/// can never be reinterpreted as shell syntax (`'` becomes `'\''`).
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Wrap a user command so the guest first extracts the uploaded archive into `workdir`
 /// and runs the command there. Returns the `(command, args)` for the exec request.
 ///
 /// The archive path and workdir are husker-controlled constants; the user command is
 /// passed as argv (never interpolated into the shell script) so it cannot be reparsed.
+///
+/// When `retrieve_paths` is non-empty, the command is run (not `exec`-ed) so that
+/// afterwards the named paths are packed into `output_path` for the host to pull
+/// back; the user command's exit code is preserved. Packing is best-effort (paths
+/// the command did not produce are skipped). Paths are single-quoted, so `--out`
+/// values cannot inject shell. busybox-safe: no `tar -T`/`--null`.
 fn wrap_sync_command(
     archive_guest_path: &str,
     workdir: &str,
     command: &[String],
+    output_path: &str,
+    retrieve_paths: &[PathBuf],
 ) -> (String, Vec<String>) {
-    let script = format!(
+    let setup = format!(
         "set -e; mkdir -p {workdir}; tar -xzf {archive_guest_path} -C {workdir}; \
-         rm -f {archive_guest_path}; cd {workdir}; exec \"$@\""
+         rm -f {archive_guest_path}; cd {workdir}; "
     );
+    let script = if retrieve_paths.is_empty() {
+        format!("{setup}exec \"$@\"")
+    } else {
+        // `./`-prefix each path so a leading `-` can never look like a tar option,
+        // and single-quote so `--out` values cannot inject shell.
+        let quoted = retrieve_paths
+            .iter()
+            .map(|p| shell_single_quote(&format!("./{}", p.to_string_lossy())))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "{setup}set +e; \"$@\"; __rc=$?; \
+             tar -czf {output_path} {quoted} 2>/dev/null || true; \
+             exit $__rc"
+        )
+    };
     let mut args = vec!["-c".to_string(), script, "husker-sync".to_string()];
     args.extend(command.iter().cloned());
     ("sh".to_string(), args)
+}
+
+/// Unpack a gzip+tar archive over `dst`, returning the relative paths written.
+/// Entries that would escape `dst` (absolute paths, `..`) are skipped.
+fn extract_archive_over(bytes: &[u8], dst: &Path) -> Result<Vec<String>> {
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(gz);
+    let mut written = Vec::new();
+    for entry in archive.entries().context("reading retrieval archive")? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            continue;
+        }
+        if entry.unpack_in(dst)? {
+            // Only record regular files (directories are structural).
+            if entry.header().entry_type().is_file() {
+                written.push(path.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    Ok(written)
 }
 
 /// The husker daemon's default listen port, used as the remote end of an
@@ -6366,6 +6492,8 @@ mod tests {
             "/tmp/.husker-sync.tgz",
             "/work",
             &["cargo".to_string(), "test".to_string()],
+            "/tmp/.husker-out.tgz",
+            &[],
         );
         assert_eq!(cmd, "sh");
         assert_eq!(args[0], "-c");
@@ -6380,13 +6508,88 @@ mod tests {
         );
         assert!(
             script.contains("exec \"$@\""),
-            "script execs the user command: {script}"
+            "no retrieval => exec form: {script}"
         );
         // the user command trails after the $0 placeholder, passed as argv (no interpolation)
         assert_eq!(
             &args[args.len() - 2..],
             &["cargo".to_string(), "test".to_string()]
         );
+    }
+
+    #[test]
+    fn wrap_sync_command_retrieves_and_preserves_exit_code() {
+        let (_cmd, args) = wrap_sync_command(
+            "/tmp/.husker-sync.tgz",
+            "/work",
+            &["cargo".to_string(), "build".to_string()],
+            "/tmp/.husker-out.tgz",
+            &[PathBuf::from("target/release/app"), PathBuf::from("src")],
+        );
+        let script = &args[1];
+        // The command is run (not exec-ed) so packing can follow it.
+        assert!(
+            !script.contains("exec \"$@\""),
+            "retrieval form runs, not execs: {script}"
+        );
+        assert!(
+            script.contains("\"$@\"; __rc=$?"),
+            "captures the command exit code: {script}"
+        );
+        assert!(
+            script.contains("tar -czf /tmp/.husker-out.tgz "),
+            "packs the output archive: {script}"
+        );
+        assert!(
+            script.contains("'./target/release/app'"),
+            "quotes the requested path: {script}"
+        );
+        assert!(
+            script.contains("'./src'"),
+            "includes every requested path: {script}"
+        );
+        assert!(
+            script.trim_end().ends_with("exit $__rc"),
+            "exits with the command's code: {script}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_neutralizes_metacharacters() {
+        assert_eq!(shell_single_quote("a b"), "'a b'");
+        // an embedded single quote is closed, escaped, and reopened
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        // shell metacharacters stay literal inside single quotes
+        assert_eq!(shell_single_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+    }
+
+    #[test]
+    fn extract_archive_over_writes_files_into_nested_dirs() {
+        // The tar crate refuses to even build a `..` entry, and its unpack also
+        // blocks traversal; combined with our explicit guard, extraction stays
+        // confined to the target dir. Here we verify the happy path: nested files
+        // land at their relative location and are reported.
+        let mut buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut b = tar::Builder::new(enc);
+            let data = b"hello";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "out/app.bin", &data[..]).unwrap();
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let written = extract_archive_over(&buf, dir.path()).unwrap();
+        assert!(
+            written.contains(&"out/app.bin".to_string()),
+            "reports the written file: {written:?}"
+        );
+        let extracted = dir.path().join("out/app.bin");
+        assert!(extracted.exists(), "writes nested file into the target dir");
+        assert_eq!(std::fs::read(&extracted).unwrap(), b"hello");
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
