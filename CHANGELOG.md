@@ -2,10 +2,32 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.4.9] - 2026-06-12
+## [0.4.9] - 2026-06-13
 
 ### Added
 
+- **OCI-native sandbox images.** `husker image import-oci <ref>` imports a
+  Docker/OCI image as a bootable rootfs (now including zstd-compressed layers).
+  Imported images boot the guest agent as PID 1 - a minimal init/supervisor that
+  mounts the pseudo-filesystems and device nodes, configures networking from the
+  kernel `ip=`, and supervises the agent as a restartable child (an agent crash
+  restarts the child instead of killing the VM). So any Dockerfile-defined
+  toolchain becomes a sandbox. Validated end to end on Firecracker, with a gated
+  boot e2e (`make test-oci-boot-e2e-gated`).
+- **`husker job --sync-cwd` clean-room sandbox.** Syncs the git-aware working
+  tree (tracked plus untracked-not-ignored files, build dirs excluded) into a
+  throwaway VM and runs there, leaving the host untouched. `--out <path>` copies
+  named artifacts back; `--write-back` applies the command's changes to the
+  synced files (build pollution never returns).
+- **`ssh://` daemon transport + capability-aware errors.** `--api-url
+  ssh://[user@]host` reaches a remote daemon over an SSH tunnel (reusing your ssh
+  config/keys, connection-multiplexed), so a macOS host can drive a remote Linux
+  Firecracker daemon. `/v1/health` advertises the backend and its capability
+  matrix; `fork`/`suspend`/`image import-oci` fail fast with a route hint when
+  the targeted backend cannot run them.
+- **Named contexts.** `husker context add/use/list/remove/show` saves named
+  daemon targets (`http://` or `ssh://`) and switches between them; `-c/--context`
+  (and `HUSKER_CONTEXT`) selects one per command.
 - **Firecracker suspend/resume.** `husker suspend <vm>` captures a VM's full
   state (guest RAM + vCPU + devices) to a per-VM slot
   (`<data_dir>/suspend/<id>/{memory,vmstate,manifest.json}`) and frees the
