@@ -2,9 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, ShellDataRequest,
-    ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode, base64_encode,
-    read_message, write_message,
+    AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, ReconfigureNetworkRequest,
+    ShellDataRequest, ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode,
+    base64_encode, read_message, write_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -133,6 +133,37 @@ where
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
             AgentResponse::GuestInfo(info) => Ok(info),
+            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    /// Reconfigure the guest's primary interface in place: apply a new IPv4
+    /// address, gateway, optional MAC, and DNS without rebooting. Used after a
+    /// fork restore re-homes the guest onto a fresh host identity.
+    pub async fn reconfigure_network(
+        &mut self,
+        interface: &str,
+        ipv4: &str,
+        prefix_len: u8,
+        gateway: &str,
+        mac: Option<&str>,
+        dns: &[String],
+    ) -> Result<(), AgentError> {
+        let request = AgentRequest::ReconfigureNetwork(ReconfigureNetworkRequest {
+            interface: interface.into(),
+            ipv4: ipv4.into(),
+            prefix_len,
+            gateway: gateway.into(),
+            mac: mac.map(Into::into),
+            dns: dns.to_vec(),
+        });
+        write_message(&mut self.stream, &request).await?;
+        let response: AgentResponse = read_message(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?;
+        match response {
+            AgentResponse::ReconfigureNetwork(_) => Ok(()),
             AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
             _ => Err(AgentError::UnexpectedResponse),
         }

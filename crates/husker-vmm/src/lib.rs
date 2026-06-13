@@ -119,6 +119,9 @@ pub struct Capabilities {
     /// `snapshot_vm` / `restore_vm` are implemented (full-state suspend/resume
     /// to disk). Firecracker only; QEMU and Apple VZ return `Unsupported`.
     pub snapshot: bool,
+    /// Forking a suspended VM from its snapshot (`RestoreTarget::Fork`) is
+    /// supported. Firecracker only; requires `snapshot`.
+    pub fork: bool,
 }
 
 impl Capabilities {
@@ -127,7 +130,10 @@ impl Capabilities {
     /// conservative default so callers fail closed.
     pub fn for_backend(kind: &str) -> Capabilities {
         match kind {
-            "firecracker" => Capabilities { snapshot: true },
+            "firecracker" => Capabilities {
+                snapshot: true,
+                fork: true,
+            },
             _ => Capabilities::default(),
         }
     }
@@ -275,7 +281,8 @@ pub struct SnapshotMeta {
 
 /// Identity under which `restore_vm` brings a VM back up.
 ///
-/// `Resume` restores the original VM in place (same id/name/CID).
+/// `Resume` restores the original VM in place (same id/name/CID). `Fork` brings
+/// up a *new* VM from a source's snapshot, giving it a fresh host identity.
 #[derive(Debug, Clone)]
 pub enum RestoreTarget {
     /// Restore the original VM under its existing identity.
@@ -285,6 +292,34 @@ pub enum RestoreTarget {
         vcpu_count: u32,
         mem_size_mib: u32,
         vsock_cid: u32,
+    },
+    /// Bring up a fork: a new VM restored from a source's snapshot.
+    ///
+    /// A Firecracker snapshot embeds the source's absolute disk path, and
+    /// `/snapshot/load` only overrides the network. So the fork is bound to its
+    /// own host TAP via a network override, while the embedded source rootfs path
+    /// is temporarily aliased to the fork's reflink clone for the duration of the
+    /// load (then undone) so the fork runs on its own writable disk. The source's
+    /// memory file is mapped copy-on-write, so restoring from it does not disturb
+    /// the (still-suspended) source.
+    Fork {
+        /// New VM id for the fork.
+        id: Uuid,
+        /// New VM name.
+        name: String,
+        vcpu_count: u32,
+        mem_size_mib: u32,
+        /// Guest CID, inherited from the snapshot (kept stable for FC restore).
+        vsock_cid: u32,
+        /// Fresh host TAP the fork's NIC is rebound to (snapshot network override).
+        tap_device: String,
+        /// The source rootfs path embedded in the snapshot (aliased during load).
+        source_rootfs: PathBuf,
+        /// The fork's reflink clone that the alias points at.
+        fork_rootfs: PathBuf,
+        /// The vsock socket path embedded in the snapshot (the fork binds it; the
+        /// source stays suspended so the path is free).
+        source_vsock_path: PathBuf,
     },
 }
 
@@ -372,11 +407,15 @@ mod tests {
     #[test]
     fn capabilities_for_backend_maps_each_kind() {
         // Firecracker is the only husker backend that implements full-state
-        // snapshot/restore today.
-        assert!(Capabilities::for_backend("firecracker").snapshot);
+        // snapshot/restore and fork today.
+        let fc = Capabilities::for_backend("firecracker");
+        assert!(fc.snapshot);
+        assert!(fc.fork);
         // QEMU and Apple VZ return Unsupported from snapshot_vm/restore_vm.
         assert!(!Capabilities::for_backend("qemu").snapshot);
+        assert!(!Capabilities::for_backend("qemu").fork);
         assert!(!Capabilities::for_backend("apple_vz").snapshot);
+        assert!(!Capabilities::for_backend("apple_vz").fork);
     }
 
     #[test]

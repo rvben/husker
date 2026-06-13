@@ -26,6 +26,56 @@ struct FcInstance {
     balloon: bool,
 }
 
+/// RAII guard that temporarily makes a snapshot's embedded source rootfs path
+/// resolve to a fork's reflink clone, so Firecracker opens the fork's writable
+/// disk on `/snapshot/load`. The source's real rootfs is moved aside and the
+/// embedded path symlinked to the clone; on drop (success or error) the real
+/// rootfs is restored, leaving Firecracker holding the clone's fd.
+///
+/// Forks of one source must be serialized (the caller holds the source's lock):
+/// two concurrent installs would both try to move the same source file aside.
+struct RootfsAlias {
+    source_rootfs: PathBuf,
+    backup: PathBuf,
+    active: bool,
+}
+
+impl RootfsAlias {
+    fn install(source_rootfs: &Path, fork_rootfs: &Path) -> Result<Self, VmmError> {
+        let backup = PathBuf::from(format!("{}.fork-src-bak", source_rootfs.display()));
+        std::fs::rename(source_rootfs, &backup)
+            .map_err(|e| VmmError::ProcessError(format!("fork: stash source rootfs aside: {e}")))?;
+        if let Err(e) = std::os::unix::fs::symlink(fork_rootfs, source_rootfs) {
+            // Restore immediately so a failed alias never strands the source.
+            let _ = std::fs::rename(&backup, source_rootfs);
+            return Err(VmmError::ProcessError(format!(
+                "fork: alias source rootfs to clone: {e}"
+            )));
+        }
+        Ok(Self {
+            source_rootfs: source_rootfs.to_path_buf(),
+            backup,
+            active: true,
+        })
+    }
+
+    fn undo(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        // Remove the symlink at the embedded path, then move the real rootfs back.
+        let _ = std::fs::remove_file(&self.source_rootfs);
+        let _ = std::fs::rename(&self.backup, &self.source_rootfs);
+    }
+}
+
+impl Drop for RootfsAlias {
+    fn drop(&mut self) {
+        self.undo();
+    }
+}
+
 /// Firecracker VMM backend.
 ///
 /// Communicates with each Firecracker process via its HTTP-over-Unix-socket API.
@@ -560,17 +610,52 @@ impl VmmBackend for FirecrackerBackend {
         src: &SnapshotPaths,
         target: RestoreTarget,
     ) -> Result<VmInfo, VmmError> {
-        let RestoreTarget::Resume {
-            id,
-            name,
-            vcpu_count,
-            mem_size_mib,
-            vsock_cid,
-        } = target;
+        // Common identity plus per-target specifics. `Resume` keeps the original
+        // identity and its own vsock path; `Fork` brings up a new VM bound to a
+        // fresh TAP, reusing the snapshot's embedded vsock path and aliasing the
+        // embedded source rootfs to the fork's clone during load.
+        let (id, name, vcpu_count, mem_size_mib, vsock_cid, vsock_path, fork) = match target {
+            RestoreTarget::Resume {
+                id,
+                name,
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+            } => {
+                let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
+                (
+                    id,
+                    name,
+                    vcpu_count,
+                    mem_size_mib,
+                    vsock_cid,
+                    vsock_path,
+                    None,
+                )
+            }
+            RestoreTarget::Fork {
+                id,
+                name,
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+                tap_device,
+                source_rootfs,
+                fork_rootfs,
+                source_vsock_path,
+            } => (
+                id,
+                name,
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+                source_vsock_path,
+                Some((tap_device, source_rootfs, fork_rootfs)),
+            ),
+        };
 
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
         let boot_log_path = self.runtime_dir.join(format!("{id}.boot.log"));
-        let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
         let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
@@ -614,21 +699,29 @@ impl VmmBackend for FirecrackerBackend {
 
         let snapshot = Self::path_to_str(&src.vmstate, "vmstate")?;
         let mem = Self::path_to_str(&src.memory, "memory")?;
-        // Resume reattaches the guest's network interface to the host TAP named in
-        // the snapshot. For same-identity resume that TAP still exists (suspend keeps
-        // host networking), so Firecracker reconnects it on load without overrides.
-        if let Err(e) = Self::fc_put(
-            &socket_path,
-            "/snapshot/load",
-            &serde_json::json!({
-                "snapshot_path": snapshot,
-                "mem_file_path": mem,
-                "resume_vm": true,
-            }),
-        )
-        .await
-        {
-            // Capture diagnostics before removing the artifacts.
+        // Resume reattaches the guest's NIC to the host TAP named in the snapshot
+        // (which still exists, since suspend keeps host networking) with no
+        // overrides. Fork rebinds the NIC to its own fresh TAP and aliases the
+        // embedded source rootfs to the fork's clone for the duration of the load.
+        let mut load_body = serde_json::json!({
+            "snapshot_path": snapshot,
+            "mem_file_path": mem,
+            "resume_vm": true,
+        });
+        let _alias = match &fork {
+            Some((tap, source_rootfs, fork_rootfs)) => {
+                load_body["network_overrides"] = serde_json::json!([{
+                    "iface_id": "eth0",
+                    "host_dev_name": tap,
+                }]);
+                Some(RootfsAlias::install(source_rootfs, fork_rootfs)?)
+            }
+            None => None,
+        };
+
+        if let Err(e) = Self::fc_put(&socket_path, "/snapshot/load", &load_body).await {
+            // Capture diagnostics before removing the artifacts. The alias guard
+            // drops here too, restoring the source's rootfs.
             let serial_tail = crate::tail_lines(&serial_log_path, 20);
             let boot_tail = crate::tail_lines(&boot_log_path, 20);
             let _ = tokio::fs::remove_file(&socket_path).await;
@@ -638,6 +731,9 @@ impl VmmBackend for FirecrackerBackend {
             crate::append_log_tails(&mut msg, serial_tail, boot_tail, "firecracker boot log");
             return Err(VmmError::ProcessError(msg));
         }
+        // Firecracker now holds the fork's rootfs fd open; undo the alias so the
+        // source keeps its own disk for a later resume.
+        drop(_alias);
 
         let info = VmInfo {
             id,
@@ -655,7 +751,7 @@ impl VmmBackend for FirecrackerBackend {
             boot_log_path,
             serial_log_path,
             process,
-            // A resumed VM is not tracked as balloon-enabled; the snapshot restores
+            // A restored VM is not tracked as balloon-enabled; the snapshot restores
             // whatever device set it had, and the balloon op is opt-in per VM.
             balloon: false,
         };

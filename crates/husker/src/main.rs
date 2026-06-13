@@ -196,6 +196,15 @@ enum Commands {
         name: String,
     },
 
+    /// Fork a suspended VM into a new running VM with a fresh identity
+    /// (Firecracker/NAT only; the source must be suspended and stays suspended)
+    Fork {
+        /// Source VM name (must be suspended)
+        source: String,
+        /// Name for the new forked VM
+        fork_name: String,
+    },
+
     /// Destroy a VM and clean up resources
     #[command(alias = "rm")]
     Destroy {
@@ -1461,6 +1470,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             "network",
         ],
         "wait" => vec!["status", "action", "vm", "ready"],
+        "fork" => vec!["status", "action", "source", "vm", "guest_ip"],
         "stop" | "pause" | "resume" | "suspend" | "destroy" => vec!["status", "action", "vm"],
         "exec" => vec!["exit_code", "stdout", "stderr"],
         "version" => vec!["client_version", "server_version"],
@@ -2114,6 +2124,39 @@ async fn run(cli: Cli) -> Result<()> {
                     msg.message
                         .push_str(" (hint: VM must be running to suspend)");
                 }
+                exit_with_error(output, msg);
+            }
+            Ok(())
+        }
+        Commands::Fork { source, fork_name } => {
+            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            let client = reqwest::Client::new();
+            let resp = api_request(with_api_auth(
+                client
+                    .post(format!("{api_url}/v1/vms/{source}/fork"))
+                    .json(&serde_json::json!({ "fork_name": fork_name })),
+                api_token.as_deref(),
+            ))
+            .await?;
+
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({ "name": fork_name }));
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "fork",
+                        "source": source,
+                        "vm": fork_name,
+                        "guest_ip": body.get("guest_ip"),
+                    }),
+                    format!("Forked '{source}' -> '{fork_name}'"),
+                );
+            } else {
+                let msg = api_error(resp, &format!("VM '{source}'")).await;
                 exit_with_error(output, msg);
             }
             Ok(())

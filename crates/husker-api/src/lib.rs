@@ -210,6 +210,12 @@ pub struct BalloonRequest {
     pub amount_mib: u32,
 }
 
+/// Body for `POST /v1/vms/{name}/fork`. `fork_name` is the new VM's name.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ForkRequest {
+    pub fork_name: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub code: String,
@@ -536,6 +542,7 @@ pub enum WsShellOutput {
         pause_vm,
         resume_vm,
         suspend_vm,
+        fork_vm,
         destroy_vm,
         set_balloon,
         exec_vm,
@@ -548,6 +555,7 @@ pub enum WsShellOutput {
     ),
     components(schemas(
         VmResponse,
+        ForkRequest,
         HostGroupResponse,
         ServiceResponse,
         ServiceInstance,
@@ -807,6 +815,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/resume", post(resume_vm::<B>))
         .route("/v1/vms/{name}/balloon", put(set_balloon::<B>))
         .route("/v1/vms/{name}/suspend", post(suspend_vm::<B>))
+        .route("/v1/vms/{name}/fork", post(fork_vm::<B>))
         .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
@@ -1942,6 +1951,30 @@ async fn suspend_vm<B: VmmBackend + 'static>(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.suspend_vm(&name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{name}/fork",
+    tag = "vms",
+    params(("name" = String, Path, description = "Source VM name (must be suspended)")),
+    request_body = ForkRequest,
+    responses(
+        (status = 201, description = "Fork created and running", body = VmResponse),
+        (status = 404, description = "Source VM not found", body = ErrorResponse),
+        (status = 409, description = "Source not suspended or fork name taken", body = ErrorResponse)
+    )
+)]
+async fn fork_vm<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Json(req): Json<ForkRequest>,
+) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let record = core
+        .fork_vm(&name, &req.fork_name)
+        .await
+        .map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(record_to_response(record))))
 }
 
 #[utoipa::path(

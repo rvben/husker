@@ -101,13 +101,21 @@ impl VmmBackend for SharedRecordingVmm {
             src.memory.exists(),
             "restore must see the captured memory file"
         );
-        let RestoreTarget::Resume {
+        let (RestoreTarget::Resume {
             id,
             name,
             vcpu_count,
             mem_size_mib,
             vsock_cid,
-        } = target;
+        }
+        | RestoreTarget::Fork {
+            id,
+            name,
+            vcpu_count,
+            mem_size_mib,
+            vsock_cid,
+            ..
+        }) = target;
         let info = VmInfo {
             id,
             name,
