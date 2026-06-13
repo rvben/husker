@@ -531,6 +531,10 @@ enum PortForwardAction {
         host_port: u16,
         /// Guest port
         guest_port: u16,
+        /// Host address to bind (macOS only; default 127.0.0.1). Use 0.0.0.0 to
+        /// expose on all interfaces.
+        #[arg(long)]
+        bind: Option<String>,
     },
     /// Remove a port forward
     Remove {
@@ -3275,19 +3279,6 @@ fn validate_daemon_bind(listen: SocketAddr, allow_remote: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "linux-net"))]
-async fn port_forward(
-    _api_url: String,
-    _api_token: Option<String>,
-    _name: String,
-    _action: PortForwardAction,
-    output: OutputFormat,
-) -> Result<()> {
-    let message = "port forwarding is not supported on this platform (requires Linux with Firecracker + nftables; macOS uses shared NAT without inbound host mapping)";
-    exit_with_error(output, message);
-}
-
-#[cfg(feature = "linux-net")]
 async fn port_forward(
     api_url: String,
     api_token: Option<String>,
@@ -3300,16 +3291,21 @@ async fn port_forward(
         PortForwardAction::Add {
             host_port,
             guest_port,
+            bind,
         } => {
+            let mut payload = serde_json::json!({
+                "host_port": host_port,
+                "guest_port": guest_port,
+            });
+            if let Some(bind) = &bind {
+                payload["bind_addr"] = serde_json::json!(bind);
+            }
             let resp = api_request(
                 with_api_auth(
                     client.post(format!("{api_url}/v1/vms/{name}/ports")),
                     api_token.as_deref(),
                 )
-                .json(&serde_json::json!({
-                    "host_port": host_port,
-                    "guest_port": guest_port,
-                })),
+                .json(&payload),
             )
             .await?;
             if resp.status().is_success() {
@@ -3378,15 +3374,16 @@ async fn port_forward(
                 println!("No port forwards for {name}");
             } else {
                 println!(
-                    "{:<12} {:<12} {:<10}",
-                    "HOST PORT", "GUEST PORT", "PROTOCOL"
+                    "{:<12} {:<12} {:<10} {:<16}",
+                    "HOST PORT", "GUEST PORT", "PROTOCOL", "BIND"
                 );
                 for pf in &forwards {
                     println!(
-                        "{:<12} {:<12} {:<10}",
+                        "{:<12} {:<12} {:<10} {:<16}",
                         pf["host_port"],
                         pf["guest_port"],
                         pf["protocol"].as_str().unwrap_or("tcp"),
+                        pf["bind_addr"].as_str().unwrap_or("-"),
                     );
                 }
             }
@@ -6590,7 +6587,9 @@ fn capability_requirement(cap: &str) -> &'static str {
     match cap {
         "fork" | "snapshot" => "a Firecracker backend (Linux)",
         "oci_import" => "a Linux daemon",
-        "port_forward" => "a Linux daemon with nftables (linux-net build)",
+        "port_forward" => {
+            "a daemon with port forwarding (nftables on Linux, or the userspace proxy on macOS)"
+        }
         "bridged_net" => "a Linux daemon with bridged networking (linux-net build)",
         _ => "a different backend",
     }
@@ -6654,6 +6653,20 @@ mod tests {
     use clap::Parser;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn port_forward_add_has_bind_flag() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let pf = cmd
+            .find_subcommand("port-forward")
+            .expect("port-forward subcommand");
+        let add = pf.find_subcommand("add").expect("add subcommand");
+        assert!(
+            add.get_arguments().any(|a| a.get_id() == "bind"),
+            "port-forward add must expose a --bind flag"
+        );
+    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
