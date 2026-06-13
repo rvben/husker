@@ -6483,12 +6483,13 @@ fn parse_ssh_url(url: &str) -> Result<SshTarget> {
 /// `control_path` enables SSH connection multiplexing: the first invocation opens
 /// a master connection at that socket and later invocations reuse it, skipping the
 /// handshake so a repeated `husker ... ssh://...` dev loop stays fast.
-fn ssh_tunnel_args(
-    target: &SshTarget,
-    local_port: u16,
-    remote_port: u16,
-    control_path: &str,
-) -> Vec<String> {
+fn ssh_tunnel_args(target: &SshTarget, local_port: u16, remote_port: u16) -> Vec<String> {
+    // A dedicated foreground tunnel: `-N` (no remote command) keeps the ssh
+    // process alive for exactly as long as the forward is needed, so the
+    // SshTunnel guard can tear it down on drop. No ControlMaster/ControlPersist:
+    // a persisted master backgrounds itself and exits the foreground process with
+    // status 0, which wait_ready() cannot distinguish from a failed connection.
+    // LogLevel=ERROR keeps ssh's banner/MOTD chatter off our streams.
     let mut args = vec![
         "-N".to_string(),
         "-o".to_string(),
@@ -6496,11 +6497,7 @@ fn ssh_tunnel_args(
         "-o".to_string(),
         "ConnectTimeout=10".to_string(),
         "-o".to_string(),
-        "ControlMaster=auto".to_string(),
-        "-o".to_string(),
-        format!("ControlPath={control_path}"),
-        "-o".to_string(),
-        "ControlPersist=60s".to_string(),
+        "LogLevel=ERROR".to_string(),
         "-L".to_string(),
         format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
     ];
@@ -6528,12 +6525,15 @@ impl SshTunnel {
     async fn establish(url: &str) -> Result<Self> {
         let target = parse_ssh_url(url)?;
         let local_port = reserve_local_port()?;
-        // `%C` is ssh's per-target connection hash: short (keeps the socket path
-        // under the ~104-char Unix limit) and unique per (user, host, port).
-        let control_path = "/tmp/husker-ssh-%C";
-        let args = ssh_tunnel_args(&target, local_port, SSH_REMOTE_DAEMON_PORT, control_path);
+        let args = ssh_tunnel_args(&target, local_port, SSH_REMOTE_DAEMON_PORT);
         let mut cmd = tokio::process::Command::new("ssh");
-        cmd.args(&args).kill_on_drop(true);
+        // The tunnel produces no application output; null its stdio so a login
+        // banner/MOTD never corrupts husker's stdout and a prompt can't block on
+        // stdin. ssh's own errors still reach the user's terminal via stderr.
+        cmd.args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
         let child = cmd
             .spawn()
             .context("spawning ssh for the ssh:// tunnel (is the ssh client installed?)")?;
@@ -8430,7 +8430,7 @@ mod tests {
             host: "192.0.2.5".into(),
             ssh_port: Some(2222),
         };
-        let args = ssh_tunnel_args(&t, 15000, 7777, "/tmp/husker-cm-%C");
+        let args = ssh_tunnel_args(&t, 15000, 7777);
         assert!(
             args.contains(&"-N".to_string()),
             "runs without a remote command"
@@ -8448,29 +8448,27 @@ mod tests {
     }
 
     #[test]
-    fn ssh_tunnel_args_reuses_connection_via_controlmaster() {
+    fn ssh_tunnel_args_is_dedicated_foreground_tunnel() {
+        // Regression: ControlPersist makes ssh background the master connection and
+        // exit the foreground process with status 0 as soon as the forward is up.
+        // wait_ready() treats any child exit as failure ("exited before it was
+        // ready"), so a persisted tunnel is misreported even though the forward
+        // works. The tunnel must be a dedicated foreground `ssh -N` that lives
+        // exactly as long as the SshTunnel guard (killed on drop), with no shared
+        // control master to leak across invocations.
         let t = SshTarget {
             user: None,
             host: "h".into(),
             ssh_port: None,
         };
-        let args = ssh_tunnel_args(&t, 100, 7777, "/tmp/husker-cm-%C");
-        // Connection multiplexing keeps a master alive so repeat invocations skip
-        // the SSH handshake.
+        let args = ssh_tunnel_args(&t, 100, 7777);
         assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-o" && w[1] == "ControlMaster=auto"),
-            "enables ControlMaster: {args:?}"
+            !args.iter().any(|a| a.starts_with("ControlPersist=")),
+            "must not persist a backgrounded master: {args:?}"
         );
         assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/husker-cm-%C"),
-            "sets the control socket path: {args:?}"
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-o" && w[1].starts_with("ControlPersist=")),
-            "persists the master after exit: {args:?}"
+            !args.iter().any(|a| a == "ControlMaster=auto"),
+            "must be self-contained (no shared master): {args:?}"
         );
     }
 
@@ -8481,7 +8479,7 @@ mod tests {
             host: "h".into(),
             ssh_port: None,
         };
-        let args = ssh_tunnel_args(&t, 100, 7777, "/tmp/husker-cm-%C");
+        let args = ssh_tunnel_args(&t, 100, 7777);
         assert_eq!(args.last().unwrap(), "h");
         assert!(
             !args.contains(&"-p".to_string()),
