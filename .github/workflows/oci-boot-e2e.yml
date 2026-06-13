@@ -1,0 +1,30 @@
+name: OCI Boot E2E
+
+# Release gate for the OCI-native sandbox keystone: import a Docker/OCI image and
+# boot it as an agent-supervised husker microVM, then assert the guest contract
+# (/proc mounted, networking up) and agent-child crash recovery on a real
+# Firecracker VM.
+#
+# This requires nested KVM + Firecracker + TAP privileges, which GitHub-hosted
+# runners do not provide, so it runs on a self-hosted runner labelled
+# (self-hosted, husker, linux) with passwordless sudo. Manual trigger only until
+# that runner is registered; add a `schedule:` (nightly) once it exists.
+on:
+  workflow_dispatch:
+
+jobs:
+  oci-boot-e2e:
+    name: OCI Boot E2E (self-hosted, KVM)
+    runs-on: [self-hosted, husker, linux]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Builds run as the runner user (its toolchain); the gate elevates with
+      # sudo internally for the daemon's TAP/Firecracker operations. PATH is
+      # preserved so cargo is found under sudo.
+      - name: OCI boot e2e gate
+        run: sudo -E env "PATH=$PATH" HUSKER_RUN_OCI_BOOT_E2E=1 make test-oci-boot-e2e-gated
