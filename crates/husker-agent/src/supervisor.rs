@@ -8,6 +8,7 @@
 
 use std::ffi::CString;
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use tracing::{info, warn};
@@ -116,6 +117,149 @@ pub fn ensure_device_nodes() {
     }
 }
 
+/// Static network configuration parsed from the kernel `ip=` parameter.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NetConfig {
+    pub addr: Ipv4Addr,
+    pub prefix: u8,
+    pub gateway: Option<Ipv4Addr>,
+    pub iface: String,
+}
+
+/// Parse the kernel `ip=<client>::<gateway>:<netmask>::<iface>:<autoconf>` token
+/// (the format husker-core sets for NAT/30 guests). Returns `None` when no `ip=`
+/// is present. The dotted netmask is converted to a prefix length.
+pub fn parse_ip_cmdline(cmdline: &str) -> Option<NetConfig> {
+    let token = cmdline
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("ip="))?;
+    let f: Vec<&str> = token.split(':').collect();
+    // 0=client 1=server 2=gateway 3=netmask 4=hostname 5=iface 6=autoconf
+    let addr: Ipv4Addr = f.first()?.parse().ok()?;
+    let prefix = netmask_to_prefix(f.get(3)?)?;
+    let gateway = f
+        .get(2)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok());
+    let iface = f
+        .get(5)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "eth0".to_string());
+    Some(NetConfig {
+        addr,
+        prefix,
+        gateway,
+        iface,
+    })
+}
+
+/// Convert a dotted IPv4 netmask (e.g. `255.255.255.252`) to a prefix length,
+/// rejecting non-contiguous masks.
+fn netmask_to_prefix(mask: &str) -> Option<u8> {
+    let octets: Vec<u8> = mask
+        .split('.')
+        .map(|o| o.parse::<u8>().ok())
+        .collect::<Option<_>>()?;
+    if octets.len() != 4 {
+        return None;
+    }
+    let bits = u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]);
+    let ones = bits.count_ones() as u8;
+    // A valid netmask is contiguous leading ones.
+    if bits.leading_ones() as u8 == ones {
+        Some(ones)
+    } else {
+        None
+    }
+}
+
+/// The `ip` argv lists to bring up loopback + the static interface and default
+/// route, in order. (The guest agent already shells `ip` for runtime network
+/// reconfiguration; the supervisor reuses that approach for initial setup.)
+pub fn ip_config_commands(cfg: &NetConfig) -> Vec<Vec<String>> {
+    let mut cmds = vec![
+        vec!["link".into(), "set".into(), "lo".into(), "up".into()],
+        vec![
+            "addr".into(),
+            "add".into(),
+            format!("{}/{}", cfg.addr, cfg.prefix),
+            "dev".into(),
+            cfg.iface.clone(),
+        ],
+        vec![
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            cfg.iface.clone(),
+            "up".into(),
+        ],
+    ];
+    if let Some(gw) = cfg.gateway {
+        cmds.push(vec![
+            "route".into(),
+            "replace".into(),
+            "default".into(),
+            "via".into(),
+            gw.to_string(),
+            "dev".into(),
+            cfg.iface.clone(),
+        ]);
+    }
+    cmds
+}
+
+fn run_ip(args: &[String]) -> io::Result<()> {
+    let status = std::process::Command::new("ip").args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("`ip {}` exited {status}", args.join(" "))))
+    }
+}
+
+/// Bring up the static network from `cfg` and write a usable `/etc/resolv.conf`
+/// and `/etc/hosts`. Returns `Err` (degraded network) if `ip` is missing or a
+/// command fails; the caller logs it loudly rather than hanging silently.
+pub fn configure_network(cfg: &NetConfig) -> io::Result<()> {
+    for cmd in ip_config_commands(cfg) {
+        run_ip(&cmd)?;
+    }
+    write_resolv_conf(cfg.gateway);
+    ensure_hosts();
+    Ok(())
+}
+
+/// Write `/etc/resolv.conf`, replacing it if it is a symlink (Debian/Ubuntu point
+/// it into `/run`, which the supervisor mounts as an empty tmpfs). The NAT
+/// gateway usually serves DNS; public resolvers are a fallback.
+pub fn write_resolv_conf(gateway: Option<Ipv4Addr>) {
+    let path = Path::new("/etc/resolv.conf");
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::create_dir_all("/etc");
+    let mut content = String::new();
+    if let Some(gw) = gateway {
+        content.push_str(&format!("nameserver {gw}\n"));
+    }
+    content.push_str("nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+    if let Err(e) = std::fs::write(path, content) {
+        warn!("could not write /etc/resolv.conf: {e}");
+    }
+}
+
+/// Ensure `/etc/hosts` has localhost entries (a distroless rootfs may lack it).
+pub fn ensure_hosts() {
+    let path = Path::new("/etc/hosts");
+    if !path.exists() {
+        let _ = std::fs::create_dir_all("/etc");
+        let _ = std::fs::write(path, "127.0.0.1 localhost\n::1 localhost\n");
+    }
+}
+
 /// Reboot the guest immediately. Used when a critical init step fails: the host
 /// observes the VM exit and reports it, rather than the guest half-booting and
 /// accepting vsock while workloads mysteriously fail. Never returns.
@@ -155,5 +299,67 @@ mod tests {
             plan.iter().all(|m| m.target.starts_with('/')),
             "mount targets are absolute"
         );
+    }
+
+    #[test]
+    fn parse_ip_cmdline_parses_static_nat_config() {
+        let cmd = "ro console=ttyS0 \
+                   ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off husker.init=1";
+        let cfg = parse_ip_cmdline(cmd).expect("ip= present");
+        assert_eq!(cfg.addr, "172.20.0.2".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(cfg.prefix, 30);
+        assert_eq!(cfg.gateway, Some("172.20.0.1".parse().unwrap()));
+        assert_eq!(cfg.iface, "eth0");
+    }
+
+    #[test]
+    fn parse_ip_cmdline_none_when_absent() {
+        assert!(parse_ip_cmdline("ro console=ttyS0 quiet").is_none());
+    }
+
+    #[test]
+    fn netmask_to_prefix_converts_and_rejects_noncontiguous() {
+        assert_eq!(netmask_to_prefix("255.255.255.252"), Some(30));
+        assert_eq!(netmask_to_prefix("255.255.255.0"), Some(24));
+        assert_eq!(netmask_to_prefix("0.0.0.0"), Some(0));
+        assert_eq!(netmask_to_prefix("255.255.255.255"), Some(32));
+        // Non-contiguous mask is rejected.
+        assert_eq!(netmask_to_prefix("255.0.255.0"), None);
+        assert_eq!(netmask_to_prefix("255.255.255"), None);
+    }
+
+    #[test]
+    fn ip_config_commands_brings_up_lo_iface_and_route() {
+        let cfg = NetConfig {
+            addr: "172.20.0.2".parse().unwrap(),
+            prefix: 30,
+            gateway: Some("172.20.0.1".parse().unwrap()),
+            iface: "eth0".into(),
+        };
+        let cmds = ip_config_commands(&cfg);
+        assert_eq!(cmds[0], vec!["link", "set", "lo", "up"]);
+        assert!(
+            cmds.iter()
+                .any(|c| c == &vec!["addr", "add", "172.20.0.2/30", "dev", "eth0"]),
+            "assigns the address: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(
+                |c| c == &vec!["route", "replace", "default", "via", "172.20.0.1", "dev", "eth0"]
+            ),
+            "adds the default route: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn ip_config_commands_omits_route_without_gateway() {
+        let cfg = NetConfig {
+            addr: "192.0.2.2".parse().unwrap(),
+            prefix: 24,
+            gateway: None,
+            iface: "eth0".into(),
+        };
+        let cmds = ip_config_commands(&cfg);
+        assert!(!cmds.iter().any(|c| c.first() == Some(&"route".to_string())));
     }
 }

@@ -24,6 +24,19 @@ async fn main() -> Result<()> {
                 husker_agent::supervisor::reboot_now();
             }
             husker_agent::supervisor::ensure_device_nodes();
+            // Static network from the kernel ip=. A failure here is degraded (no
+            // outbound network), not fatal: log loudly so it is diagnosable
+            // rather than a mysterious hang, but still serve the agent.
+            match husker_agent::supervisor::parse_ip_cmdline(&cmdline) {
+                Some(cfg) => match husker_agent::supervisor::configure_network(&cfg) {
+                    Ok(()) => info!(
+                        "guest network up: {}/{} on {} (gw {:?})",
+                        cfg.addr, cfg.prefix, cfg.iface, cfg.gateway
+                    ),
+                    Err(e) => warn!("guest network setup degraded: {e}"),
+                },
+                None => info!("no ip= on cmdline; skipping static network setup"),
+            }
         }
     }
 
