@@ -117,8 +117,6 @@ struct Manifest {
 #[derive(Debug, Deserialize)]
 struct Descriptor {
     digest: String,
-    #[serde(rename = "mediaType", default)]
-    media_type: String,
     #[serde(default)]
     size: u64,
 }
@@ -187,11 +185,8 @@ pub async fn pull_image(reference: &str, arch: &str) -> Result<PulledImage, OciE
     let mut layers = Vec::with_capacity(manifest.layers.len());
     let mut downloaded: u64 = 0;
     for layer in &manifest.layers {
-        if layer.media_type.contains("zstd") {
-            return Err(OciError::Unsupported(
-                "zstd-compressed layers are not supported yet (gzip only)".into(),
-            ));
-        }
+        // gzip and zstd layers are both flattened (codec detected by magic bytes
+        // in husker_oci::flatten); other codecs are rejected there.
         let blob = get_blob(&client, &r, &layer.digest, &token).await?;
         // Guard against a registry that under-declares sizes in the manifest.
         downloaded += blob.len() as u64;

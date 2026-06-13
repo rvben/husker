@@ -14,7 +14,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+# Pure-Rust zstd decode for OCI layers (no C dependency).
+ruzstd = "0.7"
 sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# Encode zstd fixtures in tests; runtime decode uses pure-Rust ruzstd.
+zstd = "0.13"

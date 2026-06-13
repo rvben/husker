@@ -54,9 +54,26 @@ pub fn flatten_layers(layers: &[Vec<u8>], dest: &Path) -> Result<(), OciError> {
     Ok(())
 }
 
+/// Decompress a layer blob, detecting the codec by magic bytes: gzip (`1f 8b`)
+/// or zstd (`28 b5 2f fd`). Anything else is rejected. zstd uses the pure-Rust
+/// `ruzstd` decoder (no C dependency).
+fn decompress_layer(blob: &[u8]) -> Result<Box<dyn std::io::Read + '_>, OciError> {
+    if blob.starts_with(&[0x1f, 0x8b]) {
+        Ok(Box::new(GzDecoder::new(blob)))
+    } else if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let decoder = ruzstd::StreamingDecoder::new(blob)
+            .map_err(|e| OciError::Extract(format!("zstd decode: {e}")))?;
+        Ok(Box::new(decoder))
+    } else {
+        Err(OciError::Extract(
+            "unsupported layer compression (expected gzip or zstd)".into(),
+        ))
+    }
+}
+
 fn apply_layer(blob: &[u8], dest: &Path) -> Result<(), OciError> {
-    let gz = GzDecoder::new(blob);
-    let mut archive = tar::Archive::new(gz);
+    let reader = decompress_layer(blob)?;
+    let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_overwrite(true);
 
@@ -190,6 +207,35 @@ mod tests {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(&tar_buf).unwrap();
         gz.finish().unwrap()
+    }
+
+    /// Build a one-file zstd-compressed tar layer in memory.
+    fn zstd_layer(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (name, data) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        zstd::encode_all(&tar_buf[..], 0).unwrap()
+    }
+
+    #[test]
+    fn flatten_applies_a_zstd_layer() {
+        // Modern docker buildx defaults to zstd; husker must flatten it like gzip.
+        let layer = zstd_layer(&[("app/hello.txt", b"zstd-content")]);
+        let dir = tempfile::tempdir().unwrap();
+        flatten_layers(&[layer], dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("app/hello.txt")).unwrap(),
+            "zstd-content"
+        );
     }
 
     #[test]
