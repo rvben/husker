@@ -154,6 +154,7 @@ fn port_forward_persistence() {
                 host_port: 8080,
                 guest_port: 80,
                 protocol: "tcp".into(),
+                bind_addr: None,
                 created_at: Utc::now(),
             })
             .unwrap();

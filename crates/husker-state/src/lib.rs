@@ -114,6 +114,9 @@ pub struct PortForwardRecord {
     pub host_port: u16,
     pub guest_port: u16,
     pub protocol: String,
+    /// Host bind address for the userspace proxy (macOS). `None` means the
+    /// platform default (127.0.0.1 on macOS; all-interfaces on Linux nftables).
+    pub bind_addr: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -414,6 +417,9 @@ impl StateStore {
             "ALTER TABLE vms ADD COLUMN network TEXT NOT NULL DEFAULT 'nat'",
             [],
         );
+
+        // Migration: userspace-proxy bind address for port forwards (idempotent).
+        let _ = conn.execute("ALTER TABLE port_forwards ADD COLUMN bind_addr TEXT", []);
 
         Ok(())
     }
@@ -1158,13 +1164,14 @@ impl StateStore {
     pub fn insert_port_forward(&self, record: &PortForwardRecord) -> Result<(), StateError> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO port_forwards (vm_id, host_port, guest_port, protocol, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO port_forwards (vm_id, host_port, guest_port, protocol, bind_addr, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.vm_id.to_string(),
                 record.host_port,
                 record.guest_port,
                 record.protocol,
+                record.bind_addr,
                 record.created_at.to_rfc3339(),
             ],
         )
@@ -1196,19 +1203,20 @@ impl StateStore {
     ) -> Result<Vec<PortForwardRecord>, StateError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, vm_id, host_port, guest_port, protocol, created_at
+            "SELECT id, vm_id, host_port, guest_port, protocol, bind_addr, created_at
              FROM port_forwards WHERE vm_id = ?1 ORDER BY host_port",
         )?;
         let records = stmt
             .query_map(params![vm_id.to_string()], |row| {
                 let vm_id_str: String = row.get(1)?;
-                let created_str: String = row.get(5)?;
+                let created_str: String = row.get(6)?;
                 Ok(PortForwardRecord {
                     id: row.get(0)?,
                     vm_id: parse_uuid(&vm_id_str)?,
                     host_port: row.get::<_, u32>(2)? as u16,
                     guest_port: row.get::<_, u32>(3)? as u16,
                     protocol: row.get(4)?,
+                    bind_addr: row.get(5)?,
                     created_at: parse_datetime(&created_str)?,
                 })
             })?
@@ -1274,6 +1282,14 @@ impl StateStore {
             "DELETE FROM port_forwards WHERE vm_id = ?1",
             params![vm_id.to_string()],
         )?;
+        Ok(())
+    }
+
+    /// Delete every port forward row. Used on macOS daemon startup, where
+    /// userspace proxies do not survive a restart, so all rows are stale.
+    pub fn clear_all_port_forwards(&self) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM port_forwards", [])?;
         Ok(())
     }
 
@@ -1963,8 +1979,34 @@ mod tests {
             host_port,
             guest_port,
             protocol: "tcp".into(),
+            bind_addr: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn port_forward_persists_bind_addr() {
+        let store = StateStore::open_memory().unwrap();
+        let vm = make_record("pf-bind");
+        store.insert_vm(&vm).unwrap();
+        let mut rec = make_port_forward(vm.id, 8080, 80);
+        rec.bind_addr = Some("127.0.0.1".to_string());
+        store.insert_port_forward(&rec).unwrap();
+        let listed = store.list_port_forwards_for_vm(vm.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].bind_addr.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn clear_all_port_forwards_empties_table() {
+        let store = StateStore::open_memory().unwrap();
+        let vm = make_record("pf-clear");
+        store.insert_vm(&vm).unwrap();
+        store
+            .insert_port_forward(&make_port_forward(vm.id, 8080, 80))
+            .unwrap();
+        store.clear_all_port_forwards().unwrap();
+        assert!(store.list_port_forwards_for_vm(vm.id).unwrap().is_empty());
     }
 
     #[test]

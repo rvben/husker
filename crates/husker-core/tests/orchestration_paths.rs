@@ -1153,6 +1153,7 @@ async fn reconcile_port_forwards_skips_invalid_guest_ip() {
             host_port: 19000,
             guest_port: 9000,
             protocol: "tcp".into(),
+            bind_addr: None,
             created_at: Utc::now(),
         })
         .unwrap();

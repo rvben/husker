@@ -3166,6 +3166,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             host_port,
             guest_port,
             protocol: "tcp".into(),
+            bind_addr: None,
             created_at: chrono::Utc::now(),
         };
         if let Err(e) = self
