@@ -32,6 +32,12 @@ pub enum AgentRequest {
 
     /// Resize the shell terminal.
     ShellResize(ShellResizeRequest),
+
+    /// Reconfigure the guest's primary network interface in place, without
+    /// rebooting. Sent after a snapshot restore or fork gives the VM a new
+    /// host-side identity (TAP/IP), so the live guest picks up the new address,
+    /// gateway, and DNS.
+    ReconfigureNetwork(ReconfigureNetworkRequest),
 }
 
 /// Messages sent from the guest agent back to the host.
@@ -64,6 +70,9 @@ pub enum AgentResponse {
 
     /// Shell process exited.
     ShellExit(ShellExitResponse),
+
+    /// Acknowledgement that the guest network was reconfigured.
+    ReconfigureNetwork(ReconfigureNetworkResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +125,40 @@ pub struct ErrorResponse {
 pub struct GuestInfoResponse {
     /// Non-loopback IPv4 addresses, primary first.
     pub ipv4: Vec<String>,
+}
+
+/// New network identity to apply to a guest interface after restore/fork.
+///
+/// A forked VM shares its source's snapshot, so it boots with the source's MAC
+/// and IP. husker puts every guest on one shared L2 bridge, and Firecracker's
+/// snapshot `network_overrides` only rebinds the host TAP (not the guest MAC),
+/// so the guest itself must take a fresh MAC and IP to avoid colliding with the
+/// source on the bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconfigureNetworkRequest {
+    /// Interface to reconfigure (e.g. `"eth0"`).
+    pub interface: String,
+    /// New IPv4 address (dotted quad, no prefix).
+    pub ipv4: String,
+    /// Prefix length for the address (e.g. `24`).
+    pub prefix_len: u8,
+    /// Default gateway IPv4 address.
+    pub gateway: String,
+    /// New link-layer (MAC) address. `None` leaves the current MAC unchanged
+    /// (e.g. a plain restore that keeps the source's identity).
+    #[serde(default)]
+    pub mac: Option<String>,
+    /// DNS servers to write to `/etc/resolv.conf`. Empty leaves it unchanged.
+    pub dns: Vec<String>,
+}
+
+/// Result of applying a [`ReconfigureNetworkRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconfigureNetworkResponse {
+    /// The interface that was reconfigured.
+    pub interface: String,
+    /// The IPv4 address now assigned to it.
+    pub ipv4: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +436,40 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn reconfigure_network_round_trip() {
+        let req = AgentRequest::ReconfigureNetwork(ReconfigureNetworkRequest {
+            interface: "eth0".into(),
+            ipv4: "192.0.2.10".into(),
+            prefix_len: 24,
+            gateway: "192.0.2.1".into(),
+            mac: Some("AA:FC:00:00:00:09".into()),
+            dns: vec!["192.0.2.1".into(), "1.1.1.1".into()],
+        });
+        let encoded = encode_message(&req).unwrap();
+        let (decoded, consumed): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            AgentRequest::ReconfigureNetwork(r) => {
+                assert_eq!(r.interface, "eth0");
+                assert_eq!(r.ipv4, "192.0.2.10");
+                assert_eq!(r.prefix_len, 24);
+                assert_eq!(r.gateway, "192.0.2.1");
+                assert_eq!(r.mac.as_deref(), Some("AA:FC:00:00:00:09"));
+                assert_eq!(r.dns, vec!["192.0.2.1".to_string(), "1.1.1.1".to_string()]);
+            }
+            other => panic!("expected ReconfigureNetwork, got {other:?}"),
+        }
+
+        let resp = AgentResponse::ReconfigureNetwork(ReconfigureNetworkResponse {
+            interface: "eth0".into(),
+            ipv4: "192.0.2.10".into(),
+        });
+        let encoded = encode_message(&resp).unwrap();
+        let (decoded, _): (AgentResponse, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert!(matches!(decoded, AgentResponse::ReconfigureNetwork(_)));
+    }
 
     #[test]
     fn guest_info_round_trip() {

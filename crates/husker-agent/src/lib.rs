@@ -8,8 +8,9 @@ use std::path::Path;
 use anyhow::Result;
 use husker_agent_proto::{
     AgentRequest, AgentResponse, ErrorResponse, ExecResponse, GuestInfoResponse, ReadFileResponse,
-    ShellDataResponse, ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode,
-    base64_encode, read_message, write_message,
+    ReconfigureNetworkRequest, ReconfigureNetworkResponse, ShellDataResponse, ShellExitResponse,
+    ShellStartRequest, WriteFileResponse, base64_decode, base64_encode, read_message,
+    write_message,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
@@ -370,6 +371,16 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
             }
         }
 
+        AgentRequest::ReconfigureNetwork(req) => match apply_network_reconfigure(&req).await {
+            Ok(()) => AgentResponse::ReconfigureNetwork(ReconfigureNetworkResponse {
+                interface: req.interface,
+                ipv4: req.ipv4,
+            }),
+            Err(e) => AgentResponse::Error(ErrorResponse {
+                message: format!("reconfigure-network failed: {e}"),
+            }),
+        },
+
         // ShellStart is handled in handle_connection before reaching here.
         // ShellData and ShellResize are only valid during an active shell session.
         AgentRequest::ShellStart(_) | AgentRequest::ShellData(_) | AgentRequest::ShellResize(_) => {
@@ -377,5 +388,168 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                 message: "shell messages are not valid outside a shell session".into(),
             })
         }
+    }
+}
+
+/// Build the ordered `ip` argument lists that apply a new network identity to
+/// `req.interface`. Pure (no side effects) so the plan can be unit-tested
+/// without touching the host's networking.
+///
+/// Order matters: a MAC change needs the link down first; then flush the old
+/// address before assigning the new one, and bring the link up before
+/// installing the default route through it.
+fn reconfigure_commands(req: &ReconfigureNetworkRequest) -> Vec<Vec<String>> {
+    let dev = req.interface.clone();
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    if let Some(mac) = &req.mac {
+        cmds.push(vec![
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            dev.clone(),
+            "down".into(),
+        ]);
+        cmds.push(vec![
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            dev.clone(),
+            "address".into(),
+            mac.clone(),
+        ]);
+    }
+    cmds.push(vec![
+        "addr".into(),
+        "flush".into(),
+        "dev".into(),
+        dev.clone(),
+    ]);
+    cmds.push(vec![
+        "addr".into(),
+        "add".into(),
+        format!("{}/{}", req.ipv4, req.prefix_len),
+        "dev".into(),
+        dev.clone(),
+    ]);
+    cmds.push(vec![
+        "link".into(),
+        "set".into(),
+        "dev".into(),
+        dev.clone(),
+        "up".into(),
+    ]);
+    cmds.push(vec![
+        "route".into(),
+        "replace".into(),
+        "default".into(),
+        "via".into(),
+        req.gateway.clone(),
+        "dev".into(),
+        dev,
+    ]);
+    cmds
+}
+
+/// Build `/etc/resolv.conf` contents for `dns`, or `None` to leave it untouched
+/// when no servers are supplied.
+fn resolv_conf_contents(dns: &[String]) -> Option<String> {
+    if dns.is_empty() {
+        return None;
+    }
+    Some(dns.iter().map(|s| format!("nameserver {s}\n")).collect())
+}
+
+/// Apply a new network identity to the live guest: run the `ip` commands from
+/// [`reconfigure_commands`] in order, then rewrite `/etc/resolv.conf`. Guest-only
+/// (it mutates real interfaces), so it is never exercised by host-side tests.
+async fn apply_network_reconfigure(req: &ReconfigureNetworkRequest) -> Result<(), String> {
+    for args in reconfigure_commands(req) {
+        let output = tokio::process::Command::new("ip")
+            .args(&args)
+            .output()
+            .await
+            .map_err(|e| format!("spawn `ip {}`: {e}", args.join(" ")))?;
+        if !output.status.success() {
+            return Err(format!(
+                "`ip {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    if let Some(contents) = resolv_conf_contents(&req.dns) {
+        tokio::fs::write("/etc/resolv.conf", contents)
+            .await
+            .map_err(|e| format!("write /etc/resolv.conf: {e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use husker_agent_proto::ReconfigureNetworkRequest;
+
+    fn sample_req(mac: Option<&str>) -> ReconfigureNetworkRequest {
+        ReconfigureNetworkRequest {
+            interface: "eth0".into(),
+            ipv4: "192.0.2.10".into(),
+            prefix_len: 24,
+            gateway: "192.0.2.1".into(),
+            mac: mac.map(String::from),
+            dns: vec!["192.0.2.1".into()],
+        }
+    }
+
+    #[test]
+    fn reconfigure_commands_without_mac_flush_then_assign_then_route() {
+        let cmds = reconfigure_commands(&sample_req(None));
+        // Order matters: clear the old address before assigning the new one, and
+        // bring the link up before installing the default route through it.
+        assert_eq!(
+            cmds,
+            vec![
+                vec!["addr", "flush", "dev", "eth0"],
+                vec!["addr", "add", "192.0.2.10/24", "dev", "eth0"],
+                vec!["link", "set", "dev", "eth0", "up"],
+                vec![
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    "192.0.2.1",
+                    "dev",
+                    "eth0"
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn reconfigure_commands_with_mac_brings_link_down_and_sets_address_first() {
+        let cmds = reconfigure_commands(&sample_req(Some("AA:FC:00:00:00:09")));
+        // A MAC change must precede addressing and requires the link down first.
+        assert_eq!(
+            cmds[0],
+            vec!["link", "set", "dev", "eth0", "down"],
+            "MAC change requires the link down first"
+        );
+        assert_eq!(
+            cmds[1],
+            vec!["link", "set", "dev", "eth0", "address", "AA:FC:00:00:00:09"]
+        );
+        assert_eq!(cmds[2], vec!["addr", "flush", "dev", "eth0"]);
+        // The link comes back up before the default route is installed.
+        assert_eq!(cmds[4], vec!["link", "set", "dev", "eth0", "up"]);
+        assert_eq!(cmds[5][0], "route");
+    }
+
+    #[test]
+    fn resolv_conf_contents_one_line_per_server_or_none() {
+        assert_eq!(resolv_conf_contents(&[]), None);
+        assert_eq!(
+            resolv_conf_contents(&["192.0.2.1".into(), "1.1.1.1".into()]),
+            Some("nameserver 192.0.2.1\nnameserver 1.1.1.1\n".to_string())
+        );
     }
 }
