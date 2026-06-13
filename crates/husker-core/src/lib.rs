@@ -1428,6 +1428,16 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
 
+        // Fail fast before pausing: only backends with full-state snapshot can be
+        // suspended. Otherwise a QEMU/Apple VZ VM would be paused, hit
+        // `Unsupported` at snapshot time, and have to be un-paused again.
+        if !husker_vmm::Capabilities::for_backend(&record.vmm).snapshot {
+            return Err(CoreError::Vmm(husker_vmm::VmmError::Unsupported(format!(
+                "backend '{}' does not support suspend (full-state snapshot)",
+                record.vmm
+            ))));
+        }
+
         let paused_by_us = record.state == "running";
         if paused_by_us {
             self.vmm.pause_vm(record.id).await?;

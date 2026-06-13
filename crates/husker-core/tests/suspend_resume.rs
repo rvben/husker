@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 #[derive(Default)]
 struct Calls {
+    paused: Vec<Uuid>,
     snapshot: Vec<Uuid>,
     restore: Vec<Uuid>,
     destroyed: Vec<Uuid>,
@@ -66,6 +67,7 @@ impl VmmBackend for SharedRecordingVmm {
     }
 
     async fn pause_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        self.0.calls.lock().unwrap().paused.push(id);
         if let Some(i) = self.0.vms.lock().unwrap().get_mut(&id) {
             i.state = VmState::Paused;
         }
@@ -142,6 +144,20 @@ fn core_with_running_vm(
     Uuid,
     tempfile::TempDir,
 ) {
+    core_with_running_vm_backend(name, "firecracker")
+}
+
+/// Like `core_with_running_vm` but lets the test pick the persisted backend kind
+/// (`"firecracker"`, `"qemu"`, `"apple_vz"`), which drives capability gating.
+fn core_with_running_vm_backend(
+    name: &str,
+    vmm_kind: &str,
+) -> (
+    Arc<HuskerCore<SharedRecordingVmm>>,
+    Arc<RecordingVmm>,
+    Uuid,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let inner = RecordingVmm::new();
     let vmm = SharedRecordingVmm(Arc::clone(&inner));
@@ -172,7 +188,7 @@ fn core_with_running_vm(
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: "firecracker".into(),
+        vmm: vmm_kind.into(),
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
@@ -263,6 +279,45 @@ async fn suspend_then_resume_round_trips() {
         calls.restore.len(),
         1,
         "restore should be called once during resume"
+    );
+}
+
+#[tokio::test]
+async fn suspend_on_unsupported_backend_fails_fast() {
+    // QEMU has no full-state snapshot, so suspend must be rejected *before* the
+    // VM is paused or any snapshot is attempted - not discovered mid-flight after
+    // a pause that then has to be rolled back.
+    let (core, vmm, id, _tmp) = core_with_running_vm_backend("vmq", "qemu");
+
+    let err = core.suspend_vm("vmq").await.unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("suspend") && (msg.contains("not support") || msg.contains("unsupported")),
+        "expected a clear suspend-unsupported message, got: {err}"
+    );
+
+    {
+        let calls = vmm.calls.lock().unwrap();
+        assert!(
+            calls.paused.is_empty(),
+            "VM must not be paused on a fail-fast suspend rejection"
+        );
+        assert!(
+            calls.snapshot.is_empty(),
+            "snapshot must not be attempted on an unsupported backend"
+        );
+    }
+
+    // The VM is untouched and still running.
+    let rec = core
+        .list_vms()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.id == id)
+        .unwrap();
+    assert_eq!(
+        rec.state, "running",
+        "VM must remain running after a rejected suspend"
     );
 }
 

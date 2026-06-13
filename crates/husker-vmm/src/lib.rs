@@ -103,6 +103,36 @@ impl std::str::FromStr for VmmKind {
     }
 }
 
+/// Optional features a VMM backend may support.
+///
+/// husker's Linux backend multiplexes Firecracker and QEMU per VM, so support
+/// for a feature is a property of the VM's backend *kind*, not of the single
+/// active [`VmmBackend`] object. Callers therefore resolve capabilities from the
+/// persisted backend string via [`Capabilities::for_backend`] and check them
+/// before starting an operation that a backend cannot finish (e.g. pausing a VM
+/// for suspend), failing fast instead of hitting [`VmmError::Unsupported`]
+/// mid-flight.
+///
+/// The default is conservative: an unknown backend advertises nothing optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    /// `snapshot_vm` / `restore_vm` are implemented (full-state suspend/resume
+    /// to disk). Firecracker only; QEMU and Apple VZ return `Unsupported`.
+    pub snapshot: bool,
+}
+
+impl Capabilities {
+    /// Static capabilities for a backend identified by its persisted kind string
+    /// (`"firecracker"`, `"qemu"`, `"apple_vz"`). Unrecognised kinds get the
+    /// conservative default so callers fail closed.
+    pub fn for_backend(kind: &str) -> Capabilities {
+        match kind {
+            "firecracker" => Capabilities { snapshot: true },
+            _ => Capabilities::default(),
+        }
+    }
+}
+
 /// How the guest boots. `DirectKernel` is husker's microVM default (host-supplied
 /// kernel + initrd + appended cmdline). `Uefi` boots the disk's own bootloader via
 /// OVMF firmware and carries the firmware paths it needs. `Efi` is for Apple VZ
@@ -336,8 +366,26 @@ pub trait VmmBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{VmmKind, tail_lines};
+    use super::{Capabilities, VmmKind, tail_lines};
     use std::io::Write;
+
+    #[test]
+    fn capabilities_for_backend_maps_each_kind() {
+        // Firecracker is the only husker backend that implements full-state
+        // snapshot/restore today.
+        assert!(Capabilities::for_backend("firecracker").snapshot);
+        // QEMU and Apple VZ return Unsupported from snapshot_vm/restore_vm.
+        assert!(!Capabilities::for_backend("qemu").snapshot);
+        assert!(!Capabilities::for_backend("apple_vz").snapshot);
+    }
+
+    #[test]
+    fn capabilities_for_unknown_backend_is_conservative() {
+        // An unrecognised kind advertises nothing optional, so callers fail
+        // closed rather than attempting an operation the backend can't finish.
+        assert_eq!(Capabilities::for_backend("xen"), Capabilities::default());
+        assert!(!Capabilities::default().snapshot);
+    }
 
     #[test]
     fn vmm_kind_parse_and_display() {
