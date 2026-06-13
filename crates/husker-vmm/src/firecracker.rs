@@ -413,6 +413,10 @@ impl FirecrackerBackend {
 impl VmmBackend for FirecrackerBackend {
     type VsockStream = tokio::net::UnixStream;
 
+    fn backend_kind(&self) -> &'static str {
+        "firecracker"
+    }
+
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
         if !matches!(config.boot, crate::BootMode::DirectKernel) {
             return Err(VmmError::InvalidConfig(

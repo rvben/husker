@@ -114,6 +114,12 @@ impl LinuxDispatchBackend {
 impl VmmBackend for LinuxDispatchBackend {
     type VsockStream = LinuxVsockStream;
 
+    /// The dispatch backend always has Firecracker available, so it advertises
+    /// Firecracker's (capability-defining) kind regardless of `default_kind`.
+    fn backend_kind(&self) -> &'static str {
+        "firecracker"
+    }
+
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
         let kind = config.vmm.unwrap_or(self.default_kind);
         let info = match kind {

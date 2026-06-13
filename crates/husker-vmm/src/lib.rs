@@ -397,6 +397,17 @@ pub trait VmmBackend: Send + Sync {
         id: Uuid,
         amount_mib: u32,
     ) -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
+
+    /// The capability-defining backend kind for this daemon: `"firecracker"`,
+    /// `"qemu"`, or `"apple_vz"`. Used to resolve [`Capabilities::for_backend`]
+    /// when advertising what the running daemon can do. The Linux dispatch
+    /// backend always has Firecracker available and reports `"firecracker"`.
+    ///
+    /// Defaults to `"unknown"` (conservative: advertises no optional
+    /// capabilities) for backends that do not declare a kind.
+    fn backend_kind(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 #[cfg(test)]

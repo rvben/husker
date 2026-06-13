@@ -26,7 +26,12 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Daemon API address (for client commands)
+    /// Daemon API address (for client commands).
+    ///
+    /// Accepts http://host:port or ssh://[user@]host[:port] to reach a remote
+    /// daemon over an SSH tunnel (reuses your ssh config/keys; no exposed port).
+    /// Driving a Linux daemon this way unlocks Firecracker-only operations
+    /// (fork, suspend, OCI import) from a macOS host.
     #[arg(long, env = "HUSKER_API_URL", default_value = "http://127.0.0.1:7777")]
     api_url: String,
 
@@ -1798,6 +1803,23 @@ async fn run(cli: Cli) -> Result<()> {
     // Resolve Auto -> Json/Text once based on stdout TTY state, so all
     // downstream branches can compare directly without re-calling resolve_format.
     let output = resolve_format(raw_output);
+
+    // ssh:// transport: open an SSH local-forward tunnel to a remote daemon and
+    // rewrite api_url to the local end. The guard keeps the ssh process alive for
+    // the whole command and tears it down on return.
+    let _ssh_tunnel: Option<SshTunnel>;
+    let api_url = if api_url.starts_with("ssh://") {
+        if matches!(command, Commands::Daemon { .. }) {
+            anyhow::bail!("ssh:// targets a remote daemon; `husker daemon` starts a local one");
+        }
+        let tunnel = SshTunnel::establish(&api_url).await?;
+        let local = tunnel.local_url();
+        _ssh_tunnel = Some(tunnel);
+        local
+    } else {
+        _ssh_tunnel = None;
+        api_url
+    };
     set_daemon_url(&api_url);
 
     match command {
@@ -2141,6 +2163,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Suspend { name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            preflight_capability(&api_url, api_token.as_deref(), "snapshot").await?;
             let client = reqwest::Client::new();
             let resp = api_request(with_api_auth(
                 client.post(format!("{api_url}/v1/vms/{name}/suspend")),
@@ -2170,6 +2193,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Fork { source, fork_name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
+            preflight_capability(&api_url, api_token.as_deref(), "fork").await?;
             let client = reqwest::Client::new();
             let resp = api_request(with_api_auth(
                 client
@@ -3904,6 +3928,7 @@ async fn image_command(
             }
         }
         ImageAction::ImportOci { reference, name } => {
+            preflight_capability(&api_url, api_token.as_deref(), "oci_import").await?;
             let name = name.unwrap_or_else(|| oci_default_image_name(&reference));
             let resp = api_request(
                 with_api_auth(
@@ -6015,6 +6040,215 @@ fn wrap_sync_command(
     ("sh".to_string(), args)
 }
 
+/// The husker daemon's default listen port, used as the remote end of an
+/// `ssh://` tunnel.
+const SSH_REMOTE_DAEMON_PORT: u16 = 7777;
+
+/// A parsed `ssh://[user@]host[:sshport]` daemon target.
+#[derive(Debug, PartialEq, Eq)]
+struct SshTarget {
+    user: Option<String>,
+    host: String,
+    ssh_port: Option<u16>,
+}
+
+/// Parse an `ssh://[user@]host[:sshport]` API URL into its parts.
+fn parse_ssh_url(url: &str) -> Result<SshTarget> {
+    let rest = url
+        .strip_prefix("ssh://")
+        .context("API URL must start with ssh://")?;
+    let (user, hostport) = match rest.split_once('@') {
+        Some((u, hp)) => {
+            if u.is_empty() {
+                anyhow::bail!("ssh:// URL has an empty user");
+            }
+            (Some(u.to_string()), hp)
+        }
+        None => (None, rest),
+    };
+    let (host, ssh_port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => {
+            let port: u16 = p
+                .parse()
+                .with_context(|| format!("invalid ssh port in ssh:// URL: {p}"))?;
+            (h.to_string(), Some(port))
+        }
+        None => (hostport.to_string(), None),
+    };
+    if host.is_empty() {
+        anyhow::bail!("ssh:// URL is missing a host");
+    }
+    Ok(SshTarget {
+        user,
+        host,
+        ssh_port,
+    })
+}
+
+/// Build the `ssh` argv for a `-L` local-forward tunnel from `local_port` to the
+/// remote daemon's `remote_port` on its loopback.
+///
+/// `control_path` enables SSH connection multiplexing: the first invocation opens
+/// a master connection at that socket and later invocations reuse it, skipping the
+/// handshake so a repeated `husker ... ssh://...` dev loop stays fast.
+fn ssh_tunnel_args(
+    target: &SshTarget,
+    local_port: u16,
+    remote_port: u16,
+    control_path: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-N".to_string(),
+        "-o".to_string(),
+        "ExitOnForwardFailure=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={control_path}"),
+        "-o".to_string(),
+        "ControlPersist=60s".to_string(),
+        "-L".to_string(),
+        format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
+    ];
+    if let Some(p) = target.ssh_port {
+        args.push("-p".to_string());
+        args.push(p.to_string());
+    }
+    args.push(match &target.user {
+        Some(u) => format!("{u}@{}", target.host),
+        None => target.host.clone(),
+    });
+    args
+}
+
+/// A live SSH local-forward tunnel to a remote husker daemon. The `ssh` child is
+/// killed on drop (`kill_on_drop`), so the tunnel lives exactly as long as this
+/// guard is held.
+struct SshTunnel {
+    child: tokio::process::Child,
+    local_port: u16,
+}
+
+impl SshTunnel {
+    /// Open a tunnel for an `ssh://` URL and wait until it accepts connections.
+    async fn establish(url: &str) -> Result<Self> {
+        let target = parse_ssh_url(url)?;
+        let local_port = reserve_local_port()?;
+        // `%C` is ssh's per-target connection hash: short (keeps the socket path
+        // under the ~104-char Unix limit) and unique per (user, host, port).
+        let control_path = "/tmp/husker-ssh-%C";
+        let args = ssh_tunnel_args(&target, local_port, SSH_REMOTE_DAEMON_PORT, control_path);
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&args).kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .context("spawning ssh for the ssh:// tunnel (is the ssh client installed?)")?;
+        let mut tunnel = SshTunnel { child, local_port };
+        tunnel.wait_ready().await?;
+        Ok(tunnel)
+    }
+
+    async fn wait_ready(&mut self) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                anyhow::bail!(
+                    "ssh tunnel exited before it was ready (status {status}); \
+                     check that you can `ssh` to the host and the daemon listens on \
+                     127.0.0.1:{SSH_REMOTE_DAEMON_PORT}"
+                );
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", self.local_port))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("timed out establishing the ssh:// tunnel to the daemon");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+
+    fn local_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.local_port)
+    }
+}
+
+/// Reserve an ephemeral loopback port by binding and immediately releasing it, so
+/// `ssh -L` can claim it for the forward.
+fn reserve_local_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("reserving a local port for the ssh:// tunnel")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Human-facing phrase describing what backend a capability requires.
+fn capability_requirement(cap: &str) -> &'static str {
+    match cap {
+        "fork" | "snapshot" => "a Firecracker backend (Linux)",
+        "oci_import" => "a Linux daemon",
+        "port_forward" => "a Linux daemon with nftables (linux-net build)",
+        "bridged_net" => "a Linux daemon with bridged networking (linux-net build)",
+        _ => "a different backend",
+    }
+}
+
+/// Decide whether a command requiring capability `cap` can run against the daemon
+/// described by its `/v1/health` JSON. Returns an actionable error when the daemon
+/// advertises that it lacks the capability. Stays permissive (Ok) when the daemon
+/// is too old to advertise capabilities, so old daemons fall through to the
+/// server's own rejection instead of being blocked by the client.
+fn capability_gate(health: &serde_json::Value, cap: &str) -> Result<(), String> {
+    let Some(caps) = health.get("capabilities") else {
+        return Ok(());
+    };
+    match caps.get(cap).and_then(|v| v.as_bool()) {
+        Some(false) => {
+            let backend = health
+                .get("backend")
+                .and_then(|b| b.as_str())
+                .unwrap_or("unknown");
+            let need = capability_requirement(cap);
+            Err(format!(
+                "this operation needs {need}; the daemon at the current --api-url is '{backend}', \
+                 which does not support it. Point --api-url at {need}, e.g. ssh://user@linux-host."
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Fetch `/v1/health` and fail fast if the daemon advertises that it lacks the
+/// capability `cap`. Best-effort: an unreachable or unparseable health response,
+/// or a daemon too old to advertise capabilities, falls through so the command
+/// proceeds (and the server rejects it if truly unsupported).
+async fn preflight_capability(api_url: &str, api_token: Option<&str>, cap: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let Ok(resp) = with_api_auth(client.get(format!("{api_url}/v1/health")), api_token)
+        .send()
+        .await
+    else {
+        return Ok(());
+    };
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+    let Ok(health) = resp.json::<serde_json::Value>().await else {
+        return Ok(());
+    };
+    if let Err(msg) = capability_gate(&health, cap) {
+        anyhow::bail!("{msg}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7580,6 +7814,132 @@ mod tests {
         assert!(
             Cli::try_parse_from(["husker", "run", "--net", "invalid"]).is_err(),
             "--net with invalid value should be rejected"
+        );
+    }
+
+    #[test]
+    fn capability_gate_blocks_when_unsupported() {
+        let health = serde_json::json!({
+            "backend": "apple_vz",
+            "capabilities": { "fork": false, "snapshot": false }
+        });
+        let err = capability_gate(&health, "fork").unwrap_err();
+        assert!(err.contains("apple_vz"), "names the current backend: {err}");
+        assert!(
+            err.to_lowercase().contains("firecracker"),
+            "names what is needed: {err}"
+        );
+    }
+
+    #[test]
+    fn capability_gate_allows_when_supported() {
+        let health = serde_json::json!({
+            "backend": "firecracker",
+            "capabilities": { "fork": true }
+        });
+        assert!(capability_gate(&health, "fork").is_ok());
+    }
+
+    #[test]
+    fn capability_gate_is_graceful_against_old_daemon() {
+        // No capabilities field (daemon too old to advertise): do not block.
+        let health = serde_json::json!({ "version": "0.4.4" });
+        assert!(capability_gate(&health, "fork").is_ok());
+    }
+
+    #[test]
+    fn parse_ssh_url_full() {
+        let t = parse_ssh_url("ssh://ubuntu@192.0.2.5:2222").unwrap();
+        assert_eq!(t.user.as_deref(), Some("ubuntu"));
+        assert_eq!(t.host, "192.0.2.5");
+        assert_eq!(t.ssh_port, Some(2222));
+    }
+
+    #[test]
+    fn parse_ssh_url_host_only() {
+        let t = parse_ssh_url("ssh://host.example").unwrap();
+        assert_eq!(t.user, None);
+        assert_eq!(t.host, "host.example");
+        assert_eq!(t.ssh_port, None);
+    }
+
+    #[test]
+    fn parse_ssh_url_user_no_port() {
+        let t = parse_ssh_url("ssh://ubuntu@host").unwrap();
+        assert_eq!(t.user.as_deref(), Some("ubuntu"));
+        assert_eq!(t.host, "host");
+        assert_eq!(t.ssh_port, None);
+    }
+
+    #[test]
+    fn parse_ssh_url_rejects_non_ssh_and_empty_host() {
+        assert!(parse_ssh_url("http://host").is_err());
+        assert!(parse_ssh_url("ssh://").is_err());
+    }
+
+    #[test]
+    fn ssh_tunnel_args_builds_local_forward() {
+        let t = SshTarget {
+            user: Some("ubuntu".into()),
+            host: "192.0.2.5".into(),
+            ssh_port: Some(2222),
+        };
+        let args = ssh_tunnel_args(&t, 15000, 7777, "/tmp/husker-cm-%C");
+        assert!(
+            args.contains(&"-N".to_string()),
+            "runs without a remote command"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-L" && w[1] == "127.0.0.1:15000:127.0.0.1:7777"),
+            "forwards local 15000 to remote daemon: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"),
+            "passes the ssh port: {args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "ubuntu@192.0.2.5");
+    }
+
+    #[test]
+    fn ssh_tunnel_args_reuses_connection_via_controlmaster() {
+        let t = SshTarget {
+            user: None,
+            host: "h".into(),
+            ssh_port: None,
+        };
+        let args = ssh_tunnel_args(&t, 100, 7777, "/tmp/husker-cm-%C");
+        // Connection multiplexing keeps a master alive so repeat invocations skip
+        // the SSH handshake.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ControlMaster=auto"),
+            "enables ControlMaster: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/husker-cm-%C"),
+            "sets the control socket path: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-o" && w[1].starts_with("ControlPersist=")),
+            "persists the master after exit: {args:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_tunnel_args_no_user_no_port() {
+        let t = SshTarget {
+            user: None,
+            host: "h".into(),
+            ssh_port: None,
+        };
+        let args = ssh_tunnel_args(&t, 100, 7777, "/tmp/husker-cm-%C");
+        assert_eq!(args.last().unwrap(), "h");
+        assert!(
+            !args.contains(&"-p".to_string()),
+            "no -p when ssh_port absent"
         );
     }
 

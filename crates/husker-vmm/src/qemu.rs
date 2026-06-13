@@ -447,6 +447,10 @@ impl QemuKvmBackend {
 impl crate::VmmBackend for QemuKvmBackend {
     type VsockStream = tokio_vsock::VsockStream;
 
+    fn backend_kind(&self) -> &'static str {
+        "qemu"
+    }
+
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
         if !std::path::Path::new("/dev/kvm").exists() {
             return Err(VmmError::InvalidConfig(

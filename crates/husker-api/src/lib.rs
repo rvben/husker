@@ -1086,12 +1086,23 @@ async fn health<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> Jso
     checks.insert("network_backend".into(), "ok".into());
     #[cfg(not(feature = "linux-net"))]
     checks.insert("network_backend".into(), "n/a".into());
+    let backend = core.backend_kind();
+    let base = husker_vmm::Capabilities::for_backend(backend);
+    let capabilities = DaemonCapabilities {
+        fork: base.fork,
+        snapshot: base.snapshot,
+        oci_import: cfg!(target_os = "linux"),
+        port_forward: cfg!(feature = "linux-net"),
+        bridged_net: cfg!(feature = "linux-net"),
+    };
     Json(HealthResponse {
         status: "ok".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         vms: VmCounts { total, running },
         checks,
         uptime_seconds: metrics().start.elapsed().as_secs(),
+        backend: backend.to_string(),
+        capabilities,
     })
 }
 
@@ -1102,12 +1113,34 @@ pub struct HealthResponse {
     pub vms: VmCounts,
     pub checks: HashMap<String, String>,
     pub uptime_seconds: u64,
+    /// Capability-defining backend kind: `"firecracker"`, `"qemu"`, or
+    /// `"apple_vz"`. Lets clients pre-flight backend-specific operations.
+    pub backend: String,
+    /// What this daemon's backend and build can actually do.
+    pub capabilities: DaemonCapabilities,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VmCounts {
     pub total: u64,
     pub running: u64,
+}
+
+/// The set of optional operations a daemon supports, derived from its backend
+/// kind and compile-time build features. Clients use this to fail fast with an
+/// actionable message instead of attempting an operation the daemon can't run.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DaemonCapabilities {
+    /// `husker fork` (fork a suspended VM). Firecracker only.
+    pub fork: bool,
+    /// `husker suspend` (full-state snapshot to disk). Firecracker only.
+    pub snapshot: bool,
+    /// `husker image import-oci` (import OCI/Docker images). Linux builds only.
+    pub oci_import: bool,
+    /// `husker port-forward` (nftables host->guest mapping). linux-net builds only.
+    pub port_forward: bool,
+    /// `--net bridged` (attach VMs to the LAN bridge). linux-net builds only.
+    pub bridged_net: bool,
 }
 
 #[utoipa::path(
@@ -3269,6 +3302,26 @@ mod tests {
         assert!(json["version"].as_str().is_some());
         assert_eq!(json["vms"]["total"], 0);
         assert_eq!(json["vms"]["running"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_advertises_backend_and_capabilities() {
+        // test_core() runs on a real FirecrackerBackend.
+        let app = router(test_core());
+        let response = app
+            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["backend"], "firecracker", "daemon names its backend");
+        let caps = &json["capabilities"];
+        assert_eq!(caps["fork"], true, "firecracker advertises fork");
+        assert_eq!(caps["snapshot"], true, "firecracker advertises snapshot");
+        // Platform/feature-gated capabilities reflect the build configuration.
+        assert_eq!(caps["port_forward"], cfg!(feature = "linux-net"));
+        assert_eq!(caps["bridged_net"], cfg!(feature = "linux-net"));
+        assert_eq!(caps["oci_import"], cfg!(target_os = "linux"));
     }
 
     #[tokio::test]

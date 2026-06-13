@@ -497,6 +497,10 @@ async fn dispatch_vz_op(
 impl VmmBackend for AppleVzBackend {
     type VsockStream = VzVsockStream;
 
+    fn backend_kind(&self) -> &'static str {
+        "apple_vz"
+    }
+
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
         {
             let instances = self.instances.lock().await;

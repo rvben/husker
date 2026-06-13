@@ -1990,6 +1990,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(self.state.list_vms()?)
     }
 
+    /// The capability-defining backend kind of this daemon's VMM backend
+    /// (e.g. `"firecracker"`, `"apple_vz"`). Used to advertise daemon
+    /// capabilities over the API.
+    pub fn backend_kind(&self) -> &'static str {
+        self.vmm.backend_kind()
+    }
+
     /// List all VMs with their state refreshed against the backend.
     ///
     /// Detects guest-initiated shutdowns (process exited without the daemon
