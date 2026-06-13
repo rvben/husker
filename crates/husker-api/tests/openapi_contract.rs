@@ -107,14 +107,13 @@ async fn openapi_contains_critical_paths() {
         );
     }
 
-    #[cfg(feature = "linux-net")]
-    {
-        for required in ["/v1/vms/{name}/ports", "/v1/vms/{name}/ports/{host_port}"] {
-            assert!(
-                paths.contains_key(required),
-                "missing OpenAPI path: {required}"
-            );
-        }
+    // Port-forward routes are cross-platform (nftables on Linux, a userspace
+    // proxy on macOS), so they must always be in the contract.
+    for required in ["/v1/vms/{name}/ports", "/v1/vms/{name}/ports/{host_port}"] {
+        assert!(
+            paths.contains_key(required),
+            "missing OpenAPI path: {required}"
+        );
     }
 }
 
@@ -140,7 +139,7 @@ async fn openapi_error_response_schema_is_stable() {
 }
 
 #[tokio::test]
-async fn openapi_tags_include_linux_caveat_for_ports() {
+async fn openapi_ports_tag_is_cross_platform() {
     let doc = fetch_openapi().await;
     let tags = doc["tags"].as_array().expect("tags should be an array");
     let ports_tag = tags
@@ -148,8 +147,8 @@ async fn openapi_tags_include_linux_caveat_for_ports() {
         .find(|tag| tag["name"] == "ports")
         .expect("ports tag must exist");
     let description = ports_tag["description"].as_str().unwrap_or("");
-    assert!(
-        description.contains("Linux"),
-        "ports tag description should mention Linux caveat"
+    assert_eq!(
+        description, "Port forwarding",
+        "ports tag should no longer carry a Linux-only caveat"
     );
 }

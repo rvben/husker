@@ -16,9 +16,7 @@ use axum::http::HeaderValue;
 use axum::http::Method;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-#[cfg(feature = "linux-net")]
-use axum::routing::delete;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use utoipa::OpenApi;
@@ -424,19 +422,22 @@ pub struct WriteFileResponse {
 
 // ── Port Forward Types ────────────────────────────────────────────────
 
-#[cfg(feature = "linux-net")]
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AddPortForwardRequest {
     pub host_port: u16,
     pub guest_port: u16,
+    /// Host address to bind (macOS userspace proxy). Defaults to 127.0.0.1.
+    #[serde(default)]
+    pub bind_addr: Option<String>,
 }
 
-#[cfg(feature = "linux-net")]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PortForwardResponse {
     pub host_port: u16,
     pub guest_port: u16,
     pub protocol: String,
+    /// Effective host bind address. `None` on Linux (all interfaces).
+    pub bind_addr: Option<String>,
     pub created_at: String,
 }
 
@@ -619,13 +620,12 @@ pub enum WsShellOutput {
         (name = "files", description = "File transfer to/from VMs"),
         (name = "shell", description = "Interactive shell sessions"),
         (name = "logs", description = "Serial console output"),
-        (name = "ports", description = "Port forwarding (Linux only)"),
+        (name = "ports", description = "Port forwarding"),
         (name = "health", description = "Service health")
     )
 )]
 struct ApiDoc;
 
-#[cfg(feature = "linux-net")]
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -836,7 +836,6 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/ready", get(get_ready::<B>))
         .route("/v1/metrics", get(metrics_handler::<B>));
 
-    #[cfg(feature = "linux-net")]
     let router = router
         .route(
             "/v1/vms/{name}/ports",
@@ -847,10 +846,8 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
             delete(remove_port_forward_handler::<B>),
         );
 
-    #[allow(unused_mut)]
     let mut openapi = ApiDoc::openapi();
 
-    #[cfg(feature = "linux-net")]
     {
         let pf_doc = PortForwardApiDoc::openapi();
         openapi.merge(pf_doc);
@@ -1092,7 +1089,7 @@ async fn health<B: VmmBackend + 'static>(State(core): State<AppState<B>>) -> Jso
         fork: base.fork,
         snapshot: base.snapshot,
         oci_import: cfg!(target_os = "linux"),
-        port_forward: cfg!(feature = "linux-net"),
+        port_forward: true,
         bridged_net: cfg!(feature = "linux-net"),
     };
     Json(HealthResponse {
@@ -1137,7 +1134,8 @@ pub struct DaemonCapabilities {
     pub snapshot: bool,
     /// `husker image import-oci` (import OCI/Docker images). Linux builds only.
     pub oci_import: bool,
-    /// `husker port-forward` (nftables host->guest mapping). linux-net builds only.
+    /// `husker port-forward`. nftables host->guest mapping on Linux; a userspace
+    /// TCP proxy on macOS.
     pub port_forward: bool,
     /// `--net bridged` (attach VMs to the LAN bridge). linux-net builds only.
     pub bridged_net: bool,
@@ -2779,7 +2777,6 @@ fn tail_lines(content: &str, n: u64) -> String {
 
 // ── Port Forward Handlers ─────────────────────────────────────────────
 
-#[cfg(feature = "linux-net")]
 #[utoipa::path(
     post,
     path = "/v1/vms/{name}/ports",
@@ -2797,21 +2794,31 @@ async fn add_port_forward_handler<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<AddPortForwardRequest>,
 ) -> Result<(StatusCode, Json<PortForwardResponse>), (StatusCode, Json<ErrorResponse>)> {
-    core.add_port_forward(&name, req.host_port, req.guest_port, None)
+    let bind_addr = match req.bind_addr.as_deref() {
+        Some(s) => Some(s.parse::<std::net::IpAddr>().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                error_response("invalid_argument", format!("invalid bind address: {s}")),
+            )
+        })?),
+        None => None,
+    };
+    let rec = core
+        .add_port_forward(&name, req.host_port, req.guest_port, bind_addr)
         .await
         .map_err(map_error)?;
     Ok((
         StatusCode::CREATED,
         Json(PortForwardResponse {
-            host_port: req.host_port,
-            guest_port: req.guest_port,
-            protocol: "tcp".into(),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            host_port: rec.host_port,
+            guest_port: rec.guest_port,
+            protocol: rec.protocol,
+            bind_addr: rec.bind_addr,
+            created_at: rec.created_at.to_rfc3339(),
         }),
     ))
 }
 
-#[cfg(feature = "linux-net")]
 #[utoipa::path(
     get,
     path = "/v1/vms/{name}/ports",
@@ -2834,13 +2841,13 @@ async fn list_port_forwards_handler<B: VmmBackend + 'static>(
                 host_port: pf.host_port,
                 guest_port: pf.guest_port,
                 protocol: pf.protocol,
+                bind_addr: pf.bind_addr,
                 created_at: pf.created_at.to_rfc3339(),
             })
             .collect(),
     ))
 }
 
-#[cfg(feature = "linux-net")]
 #[utoipa::path(
     delete,
     path = "/v1/vms/{name}/ports/{host_port}",
@@ -3321,7 +3328,7 @@ mod tests {
         assert_eq!(caps["fork"], true, "firecracker advertises fork");
         assert_eq!(caps["snapshot"], true, "firecracker advertises snapshot");
         // Platform/feature-gated capabilities reflect the build configuration.
-        assert_eq!(caps["port_forward"], cfg!(feature = "linux-net"));
+        assert_eq!(caps["port_forward"], serde_json::json!(true));
         assert_eq!(caps["bridged_net"], cfg!(feature = "linux-net"));
         assert_eq!(caps["oci_import"], cfg!(target_os = "linux"));
     }

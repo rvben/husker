@@ -1204,9 +1204,10 @@ async fn write_file_missing_data_returns_422() {
 
 // ── Port Forward Endpoints ───────────────────────────────────────────
 //
-// Port forward routes are only registered with the linux-net feature.
+// Port forward routes are cross-platform. The success path differs by backend
+// (nftables on Linux, a userspace proxy on macOS); these tests cover the routing
+// and error envelope, which are identical on both.
 
-#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn add_port_forward_nonexistent_vm_returns_404() {
     let app = router(test_core());
@@ -1229,7 +1230,6 @@ async fn add_port_forward_nonexistent_vm_returns_404() {
     assert!(json["error"].as_str().unwrap().contains("not found"));
 }
 
-#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn list_port_forwards_nonexistent_vm_returns_404() {
     let app = router(test_core());
@@ -1247,7 +1247,6 @@ async fn list_port_forwards_nonexistent_vm_returns_404() {
     assert!(json["error"].as_str().unwrap().contains("not found"));
 }
 
-#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn remove_port_forward_nonexistent_vm_returns_404() {
     let app = router(test_core());
@@ -1265,7 +1264,6 @@ async fn remove_port_forward_nonexistent_vm_returns_404() {
     assert!(json["error"].as_str().unwrap().contains("not found"));
 }
 
-#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn add_port_forward_missing_fields_returns_422() {
     let app = router(test_core());
@@ -1285,7 +1283,6 @@ async fn add_port_forward_missing_fields_returns_422() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn add_port_forward_invalid_json_returns_400() {
     let app = router(test_core());
@@ -1302,7 +1299,6 @@ async fn add_port_forward_invalid_json_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-#[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn list_port_forwards_empty_for_existing_vm() {
     let state = husker_state::StateStore::open_memory().unwrap();
@@ -1354,6 +1350,63 @@ async fn list_port_forwards_empty_for_existing_vm() {
     let json = response_json(response).await;
     let arr = json.as_array().expect("response should be a JSON array");
     assert!(arr.is_empty());
+}
+
+/// macOS: the full HTTP happy path binds a userspace proxy and the response
+/// mirrors the persisted record, including the effective bind address.
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
+    let state = husker_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    let record = husker_state::VmRecord {
+        id: uuid::Uuid::new_v4(),
+        name: "pf-ok".into(),
+        state: "running".into(),
+        pid: Some(1000),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: Some("127.0.0.1".into()),
+        kernel_path: String::new(),
+        rootfs_path: "/images/ubuntu.qcow2".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
+        vmm: "apple_vz".into(),
+        boot_mode: "efi".into(),
+        balloon: false,
+        volume: None,
+        network: "nat".into(),
+    };
+    state.insert_vm(&record).unwrap();
+    let storage = husker_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husker-test"),
+    };
+    let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
+    let app = router(core);
+    // host_port 0 = ephemeral; default bind is 127.0.0.1.
+    let body = serde_json::json!({ "host_port": 0, "guest_port": 80 });
+    let response = app
+        .oneshot(
+            Request::post("/v1/vms/pf-ok/ports")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let json = response_json(response).await;
+    assert_eq!(json["bind_addr"], serde_json::json!("127.0.0.1"));
+    assert_eq!(json["protocol"], serde_json::json!("tcp"));
 }
 
 // ── VmResponse Null Fields ───────────────────────────────────────────
