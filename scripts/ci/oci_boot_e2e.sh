@@ -92,13 +92,13 @@ for _ in {1..60}; do
 done
 if [[ "${ready}" != 1 ]]; then
   echo "agent did not become reachable; serial log:" >&2
-  C logs "${VM}" --source serial -n 80 >&2 || true
+  C logs "${VM}" --source serial -n 200 >&2 || true
   exit 1
 fi
 
 # 6. Assert supervisor mode + the guest contract.
 log "asserting supervisor mode and guest contract"
-C logs "${VM}" --source serial -n 80 | grep -q "agent child started" \
+C logs "${VM}" --source serial -n 200 | grep -q "agent child started" \
   || { echo "supervisor did not spawn an agent child (not in supervisor mode)" >&2; exit 1; }
 OUT="$(C exec "${VM}" -- sh -c 'test -r /proc/cmdline && echo PROC_OK; ip -4 route 2>/dev/null | grep -q "^default" && echo ROUTE_OK; echo "ALPINE $(cat /etc/alpine-release 2>/dev/null)"')"
 echo "${OUT}" | grep -q PROC_OK  || { echo "/proc not mounted in the guest" >&2; exit 1; }
