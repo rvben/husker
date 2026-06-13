@@ -18,6 +18,16 @@ pub enum NetError {
     Io(#[from] std::io::Error),
     #[error("invalid interface name '{name}': {reason}")]
     InvalidInterfaceName { name: String, reason: String },
+    #[error(
+        "bridge subnet {subnet} overlaps an existing host route {conflict} (dev {dev}). \
+         Set network.bridge_subnet (or HUSKER_BRIDGE_SUBNET) to a non-overlapping range, \
+         e.g. 172.30.0.0/16 or 10.200.0.0/16."
+    )]
+    SubnetConflict {
+        subnet: String,
+        conflict: String,
+        dev: String,
+    },
 }
 
 /// Linux interface name length limit (IFNAMSIZ - 1 for null terminator).
@@ -697,10 +707,225 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, NetError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// ── Subnet conflict detection ──────────────────────────────────────────
+
+/// Network address of `addr` masked to `prefix_len` bits.
+///
+/// `prefix_len` is clamped to 32 so an out-of-range value can never produce an
+/// invalid (UB) shift amount, even though callers already validate the range.
+fn network_addr(addr: Ipv4Addr, prefix_len: u8) -> u32 {
+    let bits = u32::from(addr);
+    match prefix_len.min(32) {
+        0 => 0,
+        p => bits & (!0u32 << (32 - p)),
+    }
+}
+
+/// Whether two IPv4 CIDR blocks overlap (one fully contains the other's
+/// network, which for CIDRs means they share the network address at the
+/// shorter prefix length).
+fn cidrs_overlap(a: Ipv4Addr, a_prefix: u8, b: Ipv4Addr, b_prefix: u8) -> bool {
+    let p = a_prefix.min(b_prefix);
+    network_addr(a, p) == network_addr(b, p)
+}
+
+/// A destination route parsed from one line of `ip route show`.
+#[derive(Debug, PartialEq, Eq)]
+struct RouteEntry {
+    base: Ipv4Addr,
+    prefix_len: u8,
+    dev: Option<String>,
+}
+
+/// Parse a route destination token: `"10.0.0.0/24"` or a bare host `"10.0.0.5"`
+/// (treated as `/32`). Returns `None` for anything that is not an IPv4 dest.
+fn parse_dest_cidr(s: &str) -> Option<(Ipv4Addr, u8)> {
+    match s.split_once('/') {
+        Some((ip, pfx)) => {
+            let ip: Ipv4Addr = ip.parse().ok()?;
+            let pfx: u8 = pfx.parse().ok()?;
+            (pfx <= 32).then_some((ip, pfx))
+        }
+        None => s.parse::<Ipv4Addr>().ok().map(|ip| (ip, 32)),
+    }
+}
+
+/// Parse one `ip route show` line into its destination CIDR and device.
+///
+/// Returns `None` for the default route and for any line whose first token is
+/// not an IPv4 destination (e.g. `blackhole`/`unreachable` routes, IPv6).
+fn parse_route_entry(line: &str) -> Option<RouteEntry> {
+    let mut toks = line.split_whitespace();
+    let dest = toks.next()?;
+    if dest == "default" {
+        return None;
+    }
+    let (base, prefix_len) = parse_dest_cidr(dest)?;
+    // Capture the `dev <name>` that follows, if any.
+    let mut dev = None;
+    while let Some(t) = toks.next() {
+        if t == "dev" {
+            dev = toks.next().map(String::from);
+            break;
+        }
+    }
+    Some(RouteEntry {
+        base,
+        prefix_len,
+        dev,
+    })
+}
+
+/// A route at this prefix length or shorter is "default-equivalent": the
+/// default route (`0.0.0.0/0`) and the split-default `/1` routes (`0.0.0.0/1` +
+/// `128.0.0.0/1`) that VPNs install for `redirect-gateway`. These represent "the
+/// rest of the internet"; a more-specific bridge subnet wins longest-prefix
+/// match without hijacking them, so they are never a real conflict.
+const DEFAULT_EQUIVALENT_MAX_PREFIX: u8 = 1;
+
+/// Find the first existing host route that overlaps `configured`, skipping
+/// default-equivalent routes and any route already on `own_bridge` (husker's own
+/// device, so a leftover bridge from a crashed run is not reported as a foreign
+/// conflict).
+fn find_subnet_conflict(
+    configured: (Ipv4Addr, u8),
+    route_output: &str,
+    own_bridge: &str,
+) -> Option<RouteEntry> {
+    route_output
+        .lines()
+        .filter_map(parse_route_entry)
+        .find(|r| {
+            r.prefix_len > DEFAULT_EQUIVALENT_MAX_PREFIX
+                && r.dev.as_deref() != Some(own_bridge)
+                && cidrs_overlap(configured.0, configured.1, r.base, r.prefix_len)
+        })
+}
+
+/// Fail if the configured bridge subnet overlaps an existing host route.
+///
+/// Run at daemon startup (after deleting husker's own stale bridge) so a
+/// misconfigured or colliding subnet is rejected with guidance instead of
+/// silently hijacking or blackholing host traffic once NAT rules are installed.
+/// `subnet_label` is the original CIDR string, used only for the error message.
+pub async fn check_subnet_conflict(
+    base: Ipv4Addr,
+    prefix_len: u8,
+    subnet_label: &str,
+    bridge_name: &str,
+) -> Result<(), NetError> {
+    let routes = run_cmd("ip", &["-4", "route", "show"]).await?;
+    if let Some(conflict) = find_subnet_conflict((base, prefix_len), &routes, bridge_name) {
+        return Err(NetError::SubnetConflict {
+            subnet: subnet_label.to_string(),
+            conflict: format!("{}/{}", conflict.base, conflict.prefix_len),
+            dev: conflict.dev.unwrap_or_else(|| "?".to_string()),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // ── Subnet conflict detection ──────────────────────────────────────
+
+    #[test]
+    fn network_addr_handles_boundary_prefixes_without_ub() {
+        let ip = Ipv4Addr::new(192, 168, 1, 5);
+        assert_eq!(network_addr(ip, 0), 0, "/0 masks to 0.0.0.0");
+        assert_eq!(network_addr(ip, 32), u32::from(ip), "/32 keeps all bits");
+        // Out-of-range prefixes are clamped to /32 rather than triggering an
+        // invalid shift; the exact value is unimportant, only that it cannot panic.
+        assert_eq!(network_addr(ip, 33), u32::from(ip));
+        assert_eq!(network_addr(ip, 255), u32::from(ip));
+    }
+
+    #[test]
+    fn cidrs_overlap_detects_containment_either_direction() {
+        let a = Ipv4Addr::new(10, 100, 0, 0);
+        // Identical block overlaps itself.
+        assert!(cidrs_overlap(a, 16, a, 16));
+        // A supernet route (10.0.0.0/8) contains husker's 10.100.0.0/16.
+        assert!(cidrs_overlap(a, 16, Ipv4Addr::new(10, 0, 0, 0), 8));
+        // A more-specific route inside the subnet still overlaps.
+        assert!(cidrs_overlap(a, 16, Ipv4Addr::new(10, 100, 5, 0), 24));
+        // A disjoint block does not overlap.
+        assert!(!cidrs_overlap(a, 16, Ipv4Addr::new(172, 30, 0, 0), 16));
+        // /0 contains everything.
+        assert!(cidrs_overlap(a, 16, Ipv4Addr::new(0, 0, 0, 0), 0));
+    }
+
+    #[test]
+    fn parse_route_entry_extracts_cidr_and_dev() {
+        let e =
+            parse_route_entry("192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.5")
+                .unwrap();
+        assert_eq!(e.base, Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(e.prefix_len, 24);
+        assert_eq!(e.dev.as_deref(), Some("wlan0"));
+
+        // A bare host route is a /32.
+        let host = parse_route_entry("10.0.0.5 dev tap0 scope link").unwrap();
+        assert_eq!(host.prefix_len, 32);
+        assert_eq!(host.dev.as_deref(), Some("tap0"));
+
+        // The default route and non-IPv4 lines are ignored.
+        assert!(parse_route_entry("default via 192.168.1.1 dev wlan0").is_none());
+        assert!(parse_route_entry("blackhole 10.1.2.0/24").is_none());
+    }
+
+    #[test]
+    fn find_subnet_conflict_reports_overlap_and_skips_own_and_default() {
+        let routes = "\
+default via 192.168.1.1 dev eth0 proto dhcp metric 100
+192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.50
+172.30.0.0/24 dev husker0 proto kernel scope link src 172.30.0.1
+";
+        // A subnet overlapping the LAN is flagged with the offending route.
+        let hit = find_subnet_conflict((Ipv4Addr::new(192, 168, 1, 0), 24), routes, "husker0")
+            .expect("LAN overlap must be detected");
+        assert_eq!(hit.base, Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(hit.dev.as_deref(), Some("eth0"));
+
+        // A subnet matching only husker's own bridge device is not a conflict.
+        assert!(
+            find_subnet_conflict((Ipv4Addr::new(172, 30, 0, 0), 24), routes, "husker0").is_none(),
+            "husker's own bridge route must not count as a foreign conflict"
+        );
+
+        // A disjoint subnet is clean.
+        assert!(
+            find_subnet_conflict((Ipv4Addr::new(10, 200, 0, 0), 16), routes, "husker0").is_none()
+        );
+    }
+
+    #[test]
+    fn find_subnet_conflict_ignores_default_equivalent_routes() {
+        // VPNs (OpenVPN `redirect-gateway def1`) install split-default /1 routes
+        // instead of a single default. Every subnet overlaps one of these, but a
+        // more-specific bridge subnet wins longest-prefix-match without hijacking
+        // them, so they must not be treated as conflicts.
+        let routes = "\
+0.0.0.0/1 dev tun0 scope link
+128.0.0.0/1 dev tun0 scope link
+0.0.0.0/0 dev tun0
+";
+        assert!(
+            find_subnet_conflict((Ipv4Addr::new(10, 100, 0, 0), 16), routes, "husker0").is_none(),
+            "split-default and 0.0.0.0/0 routes must not count as conflicts"
+        );
+
+        // A real, more-specific overlapping network (e.g. a corporate /8 over VPN)
+        // is still a genuine conflict.
+        let real = "10.0.0.0/8 dev tun0 scope link\n";
+        assert!(
+            find_subnet_conflict((Ipv4Addr::new(10, 100, 0, 0), 16), real, "husker0").is_some(),
+            "a real supernet route that would shadow the bridge subnet is a conflict"
+        );
+    }
 
     // ── IP Allocator ───────────────────────────────────────────────────
 

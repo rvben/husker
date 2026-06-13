@@ -5496,6 +5496,18 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         // Clean up any stale bridge from a previous run
         let _ = husker_net::delete_bridge(&config.bridge_name).await;
 
+        // With our own bridge removed, any host route still overlapping the
+        // configured subnet is a foreign conflict: reject it now with guidance
+        // rather than silently hijacking host traffic once NAT rules go in.
+        husker_net::check_subnet_conflict(
+            base,
+            prefix_len,
+            &config.bridge_subnet,
+            &config.bridge_name,
+        )
+        .await
+        .context("checking bridge subnet for conflicts")?;
+
         husker_net::create_bridge(&config.bridge_name, ip_allocator.gateway(), prefix_len)
             .await
             .context("creating bridge")?;
