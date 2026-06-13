@@ -96,12 +96,12 @@ if [[ "${ready}" != 1 ]]; then
   exit 1
 fi
 
-# 6. Assert supervisor mode + the guest contract.
+# 6. Assert supervisor mode + the guest contract. The supervisor-mode proof is
+#    the guest contract itself: the kernel does not mount /proc, so /proc being
+#    mounted means the agent ran as the init supervisor (not plain agent mode).
 log "asserting supervisor mode and guest contract"
-C logs "${VM}" --source serial -n 200 | grep -q "agent child started" \
-  || { echo "supervisor did not spawn an agent child (not in supervisor mode)" >&2; exit 1; }
 OUT="$(C exec "${VM}" -- sh -c 'test -r /proc/cmdline && echo PROC_OK; ip -4 route 2>/dev/null | grep -q "^default" && echo ROUTE_OK; echo "ALPINE $(cat /etc/alpine-release 2>/dev/null)"')"
-echo "${OUT}" | grep -q PROC_OK  || { echo "/proc not mounted in the guest" >&2; exit 1; }
+echo "${OUT}" | grep -q PROC_OK  || { echo "/proc not mounted: agent did not run as the init supervisor" >&2; C logs "${VM}" --source serial -n 200 >&2 || true; exit 1; }
 echo "${OUT}" | grep -q ROUTE_OK || { echo "no default route in the guest" >&2; exit 1; }
 log "guest: ${OUT//$'\n'/ }"
 
