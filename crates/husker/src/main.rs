@@ -31,9 +31,15 @@ struct Cli {
     /// Accepts http://host:port or ssh://[user@]host[:port] to reach a remote
     /// daemon over an SSH tunnel (reuses your ssh config/keys; no exposed port).
     /// Driving a Linux daemon this way unlocks Firecracker-only operations
-    /// (fork, suspend, OCI import) from a macOS host.
-    #[arg(long, env = "HUSKER_API_URL", default_value = "http://127.0.0.1:7777")]
-    api_url: String,
+    /// (fork, suspend, OCI import) from a macOS host. Overrides any selected
+    /// context. Defaults to the current context, else http://127.0.0.1:7777.
+    #[arg(long, env = "HUSKER_API_URL")]
+    api_url: Option<String>,
+
+    /// Use a saved context (see `husker context`) as the daemon target.
+    /// Overridden by --api-url. Defaults to the current context.
+    #[arg(long, short = 'c', env = "HUSKER_CONTEXT", global = true)]
+    context: Option<String>,
 
     /// Bearer token for authenticated API access.
     #[arg(long)]
@@ -469,6 +475,14 @@ enum Commands {
         action: ConfigAction,
     },
 
+    /// Manage saved daemon targets (named http:// or ssh:// URLs) and switch
+    /// between them, e.g. a local Apple VZ daemon and a remote Linux daemon
+    #[command(alias = "ctx")]
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
+
     /// Emit a machine-readable contract of the CLI (commands, args, output
     /// fields, exit codes) for agent introspection
     Schema,
@@ -478,6 +492,33 @@ enum Commands {
 enum ConfigAction {
     /// Validate the configuration file
     Check,
+}
+
+#[derive(Subcommand)]
+enum ContextAction {
+    /// Add or update a named context
+    Add {
+        /// Context name
+        name: String,
+        /// API URL (http://host:port or ssh://[user@]host[:port])
+        url: String,
+    },
+    /// List saved contexts (the current one is marked)
+    #[command(alias = "ls")]
+    List,
+    /// Select the current context used when --api-url is not given
+    Use {
+        /// Context name
+        name: String,
+    },
+    /// Remove a saved context
+    #[command(alias = "rm")]
+    Remove {
+        /// Context name
+        name: String,
+    },
+    /// Show the current context and its URL
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -1471,6 +1512,8 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "secret list"
             | "secret get"
             | "secret reveal"
+            | "context list"
+            | "context show"
     );
     let output_fields: Vec<&'static str> = match path {
         "balloon" => vec!["status", "action", "vm", "amount_mib"],
@@ -1512,6 +1555,10 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "volume create" | "volume get" => vec!["status", "action", "volume"],
         "volume delete" => vec!["status", "action", "name"],
         "volume list" => vec!["status", "action", "volumes"],
+        "context list" => vec!["contexts"],
+        "context show" => vec!["current", "api_url"],
+        "context add" => vec!["status", "action", "name", "api_url"],
+        "context use" | "context remove" => vec!["status", "action", "name"],
         _ => vec![],
     };
     (!read_only, output_fields)
@@ -1808,6 +1855,7 @@ async fn run(cli: Cli) -> Result<()> {
     let Cli {
         config: config_path,
         api_url,
+        context,
         api_token: cli_api_token,
         output: raw_output,
         command,
@@ -1816,14 +1864,22 @@ async fn run(cli: Cli) -> Result<()> {
     // downstream branches can compare directly without re-calling resolve_format.
     let output = resolve_format(raw_output);
 
+    // Context management is local-only; handle it before resolving a daemon URL.
+    if let Commands::Context { action } = command {
+        return context_command(action, output);
+    }
+
+    // Resolve the daemon target: explicit --api-url/HUSKER_API_URL, else the
+    // selected/current saved context, else the local default.
+    let api_url =
+        resolve_effective_api_url(api_url.as_deref(), context.as_deref(), &load_contexts())?;
+
     // ssh:// transport: open an SSH local-forward tunnel to a remote daemon and
     // rewrite api_url to the local end. The guard keeps the ssh process alive for
-    // the whole command and tears it down on return.
+    // the whole command and tears it down on return. `husker daemon` starts a
+    // local server and never tunnels, even if the current context is ssh://.
     let _ssh_tunnel: Option<SshTunnel>;
-    let api_url = if api_url.starts_with("ssh://") {
-        if matches!(command, Commands::Daemon { .. }) {
-            anyhow::bail!("ssh:// targets a remote daemon; `husker daemon` starts a local one");
-        }
+    let api_url = if api_url.starts_with("ssh://") && !matches!(command, Commands::Daemon { .. }) {
         let tunnel = SshTunnel::establish(&api_url).await?;
         let local = tunnel.local_url();
         _ssh_tunnel = Some(tunnel);
@@ -3064,6 +3120,9 @@ async fn run(cli: Cli) -> Result<()> {
                 check_config(config_path.as_deref())
             }
         },
+        Commands::Context { .. } => {
+            unreachable!("Context is handled before daemon-target resolution in run()")
+        }
         Commands::Schema => {
             println!(
                 "{}",
@@ -3072,6 +3131,125 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Handle `husker context` subcommands: manage saved daemon targets in
+/// `~/.config/husker/contexts.toml`. Purely local; never contacts a daemon.
+fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
+    let mut contexts = load_contexts();
+    match action {
+        ContextAction::Add { name, url } => {
+            contexts.contexts.insert(
+                name.clone(),
+                ContextEntry {
+                    api_url: url.clone(),
+                },
+            );
+            // First context added becomes current for convenience.
+            if contexts.current.is_none() {
+                contexts.current = Some(name.clone());
+            }
+            save_contexts(&contexts)?;
+            print_output(
+                output,
+                &serde_json::json!({ "status": "ok", "action": "context-add", "name": name, "api_url": url }),
+                format!("Added context '{name}' -> {url}"),
+            );
+        }
+        ContextAction::List => {
+            let items: Vec<serde_json::Value> = contexts
+                .contexts
+                .iter()
+                .map(|(name, e)| {
+                    serde_json::json!({
+                        "name": name,
+                        "api_url": e.api_url,
+                        "current": contexts.current.as_deref() == Some(name.as_str()),
+                    })
+                })
+                .collect();
+            if output == OutputFormat::Json {
+                print_output(output, &serde_json::json!({ "contexts": items }), "");
+            } else if items.is_empty() {
+                println!("No contexts. Add one: husker context add <name> <url>");
+            } else {
+                for (name, e) in &contexts.contexts {
+                    let marker = if contexts.current.as_deref() == Some(name.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!("{marker} {name}\t{}", e.api_url);
+                }
+            }
+        }
+        ContextAction::Use { name } => {
+            if !contexts.contexts.contains_key(&name) {
+                exit_with_error(
+                    output,
+                    ApiFailure {
+                        message: format!(
+                            "unknown context '{name}' (list with `husker context list`)"
+                        ),
+                        code: Some("not_found".into()),
+                        exit_code: exit_code::NOT_FOUND,
+                        hint: None,
+                    },
+                );
+            }
+            contexts.current = Some(name.clone());
+            save_contexts(&contexts)?;
+            print_output(
+                output,
+                &serde_json::json!({ "status": "ok", "action": "context-use", "name": name }),
+                format!("Switched to context '{name}'"),
+            );
+        }
+        ContextAction::Remove { name } => {
+            if contexts.contexts.remove(&name).is_none() {
+                exit_with_error(
+                    output,
+                    ApiFailure {
+                        message: format!("unknown context '{name}'"),
+                        code: Some("not_found".into()),
+                        exit_code: exit_code::NOT_FOUND,
+                        hint: None,
+                    },
+                );
+            }
+            if contexts.current.as_deref() == Some(name.as_str()) {
+                contexts.current = None;
+            }
+            save_contexts(&contexts)?;
+            print_output(
+                output,
+                &serde_json::json!({ "status": "ok", "action": "context-remove", "name": name }),
+                format!("Removed context '{name}'"),
+            );
+        }
+        ContextAction::Show => match contexts.current.as_deref() {
+            Some(name) => {
+                let url = contexts
+                    .contexts
+                    .get(name)
+                    .map(|e| e.api_url.as_str())
+                    .unwrap_or("(missing)");
+                print_output(
+                    output,
+                    &serde_json::json!({ "current": name, "api_url": url }),
+                    format!("{name}\t{url}"),
+                );
+            }
+            None => {
+                print_output(
+                    output,
+                    &serde_json::json!({ "current": serde_json::Value::Null }),
+                    "No current context (using http://127.0.0.1:7777)",
+                );
+            }
+        },
+    }
+    Ok(())
 }
 
 fn validate_daemon_bind(listen: SocketAddr, allow_remote: bool) -> Result<()> {
@@ -4892,6 +5070,81 @@ fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
         }
     }
     PathBuf::from("/etc/husker/config.toml")
+}
+
+/// A saved daemon target: a name mapped to an API URL (http:// or ssh://).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContextEntry {
+    api_url: String,
+}
+
+/// Named daemon targets ("contexts") plus the currently selected one, persisted
+/// to `~/.config/husker/contexts.toml`. Lets a host switch between, say, a local
+/// Apple VZ daemon and a remote Linux Firecracker daemon without retyping URLs.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Contexts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current: Option<String>,
+    #[serde(default)]
+    contexts: std::collections::BTreeMap<String, ContextEntry>,
+}
+
+/// Path to the contexts file (`HUSKER_CONTEXTS_FILE` overrides; used by tests).
+fn contexts_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("HUSKER_CONTEXTS_FILE") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".config/husker/contexts.toml")
+}
+
+/// Load saved contexts, or an empty set if the file is absent or unreadable.
+fn load_contexts() -> Contexts {
+    std::fs::read_to_string(contexts_path())
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist contexts, creating the parent directory if needed.
+fn save_contexts(contexts: &Contexts) -> Result<()> {
+    let path = contexts_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(contexts).context("serializing contexts")?;
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Resolve the daemon API URL to use. Precedence: an explicit `--api-url` /
+/// `HUSKER_API_URL` always wins; otherwise an explicitly named context
+/// (`--context`/`HUSKER_CONTEXT`); otherwise the saved current context; otherwise
+/// the local default. An explicitly named context that does not exist is an error;
+/// a stale `current` falls back to the default rather than bricking the CLI.
+fn resolve_effective_api_url(
+    explicit_api_url: Option<&str>,
+    context_name: Option<&str>,
+    contexts: &Contexts,
+) -> Result<String> {
+    const DEFAULT_API_URL: &str = "http://127.0.0.1:7777";
+    if let Some(url) = explicit_api_url {
+        return Ok(url.to_string());
+    }
+    if let Some(name) = context_name {
+        let entry = contexts.contexts.get(name).ok_or_else(|| {
+            anyhow::anyhow!("unknown context '{name}' (list with `husker context list`)")
+        })?;
+        return Ok(entry.api_url.clone());
+    }
+    if let Some(name) = contexts.current.as_deref()
+        && let Some(entry) = contexts.contexts.get(name)
+    {
+        return Ok(entry.api_url.clone());
+    }
+    Ok(DEFAULT_API_URL.to_string())
 }
 
 /// Apply environment variable overrides to the configuration.
@@ -8020,6 +8273,83 @@ mod tests {
         );
     }
 
+    fn ctx(url: &str) -> ContextEntry {
+        ContextEntry {
+            api_url: url.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_api_url_explicit_wins_over_everything() {
+        let mut c = Contexts {
+            current: Some("linux".into()),
+            ..Default::default()
+        };
+        c.contexts.insert("linux".into(), ctx("ssh://ubuntu@host"));
+        let u =
+            resolve_effective_api_url(Some("http://192.0.2.9:7777"), Some("linux"), &c).unwrap();
+        assert_eq!(u, "http://192.0.2.9:7777");
+    }
+
+    #[test]
+    fn resolve_api_url_named_context() {
+        let mut c = Contexts::default();
+        c.contexts.insert("linux".into(), ctx("ssh://ubuntu@host"));
+        let u = resolve_effective_api_url(None, Some("linux"), &c).unwrap();
+        assert_eq!(u, "ssh://ubuntu@host");
+    }
+
+    #[test]
+    fn resolve_api_url_uses_current_when_no_flag() {
+        let mut c = Contexts {
+            current: Some("mac".into()),
+            ..Default::default()
+        };
+        c.contexts
+            .insert("mac".into(), ctx("http://127.0.0.1:7777"));
+        let u = resolve_effective_api_url(None, None, &c).unwrap();
+        assert_eq!(u, "http://127.0.0.1:7777");
+    }
+
+    #[test]
+    fn resolve_api_url_defaults_to_localhost() {
+        let u = resolve_effective_api_url(None, None, &Contexts::default()).unwrap();
+        assert_eq!(u, "http://127.0.0.1:7777");
+    }
+
+    #[test]
+    fn resolve_api_url_unknown_named_context_errors() {
+        let err = resolve_effective_api_url(None, Some("nope"), &Contexts::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("nope"),
+            "names the bad context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_api_url_stale_current_falls_back() {
+        let c = Contexts {
+            current: Some("ghost".into()),
+            ..Default::default()
+        };
+        let u = resolve_effective_api_url(None, None, &c).unwrap();
+        assert_eq!(u, "http://127.0.0.1:7777");
+    }
+
+    #[test]
+    fn contexts_roundtrip_toml() {
+        let mut c = Contexts {
+            current: Some("linux".into()),
+            ..Default::default()
+        };
+        c.contexts.insert("linux".into(), ctx("ssh://ubuntu@host"));
+        c.contexts
+            .insert("mac".into(), ctx("http://127.0.0.1:7777"));
+        let s = toml::to_string_pretty(&c).unwrap();
+        let back: Contexts = toml::from_str(&s).unwrap();
+        assert_eq!(c, back);
+    }
+
     #[test]
     fn capability_gate_blocks_when_unsupported() {
         let health = serde_json::json!({
@@ -8144,6 +8474,25 @@ mod tests {
             !args.contains(&"-p".to_string()),
             "no -p when ssh_port absent"
         );
+    }
+
+    #[test]
+    fn context_add_and_use_parse() {
+        let cli = Cli::try_parse_from(["husker", "context", "add", "linux", "ssh://ubuntu@host"])
+            .expect("context add parses");
+        match cli.command {
+            Commands::Context {
+                action: ContextAction::Add { name, url },
+            } => {
+                assert_eq!(name, "linux");
+                assert_eq!(url, "ssh://ubuntu@host");
+            }
+            _ => panic!("expected Context::Add"),
+        }
+
+        let cli = Cli::try_parse_from(["husker", "-c", "linux", "list"])
+            .expect("global --context short flag parses");
+        assert_eq!(cli.context.as_deref(), Some("linux"));
     }
 
     #[test]
