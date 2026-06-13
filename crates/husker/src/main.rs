@@ -5983,6 +5983,13 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         tracing::info!(stale_count, "marked stale VMs as stopped");
     }
 
+    // macOS userspace port-forward proxies do not survive a daemon restart, so
+    // every persisted forward is stale. Clear them so `list` reflects reality.
+    #[cfg(not(feature = "linux-net"))]
+    if let Err(e) = state.clear_all_port_forwards() {
+        tracing::warn!(error = %e, "failed to clear stale port forwards on startup");
+    }
+
     #[cfg(feature = "linux-net")]
     state
         .ensure_cid_base(config.cid_base)

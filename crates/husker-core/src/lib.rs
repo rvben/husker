@@ -2,6 +2,10 @@
 
 pub mod agent_client;
 
+/// Userspace TCP port-forward proxy, used on backends without host nftables (macOS/VZ).
+#[cfg(not(feature = "linux-net"))]
+mod port_proxy;
+
 #[cfg(feature = "linux-net")]
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -63,6 +67,12 @@ pub enum CoreError {
     SecretCrypto(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("host port {0} is already in use")]
+    PortForwardConflict(u16),
+    #[error(
+        "permission denied binding host port {0}; privileged ports (<1024) require elevated permissions"
+    )]
+    PortForwardDenied(u16),
     #[error("I/O error: {0}")]
     Io(String),
     #[error("service operation failed: {0}")]
@@ -480,6 +490,9 @@ pub struct HuskerCore<B: VmmBackend> {
     vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-service reconcile locks; serialize concurrent reconciles of the same service.
     reconcile_locks: std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    /// Userspace TCP port-forward proxies, keyed by VM (macOS, no host nftables).
+    #[cfg(not(feature = "linux-net"))]
+    port_proxy: Arc<crate::port_proxy::PortProxy<crate::port_proxy::ActiveDialer>>,
 }
 
 /// Per-attempt timeout for agent connect+ping in readiness loops.
@@ -662,6 +675,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            port_proxy: Arc::new(crate::port_proxy::PortProxy::new(
+                crate::port_proxy::ActiveDialer::default(),
+            )),
         }
     }
 
@@ -1478,6 +1494,11 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Idempotent: stopping an already stopped VM is a no-op.
     pub async fn stop_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "stopping VM");
+        // Hold the per-VM name lock for the whole stop so a concurrent
+        // add/remove of a userspace port forward cannot interleave with the
+        // teardown below (macOS).
+        #[cfg(not(feature = "linux-net"))]
+        let _stop_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         match record.state.as_str() {
             "running" | "paused" => {}
@@ -1501,6 +1522,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         self.vmm.stop_vm(record.id).await?;
         self.state.update_vm_state(record.id, "stopped")?;
+        // macOS userspace forwards are bound to the running instance: tear them
+        // down on stop. The name lock acquired above is still held.
+        #[cfg(not(feature = "linux-net"))]
+        {
+            self.port_proxy.stop_all(record.id);
+            self.state.delete_port_forwards_for_vm(record.id)?;
+        }
         Ok(())
     }
 
@@ -1978,6 +2006,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         self.state.release_cid(record.vsock_cid)?;
+        // Abort any macOS userspace port-forward listeners before dropping the
+        // rows. (`destroy_vm` already holds the per-VM name lock.)
+        #[cfg(not(feature = "linux-net"))]
+        self.port_proxy.stop_all(record.id);
         self.state.delete_port_forwards_for_vm(record.id)?;
 
         let vm_dir = self.storage.vm_dir(&record.name);
@@ -3124,7 +3156,8 @@ impl<B: VmmBackend> HuskerCore<B> {
         name: &str,
         host_port: u16,
         guest_port: u16,
-    ) -> Result<(), CoreError> {
+        bind_addr: Option<std::net::IpAddr>,
+    ) -> Result<husker_state::PortForwardRecord, CoreError> {
         let record = self.lookup_vm(name)?;
 
         // Bridged VMs are directly on the LAN; NAT port-forwarding does not apply to them.
@@ -3132,6 +3165,17 @@ impl<B: VmmBackend> HuskerCore<B> {
             return Err(CoreError::InvalidArgument(format!(
                 "VM '{name}' uses bridged networking and is directly on the LAN; \
                  port forwards apply to NAT VMs only"
+            )));
+        }
+
+        // The Linux nftables backend exposes forwards on all host interfaces; a
+        // specific bind address is not supported here.
+        if let Some(addr) = bind_addr
+            && !addr.is_unspecified()
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "--bind {addr} is not supported on the Linux nftables backend; \
+                 forwards are reachable on all host interfaces"
             )));
         }
 
@@ -3149,12 +3193,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Idempotent behavior: if this exact forward already exists on this VM,
         // treat it as success.
         if let Ok(existing) = self.state.list_port_forwards_for_vm(record.id)
-            && existing
+            && let Some(found) = existing
                 .iter()
-                .any(|pf| pf.host_port == host_port && pf.guest_port == guest_port)
+                .find(|pf| pf.host_port == host_port && pf.guest_port == guest_port)
         {
             info!(%name, host_port, guest_port, "port forward already present (no-op)");
-            return Ok(());
+            return Ok(found.clone());
         }
 
         husker_net::add_port_forward(host_port, guest_ip, guest_port, tap_name, &self.bridge_name)
@@ -3197,7 +3241,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         info!(%name, host_port, guest_port, "port forward added");
-        Ok(())
+        Ok(pf_record)
     }
 
     /// Remove a port forward.
@@ -3216,8 +3260,97 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(())
     }
 
+    /// Add a port forward via the userspace proxy (macOS).
+    ///
+    /// Binds a host TCP listener and relays accepted connections to the guest.
+    /// The forward is bound to the running VM instance; it is torn down on stop
+    /// or destroy and does not survive a daemon restart.
+    #[cfg(not(feature = "linux-net"))]
+    pub async fn add_port_forward(
+        &self,
+        name: &str,
+        host_port: u16,
+        guest_port: u16,
+        bind_addr: Option<std::net::IpAddr>,
+    ) -> Result<husker_state::PortForwardRecord, CoreError> {
+        let _guard = self.vm_name_lock(name).lock_owned().await;
+        let record = self.lookup_vm(name)?;
+        if record.state != "running" {
+            return Err(CoreError::InvalidState {
+                name: name.into(),
+                actual: record.state,
+                expected: "running".into(),
+            });
+        }
+        let guest_ip: std::net::Ipv4Addr = record
+            .guest_ip
+            .as_deref()
+            .ok_or_else(|| CoreError::InvalidState {
+                name: name.into(),
+                actual: "running without a discovered guest IP".into(),
+                expected: "running with a guest IP".into(),
+            })?
+            .parse()
+            .map_err(|_| CoreError::InvalidArgument(format!("{name}: invalid guest IP")))?;
+
+        // Idempotent: same forward already present is a no-op.
+        if let Ok(existing) = self.state.list_port_forwards_for_vm(record.id)
+            && let Some(found) = existing
+                .iter()
+                .find(|pf| pf.host_port == host_port && pf.guest_port == guest_port)
+        {
+            return Ok(found.clone());
+        }
+
+        let bind = bind_addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let bound = self
+            .port_proxy
+            .add(record.id, bind, host_port, guest_ip, guest_port)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AddrInUse => CoreError::PortForwardConflict(host_port),
+                std::io::ErrorKind::PermissionDenied => CoreError::PortForwardDenied(host_port),
+                _ => CoreError::Io(e.to_string()),
+            })?;
+
+        let pf_record = husker_state::PortForwardRecord {
+            id: 0,
+            vm_id: record.id,
+            host_port: bound,
+            guest_port,
+            protocol: "tcp".into(),
+            bind_addr: Some(bind.to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(e) = self
+            .state
+            .insert_port_forward(&pf_record)
+            .map_err(|e| match e {
+                husker_state::StateError::PortAlreadyForwarded(_) => {
+                    CoreError::PortForwardConflict(bound)
+                }
+                other => CoreError::State(other),
+            })
+        {
+            self.port_proxy.stop(record.id, bound);
+            return Err(e);
+        }
+        info!(%name, host_port = bound, guest_port, "port forward added (userspace proxy)");
+        Ok(pf_record)
+    }
+
+    /// Remove a port forward (macOS userspace proxy).
+    #[cfg(not(feature = "linux-net"))]
+    pub async fn remove_port_forward(&self, name: &str, host_port: u16) -> Result<(), CoreError> {
+        let _guard = self.vm_name_lock(name).lock_owned().await;
+        let record = self.lookup_vm(name)?;
+        self.port_proxy.stop(record.id, host_port);
+        self.state.delete_port_forward(host_port)?;
+        info!(%name, host_port, "port forward removed (userspace proxy)");
+        Ok(())
+    }
+
     /// List port forwards for a VM.
-    #[cfg(feature = "linux-net")]
     pub fn list_port_forwards(
         &self,
         name: &str,
@@ -5393,7 +5526,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         );
 
         let err = core
-            .add_port_forward("bridged-vm", 8080, 80)
+            .add_port_forward("bridged-vm", 8080, 80, None)
             .await
             .unwrap_err();
         assert!(
@@ -5477,6 +5610,112 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage,
             runtime_dir,
         )
+    }
+
+    /// Helper: a running NAT VM record with a discovered guest IP, for the
+    /// macOS userspace port-forward tests.
+    #[cfg(not(feature = "linux-net"))]
+    fn running_nat_vm(name: &str) -> husker_state::VmRecord {
+        husker_state::VmRecord {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            state: "running".into(),
+            pid: None,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 3,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: Some("127.0.0.1".into()),
+            kernel_path: String::new(),
+            rootfs_path: "/images/ubuntu.qcow2".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: "apple_vz".into(),
+            boot_mode: "efi".into(),
+            balloon: false,
+            volume: None,
+            network: "nat".into(),
+        }
+    }
+
+    /// macOS: adding a forward to a non-running VM is a state conflict.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn add_port_forward_rejects_non_running_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let mut vm = running_nat_vm("pf-stopped");
+        vm.state = "stopped".into();
+        state.insert_vm(&vm).unwrap();
+        let core = make_vz_core(state, tmp.path());
+        let err = core
+            .add_port_forward("pf-stopped", 18080, 80, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidState { .. }));
+    }
+
+    /// macOS: a running VM without a discovered guest IP is a state conflict.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn add_port_forward_rejects_missing_guest_ip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let mut vm = running_nat_vm("pf-noip");
+        vm.guest_ip = None;
+        state.insert_vm(&vm).unwrap();
+        let core = make_vz_core(state, tmp.path());
+        let err = core
+            .add_port_forward("pf-noip", 18081, 80, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidState { .. }));
+    }
+
+    /// macOS: destroying a VM aborts its userspace proxy listeners and drops the
+    /// forward rows. Proven by the bound host port becoming free again.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn destroy_vm_tears_down_port_forwards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        state.insert_vm(&running_nat_vm("pf-td")).unwrap();
+        let core = make_vz_core(state, tmp.path());
+        // Reserve a concrete free port, then release it so the proxy can bind it.
+        let host_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        // add only binds a host listener (no vmm call, no dial until a connection
+        // arrives), so it succeeds without a live backend VM.
+        core.add_port_forward("pf-td", host_port, 5, None)
+            .await
+            .unwrap();
+        assert_eq!(core.list_port_forwards("pf-td").unwrap().len(), 1);
+        // The proxy holds the port now: a re-bind must fail.
+        assert!(std::net::TcpListener::bind(("127.0.0.1", host_port)).is_err());
+
+        core.destroy_vm("pf-td").await.unwrap();
+
+        // The listener abort is async; poll briefly until the port frees.
+        let mut freed = false;
+        for _ in 0..50 {
+            if std::net::TcpListener::bind(("127.0.0.1", host_port)).is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            freed,
+            "host port should be free after destroy aborts the proxy listener"
+        );
     }
 
     /// cloud-image + volume must be rejected before any disk I/O.

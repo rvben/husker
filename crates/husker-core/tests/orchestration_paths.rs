@@ -1020,7 +1020,7 @@ async fn add_port_forward_rejects_missing_guest_ip() {
 
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
     let err = core
-        .add_port_forward("vm-no-guest-ip", 18080, 80)
+        .add_port_forward("vm-no-guest-ip", 18080, 80, None)
         .await
         .unwrap_err()
         .to_string();
@@ -1052,7 +1052,7 @@ async fn add_port_forward_rejects_invalid_guest_ip() {
 
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
     let err = core
-        .add_port_forward("vm-invalid-guest-ip", 18081, 81)
+        .add_port_forward("vm-invalid-guest-ip", 18081, 81, None)
         .await
         .unwrap_err()
         .to_string();
@@ -1084,7 +1084,7 @@ async fn add_port_forward_rejects_missing_tap_device() {
 
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
     let err = core
-        .add_port_forward("vm-no-tap", 18082, 82)
+        .add_port_forward("vm-no-tap", 18082, 82, None)
         .await
         .unwrap_err()
         .to_string();

@@ -2797,7 +2797,7 @@ async fn add_port_forward_handler<B: VmmBackend + 'static>(
     Path(name): Path<String>,
     Json(req): Json<AddPortForwardRequest>,
 ) -> Result<(StatusCode, Json<PortForwardResponse>), (StatusCode, Json<ErrorResponse>)> {
-    core.add_port_forward(&name, req.host_port, req.guest_port)
+    core.add_port_forward(&name, req.host_port, req.guest_port, None)
         .await
         .map_err(map_error)?;
     Ok((
@@ -2888,6 +2888,8 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::InvalidArgument(_) => {
             (StatusCode::BAD_REQUEST, "invalid_argument", err.to_string())
         }
+        CoreError::PortForwardConflict(_) => (StatusCode::CONFLICT, "port_in_use", err.to_string()),
+        CoreError::PortForwardDenied(_) => (StatusCode::FORBIDDEN, "denied", err.to_string()),
         CoreError::ServiceOperationFailed(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "service_operation_failed",
