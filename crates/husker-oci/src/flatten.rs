@@ -110,19 +110,33 @@ fn is_safe_relative(path: &str) -> bool {
         })
 }
 
+/// Remove `p`, never following a symlink: a symlink (even to a directory) is
+/// unlinked, only a real directory is recursed into. OCI images are untrusted,
+/// so a symlinked path must not let a whiteout delete outside the rootfs.
 fn remove_path(p: &Path) {
-    if p.is_dir() {
-        let _ = fs::remove_dir_all(p);
-    } else {
-        let _ = fs::remove_file(p);
+    match fs::symlink_metadata(p) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            let _ = fs::remove_dir_all(p);
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(p);
+        }
+        Err(_) => {}
     }
 }
 
+/// Clear the contents of `d` only when it is a real directory; a symlink in the
+/// whiteout's place is never traversed (it could point outside the rootfs).
 fn clear_dir(d: &Path) {
-    if let Ok(rd) = fs::read_dir(d) {
-        for e in rd.flatten() {
-            remove_path(&e.path());
+    match fs::symlink_metadata(d) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            if let Ok(rd) = fs::read_dir(d) {
+                for e in rd.flatten() {
+                    remove_path(&e.path());
+                }
+            }
         }
+        _ => {}
     }
 }
 
@@ -176,6 +190,34 @@ mod tests {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(&tar_buf).unwrap();
         gz.finish().unwrap()
+    }
+
+    #[test]
+    fn whiteout_of_symlink_does_not_delete_through_it() {
+        // An untrusted layer could place a symlink to somewhere outside the
+        // rootfs, then a later layer whiteout it. Removing the whiteout target
+        // must unlink the symlink, never traverse it.
+        let outside = tempfile::tempdir().unwrap();
+        let precious = outside.path().join("precious.txt");
+        fs::write(&precious, b"keep").unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("link")).unwrap();
+
+        remove_path(&dest.path().join("link"));
+        assert!(
+            !dest.path().join("link").exists(),
+            "the symlink itself is removed"
+        );
+        assert!(
+            precious.exists(),
+            "files behind the symlink must not be deleted"
+        );
+
+        // clear_dir on a symlinked path must also refuse to traverse it.
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("link2")).unwrap();
+        clear_dir(&dest.path().join("link2"));
+        assert!(precious.exists(), "clear_dir must not traverse a symlink");
     }
 
     #[test]

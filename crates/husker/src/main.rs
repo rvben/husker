@@ -1509,7 +1509,10 @@ fn oci_default_image_name(reference: &str) -> String {
             }
         })
         .collect();
-    let trimmed = name.trim_matches('-');
+    // Cap the slug well under the catalog's 64-char resource-name limit, so a
+    // digest reference (`repo@sha256:<64 hex>`) still yields a valid name.
+    let capped: String = name.trim_matches('-').chars().take(48).collect();
+    let trimmed = capped.trim_matches('-');
     if trimmed.is_empty() {
         "oci-image".to_string()
     } else {
@@ -6393,6 +6396,18 @@ mod tests {
             }
             _ => panic!("expected snapshot restore command"),
         }
+    }
+
+    #[test]
+    fn oci_default_image_name_derivation() {
+        assert_eq!(oci_default_image_name("alpine:3.20"), "alpine-3.20");
+        assert_eq!(oci_default_image_name("ghcr.io/o/img:v1"), "img-v1");
+        assert_eq!(oci_default_image_name("alpine"), "alpine");
+        // A digest reference must stay within the 64-char catalog name limit.
+        let digest = format!("alpine@sha256:{}", "a".repeat(64));
+        let name = oci_default_image_name(&digest);
+        assert!(name.len() <= 48, "name too long: {} chars", name.len());
+        assert!(name.starts_with("alpine-sha256-a"));
     }
 
     #[test]
