@@ -329,6 +329,12 @@ enum Commands {
         #[arg(long)]
         keep: bool,
 
+        /// Sync the current working directory into the VM (git-aware: tracked plus
+        /// untracked-not-ignored files, gitignored build dirs excluded) and run the
+        /// command there. The host filesystem is never modified.
+        #[arg(long = "sync-cwd")]
+        sync_cwd: bool,
+
         /// Command and arguments (after --)
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -2371,6 +2377,7 @@ async fn run(cli: Cli) -> Result<()> {
             profile,
             timeout,
             keep,
+            sync_cwd,
             command,
         } => {
             let config = load_config(config_path.as_deref());
@@ -2506,6 +2513,37 @@ async fn run(cli: Cli) -> Result<()> {
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
                 }
 
+                // 2.5 Optionally sync the working tree into the VM (git-aware, clean-room):
+                // upload a tar.gz of the cwd and wrap the command to extract and run it
+                // inside the guest. The host filesystem is never modified.
+                let (exec_command, exec_args): (String, Vec<String>) = if sync_cwd {
+                    let cwd = std::env::current_dir()
+                        .context("resolving current directory for --sync-cwd")?;
+                    if output == OutputFormat::Text {
+                        eprintln!("[job] syncing working tree from {}", cwd.display());
+                    }
+                    let archive = build_sync_archive(&cwd)?;
+                    let encoded = husker_agent_proto::base64_encode(&archive);
+                    let write_resp = api_request(
+                        with_api_auth(
+                            client.post(format!("{api_url}/v1/vms/{name}/files/write")),
+                            api_token.as_deref(),
+                        )
+                        .json(&serde_json::json!({
+                            "path": SYNC_ARCHIVE_GUEST_PATH,
+                            "data": encoded,
+                        })),
+                    )
+                    .await?;
+                    if !write_resp.status().is_success() {
+                        let msg = api_error(write_resp, &format!("VM '{name}'")).await;
+                        anyhow::bail!("{}", msg.message);
+                    }
+                    wrap_sync_command(SYNC_ARCHIVE_GUEST_PATH, SYNC_WORKDIR, &command)
+                } else {
+                    (command[0].clone(), command[1..].to_vec())
+                };
+
                 // 3. Run the command via exec.
                 if output == OutputFormat::Text {
                     eprintln!("[job] running command");
@@ -2518,8 +2556,8 @@ async fn run(cli: Cli) -> Result<()> {
                     })
                     .collect();
                 let exec_body = serde_json::json!({
-                    "command": command[0],
-                    "args": &command[1..],
+                    "command": exec_command,
+                    "args": exec_args,
                     "env": env_map,
                     "timeout_secs": timeout,
                 });
@@ -5876,12 +5914,246 @@ async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(core: &husker_core::Hu
     }
 }
 
+/// Default guest path the working-tree archive is uploaded to for `--sync-cwd`.
+const SYNC_ARCHIVE_GUEST_PATH: &str = "/tmp/.husker-sync.tgz";
+/// Default guest directory the working tree is extracted into for `--sync-cwd`.
+const SYNC_WORKDIR: &str = "/work";
+
+/// Collect the set of files to sync into a `--sync-cwd` sandbox, relative to `dir`.
+///
+/// In a git repository the list is git-aware: tracked plus untracked-but-not-ignored
+/// files (so gitignored build dirs like `target/` are excluded by construction). Outside
+/// a git repo it falls back to every file under `dir`, skipping any `.git` directory.
+fn collect_sync_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    if dir.join(".git").is_dir() {
+        // git-aware: tracked (--cached) plus untracked-but-not-ignored (--others
+        // --exclude-standard), so gitignored build dirs are excluded by construction.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ])
+            .output()
+            .context("running git ls-files for --sync-cwd")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git ls-files failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let mut paths: Vec<PathBuf> = out
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| PathBuf::from(String::from_utf8_lossy(s).into_owned()))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    } else {
+        let mut paths = Vec::new();
+        collect_walk(dir, dir, &mut paths)?;
+        paths.sort();
+        Ok(paths)
+    }
+}
+
+/// Recursively collect regular files under `dir` (relative to `root`), skipping `.git`.
+fn collect_walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            collect_walk(root, &entry.path(), out)?;
+        } else if file_type.is_file()
+            && let Ok(rel) = entry.path().strip_prefix(root)
+        {
+            out.push(rel.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Build a gzip-compressed tar archive of the `--sync-cwd` file set rooted at `dir`.
+fn build_sync_archive(dir: &Path) -> Result<Vec<u8>> {
+    let paths = collect_sync_paths(dir)?;
+    let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(enc);
+    for rel in &paths {
+        builder
+            .append_path_with_name(dir.join(rel), rel)
+            .with_context(|| format!("adding {} to sync archive", rel.display()))?;
+    }
+    let enc = builder.into_inner().context("finalizing sync tar")?;
+    enc.finish().context("finalizing sync gzip")
+}
+
+/// Wrap a user command so the guest first extracts the uploaded archive into `workdir`
+/// and runs the command there. Returns the `(command, args)` for the exec request.
+///
+/// The archive path and workdir are husker-controlled constants; the user command is
+/// passed as argv (never interpolated into the shell script) so it cannot be reparsed.
+fn wrap_sync_command(
+    archive_guest_path: &str,
+    workdir: &str,
+    command: &[String],
+) -> (String, Vec<String>) {
+    let script = format!(
+        "set -e; mkdir -p {workdir}; tar -xzf {archive_guest_path} -C {workdir}; \
+         rm -f {archive_guest_path}; cd {workdir}; exec \"$@\""
+    );
+    let mut args = vec!["-c".to_string(), script, "husker-sync".to_string()];
+    args.extend(command.iter().cloned());
+    ("sh".to_string(), args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git must be available for sync-cwd tests");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_repo(root: &Path) {
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "t@example.com"]);
+        run_git(root, &["config", "user.name", "t"]);
+    }
+
+    #[test]
+    fn collect_sync_paths_is_git_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main(){}").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "name=\"x\"").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/junk.bin"), "x".repeat(1024)).unwrap();
+        run_git(root, &["add", "src/main.rs", "Cargo.toml", ".gitignore"]);
+        // an untracked-but-not-ignored file (dirty working tree)
+        std::fs::write(root.join("notes.txt"), "hi").unwrap();
+
+        let paths = collect_sync_paths(root).unwrap();
+        let set: std::collections::HashSet<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert!(set.contains("src/main.rs"), "tracked file synced: {set:?}");
+        assert!(set.contains("Cargo.toml"), "tracked file synced: {set:?}");
+        assert!(
+            set.contains("notes.txt"),
+            "untracked-not-ignored file synced: {set:?}"
+        );
+        assert!(
+            !set.iter().any(|p| p.starts_with("target/")),
+            "gitignored build dir excluded: {set:?}"
+        );
+    }
+
+    #[test]
+    fn collect_sync_paths_walks_non_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/b.txt"), "x").unwrap();
+        std::fs::write(root.join("top.txt"), "y").unwrap();
+
+        let paths = collect_sync_paths(root).unwrap();
+        let set: std::collections::HashSet<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(set.contains("a/b.txt"), "nested file collected: {set:?}");
+        assert!(set.contains("top.txt"), "top-level file collected: {set:?}");
+    }
+
+    #[test]
+    fn build_sync_archive_excludes_gitignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "secret").unwrap();
+        run_git(root, &["add", "a.txt", ".gitignore"]);
+
+        let bytes = build_sync_archive(root).unwrap();
+        assert!(!bytes.is_empty(), "archive must not be empty");
+        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut ar = tar::Archive::new(gz);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| {
+                e.unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "a.txt"),
+            "archive contains tracked file: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "ignored.txt"),
+            "archive excludes gitignored file: {names:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_sync_command_untars_and_execs_in_workdir() {
+        let (cmd, args) = wrap_sync_command(
+            "/tmp/.husker-sync.tgz",
+            "/work",
+            &["cargo".to_string(), "test".to_string()],
+        );
+        assert_eq!(cmd, "sh");
+        assert_eq!(args[0], "-c");
+        let script = &args[1];
+        assert!(
+            script.contains("tar -xzf /tmp/.husker-sync.tgz -C /work"),
+            "script untars archive into workdir: {script}"
+        );
+        assert!(
+            script.contains("cd /work"),
+            "script cds into workdir: {script}"
+        );
+        assert!(
+            script.contains("exec \"$@\""),
+            "script execs the user command: {script}"
+        );
+        // the user command trails after the $0 placeholder, passed as argv (no interpolation)
+        assert_eq!(
+            &args[args.len() - 2..],
+            &["cargo".to_string(), "test".to_string()]
+        );
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -7309,6 +7581,30 @@ mod tests {
             Cli::try_parse_from(["husker", "run", "--net", "invalid"]).is_err(),
             "--net with invalid value should be rejected"
         );
+    }
+
+    #[test]
+    fn job_sync_cwd_flag_parses() {
+        let cli = Cli::try_parse_from(["husker", "job", "--sync-cwd", "--", "cargo", "test"])
+            .expect("job --sync-cwd parses");
+        match cli.command {
+            Commands::Job {
+                sync_cwd, command, ..
+            } => {
+                assert!(sync_cwd, "--sync-cwd sets the flag");
+                assert_eq!(command, vec!["cargo", "test"]);
+            }
+            _ => panic!("expected Job"),
+        }
+    }
+
+    #[test]
+    fn job_sync_cwd_defaults_false() {
+        let cli = Cli::try_parse_from(["husker", "job", "--", "true"]).expect("job parses");
+        match cli.command {
+            Commands::Job { sync_cwd, .. } => assert!(!sync_cwd, "sync_cwd defaults off"),
+            _ => panic!("expected Job"),
+        }
     }
 
     #[test]
