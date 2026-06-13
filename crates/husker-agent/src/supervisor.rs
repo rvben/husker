@@ -317,9 +317,10 @@ extern "C" fn on_terminate(_sig: libc::c_int) {
 
 fn install_term_handlers() {
     // SAFETY: installing a plain extern "C" handler for SIGTERM/SIGINT.
+    let handler = on_terminate as *const () as libc::sighandler_t;
     unsafe {
-        libc::signal(libc::SIGTERM, on_terminate as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_terminate as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
     }
 }
 
