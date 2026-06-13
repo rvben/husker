@@ -14,8 +14,15 @@ fn main() -> Result<()> {
     // until the import-oci boot_init flip, so production boot is unchanged.
     #[cfg(target_os = "linux")]
     {
+        let is_pid1 = std::process::id() == 1;
+        // As PID 1 nothing is mounted yet, so /proc/cmdline is unreadable until we
+        // mount /proc. Do it first (idempotent with the supervisor's own mounts)
+        // so supervisor mode can actually be detected.
+        if is_pid1 {
+            husker_agent::supervisor::mount_proc();
+        }
         let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        if husker_agent::is_supervisor_mode(std::process::id() == 1, &cmdline) {
+        if husker_agent::is_supervisor_mode(is_pid1, &cmdline) {
             husker_agent::supervisor::run(&cmdline);
         }
     }

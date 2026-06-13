@@ -61,6 +61,20 @@ fn mount_one(spec: &MountSpec) -> io::Result<()> {
     }
 }
 
+/// Mount `/proc` (best-effort). PID 1 starts with nothing mounted, so this must
+/// run before reading `/proc/cmdline` to detect supervisor mode. Idempotent with
+/// [`mount_all`] (a second mount returns EBUSY and is skipped).
+pub fn mount_proc() {
+    if let Err(e) = mount_one(&MountSpec {
+        source: "proc",
+        target: "/proc",
+        fstype: "proc",
+        critical: false,
+    }) {
+        warn!("could not mount /proc early: {e}");
+    }
+}
+
 /// Mount the pseudo-filesystems. Returns `Err` only when a *critical* mount fails
 /// (other than "already mounted") so the caller can reboot; best-effort failures
 /// are logged and skipped.
