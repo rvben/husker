@@ -3218,10 +3218,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             .insert_port_forward(&pf_record)
             .map_err(|e| match e {
                 husker_state::StateError::PortAlreadyForwarded(port) => {
-                    CoreError::Network(husker_net::NetError::CommandFailed {
-                        cmd: "port forward".into(),
-                        message: format!("host port {port} is already forwarded"),
-                    })
+                    CoreError::PortForwardConflict(port)
                 }
                 other => CoreError::State(other),
             })
@@ -3293,16 +3290,22 @@ impl<B: VmmBackend> HuskerCore<B> {
             .parse()
             .map_err(|_| CoreError::InvalidArgument(format!("{name}: invalid guest IP")))?;
 
-        // Idempotent: same forward already present is a no-op.
+        let bind = bind_addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let bind_str = bind.to_string();
+
+        // Idempotent only when host port, guest port, AND bind address all match
+        // an existing forward. A re-add with a different bind on the same host
+        // port falls through and is rejected as a conflict by the bind below.
         if let Ok(existing) = self.state.list_port_forwards_for_vm(record.id)
-            && let Some(found) = existing
-                .iter()
-                .find(|pf| pf.host_port == host_port && pf.guest_port == guest_port)
+            && let Some(found) = existing.iter().find(|pf| {
+                pf.host_port == host_port
+                    && pf.guest_port == guest_port
+                    && pf.bind_addr.as_deref() == Some(bind_str.as_str())
+            })
         {
             return Ok(found.clone());
         }
 
-        let bind = bind_addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let bound = self
             .port_proxy
             .add(record.id, bind, host_port, guest_ip, guest_port)
@@ -3319,7 +3322,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             host_port: bound,
             guest_port,
             protocol: "tcp".into(),
-            bind_addr: Some(bind.to_string()),
+            bind_addr: Some(bind_str),
             created_at: chrono::Utc::now(),
         };
         if let Err(e) = self
@@ -3344,9 +3347,19 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub async fn remove_port_forward(&self, name: &str, host_port: u16) -> Result<(), CoreError> {
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
-        self.port_proxy.stop(record.id, host_port);
-        self.state.delete_port_forward(host_port)?;
-        info!(%name, host_port, "port forward removed (userspace proxy)");
+        // Only remove a forward that belongs to this VM. `delete_port_forward`
+        // keys on host_port globally, so an unscoped delete could drop another
+        // VM's row and orphan its listener. No-op (idempotent) otherwise.
+        let owned = self
+            .state
+            .list_port_forwards_for_vm(record.id)?
+            .iter()
+            .any(|pf| pf.host_port == host_port);
+        if owned {
+            self.port_proxy.stop(record.id, host_port);
+            self.state.delete_port_forward(host_port)?;
+            info!(%name, host_port, "port forward removed (userspace proxy)");
+        }
         Ok(())
     }
 
@@ -5716,6 +5729,74 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             freed,
             "host port should be free after destroy aborts the proxy listener"
         );
+    }
+
+    /// macOS: removing a forward via the wrong VM must not drop the owning VM's
+    /// row or orphan its listener (`delete_port_forward` keys on host_port).
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn remove_port_forward_scoped_to_owning_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let a = running_nat_vm("vm-a");
+        let mut b = running_nat_vm("vm-b");
+        b.vsock_cid = 4;
+        state.insert_vm(&a).unwrap();
+        state.insert_vm(&b).unwrap();
+        let core = make_vz_core(state, tmp.path());
+        let host_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        core.add_port_forward("vm-a", host_port, 80, None)
+            .await
+            .unwrap();
+        // Wrong-VM remove must be a no-op for vm-a's forward.
+        core.remove_port_forward("vm-b", host_port).await.unwrap();
+        assert_eq!(
+            core.list_port_forwards("vm-a").unwrap().len(),
+            1,
+            "vm-a forward must survive a wrong-VM remove"
+        );
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", host_port)).is_err(),
+            "vm-a listener must still hold the port"
+        );
+        // Removing via the owning VM works.
+        core.remove_port_forward("vm-a", host_port).await.unwrap();
+        assert!(core.list_port_forwards("vm-a").unwrap().is_empty());
+    }
+
+    /// macOS: the same host port with a different bind address is a conflict
+    /// (not silently idempotent); the same bind is idempotent.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn add_port_forward_same_port_different_bind_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        state.insert_vm(&running_nat_vm("vm-c")).unwrap();
+        let core = make_vz_core(state, tmp.path());
+        let host_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let all: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+        core.add_port_forward("vm-c", host_port, 80, Some(loopback))
+            .await
+            .unwrap();
+        // Different bind on the same host port -> conflict.
+        let err = core
+            .add_port_forward("vm-c", host_port, 80, Some(all))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::PortForwardConflict(_)));
+        // Same bind -> idempotent.
+        let rec = core
+            .add_port_forward("vm-c", host_port, 80, Some(loopback))
+            .await
+            .unwrap();
+        assert_eq!(rec.host_port, host_port);
     }
 
     /// cloud-image + volume must be rejected before any disk I/O.

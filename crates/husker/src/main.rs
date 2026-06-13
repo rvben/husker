@@ -3309,16 +3309,31 @@ async fn port_forward(
             )
             .await?;
             if resp.status().is_success() {
+                // Read the effective values from the response: the bound host
+                // port (the daemon may pick one when 0 is requested) and the
+                // effective bind address.
+                let pf: serde_json::Value =
+                    resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+                let bound = pf
+                    .get("host_port")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(host_port as u64);
+                let bind = pf.get("bind_addr").and_then(|v| v.as_str());
+                let target = match bind {
+                    Some(b) => format!("{b}:{bound}"),
+                    None => bound.to_string(),
+                };
                 print_output(
                     output,
                     &serde_json::json!({
                         "status": "ok",
                         "action": "port-forward-add",
                         "vm": name,
-                        "host_port": host_port,
+                        "host_port": bound,
                         "guest_port": guest_port,
+                        "bind_addr": bind,
                     }),
-                    format!("Port forward added: {host_port} -> {name}:{guest_port}"),
+                    format!("Port forward added: {target} -> {name}:{guest_port}"),
                 );
             } else {
                 let msg = api_error(resp, &format!("VM '{name}'")).await;

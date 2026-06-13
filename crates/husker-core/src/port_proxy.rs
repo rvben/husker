@@ -42,7 +42,10 @@ impl GuestDialer for DirectIpDialer {
 /// dialer is the only change needed to move to Approach B.
 pub type ActiveDialer = DirectIpDialer;
 
-/// One active forward's accept loop. Aborting on drop tears the listener down.
+/// One active forward's accept loop. Aborting on drop frees the bound host port
+/// (the listener lives in this task). Already-accepted relay connections run in
+/// their own detached tasks and drain naturally when either side closes - which,
+/// for a destroyed VM whose guest is gone, happens immediately.
 struct Forward {
     handle: JoinHandle<()>,
 }
