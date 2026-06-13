@@ -63,12 +63,23 @@ impl ImageReference {
         })
     }
 
-    /// HTTPS base URL for the registry's distribution API.
+    /// `http` for local registries (localhost / 127.0.0.1, like Docker's
+    /// insecure-localhost default), `https` for everything else.
+    fn scheme(&self) -> &'static str {
+        let host = self.registry.split(':').next().unwrap_or(&self.registry);
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            "http"
+        } else {
+            "https"
+        }
+    }
+
+    /// Base URL for the registry's distribution API.
     pub fn registry_base(&self) -> String {
         if self.registry == "docker.io" {
             "https://registry-1.docker.io".to_string()
         } else {
-            format!("https://{}", self.registry)
+            format!("{}://{}", self.scheme(), self.registry)
         }
     }
 
@@ -81,7 +92,7 @@ impl ImageReference {
             )
         } else {
             (
-                format!("https://{}/token", self.registry),
+                format!("{}://{}/token", self.scheme(), self.registry),
                 self.registry.clone(),
             )
         }
@@ -154,7 +165,23 @@ mod tests {
         assert_eq!(r.registry, "localhost:5000");
         assert_eq!(r.repository, "myimage");
         assert_eq!(r.reference, "dev");
-        assert_eq!(r.registry_base(), "https://localhost:5000");
+        assert_eq!(r.registry_base(), "http://localhost:5000");
+    }
+
+    #[test]
+    fn local_registry_uses_http() {
+        // Local registries (localhost / 127.0.0.1, with or without a port) are
+        // plain http by convention, like Docker's insecure-localhost default.
+        let r = parse("127.0.0.1:5000/img:dev");
+        assert_eq!(r.registry, "127.0.0.1:5000");
+        assert_eq!(r.registry_base(), "http://127.0.0.1:5000");
+        assert_eq!(r.auth_endpoint().0, "http://127.0.0.1:5000/token");
+
+        let l = parse("localhost:5000/img:dev");
+        assert_eq!(l.registry_base(), "http://localhost:5000");
+
+        // A real remote registry stays https.
+        assert_eq!(parse("ghcr.io/o/i:v1").registry_base(), "https://ghcr.io");
     }
 
     #[test]

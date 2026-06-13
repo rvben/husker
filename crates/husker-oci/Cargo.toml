@@ -22,3 +22,5 @@ sha2 = "0.10"
 tempfile = "3"
 # Encode zstd fixtures in tests; runtime decode uses pure-Rust ruzstd.
 zstd = "0.13"
+# In-process mock OCI registry for the end-to-end import test.
+axum = { workspace = true }
