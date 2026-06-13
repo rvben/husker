@@ -11,7 +11,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// A pseudo-filesystem the supervisor mounts during init.
 pub struct MountSpec {
@@ -273,6 +273,96 @@ pub fn reboot_now() -> ! {
     // If reboot somehow returns, PID 1 must never exit - spin instead.
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Run as the guest init/supervisor (PID 1): perform minimal init, then
+/// supervise the agent as a restartable child. Never returns.
+pub fn run(cmdline: &str) -> ! {
+    info!("husker-agent running as the guest init/supervisor (husker.init=1)");
+
+    // A critical mount failing means a half-booted guest; reboot rather than
+    // serve in a broken state. Best-effort mounts are skipped inside.
+    if let Err(e) = mount_all() {
+        error!("fatal init failure: {e}; rebooting guest");
+        reboot_now();
+    }
+    ensure_device_nodes();
+
+    // Static network from the kernel ip=. A failure is degraded (no outbound
+    // network), not fatal: logged loudly so it is diagnosable, then serve anyway.
+    match parse_ip_cmdline(cmdline) {
+        Some(cfg) => match configure_network(&cfg) {
+            Ok(()) => info!(
+                "guest network up: {}/{} on {} (gw {:?})",
+                cfg.addr, cfg.prefix, cfg.iface, cfg.gateway
+            ),
+            Err(e) => warn!("guest network setup degraded: {e}"),
+        },
+        None => info!("no ip= on cmdline; skipping static network setup"),
+    }
+
+    supervise()
+}
+
+extern "C" fn on_terminate(_sig: libc::c_int) {
+    // PID 1 has no default signal dispositions; on stop, power the guest off.
+    // sync + reboot are terminal, which is acceptable from a handler here.
+    // SAFETY: both calls take no pointers; reboot does not return on success.
+    unsafe {
+        libc::sync();
+        libc::reboot(libc::RB_POWER_OFF);
+    }
+}
+
+fn install_term_handlers() {
+    // SAFETY: installing a plain extern "C" handler for SIGTERM/SIGINT.
+    unsafe {
+        libc::signal(libc::SIGTERM, on_terminate as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_terminate as libc::sighandler_t);
+    }
+}
+
+/// Supervise the agent: run it as a child (a re-exec of this binary, which is
+/// not PID 1 so it serves normally), restart it if it exits, and reap any
+/// re-parented orphans - PID 1's duty. Never returns.
+fn supervise() -> ! {
+    install_term_handlers();
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/husker-agent"));
+    const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+    loop {
+        let child = match std::process::Command::new(&exe).spawn() {
+            Ok(c) => c.id() as libc::pid_t,
+            Err(e) => {
+                warn!("failed to spawn agent child: {e}; retrying");
+                std::thread::sleep(RESTART_DELAY);
+                continue;
+            }
+        };
+        info!("agent child started (pid {child})");
+
+        // Reap children until our agent child exits; orphans are reaped along
+        // the way so they never linger as zombies.
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: status is a valid pointer for the duration of the call.
+            let reaped = unsafe { libc::waitpid(-1, &mut status, 0) };
+            if reaped == child {
+                warn!("agent child {child} exited; restarting");
+                break;
+            }
+            if reaped < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::ECHILD {
+                    break; // no children remain; respawn the agent
+                }
+                // EINTR or transient: keep waiting.
+            }
+            // reaped > 0 && != child: an orphan was reaped; keep waiting.
+        }
+        std::thread::sleep(RESTART_DELAY);
     }
 }
 

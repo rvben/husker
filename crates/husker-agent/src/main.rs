@@ -1,65 +1,55 @@
 use anyhow::{Context, Result};
 use tracing::{error, info, warn};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     info!("husker-agent starting");
 
     // Guest init/supervisor mode: when booted as PID 1 with the husker.init=1
-    // marker (set by import-oci images), the agent performs minimal init -
-    // mounts, networking, child reaping - before serving. Detection is wired
-    // here; the init duties are added incrementally and are not yet set on any
-    // image in production (imported images still boot the existing path).
+    // marker (set by import-oci images), the agent becomes a minimal init - it
+    // performs mounts/network/device setup and then supervises itself as a
+    // restartable child, never returning. Otherwise (normal agent, or the
+    // supervisor's own child) it serves requests. No image sets husker.init=1
+    // until the import-oci boot_init flip, so production boot is unchanged.
     #[cfg(target_os = "linux")]
     {
         let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
         if husker_agent::is_supervisor_mode(std::process::id() == 1, &cmdline) {
-            info!("husker-agent running as the guest init/supervisor (husker.init=1)");
-            // A critical mount failing means a half-booted guest; reboot rather
-            // than serve in a broken state. Best-effort mounts are skipped inside.
-            if let Err(e) = husker_agent::supervisor::mount_all() {
-                error!("fatal init failure: {e}; rebooting guest");
-                husker_agent::supervisor::reboot_now();
-            }
-            husker_agent::supervisor::ensure_device_nodes();
-            // Static network from the kernel ip=. A failure here is degraded (no
-            // outbound network), not fatal: log loudly so it is diagnosable
-            // rather than a mysterious hang, but still serve the agent.
-            match husker_agent::supervisor::parse_ip_cmdline(&cmdline) {
-                Some(cfg) => match husker_agent::supervisor::configure_network(&cfg) {
-                    Ok(()) => info!(
-                        "guest network up: {}/{} on {} (gw {:?})",
-                        cfg.addr, cfg.prefix, cfg.iface, cfg.gateway
-                    ),
-                    Err(e) => warn!("guest network setup degraded: {e}"),
-                },
-                None => info!("no ip= on cmdline; skipping static network setup"),
-            }
+            husker_agent::supervisor::run(&cmdline);
         }
     }
 
-    if let Err(e) = husker_agent::configure_self_cgroup(
-        std::path::Path::new("/sys/fs/cgroup"),
-        husker_agent::AGENT_MEMORY_HIGH_BYTES,
-    ) {
-        warn!("cgroup self-limit not applied: {e}");
-    }
+    run_agent()
+}
 
-    // Transport selection:
-    // 1. HUSKER_AGENT_SOCKET env var → Unix socket (dev/testing)
-    // 2. Linux → vsock port 52 (production)
-    // 3. macOS → default Unix socket fallback (dev)
-    if let Ok(path) = std::env::var("HUSKER_AGENT_SOCKET") {
-        listen_unix(&path).await
-    } else if cfg!(target_os = "linux") {
-        listen_vsock().await
-    } else {
-        let default_path = "/tmp/husker-agent.sock";
-        let _ = std::fs::remove_file(default_path);
-        listen_unix(default_path).await
-    }
+/// Run the agent service: normal mode, or the supervisor's restartable child.
+/// Builds its own Tokio runtime (the supervisor itself stays a minimal sync
+/// PID 1 with no async runtime).
+fn run_agent() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("building Tokio runtime")?;
+    runtime.block_on(async {
+        if let Err(e) = husker_agent::configure_self_cgroup(
+            std::path::Path::new("/sys/fs/cgroup"),
+            husker_agent::AGENT_MEMORY_HIGH_BYTES,
+        ) {
+            warn!("cgroup self-limit not applied: {e}");
+        }
+
+        // Transport selection:
+        // 1. HUSKER_AGENT_SOCKET env var → Unix socket (dev/testing)
+        // 2. Linux → vsock port 52 (production)
+        // 3. macOS → default Unix socket fallback (dev)
+        if let Ok(path) = std::env::var("HUSKER_AGENT_SOCKET") {
+            listen_unix(&path).await
+        } else if cfg!(target_os = "linux") {
+            listen_vsock().await
+        } else {
+            let default_path = "/tmp/husker-agent.sock";
+            let _ = std::fs::remove_file(default_path);
+            listen_unix(default_path).await
+        }
+    })
 }
 
 async fn listen_unix(path: &str) -> Result<()> {
