@@ -544,33 +544,55 @@ const GUEST_NET_SCRIPT: &[u8] = include_bytes!("../../../guest/husker-net.sh");
 #[cfg(feature = "linux-net")]
 fn inject_guest_runtime(dir: &std::path::Path, agent: &[u8]) -> Result<(), CoreError> {
     use std::os::unix::fs::PermissionsExt;
-    let write_exec = |rel: &str, bytes: &[u8]| -> Result<(), CoreError> {
-        let p = dir.join(rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| CoreError::Io(format!("mkdir {}: {e}", parent.display())))?;
+
+    // Resolve `rel` under `dir` without following any symlink: a symlink (or
+    // plain file) in a parent position is replaced with a real directory. OCI
+    // images are untrusted and the daemon runs as root, so an injected path must
+    // never be redirected (e.g. via `usr/local/bin -> /etc`) outside the rootfs.
+    fn safe_target(dir: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, CoreError> {
+        let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+        let (dirs, file) = comps.split_at(comps.len().saturating_sub(1));
+        let mut cur = dir.to_path_buf();
+        for d in dirs {
+            cur = cur.join(d);
+            match std::fs::symlink_metadata(&cur) {
+                Ok(m) if m.file_type().is_dir() => {}
+                Ok(_) => {
+                    std::fs::remove_file(&cur)
+                        .or_else(|_| std::fs::remove_dir_all(&cur))
+                        .map_err(|e| CoreError::Io(format!("replace {}: {e}", cur.display())))?;
+                    std::fs::create_dir(&cur)
+                        .map_err(|e| CoreError::Io(format!("mkdir {}: {e}", cur.display())))?;
+                }
+                Err(_) => std::fs::create_dir(&cur)
+                    .map_err(|e| CoreError::Io(format!("mkdir {}: {e}", cur.display())))?,
+            }
         }
-        std::fs::write(&p, bytes)
-            .map_err(|e| CoreError::Io(format!("write {}: {e}", p.display())))?;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| CoreError::Io(format!("chmod {}: {e}", p.display())))?;
+        Ok(cur.join(file.first().copied().unwrap_or("")))
+    }
+
+    let write = |rel: &str, bytes: &[u8], mode: u32| -> Result<(), CoreError> {
+        let target = safe_target(dir, rel)?;
+        // Unlink any existing symlink/file at the target before writing (no follow).
+        let _ = std::fs::remove_file(&target);
+        std::fs::write(&target, bytes)
+            .map_err(|e| CoreError::Io(format!("write {}: {e}", target.display())))?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| CoreError::Io(format!("chmod {}: {e}", target.display())))?;
         Ok(())
     };
-    write_exec("usr/local/bin/husker-agent", agent)?;
-    write_exec("usr/local/sbin/husker-net.sh", GUEST_NET_SCRIPT)?;
 
-    let inittab = dir.join("etc/inittab");
-    if let Some(parent) = inittab.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CoreError::Io(format!("mkdir etc: {e}")))?;
-    }
-    std::fs::write(&inittab, GUEST_INITTAB)
-        .map_err(|e| CoreError::Io(format!("write inittab: {e}")))?;
+    write("usr/local/bin/husker-agent", agent, 0o755)?;
+    write("usr/local/sbin/husker-net.sh", GUEST_NET_SCRIPT, 0o755)?;
+    write("etc/inittab", GUEST_INITTAB, 0o644)?;
 
     // The host kernel + initramfs hand off to /sbin/init; busybox-based images
-    // ship busybox but may not symlink it there.
-    let sbin_init = dir.join("sbin/init");
-    if !sbin_init.exists() && dir.join("bin/busybox").exists() {
-        let _ = std::fs::create_dir_all(dir.join("sbin"));
+    // ship busybox but may not symlink it there. Use symlink_metadata so an
+    // image-provided /sbin/init symlink is not followed off the rootfs.
+    let sbin_init = safe_target(dir, "sbin/init")?;
+    let has_init = std::fs::symlink_metadata(&sbin_init).is_ok();
+    let has_busybox = std::fs::symlink_metadata(dir.join("bin/busybox")).is_ok();
+    if !has_init && has_busybox {
         let _ = std::os::unix::fs::symlink("/bin/busybox", &sbin_init);
     }
     Ok(())
@@ -2563,6 +2585,14 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .await
                 .map_err(|e| CoreError::Io(format!("size join: {e}")))?
         };
+        // Bound disk use: refuse images whose extracted tree is implausibly large
+        // (a decompression-bomb guard on top of the compressed-download cap).
+        const MAX_ROOTFS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        if tree_size > MAX_ROOTFS_BYTES {
+            return Err(CoreError::InvalidArgument(format!(
+                "imported rootfs is {tree_size} bytes, over the {MAX_ROOTFS_BYTES}-byte limit"
+            )));
+        }
         let size_bytes = (tree_size * 2).max(128 * 1024 * 1024) + 64 * 1024 * 1024;
         husker_storage::build_ext4_from_dir(&rootfs_dir, &image_path, size_bytes).await?;
 
@@ -3920,6 +3950,36 @@ mod tests {
         assert_eq!(
             resolve_vmm_kind(None, true, VmmKind::Firecracker).unwrap(),
             VmmKind::Qemu
+        );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn inject_guest_runtime_does_not_follow_symlinks() {
+        // An untrusted image symlinks an injection-path parent to an outside dir;
+        // injection must replace the symlink with a real dir and write inside the
+        // rootfs, never through the symlink.
+        let rootfs = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("usr/local")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), rootfs.path().join("usr/local/bin")).unwrap();
+
+        inject_guest_runtime(rootfs.path(), b"AGENT").unwrap();
+
+        assert!(
+            !outside.path().join("husker-agent").exists(),
+            "must not write through the symlink to outside the rootfs"
+        );
+        assert!(
+            std::fs::symlink_metadata(rootfs.path().join("usr/local/bin"))
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "the symlinked parent is replaced with a real directory"
+        );
+        assert_eq!(
+            std::fs::read(rootfs.path().join("usr/local/bin/husker-agent")).unwrap(),
+            b"AGENT"
         );
     }
 

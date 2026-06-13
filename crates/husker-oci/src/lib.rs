@@ -119,7 +119,13 @@ struct Descriptor {
     digest: String,
     #[serde(rename = "mediaType", default)]
     media_type: String,
+    #[serde(default)]
+    size: u64,
 }
+
+/// Cap on total compressed layer bytes for a single import, bounding memory and
+/// download time against hostile or accidental giant images.
+const MAX_PULL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ManifestIndex {
@@ -147,6 +153,8 @@ pub async fn pull_image(reference: &str, arch: &str) -> Result<PulledImage, OciE
     let r = ImageReference::parse(reference)?;
     let client = reqwest::Client::builder()
         .user_agent("husker-oci")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| OciError::Http(e.to_string()))?;
 
@@ -165,17 +173,34 @@ pub async fn pull_image(reference: &str, arch: &str) -> Result<PulledImage, OciE
         serde_json::from_slice(&body).map_err(|e| OciError::Malformed(format!("manifest: {e}")))?
     };
 
+    // Bound the total download (declared layer sizes) before fetching anything.
+    let declared: u64 = manifest.layers.iter().map(|l| l.size).sum();
+    if declared > MAX_PULL_BYTES {
+        return Err(OciError::Unsupported(format!(
+            "image layers total {declared} bytes, over the {MAX_PULL_BYTES}-byte import limit"
+        )));
+    }
+
     let config_blob = get_blob(&client, &r, &manifest.config.digest, &token).await?;
     let config = parse_image_config(&config_blob)?;
 
     let mut layers = Vec::with_capacity(manifest.layers.len());
+    let mut downloaded: u64 = 0;
     for layer in &manifest.layers {
         if layer.media_type.contains("zstd") {
             return Err(OciError::Unsupported(
                 "zstd-compressed layers are not supported yet (gzip only)".into(),
             ));
         }
-        layers.push(get_blob(&client, &r, &layer.digest, &token).await?);
+        let blob = get_blob(&client, &r, &layer.digest, &token).await?;
+        // Guard against a registry that under-declares sizes in the manifest.
+        downloaded += blob.len() as u64;
+        if downloaded > MAX_PULL_BYTES {
+            return Err(OciError::Unsupported(format!(
+                "image exceeded the {MAX_PULL_BYTES}-byte import limit while downloading"
+            )));
+        }
+        layers.push(blob);
     }
 
     Ok(PulledImage { config, layers })
@@ -220,10 +245,26 @@ async fn fetch_pull_token(
         .send()
         .await
         .map_err(|e| OciError::Http(e.to_string()))?;
-    if !resp.status().is_success() {
-        // Some registries (e.g. plain local) don't require a token; treat a
-        // failed token fetch as "no token" and let the manifest request decide.
-        return Ok(String::new());
+    let status = resp.status();
+    if !status.is_success() {
+        // A missing token endpoint (404) can mean the registry allows anonymous
+        // pulls; any other failure (401/403/429/5xx) is real and must surface
+        // rather than masquerade as a confusing later 401.
+        if status.as_u16() == 404 {
+            return Ok(String::new());
+        }
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(OciError::Status {
+            status: status.as_u16(),
+            url,
+            body,
+        });
     }
     let v: serde_json::Value = resp
         .json()
@@ -313,8 +354,11 @@ async fn get_blob(
 fn verify_digest(digest: &str, bytes: &[u8]) -> Result<(), OciError> {
     use sha2::{Digest, Sha256};
     let Some(expected) = digest.strip_prefix("sha256:") else {
-        // Only sha256 is verified; unknown algorithms pass through.
-        return Ok(());
+        // Fail closed: we only verify sha256, so refuse any other algorithm
+        // rather than processing an unverified blob.
+        return Err(OciError::Unsupported(format!(
+            "unsupported digest algorithm (only sha256 is verified): {digest}"
+        )));
     };
     let actual = hex_lower(&Sha256::digest(bytes));
     if actual != expected {
@@ -413,9 +457,7 @@ mod tests {
     fn verify_digest_detects_mismatch() {
         // sha256 of "hello" is well-known; a wrong digest must be rejected.
         assert!(verify_digest("sha256:deadbeef", b"hello").is_err());
-        assert!(
-            verify_digest("md5:whatever", b"hello").is_ok(),
-            "non-sha256 passes through"
-        );
+        // A non-sha256 algorithm fails closed rather than skipping verification.
+        assert!(verify_digest("md5:whatever", b"hello").is_err());
     }
 }
