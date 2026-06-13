@@ -1113,7 +1113,9 @@ async fn port_forward_applies_for_qemu_backed_vm() {
     husker_net::create_bridge("husker0", std::net::Ipv4Addr::new(192, 0, 2, 1), 30)
         .await
         .unwrap();
-    husker_net::init_nat("husker0", "192.0.2.0/30", "eth0").await.ok();
+    husker_net::init_nat("husker0", "192.0.2.0/30", "eth0")
+        .await
+        .ok();
 
     let state = StateStore::open_memory().unwrap();
     let mut vm = vm_record(
