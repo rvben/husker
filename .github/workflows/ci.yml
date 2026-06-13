@@ -129,6 +129,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: make test-macos
+      - run: make test-macos-api
       - run: make test-initramfs
 
   audit:

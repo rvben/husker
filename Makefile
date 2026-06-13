@@ -66,9 +66,15 @@ check-macos:
 	cargo check --workspace --no-default-features
 
 # Run tests on macOS (without linux-net feature)
-# Excludes husker-api whose integration tests require linux-net
+# Excludes husker-api; run its no-default-features suite via `test-macos-api`.
 test-macos:
 	cargo nextest run --workspace --no-default-features --exclude husker-api 2>/dev/null || cargo test --workspace --no-default-features --exclude husker-api
+
+# Run husker-api tests on the macOS (no-linux-net) build. test-macos excludes
+# husker-api, so this is the twin that exercises the cross-platform API surface
+# (e.g. boot-mode and port-forward logic that has linux-net-gated counterparts).
+test-macos-api:
+	cargo nextest run -p husker-api --no-default-features 2>/dev/null || cargo test -p husker-api --no-default-features
 
 # Run all tests
 test:
