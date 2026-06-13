@@ -1597,9 +1597,14 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// allocated TAP/IP/MAC, and re-homes the guest's network in place via the
     /// agent. The source stays suspended.
     ///
-    /// Limitations (v1): NAT-mode, Firecracker-backed sources only, and one
-    /// running fork per source at a time (the fork reuses the source's vsock
-    /// path, so the source must not be resumed while a fork of it runs).
+    /// Limitations (v1): NAT-mode, Firecracker-backed, volume-free sources only.
+    /// The fork reuses the source's vsock path, so (a) only one running fork per
+    /// source at a time and the source must stay suspended while a fork of it
+    /// runs, and (b) forks are ephemeral - destroy them rather than suspending
+    /// them (a forked VM's snapshot still embeds the source's vsock path, which a
+    /// plain resume cannot reconstruct). A volume-backed source is rejected
+    /// because the snapshot embeds the source's writable volume disk, which the
+    /// fork would otherwise share.
     #[cfg(feature = "linux-net")]
     pub async fn fork_vm(&self, source_name: &str, fork_name: &str) -> Result<VmRecord, CoreError> {
         info!(%source_name, %fork_name, "forking VM");
@@ -1632,6 +1637,16 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "fork is only supported for NAT-mode VMs".into(),
             ));
         }
+        // The snapshot embeds the source's writable volume disk, and the fork only
+        // clones the rootfs, so a fork would silently share (and corrupt) the
+        // source's volume. Reject volume-backed sources.
+        if source.volume.is_some() {
+            return Err(CoreError::InvalidArgument(
+                "cannot fork a VM with an attached volume (the fork would share the \
+                 source's writable volume)"
+                    .into(),
+            ));
+        }
         if self.lookup_vm(fork_name).is_ok() {
             return Err(CoreError::VmAlreadyExists(fork_name.into()));
         }
@@ -1657,7 +1672,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         fork_name: &str,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
-        // Fresh host identity for the fork.
+        // Fresh host identity for the fork. `cid` is the fork's host-side id: it
+        // names the TAP (`husker{cid}`) and derives the MAC, and is what we
+        // persist. The guest's internal vsock CID stays the source's (baked in
+        // the snapshot), which is harmless because host->guest agent connections
+        // are Unix-socket-path based, not CID-addressed.
         let guest_ip = self.ip_allocator.allocate()?;
         resources.guest_ip = Some(guest_ip);
         let cid = self.state.allocate_cid()?;
@@ -1667,9 +1686,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         let gateway = self.ip_allocator.gateway();
         let prefix_len = self.ip_allocator.prefix_len();
 
+        // Create the TAP (Firecracker binds it during restore) but do NOT attach it
+        // to the bridge yet: the fork resumes with the source's IP and MAC, so
+        // bridging it before the guest is re-homed would put a duplicate identity on
+        // the shared L2. It joins the bridge only after ReconfigureNetwork below.
         husker_net::create_tap(&tap_name).await?;
         resources.tap_name = Some(tap_name.clone());
-        husker_net::attach_to_bridge(&tap_name, &self.bridge_name).await?;
 
         // Clone the source's live rootfs into the fork's dir (reflink CoW).
         let fork_dir = self.storage.vm_dir(fork_name);
@@ -1712,6 +1734,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Re-home the guest's network identity (new MAC + IP + gateway + DNS) live.
         self.reconfigure_fork_network(info.id, &guest_ip, prefix_len, gateway, &mac)
             .await?;
+
+        // Now that the guest carries its own MAC and IP, join it to the bridge.
+        husker_net::attach_to_bridge(&tap_name, &self.bridge_name).await?;
 
         // Persist the fork as a running VM.
         let now = chrono::Utc::now();

@@ -43,6 +43,19 @@ struct RootfsAlias {
 impl RootfsAlias {
     fn install(source_rootfs: &Path, fork_rootfs: &Path) -> Result<Self, VmmError> {
         let backup = PathBuf::from(format!("{}.fork-src-bak", source_rootfs.display()));
+        // Crash recovery: a leftover backup means a previous fork died after the
+        // rename but before the undo, leaving `source_rootfs` as a stale symlink to
+        // a fork clone and the real rootfs in `backup`. Restore the real rootfs
+        // before re-aliasing, so the source disk is never lost or overwritten.
+        if backup.exists() {
+            let _ = std::fs::remove_file(source_rootfs);
+            std::fs::rename(&backup, source_rootfs).map_err(|e| {
+                VmmError::ProcessError(format!(
+                    "fork: recover stranded source rootfs from {}: {e}",
+                    backup.display()
+                ))
+            })?;
+        }
         std::fs::rename(source_rootfs, &backup)
             .map_err(|e| VmmError::ProcessError(format!("fork: stash source rootfs aside: {e}")))?;
         if let Err(e) = std::os::unix::fs::symlink(fork_rootfs, source_rootfs) {
