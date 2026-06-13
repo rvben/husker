@@ -2,6 +2,11 @@
 
 mod pty;
 
+/// Guest init/supervisor duties (mounts, device nodes, networking, child
+/// supervision) for booting arbitrary OCI rootfs images as PID 1.
+#[cfg(target_os = "linux")]
+pub mod supervisor;
+
 use std::os::fd::AsRawFd;
 use std::path::Path;
 

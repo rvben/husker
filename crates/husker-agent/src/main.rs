@@ -17,6 +17,13 @@ async fn main() -> Result<()> {
         let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
         if husker_agent::is_supervisor_mode(std::process::id() == 1, &cmdline) {
             info!("husker-agent running as the guest init/supervisor (husker.init=1)");
+            // A critical mount failing means a half-booted guest; reboot rather
+            // than serve in a broken state. Best-effort mounts are skipped inside.
+            if let Err(e) = husker_agent::supervisor::mount_all() {
+                error!("fatal init failure: {e}; rebooting guest");
+                husker_agent::supervisor::reboot_now();
+            }
+            husker_agent::supervisor::ensure_device_nodes();
         }
     }
 
