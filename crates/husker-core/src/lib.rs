@@ -530,6 +530,19 @@ fn resolve_vmm_kind(
     }
 }
 
+/// Append the agent-supervisor boot tokens to a direct-kernel cmdline when the
+/// booting image declares a `boot_init` (set by `import-oci`). A user-supplied
+/// explicit `init=` already on the cmdline wins and is left untouched.
+#[cfg(feature = "linux-net")]
+fn apply_boot_init(base: &str, boot_init: Option<&str>) -> String {
+    match boot_init {
+        Some(path) if !base.split_whitespace().any(|t| t.starts_with("init=")) => {
+            format!("{base} init={path} husker.init=1")
+        }
+        _ => base.to_string(),
+    }
+}
+
 /// Guest runtime injected into an OCI rootfs so it boots as a husker microVM:
 /// busybox init reads the inittab, which mounts essentials, configures the
 /// network, and starts the agent.
@@ -1009,6 +1022,19 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let volume_path = volume_attachment.as_ref().map(|(_, p)| p.clone());
 
+        // If the booting rootfs is a catalog image with a boot_init (an OCI image
+        // imported by `import-oci`), boot it via the agent supervisor. Looked up
+        // by the source rootfs path so it works however the image was referenced.
+        let boot_init = if is_cloud {
+            None
+        } else {
+            self.state.list_images().ok().and_then(|imgs| {
+                imgs.into_iter()
+                    .find(|i| i.file_path == record_rootfs_path)
+                    .and_then(|i| i.boot_init)
+            })
+        };
+
         // NAT direct-kernel VMs pass the static IP as a kernel boot parameter.
         // Cloud VMs (NAT and bridged) use cloud-init for network; kernel_args is None.
         let kernel_args = if is_cloud {
@@ -1021,11 +1047,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 ""
             };
-            Some(format!(
+            let base = format!(
                 "console=ttyS0 reboot=k panic=1 pci=off{root} \
                  ip={ip}::{gateway}:{netmask}::eth0:off",
                 ip = guest_ip.expect("direct-kernel boot is always NAT")
-            ))
+            );
+            Some(apply_boot_init(&base, boot_init.as_deref()))
         };
 
         let vm_config = husker_vmm::VmConfig {
@@ -2614,10 +2641,10 @@ impl<B: VmmBackend> HuskerCore<B> {
             file_path: image_path.to_string_lossy().into_owned(),
             format: "ext4".into(),
             kind: "rootfs".into(),
-            // boot_init is set to the agent (PID-1 supervisor) once the agent
-            // supports that mode (Phase 2); until then imported images keep the
-            // existing busybox-init boot path.
-            boot_init: None,
+            // Boot imported OCI images via the guest agent as PID 1 (the agent
+            // supervisor does mounts/network/reaping), since they carry no
+            // busybox init. The injected agent lives at this path.
+            boot_init: Some("/usr/local/bin/husker-agent".to_string()),
             size_bytes: metadata.len(),
             created_at: chrono::Utc::now(),
         };
@@ -3924,6 +3951,24 @@ async fn remove_file_best_effort(path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn apply_boot_init_appends_supervisor_tokens_when_set() {
+        let base = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw \
+                    ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off";
+        let cmd = apply_boot_init(base, Some("/usr/local/bin/husker-agent"));
+        assert!(cmd.contains("init=/usr/local/bin/husker-agent"));
+        assert!(cmd.contains("husker.init=1"));
+        // Unchanged when no boot_init is set.
+        assert_eq!(apply_boot_init(base, None), base);
+        // A user-supplied explicit init= wins (left untouched).
+        let with_init = "console=ttyS0 init=/sbin/myinit";
+        assert_eq!(
+            apply_boot_init(with_init, Some("/usr/local/bin/husker-agent")),
+            with_init
+        );
+    }
 
     #[cfg(feature = "linux-net")]
     #[test]
