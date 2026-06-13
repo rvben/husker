@@ -27,13 +27,48 @@ pub struct MountSpec {
 /// (cmdline parsing and device nodes depend on them); the rest are best-effort.
 pub fn mount_plan() -> Vec<MountSpec> {
     vec![
-        MountSpec { source: "proc", target: "/proc", fstype: "proc", critical: true },
-        MountSpec { source: "devtmpfs", target: "/dev", fstype: "devtmpfs", critical: true },
-        MountSpec { source: "sysfs", target: "/sys", fstype: "sysfs", critical: false },
-        MountSpec { source: "devpts", target: "/dev/pts", fstype: "devpts", critical: false },
-        MountSpec { source: "tmpfs", target: "/tmp", fstype: "tmpfs", critical: false },
-        MountSpec { source: "tmpfs", target: "/run", fstype: "tmpfs", critical: false },
-        MountSpec { source: "cgroup2", target: "/sys/fs/cgroup", fstype: "cgroup2", critical: false },
+        MountSpec {
+            source: "proc",
+            target: "/proc",
+            fstype: "proc",
+            critical: true,
+        },
+        MountSpec {
+            source: "devtmpfs",
+            target: "/dev",
+            fstype: "devtmpfs",
+            critical: true,
+        },
+        MountSpec {
+            source: "sysfs",
+            target: "/sys",
+            fstype: "sysfs",
+            critical: false,
+        },
+        MountSpec {
+            source: "devpts",
+            target: "/dev/pts",
+            fstype: "devpts",
+            critical: false,
+        },
+        MountSpec {
+            source: "tmpfs",
+            target: "/tmp",
+            fstype: "tmpfs",
+            critical: false,
+        },
+        MountSpec {
+            source: "tmpfs",
+            target: "/run",
+            fstype: "tmpfs",
+            critical: false,
+        },
+        MountSpec {
+            source: "cgroup2",
+            target: "/sys/fs/cgroup",
+            fstype: "cgroup2",
+            critical: false,
+        },
     ]
 }
 
@@ -88,7 +123,10 @@ pub fn mount_all() -> io::Result<()> {
             Err(e) if spec.critical => {
                 return Err(io::Error::new(
                     e.kind(),
-                    format!("critical mount {} on {} failed: {e}", spec.fstype, spec.target),
+                    format!(
+                        "critical mount {} on {} failed: {e}",
+                        spec.fstype, spec.target
+                    ),
                 ));
             }
             Err(e) => warn!(
@@ -228,7 +266,10 @@ fn run_ip(args: &[String]) -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!("`ip {}` exited {status}", args.join(" "))))
+        Err(io::Error::other(format!(
+            "`ip {}` exited {status}",
+            args.join(" ")
+        )))
     }
 }
 
@@ -388,7 +429,11 @@ mod tests {
     #[test]
     fn mount_plan_marks_proc_and_dev_critical() {
         let plan = mount_plan();
-        let critical: Vec<&str> = plan.iter().filter(|m| m.critical).map(|m| m.target).collect();
+        let critical: Vec<&str> = plan
+            .iter()
+            .filter(|m| m.critical)
+            .map(|m| m.target)
+            .collect();
         assert_eq!(critical, vec!["/proc", "/dev"]);
         assert!(
             plan.iter()
@@ -449,9 +494,16 @@ mod tests {
             "assigns the address: {cmds:?}"
         );
         assert!(
-            cmds.iter().any(
-                |c| c == &vec!["route", "replace", "default", "via", "172.20.0.1", "dev", "eth0"]
-            ),
+            cmds.iter().any(|c| c
+                == &vec![
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    "172.20.0.1",
+                    "dev",
+                    "eth0"
+                ]),
             "adds the default route: {cmds:?}"
         );
     }
