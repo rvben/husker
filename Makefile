@@ -159,6 +159,19 @@ test-vz-cloud-e2e-gated: ## Gated VZ cloud-image e2e (macOS only)
 	HUSKER_RUN_VZ_CLOUD_E2E=1 cargo nextest run -p husker --no-default-features \
 		--run-ignored all vz_cloud
 
+# Gated OCI-import boot e2e: import a Docker image and boot it as an
+# agent-supervised microVM (the OCI-native sandbox keystone). Needs Linux with
+# KVM + Firecracker + the x86_64-musl target, and TAP/Firecracker privileges
+# (run under sudo). Fetches a built-in-driver kernel unless HUSKER_E2E_KERNEL is
+# set. Intended for a self-hosted [self-hosted, husker] runner.
+# Usage: HUSKER_RUN_OCI_BOOT_E2E=1 make test-oci-boot-e2e-gated
+test-oci-boot-e2e-gated: ## Gated OCI-import boot e2e (Linux/KVM/Firecracker)
+	@if [ "$${HUSKER_RUN_OCI_BOOT_E2E:-0}" = "1" ]; then \
+		bash scripts/ci/oci_boot_e2e.sh; \
+	else \
+		echo "Skipping OCI boot e2e (set HUSKER_RUN_OCI_BOOT_E2E=1; needs Linux/KVM/Firecracker/root)"; \
+	fi
+
 # API/CLI contract tests (OpenAPI + CLI output schema stability)
 test-contracts:
 	cargo test -p husker-api --test openapi_contract
