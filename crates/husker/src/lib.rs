@@ -10,6 +10,11 @@ pub mod images;
 pub const EMBEDDED_AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent.bin"));
 
 /// Whether a guest agent was embedded at build time.
+///
+/// `EMBEDDED_AGENT` is a compile-time constant, so this is const-evaluable;
+/// surfacing that build-time fact at runtime (for logging and create-time
+/// gating) is the point, hence the `const_is_empty` allow.
+#[allow(clippy::const_is_empty)]
 pub fn agent_embedded() -> bool {
     !EMBEDDED_AGENT.is_empty()
 }
@@ -197,6 +202,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::const_is_empty)] // EMBEDDED_AGENT is const; the consistency check is intentional.
     fn embedded_agent_const_is_accessible() {
         // On a normal dev/CI build the agent is absent, so this is empty; the point
         // is that the const + include_bytes! compile and the accessor is consistent.
