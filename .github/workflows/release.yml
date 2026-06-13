@@ -67,7 +67,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v7
 
       - name: Clean stale dist
         run: rm -rf dist target/wheels
@@ -198,7 +198,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v7
 
       - name: Install maturin
         shell: bash
@@ -224,7 +224,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
 
