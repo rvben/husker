@@ -530,6 +530,52 @@ fn resolve_vmm_kind(
     }
 }
 
+/// Guest runtime injected into an OCI rootfs so it boots as a husker microVM:
+/// busybox init reads the inittab, which mounts essentials, configures the
+/// network, and starts the agent.
+#[cfg(feature = "linux-net")]
+const GUEST_INITTAB: &[u8] = include_bytes!("../../../guest/inittab");
+#[cfg(feature = "linux-net")]
+const GUEST_NET_SCRIPT: &[u8] = include_bytes!("../../../guest/husker-net.sh");
+
+/// Write the husker agent, inittab, and net script into an OCI rootfs tree, and
+/// ensure `/sbin/init` exists (symlinked to busybox when present) so the microVM
+/// boots into the agent.
+#[cfg(feature = "linux-net")]
+fn inject_guest_runtime(dir: &std::path::Path, agent: &[u8]) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    let write_exec = |rel: &str, bytes: &[u8]| -> Result<(), CoreError> {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CoreError::Io(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        std::fs::write(&p, bytes)
+            .map_err(|e| CoreError::Io(format!("write {}: {e}", p.display())))?;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| CoreError::Io(format!("chmod {}: {e}", p.display())))?;
+        Ok(())
+    };
+    write_exec("usr/local/bin/husker-agent", agent)?;
+    write_exec("usr/local/sbin/husker-net.sh", GUEST_NET_SCRIPT)?;
+
+    let inittab = dir.join("etc/inittab");
+    if let Some(parent) = inittab.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CoreError::Io(format!("mkdir etc: {e}")))?;
+    }
+    std::fs::write(&inittab, GUEST_INITTAB)
+        .map_err(|e| CoreError::Io(format!("write inittab: {e}")))?;
+
+    // The host kernel + initramfs hand off to /sbin/init; busybox-based images
+    // ship busybox but may not symlink it there.
+    let sbin_init = dir.join("sbin/init");
+    if !sbin_init.exists() && dir.join("bin/busybox").exists() {
+        let _ = std::fs::create_dir_all(dir.join("sbin"));
+        let _ = std::os::unix::fs::symlink("/bin/busybox", &sbin_init);
+    }
+    Ok(())
+}
+
 impl<B: VmmBackend> HuskerCore<B> {
     /// Create a new HuskerCore with Linux networking (bridge + TAP + nftables).
     #[cfg(feature = "linux-net")]
@@ -2458,6 +2504,101 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         Ok(record)
+    }
+
+    /// Build a husker rootfs image from an OCI/Docker image and register it.
+    ///
+    /// Pulls the image, flattens its layers, injects the husker agent + guest
+    /// runtime so the rootfs boots into the agent, builds an ext4 image, and
+    /// registers it in the catalog as a `rootfs` image runnable with `husker run`.
+    /// v1 targets busybox-init images (e.g. alpine); the host must have
+    /// `mkfs.ext4` and the daemon must embed the guest agent.
+    #[cfg(feature = "linux-net")]
+    pub async fn import_oci_image(
+        &self,
+        name: &str,
+        reference: &str,
+    ) -> Result<ImageRecord, CoreError> {
+        validate_resource_name("image", name)?;
+        if self.embedded_agent.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "OCI import needs the embedded guest agent; build the daemon with \
+                 `make build-agent` (or set HUSKER_EMBED_AGENT_BIN) first"
+                    .into(),
+            ));
+        }
+        match self.state.get_image_by_name(name) {
+            Ok(_) => return Err(CoreError::ImageAlreadyExists(name.into())),
+            Err(husker_state::StateError::ImageNotFoundByName(_)) => {}
+            Err(other) => return Err(CoreError::State(other)),
+        }
+
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unsupported host architecture for OCI import: {other}"
+                )));
+            }
+        };
+
+        // Pull + flatten into a temp dir, then inject the guest runtime.
+        let work = tempfile::tempdir().map_err(|e| CoreError::Io(format!("oci work dir: {e}")))?;
+        let rootfs_dir = work.path().join("rootfs");
+        husker_oci::pull_and_flatten(reference, arch, &rootfs_dir)
+            .await
+            .map_err(|e| CoreError::InvalidArgument(format!("pull {reference}: {e}")))?;
+        inject_guest_runtime(&rootfs_dir, self.embedded_agent)?;
+
+        // Build the ext4 image sized to the tree plus generous overhead.
+        let catalog_dir = self.storage.images_dir().join("catalog");
+        tokio::fs::create_dir_all(&catalog_dir)
+            .await
+            .map_err(husker_storage::StorageError::Io)?;
+        let image_path = catalog_dir.join(format!("{name}.ext4"));
+        let tree_size = {
+            let d = rootfs_dir.clone();
+            tokio::task::spawn_blocking(move || husker_storage::dir_apparent_size(&d))
+                .await
+                .map_err(|e| CoreError::Io(format!("size join: {e}")))?
+        };
+        let size_bytes = (tree_size * 2).max(128 * 1024 * 1024) + 64 * 1024 * 1024;
+        husker_storage::build_ext4_from_dir(&rootfs_dir, &image_path, size_bytes).await?;
+
+        let metadata = tokio::fs::metadata(&image_path)
+            .await
+            .map_err(husker_storage::StorageError::Io)?;
+        let record = ImageRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            source_path: format!("oci://{reference}"),
+            file_path: image_path.to_string_lossy().into_owned(),
+            format: "ext4".into(),
+            kind: "rootfs".into(),
+            size_bytes: metadata.len(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(err) = self.state.insert_image(&record).map_err(|e| match e {
+            husker_state::StateError::ImageAlreadyExists(n) => CoreError::ImageAlreadyExists(n),
+            other => CoreError::State(other),
+        }) {
+            let _ = tokio::fs::remove_file(&image_path).await;
+            return Err(err);
+        }
+        Ok(record)
+    }
+
+    /// OCI import is Linux-only (needs `mkfs.ext4`); the macOS build rejects it.
+    #[cfg(not(feature = "linux-net"))]
+    pub async fn import_oci_image(
+        &self,
+        _name: &str,
+        _reference: &str,
+    ) -> Result<ImageRecord, CoreError> {
+        Err(CoreError::Vmm(husker_vmm::VmmError::Unsupported(
+            "OCI image import is only supported on Linux".into(),
+        )))
     }
 
     /// List all catalog images.

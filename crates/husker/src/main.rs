@@ -634,6 +634,14 @@ enum ImageAction {
         #[arg(long, value_parser = ["rootfs", "cloud-image"])]
         kind: Option<String>,
     },
+    /// Import an OCI/Docker image as a bootable rootfs (busybox-based, e.g. alpine)
+    ImportOci {
+        /// OCI/Docker reference, e.g. alpine:3.20 or ghcr.io/owner/image:tag
+        reference: String,
+        /// Catalog name for the image (defaults to a slug of the reference)
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// List imported images
     List,
     /// Get an image by name
@@ -1484,6 +1492,29 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         _ => vec![],
     };
     (!read_only, output_fields)
+}
+
+/// Derive a default catalog image name from an OCI reference: the last path
+/// component with its tag, sanitized (e.g. `alpine:3.20` -> `alpine-3.20`,
+/// `ghcr.io/o/img:v1` -> `img-v1`).
+fn oci_default_image_name(reference: &str) -> String {
+    let last = reference.rsplit('/').next().unwrap_or(reference);
+    let name: String = last
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = name.trim_matches('-');
+    if trimmed.is_empty() {
+        "oci-image".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 impl Default for Config {
@@ -3828,6 +3859,36 @@ async fn image_command(
                 );
             } else {
                 let msg = api_error(resp, &format!("image '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        ImageAction::ImportOci { reference, name } => {
+            let name = name.unwrap_or_else(|| oci_default_image_name(&reference));
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/images/import-oci")),
+                    api_token.as_deref(),
+                )
+                .json(&serde_json::json!({ "name": &name, "reference": &reference })),
+            )
+            .await?;
+
+            if resp.status().is_success() {
+                let image: serde_json::Value = resp.json().await?;
+                print_output(
+                    output,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "action": "image-import-oci",
+                        "image": image,
+                    }),
+                    format!(
+                        "Imported OCI image '{reference}' as '{}'",
+                        image["name"].as_str().unwrap_or(&name)
+                    ),
+                );
+            } else {
+                let msg = api_error(resp, &format!("image '{reference}'")).await;
                 exit_with_error(output, msg);
             }
         }

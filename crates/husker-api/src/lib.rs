@@ -216,6 +216,15 @@ pub struct ForkRequest {
     pub fork_name: String,
 }
 
+/// Body for `POST /v1/images/import-oci`: pull an OCI image and register it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportOciRequest {
+    /// Catalog name for the resulting image.
+    pub name: String,
+    /// OCI/Docker reference, e.g. `alpine:3.20` or `ghcr.io/o/i:tag`.
+    pub reference: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub code: String,
@@ -517,6 +526,7 @@ pub enum WsShellOutput {
         scale_service,
         list_images,
         import_image,
+        import_oci_image,
         get_image,
         delete_image,
         export_image,
@@ -589,6 +599,7 @@ pub enum WsShellOutput {
         CreateSnapshotRequest,
         RestoreSnapshotRequest,
         ImportImageRequest,
+        ImportOciRequest,
         ExportImageRequest,
         CreateSecretRequest,
         RotateSecretRequest,
@@ -776,6 +787,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         )
         .route("/v1/services/{name}/scale", post(scale_service::<B>))
         .route("/v1/images", get(list_images::<B>).post(import_image::<B>))
+        .route("/v1/images/import-oci", post(import_oci_image::<B>))
         .route(
             "/v1/images/{name}",
             get(get_image::<B>).delete(delete_image::<B>),
@@ -1435,6 +1447,28 @@ async fn import_image<B: VmmBackend + 'static>(
     Json(req): Json<ImportImageRequest>,
 ) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
     let image = core.import_image(req).await.map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(image_to_response(image))))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/images/import-oci",
+    tag = "images",
+    request_body = ImportOciRequest,
+    responses(
+        (status = 201, description = "OCI image imported as a rootfs", body = ImageResponse),
+        (status = 409, description = "Image already exists", body = ErrorResponse),
+        (status = 400, description = "Invalid reference or pull failed", body = ErrorResponse)
+    )
+)]
+async fn import_oci_image<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<ImportOciRequest>,
+) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let image = core
+        .import_oci_image(&req.name, &req.reference)
+        .await
+        .map_err(map_error)?;
     Ok((StatusCode::CREATED, Json(image_to_response(image))))
 }
 

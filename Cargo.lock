@@ -990,6 +990,7 @@ dependencies = [
  "husker-agent-proto",
  "husker-cloudinit",
  "husker-net",
+ "husker-oci",
  "husker-state",
  "husker-storage",
  "husker-vmm",
@@ -1011,6 +1012,22 @@ version = "0.4.9"
 dependencies = [
  "proptest",
  "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "husker-oci"
+version = "0.4.9"
+dependencies = [
+ "flate2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

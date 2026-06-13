@@ -384,6 +384,79 @@ pub async fn create_volume_image(path: &Path, size_bytes: u64) -> Result<(), Sto
     }
 }
 
+/// Build an ext4 image at `path` populated from the directory tree `src_dir`,
+/// using `mkfs.ext4 -d`. `size_bytes` must be large enough to hold the tree
+/// plus filesystem overhead. The partial image is removed on failure.
+///
+/// `path` must not already exist.
+pub async fn build_ext4_from_dir(
+    src_dir: &Path,
+    path: &Path,
+    size_bytes: u64,
+) -> Result<(), StorageError> {
+    if path.exists() {
+        return Err(StorageError::VolumeImage(format!(
+            "image already exists: {}",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    {
+        let file = std::fs::File::create(path)?;
+        file.set_len(size_bytes)?;
+    }
+    let output = tokio::process::Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg("-q")
+        .arg("-d")
+        .arg(src_dir)
+        .arg(path)
+        .output()
+        .await;
+    match output {
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(StorageError::VolumeImage(format!(
+                "mkfs.ext4 -d spawn failed: {e}"
+            )))
+        }
+        Ok(out) if !out.status.success() => {
+            let _ = std::fs::remove_file(path);
+            Err(StorageError::VolumeImage(format!(
+                "mkfs.ext4 -d {} failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Total apparent size of all regular files under `dir`, for sizing an ext4
+/// image built from it. Best-effort: unreadable entries are skipped.
+pub fn dir_apparent_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 /// Validate that a volume image file exists at `path`.
 ///
 /// Used at attach time to confirm the image has not been deleted outside husker.

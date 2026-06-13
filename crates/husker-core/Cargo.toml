@@ -15,6 +15,7 @@ husker-vmm = { workspace = true }
 husker-net = { workspace = true, optional = true }
 husker-cloudinit = { workspace = true }
 husker-storage = { workspace = true }
+husker-oci = { workspace = true }
 husker-state = { workspace = true }
 husker-agent-proto = { workspace = true }
 tokio = { workspace = true }

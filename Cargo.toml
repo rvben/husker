@@ -10,6 +10,7 @@ members = [
     "crates/husker-api",
     "crates/husker-state",
     "crates/husker-cloudinit",
+    "crates/husker-oci",
 ]
 resolver = "3"
 
@@ -92,6 +93,7 @@ husker-agent-proto = { path = "crates/husker-agent-proto" }
 husker-api = { path = "crates/husker-api", default-features = false }
 husker-state = { path = "crates/husker-state" }
 husker-cloudinit = { path = "crates/husker-cloudinit" }
+husker-oci = { path = "crates/husker-oci" }
 
 [profile.release]
 lto = true
