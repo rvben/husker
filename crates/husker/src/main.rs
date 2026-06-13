@@ -342,7 +342,9 @@ enum Commands {
 
         /// Sync the current working directory into the VM (git-aware: tracked plus
         /// untracked-not-ignored files, gitignored build dirs excluded) and run the
-        /// command there. The host filesystem is never modified.
+        /// command there. The host filesystem is never modified (see --out /
+        /// --write-back to pull results back). The command runs in the job's image,
+        /// so pass a rootfs or --cloud-image that has your toolchain.
         #[arg(long = "sync-cwd")]
         sync_cwd: bool,
 
@@ -2771,6 +2773,17 @@ async fn run(cli: Cli) -> Result<()> {
                             eprintln!("[job] exit code {exit_code}, destroying vm");
                         }
                         do_cleanup().await;
+                    }
+                    // Exit 127 in a synced sandbox almost always means the command
+                    // isn't in the (minimal) default image. Point at the fix.
+                    if sync_cwd && exit_code == 127 && output == OutputFormat::Text {
+                        eprintln!(
+                            "[job] hint: exit 127 usually means the command was not found in the \
+                             sandbox image. The default image is minimal (no language toolchains); \
+                             run against an image that includes your toolchain (pass a rootfs path \
+                             or --cloud-image, e.g. a Docker image brought in with \
+                             `husker image import-oci`)."
+                        );
                     }
                     if exit_code != 0 {
                         std::process::exit(exit_code.clamp(1, 255) as i32);
