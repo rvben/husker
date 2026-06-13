@@ -190,6 +190,14 @@ const DEFAULT_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 /// runaway exec buffer degrades gracefully instead of taking the agent down.
 pub const AGENT_MEMORY_HIGH_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Whether this process should run as the guest init/supervisor. It must be
+/// PID 1 *and* the kernel cmdline must carry the explicit `husker.init=1`
+/// marker, so the agent never assumes init duties merely because it happens to
+/// be PID 1 (e.g. in a container, PID namespace, or test harness).
+pub fn is_supervisor_mode(is_pid1: bool, kernel_cmdline: &str) -> bool {
+    is_pid1 && kernel_cmdline.split_whitespace().any(|t| t == "husker.init=1")
+}
+
 /// Places the calling process in a dedicated cgroup v2 leaf with a memory
 /// throttle, so the agent can never starve the workload of guest memory.
 /// `cgroup_root` is the mounted cgroup2 filesystem (normally /sys/fs/cgroup).
@@ -489,6 +497,18 @@ async fn apply_network_reconfigure(req: &ReconfigureNetworkRequest) -> Result<()
 mod tests {
     use super::*;
     use husker_agent_proto::ReconfigureNetworkRequest;
+
+    #[test]
+    fn supervisor_mode_requires_pid1_and_marker() {
+        // PID 1 with the explicit marker -> supervisor.
+        assert!(is_supervisor_mode(true, "ro init=/usr/local/bin/husker-agent husker.init=1"));
+        // PID 1 without the marker -> not supervisor (avoid accidental init).
+        assert!(!is_supervisor_mode(true, "ro console=ttyS0 quiet"));
+        // The marker without being PID 1 -> not supervisor.
+        assert!(!is_supervisor_mode(false, "husker.init=1"));
+        // A substring must not match a whole token.
+        assert!(!is_supervisor_mode(true, "husker.init=10"));
+    }
 
     fn sample_req(mac: Option<&str>) -> ReconfigureNetworkRequest {
         ReconfigureNetworkRequest {

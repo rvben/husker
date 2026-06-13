@@ -7,6 +7,19 @@ async fn main() -> Result<()> {
 
     info!("husker-agent starting");
 
+    // Guest init/supervisor mode: when booted as PID 1 with the husker.init=1
+    // marker (set by import-oci images), the agent performs minimal init -
+    // mounts, networking, child reaping - before serving. Detection is wired
+    // here; the init duties are added incrementally and are not yet set on any
+    // image in production (imported images still boot the existing path).
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        if husker_agent::is_supervisor_mode(std::process::id() == 1, &cmdline) {
+            info!("husker-agent running as the guest init/supervisor (husker.init=1)");
+        }
+    }
+
     if let Err(e) = husker_agent::configure_self_cgroup(
         std::path::Path::new("/sys/fs/cgroup"),
         husker_agent::AGENT_MEMORY_HIGH_BYTES,
