@@ -8,7 +8,10 @@ use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use tar::Archive;
 
-pub const FIRECRACKER_VERSION: &str = "v1.10.1";
+// `husker fork` overrides the host TAP name on `/snapshot/load` via the
+// `network_overrides` field, added in Firecracker 1.12.0 (PR #4731), so the
+// pinned binary must be >= 1.12.0. Pin a recent stable.
+pub const FIRECRACKER_VERSION: &str = "v1.16.0";
 
 fn binary_name() -> String {
     format!(

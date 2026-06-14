@@ -98,6 +98,34 @@ pub struct FirecrackerBackend {
     instances: Arc<Mutex<HashMap<Uuid, FcInstance>>>,
 }
 
+/// Minimum Firecracker version `husker fork` needs: the `network_overrides`
+/// field on `/snapshot/load`, added in 1.12.0 (PR #4731).
+const FORK_MIN_FIRECRACKER: (u32, u32, u32) = (1, 12, 0);
+
+/// Parse Firecracker's `--version` output into `(major, minor, patch)`. The
+/// first line looks like `Firecracker v1.16.0`; the first whitespace token that
+/// parses as `X.Y[.Z]` (optional leading `v`, trailing non-digits ignored) wins.
+fn parse_firecracker_version(output: &str) -> Option<(u32, u32, u32)> {
+    let line = output.lines().next()?;
+    line.split_whitespace().find_map(|tok| {
+        let t = tok.trim_start_matches('v');
+        let mut it = t.split('.');
+        let major = it.next()?.parse::<u32>().ok()?;
+        let minor = it.next()?.parse::<u32>().ok()?;
+        let patch = it
+            .next()
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        Some((major, minor, patch))
+    })
+}
+
 impl FirecrackerBackend {
     pub fn new(firecracker_bin: impl Into<PathBuf>, runtime_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -105,6 +133,39 @@ impl FirecrackerBackend {
             runtime_dir: runtime_dir.into(),
             instances: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Fail with a clear message when the installed Firecracker is too old to
+    /// fork (it would otherwise reject the `network_overrides` field with an
+    /// opaque 400). Run `firecracker --version` and compare.
+    async fn assert_firecracker_supports_fork(&self) -> Result<(), VmmError> {
+        let output = tokio::process::Command::new(&self.firecracker_bin)
+            .arg("--version")
+            .output()
+            .await
+            .map_err(|e| {
+                VmmError::ProcessError(format!(
+                    "run `{} --version`: {e}",
+                    self.firecracker_bin.display()
+                ))
+            })?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let version = parse_firecracker_version(&text).ok_or_else(|| {
+            VmmError::ProcessError(format!(
+                "could not parse Firecracker version from: {}",
+                text.trim()
+            ))
+        })?;
+        if version < FORK_MIN_FIRECRACKER {
+            let (mi, mj, mp) = FORK_MIN_FIRECRACKER;
+            let (a, b, c) = version;
+            return Err(VmmError::Unsupported(format!(
+                "husker fork requires Firecracker >= {mi}.{mj}.{mp} (it overrides the host TAP \
+                 on snapshot restore via `network_overrides`, added in {mi}.{mj}.{mp}); found \
+                 {a}.{b}.{c}. Upgrade firecracker."
+            )));
+        }
+        Ok(())
     }
 
     /// Send an HTTP request to the Firecracker API over its Unix socket.
@@ -671,6 +732,14 @@ impl VmmBackend for FirecrackerBackend {
             ),
         };
 
+        // A fork rebinds the guest NIC to a fresh host TAP via the
+        // `network_overrides` field on `/snapshot/load`, which Firecracker only
+        // understands from 1.12.0 on. Check up front so an old binary fails with
+        // a clear, actionable message instead of an opaque deserialization 400.
+        if fork.is_some() {
+            self.assert_firecracker_supports_fork().await?;
+        }
+
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
         let boot_log_path = self.runtime_dir.join(format!("{id}.boot.log"));
         let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
@@ -812,6 +881,45 @@ impl VmmBackend for FirecrackerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_firecracker_version_extracts_semver() {
+        assert_eq!(
+            parse_firecracker_version("Firecracker v1.16.0\nSupported ..."),
+            Some((1, 16, 0))
+        );
+        // No leading 'v', extra patch text, and minimal "X.Y" all parse.
+        assert_eq!(
+            parse_firecracker_version("Firecracker 1.12.3"),
+            Some((1, 12, 3))
+        );
+        assert_eq!(
+            parse_firecracker_version("Firecracker v2.0.0-rc1"),
+            Some((2, 0, 0))
+        );
+        assert_eq!(
+            parse_firecracker_version("Firecracker v1.10"),
+            Some((1, 10, 0))
+        );
+        // Junk lines yield nothing.
+        assert_eq!(parse_firecracker_version("no version here"), None);
+        assert_eq!(parse_firecracker_version(""), None);
+    }
+
+    #[test]
+    fn fork_min_version_ordering() {
+        // Tuple ordering is the comparison the preflight uses.
+        assert!(
+            (1, 10, 1) < FORK_MIN_FIRECRACKER,
+            "v1.10.1 is too old to fork"
+        );
+        assert!(
+            (1, 11, 0) < FORK_MIN_FIRECRACKER,
+            "v1.11.0 is too old to fork"
+        );
+        assert!((1, 12, 0) >= FORK_MIN_FIRECRACKER, "v1.12.0 is the floor");
+        assert!((1, 16, 0) >= FORK_MIN_FIRECRACKER, "v1.16.0 supports fork");
+    }
 
     #[test]
     fn vm_state_display() {
