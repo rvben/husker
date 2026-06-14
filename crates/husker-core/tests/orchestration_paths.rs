@@ -1095,25 +1095,36 @@ async fn add_port_forward_rejects_missing_tap_device() {
 /// `add_port_forward` keys on the TAP/guest IP and never branches on VMM kind.
 ///
 /// Gated like the other net e2e tests: runs and no-ops by default, and does real
-/// nft work only under `HUSKER_RUN_NET_E2E=1` with root on Linux. The host
-/// interface passed to `init_nat` may need adjusting per host.
+/// nft work only under `HUSKER_RUN_NET_E2E=1` with root on Linux. Uses a
+/// test-only bridge/subnet, so it is safe to run on a host already running a
+/// husker daemon (it never touches the daemon's `husker0` bridge or table).
 #[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn port_forward_applies_for_qemu_backed_vm() {
     if std::env::var("HUSKER_RUN_NET_E2E").is_err() {
         return;
     }
+    const BRIDGE: &str = "hpfq0";
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("run");
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // The bridge `add_port_forward` targets (build_core uses "husker0").
-    husker_net::create_bridge("husker0", std::net::Ipv4Addr::new(192, 0, 2, 1), 30)
+    // Detect the default-route interface for the masquerade rule.
+    let host_iface = std::process::Command::new("sh")
+        .args(["-c", "ip route show default | awk '{print $5; exit}'"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "eth0".into());
+
+    husker_net::create_bridge(BRIDGE, std::net::Ipv4Addr::new(192, 0, 2, 1), 24)
         .await
         .unwrap();
-    husker_net::init_nat("husker0", "192.0.2.0/30", "eth0")
+    husker_net::init_nat(BRIDGE, "192.0.2.0/24", &host_iface)
         .await
         .ok();
 
@@ -1126,12 +1137,24 @@ async fn port_forward_applies_for_qemu_backed_vm() {
         None,
         None,
         Some("192.0.2.2".into()),
-        Some("husker-pf-qemu".into()),
+        Some("hpfq-tap0".into()),
     );
     vm.vmm = "qemu".into();
     state.insert_vm(&vm).unwrap();
 
-    let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
+    // Core wired to the test bridge (build_core hardcodes husker0).
+    let core = Arc::new(HuskerCore::new(
+        MockVmm::new(),
+        state,
+        husker_net::IpAllocator::new(std::net::Ipv4Addr::new(192, 0, 2, 0), 24),
+        StorageConfig {
+            data_dir: data_dir.clone(),
+        },
+        BRIDGE.to_string(),
+        vec!["8.8.8.8".into()],
+        runtime_dir.clone(),
+    ));
+
     core.add_port_forward("qemu-pf", 18090, 80, None)
         .await
         .unwrap();
@@ -1139,23 +1162,34 @@ async fn port_forward_applies_for_qemu_backed_vm() {
     assert_eq!(forwards.len(), 1);
     assert_eq!(forwards[0].host_port, 18090);
 
-    let nft = tokio::process::Command::new("nft")
-        .args([
-            "list",
-            "table",
-            "ip",
-            &husker_net::nft_table_for_bridge("husker0"),
-        ])
+    let table = husker_net::nft_table_for_bridge(BRIDGE);
+    let rules = tokio::process::Command::new("nft")
+        .args(["list", "table", "ip", &table])
+        .output()
+        .await
+        .unwrap();
+    let rules = String::from_utf8_lossy(&rules.stdout);
+    assert!(
+        rules.contains("18090") && rules.contains("192.0.2.2"),
+        "nft DNAT rule should target the qemu-backed VM's guest:\n{rules}"
+    );
+
+    core.remove_port_forward("qemu-pf", 18090).await.unwrap();
+    let after = tokio::process::Command::new("nft")
+        .args(["list", "table", "ip", &table])
         .output()
         .await
         .unwrap();
     assert!(
-        String::from_utf8_lossy(&nft.stdout).contains("18090"),
-        "nft DNAT rule should exist for the qemu-backed VM's forward"
+        !String::from_utf8_lossy(&after.stdout).contains("18090"),
+        "nft DNAT rule should be gone after removal"
     );
 
-    core.remove_port_forward("qemu-pf", 18090).await.unwrap();
-    husker_net::delete_bridge("husker0").await.ok();
+    husker_net::delete_bridge(BRIDGE).await.ok();
+    let _ = tokio::process::Command::new("nft")
+        .args(["delete", "table", "ip", &table])
+        .output()
+        .await;
 }
 
 #[cfg(feature = "linux-net")]
