@@ -6124,11 +6124,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage,
             runtime_dir,
         )
-        .with_default_images(
-            Some(kernel_path.clone()),
-            Some(rootfs_path.clone()),
-            None,
-        );
+        .with_default_images(Some(kernel_path.clone()), Some(rootfs_path.clone()), None);
 
         // A request with no explicit kernel/rootfs should not return the
         // "no kernel specified" error; it should get past validation and

@@ -1735,7 +1735,9 @@ fn build_vm_request_body(
         // Only include kernel/rootfs/initrd in the request when the user explicitly
         // provided them. When omitted, the daemon resolves defaults from its own
         // config, ensuring the paths exist on the daemon host rather than the client.
-        let explicit_rootfs = args.rootfs.map(|path| husker::resolve_rootfs_arg(path, &config.data_dir));
+        let explicit_rootfs = args
+            .rootfs
+            .map(|path| husker::resolve_rootfs_arg(path, &config.data_dir));
         let explicit_kernel = args.kernel;
         let explicit_initrd = args.initrd;
 
@@ -1772,9 +1774,7 @@ fn build_vm_request_body(
                 .as_ref()
                 .map(|p: &std::path::PathBuf| p.display().to_string())
                 .unwrap_or_else(|| "(daemon default)".to_string());
-            eprintln!(
-                "Using: kernel={kernel_str} rootfs={rootfs_str} initrd={initrd_str}",
-            );
+            eprintln!("Using: kernel={kernel_str} rootfs={rootfs_str} initrd={initrd_str}",);
         }
         if let Some(ref rootfs) = explicit_rootfs {
             body["rootfs_path"] = serde_json::json!(rootfs);
