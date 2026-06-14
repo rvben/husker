@@ -143,6 +143,43 @@ async fn exec_times_out_on_long_running_command() {
 }
 
 #[tokio::test]
+async fn exec_returns_promptly_when_a_backgrounded_child_holds_the_pipe() {
+    // A foreground command that exits while a backgrounded process inherits its
+    // stdout must not keep `exec` blocked: once the foreground command is done we
+    // return its output promptly (bounded by the drain grace) instead of waiting
+    // for the orphaned grandchild to close the pipe. Regression for an unbounded
+    // drain-join on the clean-exit path.
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::Exec(ExecRequest {
+        command: "sh".into(),
+        args: vec!["-c".into(), "sleep 30 & echo done".into()],
+        working_dir: None,
+        env: vec![],
+        timeout_secs: Some(60),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(5), read_message(&mut stream))
+            .await
+            .expect(
+                "exec must return promptly after the foreground child exits, not block \
+                 on the backgrounded grandchild still holding the stdout pipe",
+            )
+            .unwrap()
+            .unwrap();
+
+    match response {
+        AgentResponse::Exec(r) => {
+            assert_eq!(r.exit_code, 0, "foreground command exited cleanly");
+            assert_eq!(r.stdout.trim(), "done");
+        }
+        other => panic!("expected Exec response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn exec_nonexistent_command() {
     let mut stream = spawn_agent().await;
 

@@ -265,6 +265,28 @@ fn resolve_exec_timeout(requested: Option<u64>) -> std::time::Duration {
     }
 }
 
+/// Grace given to the stdout/stderr drain tasks to flush after the foreground
+/// child has finished (exited or been killed). Bounds the case where a
+/// backgrounded grandchild inherited the pipes and never closes them, so a
+/// one-shot exec returns the foreground result promptly instead of blocking on
+/// an orphan. The buffered output of the foreground process drains in
+/// microseconds, so this only ever delays the orphan edge case.
+const EXEC_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Flush whatever the drain tasks have buffered, bounded by [`EXEC_DRAIN_GRACE`].
+/// Detached tasks left running (an orphan still holding a pipe) are harmless: the
+/// buffer is captured by the caller after this returns.
+async fn join_drains_with_grace(
+    out_task: tokio::task::JoinHandle<()>,
+    err_task: tokio::task::JoinHandle<()>,
+) {
+    let _ = tokio::time::timeout(EXEC_DRAIN_GRACE, async {
+        let _ = out_task.await;
+        let _ = err_task.await;
+    })
+    .await;
+}
+
 /// Drain an async reader into a shared buffer until EOF, so a child's output is
 /// captured incrementally and a timeout can still return what was produced.
 fn spawn_drain<R>(
@@ -321,8 +343,7 @@ async fn run_exec_with_capture(
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
-            let _ = out_task.await;
-            let _ = err_task.await;
+            join_drains_with_grace(out_task, err_task).await;
             AgentResponse::Exec(ExecResponse {
                 exit_code: status.code().unwrap_or(-1),
                 stdout: take(&out_buf),
@@ -334,13 +355,9 @@ async fn run_exec_with_capture(
         }),
         Err(_) => {
             let _ = child.start_kill();
-            // Give the drain tasks a moment to flush whatever buffered before the
-            // kill closes the pipes, then collect the partial output.
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(250), async {
-                let _ = out_task.await;
-                let _ = err_task.await;
-            })
-            .await;
+            // Flush whatever buffered before the kill closes the pipes, then
+            // collect the partial output.
+            join_drains_with_grace(out_task, err_task).await;
             let mut stderr = take(&err_buf);
             if !stderr.is_empty() && !stderr.ends_with('\n') {
                 stderr.push('\n');
