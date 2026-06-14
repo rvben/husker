@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.14] - 2026-06-14
+
+A round of OCI/job usability fixes found while dogfooding the OCI-boot work.
+
+### Added
+
+- **`run`/`job` accept a catalog image name or an OCI reference, not just a
+  path.** `husker job python:3.12-alpine -- ...` auto-imports the image on first
+  use (cached afterwards), and `husker run myimg` resolves a catalog image by
+  name - no need to know the on-disk catalog path. A bare unknown name now gives
+  a clear error instead of a missing-file one.
+- **`husker job <oci-image>` with no command runs the image default.** Like
+  `docker run <image>`, omitting the command after `--` now runs the image's
+  Entrypoint + Cmd instead of being a parse error; any args you pass are
+  appended. A plain (non-OCI) rootfs with no default returns a clear error.
+- **`--env-file <path>` for `run`, `job`, and `exec`.** Read environment
+  variables from a `KEY=VALUE` file (repeatable) instead of `-e` flags that land
+  in the host process table and shell history. Blank lines and `#` comments are
+  skipped, a leading `export ` is tolerated, and a line without `=` fails loudly;
+  an explicit `-e` overrides a file entry on a key collision.
+- **Per-VM `--dns <ip>` and `--add-host name:ip` for `run` and `job`.** Override
+  a single VM's DNS and `/etc/hosts` without the daemon-wide `dns_servers` change
+  that affected every VM (including service runners). `--dns` replaces the VM's
+  `/etc/resolv.conf` nameservers; `--add-host` merges entries into `/etc/hosts`
+  idempotently. The `name:ip` split is on the first colon, so IPv6 values work.
+
+### Fixed
+
+- **Long execs honor `--timeout` and no longer lose their output.** Previously
+  `--timeout` only bounded the daemon-side call while the guest agent capped
+  every command at 600s and discarded the partial output on timeout. The timeout
+  now propagates to the agent, and on timeout the command's output so far is
+  returned with exit code 124 (the conventional timeout code) plus a note.
+- **Boot and agent-readiness failures point at the guest serial log.** A VM that
+  boots but whose guest never brings up the agent (and a `job` that times out
+  waiting for boot) now include the tail of the guest serial console plus a
+  `husker logs --source serial <name>` hint, instead of a bare "agent not ready".
+
+### Changed
+
+- **`husker image delete` is gated on confirmation like `husker destroy`:** it
+  prompts on a TTY and requires `--yes` when stdin is not a TTY (and now accepts
+  `--yes`, which it previously rejected).
+
 ## [0.4.13] - 2026-06-14
 
 ### Added
