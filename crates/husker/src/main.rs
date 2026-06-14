@@ -130,6 +130,16 @@ enum Commands {
         #[arg(long = "env-file")]
         env_file: Vec<PathBuf>,
 
+        /// DNS server for this VM's /etc/resolv.conf (repeatable). Scoped to this
+        /// VM only, unlike the daemon-wide dns_servers config.
+        #[arg(long = "dns")]
+        dns: Vec<String>,
+
+        /// Add a hostname-to-IP entry to this VM's /etc/hosts as name:ip
+        /// (repeatable), e.g. --add-host registry.local:192.0.2.10.
+        #[arg(long = "add-host")]
+        add_host: Vec<String>,
+
         /// Backend to run this VM on
         #[arg(long, value_parser = ["firecracker", "qemu"])]
         vmm: Option<String>,
@@ -310,6 +320,16 @@ enum Commands {
         /// secrets out of the process table and shell history; explicit -e wins.
         #[arg(long = "env-file")]
         env_file: Vec<PathBuf>,
+
+        /// DNS server for this VM's /etc/resolv.conf (repeatable). Scoped to this
+        /// VM only, unlike the daemon-wide dns_servers config.
+        #[arg(long = "dns")]
+        dns: Vec<String>,
+
+        /// Add a hostname-to-IP entry to this VM's /etc/hosts as name:ip
+        /// (repeatable), e.g. --add-host registry.local:192.0.2.10.
+        #[arg(long = "add-host")]
+        add_host: Vec<String>,
 
         /// Backend to run this VM on
         #[arg(long, value_parser = ["firecracker", "qemu"])]
@@ -1015,6 +1035,182 @@ async fn serial_boot_hint(
         "\n--- guest serial console (tail) ---\n{tail}\n\
          hint: run `husker logs --source serial {name}` for the full guest console"
     )
+}
+
+/// Parse a `--add-host name:ip` value into `(hostname, ip)`. The split is on the
+/// FIRST `:` so IPv6 addresses (which contain colons) work
+/// (`db:2001:db8::1` -> `("db", "2001:db8::1")`); the IP must parse.
+fn parse_add_host(spec: &str) -> anyhow::Result<(String, String)> {
+    let (host, ip) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--add-host expects name:ip, got `{spec}`"))?;
+    let host = host.trim();
+    let ip = ip.trim();
+    if host.is_empty() {
+        anyhow::bail!("--add-host has an empty hostname in `{spec}`");
+    }
+    ip.parse::<std::net::IpAddr>()
+        .map_err(|_| anyhow::anyhow!("--add-host `{spec}` has an invalid IP `{ip}`"))?;
+    Ok((host.to_string(), ip.to_string()))
+}
+
+/// Validate `--dns` values as IP addresses, returning them unchanged.
+fn validate_dns(dns: &[String]) -> anyhow::Result<()> {
+    for d in dns {
+        d.parse::<std::net::IpAddr>()
+            .map_err(|_| anyhow::anyhow!("--dns `{d}` is not a valid IP address"))?;
+    }
+    Ok(())
+}
+
+/// `/etc/resolv.conf` contents for the given nameservers (one per line).
+fn render_resolv_conf(dns: &[String]) -> String {
+    dns.iter().map(|s| format!("nameserver {s}\n")).collect()
+}
+
+/// Merge `host -> ip` entries into existing `/etc/hosts` content, appending any
+/// pair not already present (idempotent). Returns the new file content.
+fn merge_etc_hosts(existing: &str, additions: &[(String, String)]) -> String {
+    let mut out = existing.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for (host, ip) in additions {
+        let already = existing.lines().any(|l| {
+            let mut toks = l.split_whitespace();
+            toks.next() == Some(ip.as_str()) && toks.any(|t| t == host)
+        });
+        if !already {
+            out.push_str(&format!("{ip}\t{host}\n"));
+        }
+    }
+    out
+}
+
+/// Apply per-VM DNS and host entries by writing `/etc/resolv.conf` (replacing it
+/// with `--dns` nameservers) and merging `--add-host` entries into `/etc/hosts`,
+/// both via the guest file API. Scoped to this VM only - no daemon-wide change.
+async fn apply_dns_hosts(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_token: Option<&str>,
+    name: &str,
+    dns: &[String],
+    add_host: &[(String, String)],
+) -> anyhow::Result<()> {
+    if !dns.is_empty() {
+        write_guest_file(
+            client,
+            api_url,
+            api_token,
+            name,
+            "/etc/resolv.conf",
+            render_resolv_conf(dns).as_bytes(),
+        )
+        .await?;
+    }
+    if !add_host.is_empty() {
+        let existing = read_guest_file_or_empty(client, api_url, api_token, name, "/etc/hosts")
+            .await
+            .unwrap_or_default();
+        let merged = merge_etc_hosts(&existing, add_host);
+        write_guest_file(
+            client,
+            api_url,
+            api_token,
+            name,
+            "/etc/hosts",
+            merged.as_bytes(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Poll a VM's `/ready` endpoint until it reports ready or the deadline passes.
+/// Returns `Ok(true)` when ready, `Ok(false)` on timeout, and `Err` if the VM is
+/// gone or the daemon errors.
+async fn wait_for_vm_ready(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_token: Option<&str>,
+    name: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<bool> {
+    let ready_url = format!("{api_url}/v1/vms/{name}/ready");
+    let deadline = std::time::Instant::now() + timeout;
+    let mut backoff = std::time::Duration::from_millis(200);
+    loop {
+        let resp = api_request(with_api_auth(client.get(&ready_url), api_token)).await?;
+        if !resp.status().is_success() {
+            let msg = api_error(resp, &format!("VM '{name}'")).await;
+            anyhow::bail!("{}", msg.message);
+        }
+        let rdy: serde_json::Value = resp.json().await?;
+        if rdy.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
+            return Ok(true);
+        }
+        if std::time::Instant::now() + backoff >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Write `data` to `path` inside a VM via the guest file API.
+async fn write_guest_file(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_token: Option<&str>,
+    name: &str,
+    path: &str,
+    data: &[u8],
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "path": path,
+        "data": husker_agent_proto::base64_encode(data),
+    });
+    let resp = api_request(
+        with_api_auth(
+            client.post(format!("{api_url}/v1/vms/{name}/files/write")),
+            api_token,
+        )
+        .json(&body),
+    )
+    .await?;
+    if !resp.status().is_success() {
+        let msg = api_error(resp, &format!("VM '{name}'")).await;
+        anyhow::bail!("writing {path}: {}", msg.message);
+    }
+    Ok(())
+}
+
+/// Read `path` from a VM via the guest file API, returning an empty string if the
+/// file does not exist yet (so a fresh `/etc/hosts` merges cleanly).
+async fn read_guest_file_or_empty(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_token: Option<&str>,
+    name: &str,
+    path: &str,
+) -> anyhow::Result<String> {
+    let resp = api_request(
+        with_api_auth(
+            client.post(format!("{api_url}/v1/vms/{name}/files/read")),
+            api_token,
+        )
+        .json(&serde_json::json!({ "path": path })),
+    )
+    .await?;
+    if !resp.status().is_success() {
+        return Ok(String::new());
+    }
+    let result: serde_json::Value = resp.json().await?;
+    let b64 = result["data"].as_str().unwrap_or("");
+    let bytes = husker_agent_proto::base64_decode(b64)
+        .map_err(|e| anyhow::anyhow!("invalid base64 from server: {e}"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Flags shared by `run` and `job` that describe the VM to create.
@@ -2045,6 +2241,8 @@ async fn run(cli: Cli) -> Result<()> {
             userdata,
             env,
             env_file,
+            dns,
+            add_host,
             vmm,
             cloud_image,
             disk_size,
@@ -2061,6 +2259,12 @@ async fn run(cli: Cli) -> Result<()> {
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
             let env = merge_env(&env_file, env)?;
+            // Validate DNS/host overrides before creating the VM.
+            validate_dns(&dns)?;
+            let add_host = add_host
+                .iter()
+                .map(|s| parse_add_host(s))
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let args = VmRequestArgs {
                 rootfs,
                 kernel,
@@ -2131,6 +2335,45 @@ async fn run(cli: Cli) -> Result<()> {
 
                 if userdata.is_some() {
                     println!("  Userdata script queued (check status with `husker info {name}`)");
+                }
+            }
+
+            // Apply per-VM DNS / host overrides once the agent is reachable. Only
+            // waits for readiness when these flags are set, so a plain `run` stays
+            // non-blocking.
+            if !dns.is_empty() || !add_host.is_empty() {
+                let ready_timeout = if vm.get("boot_mode").and_then(|b| b.as_str()) == Some("uefi")
+                {
+                    husker_core::UEFI_READY_TIMEOUT_SECS
+                } else {
+                    husker_core::DEFAULT_READY_TIMEOUT_SECS
+                };
+                let ready = wait_for_vm_ready(
+                    &client,
+                    &api_url,
+                    api_token.as_deref(),
+                    &name,
+                    std::time::Duration::from_secs(ready_timeout),
+                )
+                .await?;
+                if !ready {
+                    let hint =
+                        serial_boot_hint(&client, &api_url, api_token.as_deref(), &name).await;
+                    anyhow::bail!(
+                        "VM '{name}' did not become ready to apply --dns/--add-host{hint}"
+                    );
+                }
+                apply_dns_hosts(
+                    &client,
+                    &api_url,
+                    api_token.as_deref(),
+                    &name,
+                    &dns,
+                    &add_host,
+                )
+                .await?;
+                if output == OutputFormat::Text {
+                    println!("  Applied per-VM DNS/host overrides");
                 }
             }
             Ok(())
@@ -2572,6 +2815,8 @@ async fn run(cli: Cli) -> Result<()> {
             memory,
             env,
             env_file,
+            dns,
+            add_host,
             vmm,
             cloud_image,
             disk_size,
@@ -2592,6 +2837,12 @@ async fn run(cli: Cli) -> Result<()> {
             let name =
                 name.unwrap_or_else(|| format!("job-{}", &uuid::Uuid::new_v4().to_string()[..8]));
             let env = merge_env(&env_file, env)?;
+            // Validate DNS/host overrides before booting a VM.
+            validate_dns(&dns)?;
+            let add_host = add_host
+                .iter()
+                .map(|s| parse_add_host(s))
+                .collect::<anyhow::Result<Vec<_>>>()?;
 
             // An empty command runs the image's default entrypoint (resolved by
             // the guest agent). That is meaningless with --sync-cwd, which wraps
@@ -2734,6 +2985,17 @@ async fn run(cli: Cli) -> Result<()> {
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
                 }
+
+                // 2.4 Apply per-VM DNS / host overrides before running the command.
+                apply_dns_hosts(
+                    &client,
+                    &api_url,
+                    api_token.as_deref(),
+                    &name,
+                    &dns,
+                    &add_host,
+                )
+                .await?;
 
                 // 2.5 Optionally sync the working tree into the VM (git-aware, clean-room):
                 // upload a tar.gz of the cwd and wrap the command to extract and run it
@@ -6852,6 +7114,59 @@ mod tests {
         let map: std::collections::HashMap<_, _> =
             merged.iter().filter_map(|s| s.split_once('=')).collect();
         assert_eq!(map["SHARED"], "from_flag");
+    }
+
+    #[test]
+    fn parse_add_host_splits_on_first_colon_and_validates_ip() {
+        assert_eq!(
+            parse_add_host("registry.local:192.0.2.10").unwrap(),
+            ("registry.local".to_string(), "192.0.2.10".to_string())
+        );
+        // IPv6 values contain colons; the split is on the first colon only.
+        assert_eq!(
+            parse_add_host("db:2001:db8::1").unwrap(),
+            ("db".to_string(), "2001:db8::1".to_string())
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            parse_add_host(" host : 192.0.2.1 ").unwrap(),
+            ("host".to_string(), "192.0.2.1".to_string())
+        );
+        // Errors: no colon, empty host, non-IP value.
+        assert!(parse_add_host("noip").is_err());
+        assert!(parse_add_host(":192.0.2.1").is_err());
+        assert!(parse_add_host("host:not-an-ip").is_err());
+    }
+
+    #[test]
+    fn validate_dns_rejects_non_ip() {
+        assert!(validate_dns(&["192.0.2.1".into(), "2001:db8::1".into()]).is_ok());
+        assert!(validate_dns(&["not-an-ip".into()]).is_err());
+    }
+
+    #[test]
+    fn render_resolv_conf_one_nameserver_per_line() {
+        assert_eq!(
+            render_resolv_conf(&["192.0.2.1".into(), "192.0.2.2".into()]),
+            "nameserver 192.0.2.1\nnameserver 192.0.2.2\n"
+        );
+        assert_eq!(render_resolv_conf(&[]), "");
+    }
+
+    #[test]
+    fn merge_etc_hosts_appends_idempotently() {
+        let existing = "127.0.0.1\tlocalhost\n";
+        let merged = merge_etc_hosts(existing, &[("registry.local".into(), "192.0.2.10".into())]);
+        assert_eq!(merged, "127.0.0.1\tlocalhost\n192.0.2.10\tregistry.local\n");
+
+        // Re-applying the same entry does not duplicate it.
+        let again = merge_etc_hosts(&merged, &[("registry.local".into(), "192.0.2.10".into())]);
+        assert_eq!(again, merged);
+
+        // A file without a trailing newline gets one before the appended entry.
+        let no_newline = "127.0.0.1\tlocalhost";
+        let merged = merge_etc_hosts(no_newline, &[("h".into(), "192.0.2.5".into())]);
+        assert_eq!(merged, "127.0.0.1\tlocalhost\n192.0.2.5\th\n");
     }
 
     #[test]
