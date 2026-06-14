@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.13] - 2026-06-14
+
+### Added
+
+- **Boot and run any OCI/Docker image, not just busybox/alpine.** Images imported
+  with `husker image import-oci` of any base (debian-slim, distroless, ...) now
+  boot into the guest agent as PID 1 and run with the image's own environment: a
+  bare `python3` resolves, `$PWD` matches the image's `WorkingDir`, and the network
+  comes up with no `iproute2`/busybox in the rootfs (the agent loads the needed
+  kernel modules and configures networking via netlink directly). Previously only
+  busybox-init images booted; a debian-slim image panicked at `switch_root`.
+
+### Fixed
+
+- **`husker fork` works again.** Fork rebinds the guest NIC to a fresh host TAP on
+  snapshot restore via Firecracker's `network_overrides` field, added in Firecracker
+  1.12.0, but husker pinned 1.10.1, so fork failed with an opaque 400 and had never
+  worked against the installed binary. The pinned Firecracker is bumped to 1.16.0,
+  and a preflight now fails with a clear "requires Firecracker >= 1.12.0" message on
+  older binaries.
+- **Imported OCI VMs keep their configured DNS.** The agent supervisor no longer
+  overwrites a `/etc/resolv.conf` the daemon seeded from its configured `dns_servers`.
+
+### Changed
+
+- Pinned Firecracker bumped from 1.10.1 to 1.16.0 (required for `husker fork`; no
+  husker-used API field changed between the two versions).
+
 ## [0.4.12] - 2026-06-14
 
 ### Fixed
