@@ -5,7 +5,7 @@ An open-source microVM manager built on [Firecracker](https://firecracker-microv
 - Boot lightweight VMs in milliseconds
 - Execute commands, transfer files, open interactive shells
 - Stream serial console logs
-- Port forwarding with nftables NAT (Linux)
+- Port forwarding (nftables NAT on Linux, a userspace TCP proxy on macOS)
 - REST API + CLI
 - Cloud-init style userdata scripts
 
@@ -95,7 +95,7 @@ Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` fo
 | Platform | Backend | Networking | Status |
 |----------|---------|------------|--------|
 | Linux x86_64 | Firecracker | TAP + nftables NAT, port forwarding | Usable |
-| macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed) | Experimental |
+| macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed), port forwarding (userspace proxy) | Experimental |
 | Linux x86_64 | QEMU/KVM | TAP + nftables NAT, port forwarding | Experimental |
 
 ### QEMU/KVM backend (Linux)
