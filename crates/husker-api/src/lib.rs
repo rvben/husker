@@ -2123,9 +2123,21 @@ async fn exec_vm<B: VmmBackend + 'static>(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    // The guest agent enforces the run timeout itself (so it returns the partial
+    // output with exit 124 instead of the daemon cancelling and losing it). The
+    // daemon adds a grace window on top, so a genuinely unresponsive agent (not
+    // even answering the timeout) still bounds the request.
+    let run_timeout = resolve_exec_run_timeout(req.timeout_secs, &policy);
+    let grace = run_timeout + Duration::from_secs(30);
     let result = tokio::time::timeout(
-        resolve_exec_run_timeout(req.timeout_secs, &policy),
-        conn.exec(&req.command, &args, req.working_dir.as_deref(), &env),
+        grace,
+        conn.exec_with_timeout(
+            &req.command,
+            &args,
+            req.working_dir.as_deref(),
+            &env,
+            Some(run_timeout.as_secs()),
+        ),
     )
     .await
     .map_err(|_| {
@@ -2133,7 +2145,7 @@ async fn exec_vm<B: VmmBackend + 'static>(
             StatusCode::REQUEST_TIMEOUT,
             error_response_with_hint(
                 "exec_timeout",
-                "command execution timed out",
+                "command execution timed out and the agent did not respond",
                 "increase exec timeout policy or optimize guest command runtime",
             ),
         )

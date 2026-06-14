@@ -252,6 +252,112 @@ fn escape_agent_cgroup() {
     let _ = std::fs::write("/sys/fs/cgroup/cgroup.procs", "0");
 }
 
+/// Hard ceiling on a single exec, even when a caller requests longer (a guard
+/// against an unbounded run from a buggy or hostile client). 24 hours.
+const AGENT_EXEC_HARD_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// The run timeout for an exec: the request's value (clamped to a sane range) or
+/// the agent default ([`exec_timeout`]) when the request specifies none.
+fn resolve_exec_timeout(requested: Option<u64>) -> std::time::Duration {
+    match requested {
+        Some(secs) => std::time::Duration::from_secs(secs.clamp(1, AGENT_EXEC_HARD_MAX_SECS)),
+        None => exec_timeout(),
+    }
+}
+
+/// Drain an async reader into a shared buffer until EOF, so a child's output is
+/// captured incrementally and a timeout can still return what was produced.
+fn spawn_drain<R>(
+    mut reader: R,
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf
+                    .lock()
+                    .expect("exec buffer mutex")
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+}
+
+/// Spawn `cmd`, capture stdout/stderr incrementally, and enforce `timeout`. On
+/// a clean exit, returns the exit code and full output. On timeout, kills the
+/// child and returns the *partial* output with exit code 124 (the conventional
+/// timeout code) plus a note - it never discards what the command produced.
+async fn run_exec_with_capture(
+    mut cmd: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> AgentResponse {
+    use std::sync::{Arc, Mutex};
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return AgentResponse::Error(ErrorResponse {
+                message: format!("exec failed: {e}"),
+            });
+        }
+    };
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let out_task = spawn_drain(stdout, out_buf.clone());
+    let err_task = spawn_drain(stderr, err_buf.clone());
+
+    let take = |buf: &Arc<Mutex<Vec<u8>>>| {
+        String::from_utf8_lossy(&buf.lock().expect("exec mutex")).into_owned()
+    };
+
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let _ = out_task.await;
+            let _ = err_task.await;
+            AgentResponse::Exec(ExecResponse {
+                exit_code: status.code().unwrap_or(-1),
+                stdout: take(&out_buf),
+                stderr: take(&err_buf),
+            })
+        }
+        Ok(Err(e)) => AgentResponse::Error(ErrorResponse {
+            message: format!("exec failed: {e}"),
+        }),
+        Err(_) => {
+            let _ = child.start_kill();
+            // Give the drain tasks a moment to flush whatever buffered before the
+            // kill closes the pipes, then collect the partial output.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                let _ = out_task.await;
+                let _ = err_task.await;
+            })
+            .await;
+            let mut stderr = take(&err_buf);
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!(
+                "[husker: exec timed out after {}s; output above is partial]",
+                timeout.as_secs()
+            ));
+            AgentResponse::Exec(ExecResponse {
+                exit_code: 124,
+                stdout: take(&out_buf),
+                stderr,
+            })
+        }
+    }
+}
+
 fn exec_timeout() -> std::time::Duration {
     let secs = std::env::var("HUSKER_AGENT_EXEC_TIMEOUT_SECS")
         .ok()
@@ -421,7 +527,7 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
         },
 
         AgentRequest::Exec(req) => {
-            let timeout = exec_timeout();
+            let timeout = resolve_exec_timeout(req.timeout_secs);
             let plan = plan_exec(&req, oci_runtime_config());
             let mut cmd = tokio::process::Command::new(&plan.program);
             cmd.args(&req.args)
@@ -441,21 +547,7 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                     Ok(())
                 });
             }
-            let fut = cmd.output();
-
-            match tokio::time::timeout(timeout, fut).await {
-                Ok(Ok(output)) => AgentResponse::Exec(ExecResponse {
-                    exit_code: output.status.code().unwrap_or(-1),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                }),
-                Ok(Err(e)) => AgentResponse::Error(ErrorResponse {
-                    message: format!("exec failed: {e}"),
-                }),
-                Err(_) => AgentResponse::Error(ErrorResponse {
-                    message: format!("exec timed out after {}s", timeout.as_secs()),
-                }),
-            }
+            run_exec_with_capture(cmd, timeout).await
         }
 
         AgentRequest::ReadFile(req) => {
@@ -718,6 +810,7 @@ mod tests {
             args: vec!["-V".into()],
             working_dir: None,
             env: vec![("LANG".into(), "en_US".into())],
+            timeout_secs: None,
         };
         let plan = plan_exec(&req, Some(&cfg));
         assert!(plan.clear_env, "OCI exec runs with container-clean env");
@@ -729,12 +822,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_exec_timeout_clamps_request_else_uses_default() {
+        // A requested timeout is used, clamped to [1, hard max].
+        assert_eq!(resolve_exec_timeout(Some(120)).as_secs(), 120);
+        assert_eq!(resolve_exec_timeout(Some(0)).as_secs(), 1, "floor at 1s");
+        assert_eq!(
+            resolve_exec_timeout(Some(u64::MAX)).as_secs(),
+            AGENT_EXEC_HARD_MAX_SECS,
+            "ceiling at the hard max"
+        );
+        // None falls back to the agent default (600s without the env override).
+        assert_eq!(resolve_exec_timeout(None), exec_timeout());
+    }
+
+    #[test]
     fn plan_exec_non_oci_keeps_inherited_env() {
         let req = ExecRequest {
             command: "echo".into(),
             args: vec!["hi".into()],
             working_dir: Some("/tmp".into()),
             env: vec![("FOO".into(), "bar".into())],
+            timeout_secs: None,
         };
         let plan = plan_exec(&req, None);
         assert!(!plan.clear_env, "non-OCI exec inherits the agent env");

@@ -81,6 +81,12 @@ pub struct ExecRequest {
     pub args: Vec<String>,
     pub working_dir: Option<String>,
     pub env: Vec<(String, String)>,
+    /// Max seconds the command may run before the agent kills it and returns the
+    /// partial output (with exit code 124). `None` uses the agent default.
+    /// `#[serde(default)]` so an older agent tolerates the field and a newer one
+    /// tolerates its absence.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Canonical in-guest path of the imported OCI runtime config. `import-oci`
@@ -544,6 +550,7 @@ mod tests {
             args: vec!["-la".into()],
             working_dir: Some("/tmp".into()),
             env: vec![("FOO".into(), "bar".into())],
+            timeout_secs: None,
         });
         let encoded = encode_message(&req).unwrap();
         let (decoded, consumed): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
@@ -621,6 +628,7 @@ mod tests {
             args: vec![],
             working_dir: None,
             env: vec![],
+            timeout_secs: None,
         });
         let bytes = encode_message(&msg).unwrap();
 
@@ -856,6 +864,7 @@ mod tests {
                 args: args.clone(),
                 working_dir: wd.clone(),
                 env: Vec::new(),
+                timeout_secs: None,
             });
             let encoded = encode_message(&req).unwrap();
             let decoded: Option<(AgentRequest, usize)> = decode_message(&encoded).unwrap();

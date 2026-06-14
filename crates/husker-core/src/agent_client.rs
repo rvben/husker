@@ -169,13 +169,28 @@ where
         }
     }
 
-    /// Execute a command inside the VM.
+    /// Execute a command inside the VM with the agent's default run timeout.
     pub async fn exec(
         &mut self,
         command: &str,
         args: &[&str],
         working_dir: Option<&str>,
         env: &[(&str, &str)],
+    ) -> Result<ExecResult, AgentError> {
+        self.exec_with_timeout(command, args, working_dir, env, None)
+            .await
+    }
+
+    /// Execute a command inside the VM. `timeout_secs` is the max run time the
+    /// guest agent enforces (it returns the partial output with exit 124 on
+    /// timeout); `None` uses the agent's own default.
+    pub async fn exec_with_timeout(
+        &mut self,
+        command: &str,
+        args: &[&str],
+        working_dir: Option<&str>,
+        env: &[(&str, &str)],
+        timeout_secs: Option<u64>,
     ) -> Result<ExecResult, AgentError> {
         let request = AgentRequest::Exec(ExecRequest {
             command: command.into(),
@@ -185,6 +200,7 @@ where
                 .iter()
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
+            timeout_secs,
         });
         write_message(&mut self.stream, &request).await?;
 

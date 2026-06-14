@@ -41,6 +41,7 @@ async fn exec_request_roundtrip() {
         args: vec!["-la".into(), "/tmp".into()],
         working_dir: Some("/home".into()),
         env: vec![("FOO".into(), "bar".into())],
+        timeout_secs: None,
     });
     write_message(&mut client, &request).await.unwrap();
 
@@ -84,6 +85,7 @@ async fn multiple_requests_on_one_connection() {
             args: vec![],
             working_dir: None,
             env: vec![],
+            timeout_secs: None,
         });
         write_message(&mut client, &request).await.unwrap();
 

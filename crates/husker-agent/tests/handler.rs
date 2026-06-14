@@ -66,6 +66,7 @@ async fn exec_echo() {
         args: vec!["hello".into()],
         working_dir: None,
         env: vec![],
+        timeout_secs: None,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -89,6 +90,7 @@ async fn exec_with_env() {
         args: vec!["-c".into(), "echo $MY_VAR".into()],
         working_dir: None,
         env: vec![("MY_VAR".into(), "test_value".into())],
+        timeout_secs: None,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -117,6 +119,7 @@ async fn exec_times_out_on_long_running_command() {
         args: vec!["30".into()],
         working_dir: None,
         env: vec![],
+        timeout_secs: None,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -124,15 +127,18 @@ async fn exec_times_out_on_long_running_command() {
     unsafe {
         std::env::remove_var("HUSKER_AGENT_EXEC_TIMEOUT_SECS");
     }
+    // A timed-out exec returns the conventional 124 exit code with whatever
+    // output the command produced, plus a note - never a bare error that drops it.
     match response {
-        AgentResponse::Error(e) => {
+        AgentResponse::Exec(r) => {
+            assert_eq!(r.exit_code, 124, "timeout should report exit 124");
             assert!(
-                e.message.contains("timed out"),
-                "expected timeout error, got: {}",
-                e.message
+                r.stderr.contains("timed out"),
+                "expected a timeout note in stderr, got: {}",
+                r.stderr
             );
         }
-        other => panic!("expected Error, got {other:?}"),
+        other => panic!("expected Exec with exit 124, got {other:?}"),
     }
 }
 
@@ -145,6 +151,7 @@ async fn exec_nonexistent_command() {
         args: vec![],
         working_dir: None,
         env: vec![],
+        timeout_secs: None,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -398,6 +405,7 @@ async fn multiple_operations_on_one_connection() {
         args: vec!["test".into()],
         working_dir: None,
         env: vec![],
+        timeout_secs: None,
     });
     write_message(&mut stream, &request).await.unwrap();
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
@@ -613,6 +621,7 @@ async fn normal_requests_still_work_with_shell_protocol() {
         args: vec!["regression_test".into()],
         working_dir: None,
         env: vec![],
+        timeout_secs: None,
     });
     write_message(&mut stream, &request).await.unwrap();
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
