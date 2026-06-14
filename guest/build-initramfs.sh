@@ -139,6 +139,16 @@ cat > "$INITRAMFS/init" << 'INIT_EOF'
 /bin/mount -t sysfs sys /sys
 /bin/mount -t devtmpfs devtmpfs /dev
 
+# Honor an explicit init= from the kernel cmdline (husker boots imported OCI
+# images via init=/usr/local/bin/husker-agent so the agent supervisor becomes
+# PID 1); default to /sbin/init for everything else.
+INIT=/sbin/init
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+    init=*) INIT="${tok#init=}" ;;
+    esac
+done
+
 MDIR=/lib/modules/KVER_PLACEHOLDER
 
 # Load block device modules
@@ -198,7 +208,7 @@ done
 /bin/umount /sys
 /bin/umount /dev
 
-exec /bin/switch_root /mnt/root /sbin/init
+exec /bin/switch_root /mnt/root "$INIT"
 INIT_EOF
 
 # Substitute kernel version into init script

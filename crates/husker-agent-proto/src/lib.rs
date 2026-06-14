@@ -83,6 +83,32 @@ pub struct ExecRequest {
     pub env: Vec<(String, String)>,
 }
 
+/// Canonical in-guest path of the imported OCI runtime config. `import-oci`
+/// writes [`OciRuntimeConfig`] here inside the rootfs; the guest agent reads it
+/// to apply the image's environment and working directory when exec'ing.
+pub const OCI_CONFIG_PATH: &str = "/etc/husker/oci-config.json";
+
+/// Runtime configuration captured from an imported OCI/Docker image and written
+/// into its rootfs at [`OCI_CONFIG_PATH`]. The guest agent applies it so that
+/// commands run with the image's `PATH`/environment and working directory,
+/// matching container semantics (a bare `python3` resolves, `$PWD` is the
+/// image's `WorkingDir`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciRuntimeConfig {
+    /// `Env` entries as `KEY=VALUE` strings (e.g. `PATH=/usr/local/bin:...`).
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// `WorkingDir`, if the image set one.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// `Entrypoint` from the image (default command prefix).
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// `Cmd` from the image (default command / args).
+    #[serde(default)]
+    pub cmd: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecResponse {
     pub exit_code: i32,
@@ -487,6 +513,28 @@ mod tests {
             AgentResponse::GuestInfo(g) => assert_eq!(g.ipv4, vec!["192.0.2.7".to_string()]),
             other => panic!("expected GuestInfo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oci_runtime_config_round_trips_and_defaults() {
+        let cfg = OciRuntimeConfig {
+            env: vec![
+                "PATH=/usr/local/bin:/usr/bin".into(),
+                "PYTHON_VERSION=3.12".into(),
+            ],
+            working_dir: Some("/app".into()),
+            entrypoint: vec!["python3".into()],
+            cmd: vec!["app.py".into()],
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OciRuntimeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+
+        // Missing fields default (forward/backward compatibility of the file).
+        let minimal: OciRuntimeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(minimal, OciRuntimeConfig::default());
+        assert!(minimal.env.is_empty());
+        assert!(minimal.working_dir.is_none());
     }
 
     #[test]

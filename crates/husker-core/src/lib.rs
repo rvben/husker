@@ -564,19 +564,18 @@ fn apply_boot_init(base: &str, boot_init: Option<&str>) -> String {
     }
 }
 
-/// Guest runtime injected into an OCI rootfs so it boots as a husker microVM:
-/// busybox init reads the inittab, which mounts essentials, configures the
-/// network, and starts the agent.
+/// Write the husker agent and its OCI runtime config into an imported rootfs and
+/// point `/sbin/init` at the agent, so the microVM boots into the agent as PID 1
+/// regardless of the base image. The initramfs `switch_root`s into `/sbin/init`;
+/// the agent then detects `husker.init=1` and runs the supervisor (mounts,
+/// kernel modules, networking), making the boot path identical for busybox,
+/// debian-slim, and distroless images alike.
 #[cfg(feature = "linux-net")]
-const GUEST_INITTAB: &[u8] = include_bytes!("../../../guest/inittab");
-#[cfg(feature = "linux-net")]
-const GUEST_NET_SCRIPT: &[u8] = include_bytes!("../../../guest/husker-net.sh");
-
-/// Write the husker agent, inittab, and net script into an OCI rootfs tree, and
-/// ensure `/sbin/init` exists (symlinked to busybox when present) so the microVM
-/// boots into the agent.
-#[cfg(feature = "linux-net")]
-fn inject_guest_runtime(dir: &std::path::Path, agent: &[u8]) -> Result<(), CoreError> {
+fn inject_guest_runtime(
+    dir: &std::path::Path,
+    agent: &[u8],
+    oci_config: &husker_agent_proto::OciRuntimeConfig,
+) -> Result<(), CoreError> {
     use std::os::unix::fs::PermissionsExt;
 
     // Resolve `rel` under `dir` without following any symlink: a symlink (or
@@ -617,18 +616,24 @@ fn inject_guest_runtime(dir: &std::path::Path, agent: &[u8]) -> Result<(), CoreE
     };
 
     write("usr/local/bin/husker-agent", agent, 0o755)?;
-    write("usr/local/sbin/husker-net.sh", GUEST_NET_SCRIPT, 0o755)?;
-    write("etc/inittab", GUEST_INITTAB, 0o644)?;
 
-    // The host kernel + initramfs hand off to /sbin/init; busybox-based images
-    // ship busybox but may not symlink it there. Use symlink_metadata so an
-    // image-provided /sbin/init symlink is not followed off the rootfs.
+    // The runtime config the agent applies on exec: the image's PATH/env and
+    // working directory, so a bare `python3` resolves and `$PWD` matches the
+    // image's WorkingDir. Always written (even when empty) so the agent can tell
+    // an imported OCI rootfs from the baseline rootfs.
+    let config_json = serde_json::to_vec_pretty(oci_config)
+        .map_err(|e| CoreError::Io(format!("serialize oci config: {e}")))?;
+    write("etc/husker/oci-config.json", &config_json, 0o644)?;
+
+    // Boot every imported image via the agent supervisor: the initramfs
+    // `switch_root`s into `/sbin/init`, so replace whatever the image ships
+    // there with a symlink to the agent. `safe_target` already replaced any
+    // symlinked parent with a real directory; unlink any leaf init first so the
+    // symlink is created in-rootfs (never followed off it).
     let sbin_init = safe_target(dir, "sbin/init")?;
-    let has_init = std::fs::symlink_metadata(&sbin_init).is_ok();
-    let has_busybox = std::fs::symlink_metadata(dir.join("bin/busybox")).is_ok();
-    if !has_init && has_busybox {
-        let _ = std::os::unix::fs::symlink("/bin/busybox", &sbin_init);
-    }
+    let _ = std::fs::remove_file(&sbin_init);
+    std::os::unix::fs::symlink("/usr/local/bin/husker-agent", &sbin_init)
+        .map_err(|e| CoreError::Io(format!("symlink {}: {e}", sbin_init.display())))?;
     Ok(())
 }
 
@@ -2710,13 +2715,21 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         };
 
-        // Pull + flatten into a temp dir, then inject the guest runtime.
+        // Pull + flatten into a temp dir, then inject the guest runtime. The
+        // image's runtime config (env/PATH/WorkingDir) is captured and written
+        // into the rootfs so the agent applies it on exec.
         let work = tempfile::tempdir().map_err(|e| CoreError::Io(format!("oci work dir: {e}")))?;
         let rootfs_dir = work.path().join("rootfs");
-        husker_oci::pull_and_flatten(reference, arch, &rootfs_dir)
+        let image_config = husker_oci::pull_and_flatten(reference, arch, &rootfs_dir)
             .await
             .map_err(|e| CoreError::InvalidArgument(format!("pull {reference}: {e}")))?;
-        inject_guest_runtime(&rootfs_dir, self.embedded_agent)?;
+        let oci_runtime = husker_agent_proto::OciRuntimeConfig {
+            env: image_config.env,
+            working_dir: image_config.working_dir,
+            entrypoint: image_config.entrypoint,
+            cmd: image_config.cmd,
+        };
+        inject_guest_runtime(&rootfs_dir, self.embedded_agent, &oci_runtime)?;
 
         // Build the ext4 image sized to the tree plus generous overhead.
         let catalog_dir = self.storage.images_dir().join("catalog");
@@ -4246,7 +4259,12 @@ mod tests {
         std::fs::create_dir_all(rootfs.path().join("usr/local")).unwrap();
         std::os::unix::fs::symlink(outside.path(), rootfs.path().join("usr/local/bin")).unwrap();
 
-        inject_guest_runtime(rootfs.path(), b"AGENT").unwrap();
+        inject_guest_runtime(
+            rootfs.path(),
+            b"AGENT",
+            &husker_agent_proto::OciRuntimeConfig::default(),
+        )
+        .unwrap();
 
         assert!(
             !outside.path().join("husker-agent").exists(),
@@ -4263,6 +4281,40 @@ mod tests {
             std::fs::read(rootfs.path().join("usr/local/bin/husker-agent")).unwrap(),
             b"AGENT"
         );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn inject_guest_runtime_boots_via_agent_and_writes_oci_config() {
+        // An image that ships its own /sbin/init (e.g. a symlink into the image)
+        // must be overridden so the husker agent becomes PID 1, and the OCI
+        // runtime config must be written for the agent to apply on exec.
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("sbin")).unwrap();
+        // Pre-existing image init that must be replaced.
+        std::os::unix::fs::symlink("/lib/systemd/systemd", rootfs.path().join("sbin/init"))
+            .unwrap();
+
+        let cfg = husker_agent_proto::OciRuntimeConfig {
+            env: vec!["PATH=/usr/local/bin:/usr/bin".into()],
+            working_dir: Some("/app".into()),
+            entrypoint: vec![],
+            cmd: vec![],
+        };
+        inject_guest_runtime(rootfs.path(), b"AGENT", &cfg).unwrap();
+
+        // /sbin/init now points at the agent (boots via the supervisor).
+        let init_target = std::fs::read_link(rootfs.path().join("sbin/init")).unwrap();
+        assert_eq!(
+            init_target,
+            std::path::Path::new("/usr/local/bin/husker-agent")
+        );
+
+        // The OCI runtime config is written and round-trips.
+        let written = std::fs::read(rootfs.path().join("etc/husker/oci-config.json")).unwrap();
+        let parsed: husker_agent_proto::OciRuntimeConfig =
+            serde_json::from_slice(&written).unwrap();
+        assert_eq!(parsed, cfg);
     }
 
     #[cfg(feature = "linux-net")]

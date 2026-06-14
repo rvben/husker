@@ -9,6 +9,7 @@
 use std::ffi::CString;
 use std::io;
 use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use tracing::{error, info, warn};
@@ -169,6 +170,71 @@ pub fn ensure_device_nodes() {
     }
 }
 
+/// Kernel modules the agent needs, in dependency order. On the modular Alpine
+/// `-virt` guest kernel these are `.ko` files the initramfs copies into
+/// [`MODULES_DIR`]; on a monolithic kernel they are built in and the files are
+/// simply absent. A distroless rootfs has no `modprobe`/`insmod`, so the
+/// supervisor loads them directly via `finit_module`.
+const REQUIRED_MODULES: &[&str] = &[
+    // vsock transport - must be up before the agent child binds its socket.
+    "vsock",
+    "vmw_vsock_virtio_transport_common",
+    "vmw_vsock_virtio_transport",
+    // networking: virtio_net plus its failover deps, and af_packet (raw sockets).
+    "af_packet",
+    "failover",
+    "net_failover",
+    "virtio_net",
+];
+
+/// Directory the initramfs copies guest kernel modules into.
+const MODULES_DIR: &str = "/lib/modules";
+
+/// Load [`REQUIRED_MODULES`] from [`MODULES_DIR`] via `finit_module`.
+/// Best-effort: an absent `.ko` (built into the kernel) or an already-loaded
+/// module is skipped; other failures are logged. Returns how many were newly
+/// loaded (for the boot log).
+pub fn load_kernel_modules() -> usize {
+    let mut loaded = 0;
+    for name in REQUIRED_MODULES {
+        match load_module(name) {
+            Ok(true) => {
+                loaded += 1;
+                info!("loaded kernel module {name}");
+            }
+            Ok(false) => {} // built-in, absent, or already loaded
+            Err(e) => warn!("could not load kernel module {name}: {e}"),
+        }
+    }
+    loaded
+}
+
+/// Load a single named module from [`MODULES_DIR`]. `Ok(true)` if loaded now,
+/// `Ok(false)` if absent (built-in) or already present.
+fn load_module(name: &str) -> io::Result<bool> {
+    let path = format!("{MODULES_DIR}/{name}.ko");
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let params = CString::new("").expect("empty params has no NUL");
+    // SAFETY: file is held for the call so its fd is valid; params is a valid
+    // C string; flags are 0. finit_module returns 0 on success, -1 on error.
+    let rc = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), params.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(true)
+    } else {
+        let e = io::Error::last_os_error();
+        // EEXIST: already loaded (e.g. built in, or pulled in as a dependency).
+        if e.raw_os_error() == Some(libc::EEXIST) {
+            Ok(false)
+        } else {
+            Err(e)
+        }
+    }
+}
+
 /// Static network configuration parsed from the kernel `ip=` parameter.
 #[derive(Debug, PartialEq, Eq)]
 pub struct NetConfig {
@@ -226,60 +292,12 @@ fn netmask_to_prefix(mask: &str) -> Option<u8> {
     }
 }
 
-/// The `ip` argv lists to bring up loopback + the static interface and default
-/// route, in order. (The guest agent already shells `ip` for runtime network
-/// reconfiguration; the supervisor reuses that approach for initial setup.)
-pub fn ip_config_commands(cfg: &NetConfig) -> Vec<Vec<String>> {
-    let mut cmds = vec![
-        vec!["link".into(), "set".into(), "lo".into(), "up".into()],
-        vec![
-            "addr".into(),
-            "add".into(),
-            format!("{}/{}", cfg.addr, cfg.prefix),
-            "dev".into(),
-            cfg.iface.clone(),
-        ],
-        vec![
-            "link".into(),
-            "set".into(),
-            "dev".into(),
-            cfg.iface.clone(),
-            "up".into(),
-        ],
-    ];
-    if let Some(gw) = cfg.gateway {
-        cmds.push(vec![
-            "route".into(),
-            "replace".into(),
-            "default".into(),
-            "via".into(),
-            gw.to_string(),
-            "dev".into(),
-            cfg.iface.clone(),
-        ]);
-    }
-    cmds
-}
-
-fn run_ip(args: &[String]) -> io::Result<()> {
-    let status = std::process::Command::new("ip").args(args).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "`ip {}` exited {status}",
-            args.join(" ")
-        )))
-    }
-}
-
 /// Bring up the static network from `cfg` and write a usable `/etc/resolv.conf`
-/// and `/etc/hosts`. Returns `Err` (degraded network) if `ip` is missing or a
-/// command fails; the caller logs it loudly rather than hanging silently.
+/// and `/etc/hosts`. Returns `Err` (degraded network) if the netlink setup fails;
+/// the caller logs it loudly rather than hanging silently. Uses netlink directly
+/// (not `ip`), so it works on a distroless rootfs with no userspace tools.
 pub fn configure_network(cfg: &NetConfig) -> io::Result<()> {
-    for cmd in ip_config_commands(cfg) {
-        run_ip(&cmd)?;
-    }
+    crate::netlink::configure_static(&cfg.iface, cfg.addr, cfg.prefix, cfg.gateway)?;
     write_resolv_conf(cfg.gateway);
     ensure_hosts();
     Ok(())
@@ -343,6 +361,12 @@ pub fn run(cmdline: &str) -> ! {
         reboot_now();
     }
     ensure_device_nodes();
+
+    // Load the modules the agent needs: vsock (its own transport, required
+    // before the child binds) and virtio_net (so the interface exists for the
+    // network setup below). No-op on a monolithic kernel where they are built in.
+    let n = load_kernel_modules();
+    info!("loaded {n} kernel module(s)");
 
     // Static network from the kernel ip=. A failure is degraded (no outbound
     // network), not fatal: logged loudly so it is diagnosable, then serve anyway.
@@ -476,47 +500,5 @@ mod tests {
         // Non-contiguous mask is rejected.
         assert_eq!(netmask_to_prefix("255.0.255.0"), None);
         assert_eq!(netmask_to_prefix("255.255.255"), None);
-    }
-
-    #[test]
-    fn ip_config_commands_brings_up_lo_iface_and_route() {
-        let cfg = NetConfig {
-            addr: "172.20.0.2".parse().unwrap(),
-            prefix: 30,
-            gateway: Some("172.20.0.1".parse().unwrap()),
-            iface: "eth0".into(),
-        };
-        let cmds = ip_config_commands(&cfg);
-        assert_eq!(cmds[0], vec!["link", "set", "lo", "up"]);
-        assert!(
-            cmds.iter()
-                .any(|c| c == &vec!["addr", "add", "172.20.0.2/30", "dev", "eth0"]),
-            "assigns the address: {cmds:?}"
-        );
-        assert!(
-            cmds.iter().any(|c| c
-                == &vec![
-                    "route",
-                    "replace",
-                    "default",
-                    "via",
-                    "172.20.0.1",
-                    "dev",
-                    "eth0"
-                ]),
-            "adds the default route: {cmds:?}"
-        );
-    }
-
-    #[test]
-    fn ip_config_commands_omits_route_without_gateway() {
-        let cfg = NetConfig {
-            addr: "192.0.2.2".parse().unwrap(),
-            prefix: 24,
-            gateway: None,
-            iface: "eth0".into(),
-        };
-        let cmds = ip_config_commands(&cfg);
-        assert!(!cmds.iter().any(|c| c.first() == Some(&"route".to_string())));
     }
 }

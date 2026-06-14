@@ -929,6 +929,7 @@ dependencies = [
  "husker-agent-proto",
  "if-addrs",
  "libc",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-vsock 0.6.0",
