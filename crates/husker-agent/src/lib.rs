@@ -561,67 +561,9 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
     }
 }
 
-/// Build the ordered `ip` argument lists that apply a new network identity to
-/// `req.interface`. Pure (no side effects) so the plan can be unit-tested
-/// without touching the host's networking.
-///
-/// Order matters: a MAC change needs the link down first; then flush the old
-/// address before assigning the new one, and bring the link up before
-/// installing the default route through it.
-fn reconfigure_commands(req: &ReconfigureNetworkRequest) -> Vec<Vec<String>> {
-    let dev = req.interface.clone();
-    let mut cmds: Vec<Vec<String>> = Vec::new();
-    if let Some(mac) = &req.mac {
-        cmds.push(vec![
-            "link".into(),
-            "set".into(),
-            "dev".into(),
-            dev.clone(),
-            "down".into(),
-        ]);
-        cmds.push(vec![
-            "link".into(),
-            "set".into(),
-            "dev".into(),
-            dev.clone(),
-            "address".into(),
-            mac.clone(),
-        ]);
-    }
-    cmds.push(vec![
-        "addr".into(),
-        "flush".into(),
-        "dev".into(),
-        dev.clone(),
-    ]);
-    cmds.push(vec![
-        "addr".into(),
-        "add".into(),
-        format!("{}/{}", req.ipv4, req.prefix_len),
-        "dev".into(),
-        dev.clone(),
-    ]);
-    cmds.push(vec![
-        "link".into(),
-        "set".into(),
-        "dev".into(),
-        dev.clone(),
-        "up".into(),
-    ]);
-    cmds.push(vec![
-        "route".into(),
-        "replace".into(),
-        "default".into(),
-        "via".into(),
-        req.gateway.clone(),
-        "dev".into(),
-        dev,
-    ]);
-    cmds
-}
-
 /// Build `/etc/resolv.conf` contents for `dns`, or `None` to leave it untouched
-/// when no servers are supplied.
+/// when no servers are supplied. Used by the Linux-only network reconfigure.
+#[cfg(target_os = "linux")]
 fn resolv_conf_contents(dns: &[String]) -> Option<String> {
     if dns.is_empty() {
         return None;
@@ -629,24 +571,55 @@ fn resolv_conf_contents(dns: &[String]) -> Option<String> {
     Some(dns.iter().map(|s| format!("nameserver {s}\n")).collect())
 }
 
-/// Apply a new network identity to the live guest: run the `ip` commands from
-/// [`reconfigure_commands`] in order, then rewrite `/etc/resolv.conf`. Guest-only
-/// (it mutates real interfaces), so it is never exercised by host-side tests.
-async fn apply_network_reconfigure(req: &ReconfigureNetworkRequest) -> Result<(), String> {
-    for args in reconfigure_commands(req) {
-        let output = tokio::process::Command::new("ip")
-            .args(&args)
-            .output()
-            .await
-            .map_err(|e| format!("spawn `ip {}`: {e}", args.join(" ")))?;
-        if !output.status.success() {
-            return Err(format!(
-                "`ip {}` failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+/// Parse a `AA:BB:CC:DD:EE:FF` MAC string into six bytes.
+#[cfg(target_os = "linux")]
+fn parse_mac(s: &str) -> Result<[u8; 6], String> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for slot in out.iter_mut() {
+        let part = parts
+            .next()
+            .ok_or_else(|| format!("mac {s} has too few octets"))?;
+        *slot = u8::from_str_radix(part, 16).map_err(|e| format!("mac {s}: {e}"))?;
     }
+    if parts.next().is_some() {
+        return Err(format!("mac {s} has too many octets"));
+    }
+    Ok(out)
+}
+
+/// Apply a new network identity to the live guest via netlink (no `ip`
+/// dependency, so it works on a distroless guest after a snapshot restore or
+/// fork), then rewrite `/etc/resolv.conf`. Guest-only (it mutates real
+/// interfaces), so it is never exercised by host-side tests.
+#[cfg(target_os = "linux")]
+async fn apply_network_reconfigure(req: &ReconfigureNetworkRequest) -> Result<(), String> {
+    let iface = req.interface.clone();
+    let mac = match req.mac.as_deref() {
+        Some(s) => Some(parse_mac(s)?),
+        None => None,
+    };
+    let addr: std::net::Ipv4Addr = req
+        .ipv4
+        .parse()
+        .map_err(|e| format!("invalid ipv4 {}: {e}", req.ipv4))?;
+    let prefix = req.prefix_len;
+    let gateway = if req.gateway.is_empty() {
+        None
+    } else {
+        Some(
+            req.gateway
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|e| format!("invalid gateway {}: {e}", req.gateway))?,
+        )
+    };
+    // netlink syscalls are blocking; keep them off the async reactor.
+    tokio::task::spawn_blocking(move || {
+        crate::netlink::reconfigure(&iface, mac, addr, prefix, gateway)
+    })
+    .await
+    .map_err(|e| format!("netlink task panicked: {e}"))?
+    .map_err(|e| format!("netlink reconfigure: {e}"))?;
     if let Some(contents) = resolv_conf_contents(&req.dns) {
         tokio::fs::write("/etc/resolv.conf", contents)
             .await
@@ -655,10 +628,17 @@ async fn apply_network_reconfigure(req: &ReconfigureNetworkRequest) -> Result<()
     Ok(())
 }
 
+/// Network reconfigure targets real guest interfaces via netlink, so it is only
+/// available on Linux; the macOS dev build returns a clear error.
+#[cfg(not(target_os = "linux"))]
+async fn apply_network_reconfigure(req: &ReconfigureNetworkRequest) -> Result<(), String> {
+    let _ = req;
+    Err("network reconfigure is only supported on Linux guests".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use husker_agent_proto::ReconfigureNetworkRequest;
 
     fn oci_cfg(env: &[&str], working_dir: Option<&str>) -> OciRuntimeConfig {
         OciRuntimeConfig {
@@ -778,60 +758,22 @@ mod tests {
         assert!(!is_supervisor_mode(true, "husker.init=10"));
     }
 
-    fn sample_req(mac: Option<&str>) -> ReconfigureNetworkRequest {
-        ReconfigureNetworkRequest {
-            interface: "eth0".into(),
-            ipv4: "192.0.2.10".into(),
-            prefix_len: 24,
-            gateway: "192.0.2.1".into(),
-            mac: mac.map(String::from),
-            dns: vec!["192.0.2.1".into()],
-        }
-    }
-
+    #[cfg(target_os = "linux")]
     #[test]
-    fn reconfigure_commands_without_mac_flush_then_assign_then_route() {
-        let cmds = reconfigure_commands(&sample_req(None));
-        // Order matters: clear the old address before assigning the new one, and
-        // bring the link up before installing the default route through it.
+    fn parse_mac_parses_and_rejects_malformed() {
         assert_eq!(
-            cmds,
-            vec![
-                vec!["addr", "flush", "dev", "eth0"],
-                vec!["addr", "add", "192.0.2.10/24", "dev", "eth0"],
-                vec!["link", "set", "dev", "eth0", "up"],
-                vec![
-                    "route",
-                    "replace",
-                    "default",
-                    "via",
-                    "192.0.2.1",
-                    "dev",
-                    "eth0"
-                ],
-            ]
+            parse_mac("AA:FC:00:00:00:09").unwrap(),
+            [0xAA, 0xFC, 0x00, 0x00, 0x00, 0x09]
         );
+        assert!(parse_mac("AA:FC:00:00:00").is_err(), "too few octets");
+        assert!(
+            parse_mac("AA:FC:00:00:00:09:11").is_err(),
+            "too many octets"
+        );
+        assert!(parse_mac("ZZ:FC:00:00:00:09").is_err(), "non-hex");
     }
 
-    #[test]
-    fn reconfigure_commands_with_mac_brings_link_down_and_sets_address_first() {
-        let cmds = reconfigure_commands(&sample_req(Some("AA:FC:00:00:00:09")));
-        // A MAC change must precede addressing and requires the link down first.
-        assert_eq!(
-            cmds[0],
-            vec!["link", "set", "dev", "eth0", "down"],
-            "MAC change requires the link down first"
-        );
-        assert_eq!(
-            cmds[1],
-            vec!["link", "set", "dev", "eth0", "address", "AA:FC:00:00:00:09"]
-        );
-        assert_eq!(cmds[2], vec!["addr", "flush", "dev", "eth0"]);
-        // The link comes back up before the default route is installed.
-        assert_eq!(cmds[4], vec!["link", "set", "dev", "eth0", "up"]);
-        assert_eq!(cmds[5][0], "route");
-    }
-
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolv_conf_contents_one_line_per_server_or_none() {
         assert_eq!(resolv_conf_contents(&[]), None);

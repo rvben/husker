@@ -1,28 +1,40 @@
-//! Minimal `NETLINK_ROUTE` message encoding for static interface setup, used by
-//! the guest supervisor to configure networking without `iproute2`/`busybox`
-//! (a distroless OCI rootfs ships neither). Only the four operations the
-//! supervisor needs are implemented: bring a link up, add an address, and add a
+//! Minimal `NETLINK_ROUTE` message encoding for guest interface setup, used to
+//! configure networking without `iproute2`/`busybox` (a distroless OCI rootfs
+//! ships neither). Covers the operations the supervisor needs at boot
+//! ([`configure_static`]) and that a snapshot restore/fork needs at runtime
+//! ([`reconfigure`]): link up/down, set MAC, add/delete/dump addresses, and the
 //! default route.
 //!
-//! The message encoders are pure (they only build byte buffers from stable
-//! kernel UAPI constants) so they are unit-tested on any host; the socket I/O
-//! that actually applies them is Linux-only (see [`apply`]).
+//! The message encoders and the dump parser are pure (they build/read byte
+//! buffers using stable kernel UAPI constants) so they are unit-tested; the
+//! socket I/O that applies them lives in [`apply`].
 
 use std::net::Ipv4Addr;
 
 // ── Kernel UAPI constants (stable ABI) ──────────────────────────────────────
 
-/// Modify/create a link (used here to set `IFF_UP`).
+/// Modify/create a link (used here to set `IFF_UP` or the MAC address).
 pub const RTM_NEWLINK: u16 = 16;
 /// Add an address to an interface.
 pub const RTM_NEWADDR: u16 = 20;
+/// Remove an address from an interface.
+pub const RTM_DELADDR: u16 = 21;
+/// Dump addresses.
+pub const RTM_GETADDR: u16 = 22;
 /// Add a route.
 pub const RTM_NEWROUTE: u16 = 24;
 
+/// End-of-dump marker message type.
+const NLMSG_DONE: u16 = 3;
+/// Error/ack message type.
+const NLMSG_ERROR: u16 = 2;
+
 const NLM_F_REQUEST: u16 = 0x001;
 const NLM_F_ACK: u16 = 0x004;
-const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_CREATE: u16 = 0x400;
+/// Dump request: root + match.
+const NLM_F_DUMP: u16 = 0x100 | 0x200;
 
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
@@ -32,6 +44,7 @@ const IFF_UP: u32 = 0x1;
 // rtnetlink attribute types.
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
+const IFLA_ADDRESS: u16 = 1;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 
@@ -128,7 +141,120 @@ pub fn default_route_msg(seq: u32, ifindex: u32, gateway: Ipv4Addr) -> Vec<u8> {
     finalize(buf)
 }
 
-pub use apply::configure_static;
+/// Build an `RTM_NEWLINK` message that clears `IFF_UP` on `ifindex` (link down).
+pub fn link_down_msg(seq: u32, ifindex: u32) -> Vec<u8> {
+    let mut buf = header(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, seq);
+    buf.push(AF_UNSPEC); // ifi_family
+    buf.push(0); // __pad
+    buf.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+    buf.extend_from_slice(&(ifindex as i32).to_ne_bytes()); // ifi_index
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags (down)
+    buf.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_change (only IFF_UP)
+    finalize(buf)
+}
+
+/// Build an `RTM_NEWLINK` message that sets the MAC address of `ifindex`.
+pub fn set_mac_msg(seq: u32, ifindex: u32, mac: [u8; 6]) -> Vec<u8> {
+    let mut buf = header(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, seq);
+    buf.push(AF_UNSPEC);
+    buf.push(0);
+    buf.extend_from_slice(&0u16.to_ne_bytes());
+    buf.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags (unchanged)
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change (none)
+    push_attr(&mut buf, IFLA_ADDRESS, &mac);
+    finalize(buf)
+}
+
+/// Build an `RTM_DELADDR` message removing `addr/prefix` from `ifindex`.
+pub fn del_addr_msg(seq: u32, ifindex: u32, addr: Ipv4Addr, prefix: u8) -> Vec<u8> {
+    let mut buf = header(RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, seq);
+    buf.push(AF_INET); // ifa_family
+    buf.push(prefix); // ifa_prefixlen
+    buf.push(0); // ifa_flags
+    buf.push(RT_SCOPE_UNIVERSE); // ifa_scope
+    buf.extend_from_slice(&ifindex.to_ne_bytes()); // ifa_index
+    push_attr(&mut buf, IFA_LOCAL, &addr.octets());
+    push_attr(&mut buf, IFA_ADDRESS, &addr.octets());
+    finalize(buf)
+}
+
+/// Build an `RTM_GETADDR` dump request for all IPv4 addresses.
+pub fn getaddr_dump_msg(seq: u32) -> Vec<u8> {
+    let mut buf = header(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, seq);
+    buf.push(AF_INET); // ifa_family filter
+    buf.push(0); // ifa_prefixlen
+    buf.push(0); // ifa_flags
+    buf.push(0); // ifa_scope
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // ifa_index (0 = all)
+    finalize(buf)
+}
+
+/// Parse `RTM_NEWADDR` messages from an `RTM_GETADDR` dump reply, returning the
+/// `(address, prefix_len)` of every IPv4 address on `ifindex`. Stops at
+/// `NLMSG_DONE`/`NLMSG_ERROR`. Pure (operates on the raw reply bytes) so it is
+/// unit-tested without a socket.
+pub fn parse_dump_addrs(buf: &[u8], ifindex: u32) -> Vec<(Ipv4Addr, u8)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 16 <= buf.len() {
+        let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let msg_type = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+        if len < 16 || off + len > buf.len() {
+            break;
+        }
+        if msg_type == NLMSG_DONE || msg_type == NLMSG_ERROR {
+            break;
+        }
+        if msg_type == RTM_NEWADDR {
+            // ifaddrmsg starts at off+16: family, prefixlen, flags, scope, index.
+            let body = off + 16;
+            let family = buf[body];
+            let prefix = buf[body + 1];
+            let idx =
+                u32::from_ne_bytes([buf[body + 4], buf[body + 5], buf[body + 6], buf[body + 7]]);
+            if family == AF_INET && idx == ifindex {
+                // Walk the attrs (after the 8-byte ifaddrmsg) for IFA_LOCAL/ADDRESS.
+                let mut a = body + 8;
+                while a + 4 <= off + len {
+                    let rta_len = u16::from_ne_bytes([buf[a], buf[a + 1]]) as usize;
+                    let rta_type = u16::from_ne_bytes([buf[a + 2], buf[a + 3]]);
+                    if rta_len < 4 || a + rta_len > off + len {
+                        break;
+                    }
+                    if (rta_type == IFA_LOCAL || rta_type == IFA_ADDRESS) && rta_len >= 8 {
+                        let ip = Ipv4Addr::new(buf[a + 4], buf[a + 5], buf[a + 6], buf[a + 7]);
+                        out.push((ip, prefix));
+                        break; // one address per ifaddrmsg is enough
+                    }
+                    a += (rta_len + 3) & !3;
+                }
+            }
+        }
+        off += (len + 3) & !3;
+    }
+    out
+}
+
+/// Whether a (possibly partial) netlink dump buffer contains the `NLMSG_DONE`
+/// end marker, so the reader knows it has the full reply.
+pub fn dump_has_done(buf: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off + 16 <= buf.len() {
+        let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let msg_type = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+        if len < 16 || off + len > buf.len() {
+            break;
+        }
+        if msg_type == NLMSG_DONE {
+            return true;
+        }
+        off += (len + 3) & !3;
+    }
+    false
+}
+
+pub use apply::{configure_static, reconfigure};
 
 /// Socket I/O that sends the encoded messages to the kernel.
 mod apply {
@@ -137,7 +263,10 @@ mod apply {
     use std::net::Ipv4Addr;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use super::{add_addr_msg, default_route_msg, link_up_msg};
+    use super::{
+        add_addr_msg, default_route_msg, del_addr_msg, dump_has_done, getaddr_dump_msg,
+        link_down_msg, link_up_msg, parse_dump_addrs, set_mac_msg,
+    };
 
     /// Resolve an interface name to its kernel index (`if_nametoindex`).
     fn interface_index(name: &str) -> io::Result<u32> {
@@ -236,6 +365,68 @@ mod apply {
         }
         Ok(())
     }
+
+    /// Remove every IPv4 address currently on `ifindex` (an `RTM_GETADDR` dump
+    /// followed by an `RTM_DELADDR` per result). Per-address delete failures are
+    /// ignored (the address may already be gone).
+    fn flush_addrs(sock: &OwnedFd, ifindex: u32) -> io::Result<()> {
+        let fd = sock.as_raw_fd();
+        let req = getaddr_dump_msg(100);
+        // SAFETY: req is a valid slice; pointer + length passed to send.
+        let sent = unsafe { libc::send(fd, req.as_ptr() as *const libc::c_void, req.len(), 0) };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A dump can span several datagrams; read until the NLMSG_DONE marker.
+        let mut dump = Vec::new();
+        for _ in 0..16 {
+            let mut buf = [0u8; 8192];
+            // SAFETY: buf is a valid, sufficiently large buffer for one datagram.
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if n == 0 {
+                break;
+            }
+            dump.extend_from_slice(&buf[..n as usize]);
+            if dump_has_done(&dump) {
+                break;
+            }
+        }
+        for (i, (addr, prefix)) in parse_dump_addrs(&dump, ifindex).into_iter().enumerate() {
+            let seq = 200 + i as u32;
+            let _ = send_recv(sock, &del_addr_msg(seq, ifindex, addr, prefix));
+        }
+        Ok(())
+    }
+
+    /// Apply a new network identity to an existing interface: optionally change
+    /// its MAC, flush its old addresses, assign `addr/prefix`, bring it up, and
+    /// (when `gateway` is set) install the default route - all via netlink, so it
+    /// works on a distroless guest after a snapshot restore or fork.
+    pub fn reconfigure(
+        iface: &str,
+        mac: Option<[u8; 6]>,
+        addr: Ipv4Addr,
+        prefix: u8,
+        gateway: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        let sock = open_socket()?;
+        let ifindex = interface_index(iface)?;
+
+        if let Some(mac) = mac {
+            send_recv(&sock, &link_down_msg(1, ifindex))?;
+            send_recv(&sock, &set_mac_msg(2, ifindex, mac))?;
+        }
+        flush_addrs(&sock, ifindex)?;
+        send_recv(&sock, &add_addr_msg(3, ifindex, addr, prefix))?;
+        send_recv(&sock, &link_up_msg(4, ifindex))?;
+        if let Some(gw) = gateway {
+            send_recv(&sock, &default_route_msg(5, ifindex, gw))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -318,5 +509,64 @@ mod tests {
         assert_eq!(align4(1), 4);
         assert_eq!(align4(4), 4);
         assert_eq!(align4(5), 8);
+    }
+
+    #[test]
+    fn link_down_msg_clears_up_flag() {
+        let msg = link_down_msg(1, 7);
+        assert_eq!(read_u16(&msg, 4), RTM_NEWLINK);
+        assert_eq!(read_u32(&msg, 20) as i32, 7, "ifi_index");
+        assert_eq!(read_u32(&msg, 24), 0, "ifi_flags cleared");
+        assert_eq!(read_u32(&msg, 28), IFF_UP, "ifi_change is IFF_UP");
+    }
+
+    #[test]
+    fn set_mac_msg_carries_link_address_attr() {
+        let mac = [0xAA, 0xFC, 0x00, 0x00, 0x00, 0x09];
+        let msg = set_mac_msg(2, 9, mac);
+        assert_eq!(read_u16(&msg, 4), RTM_NEWLINK);
+        assert_eq!(read_u32(&msg, 20) as i32, 9);
+        // First attr at offset 32 (header 16 + ifinfomsg 16): len=10, IFLA_ADDRESS.
+        assert_eq!(read_u16(&msg, 32), 10);
+        assert_eq!(read_u16(&msg, 34), IFLA_ADDRESS);
+        assert_eq!(&msg[36..42], &mac);
+    }
+
+    #[test]
+    fn del_addr_msg_targets_address_and_prefix() {
+        let addr = Ipv4Addr::new(192, 0, 2, 5);
+        let msg = del_addr_msg(3, 9, addr, 30);
+        assert_eq!(read_u16(&msg, 4), RTM_DELADDR);
+        assert_eq!(msg[16], AF_INET);
+        assert_eq!(msg[17], 30);
+        assert_eq!(read_u32(&msg, 20), 9);
+        assert_eq!(&msg[28..32], &addr.octets());
+    }
+
+    #[test]
+    fn parse_dump_addrs_filters_by_interface_and_detects_done() {
+        // A dump reply is structurally identical to RTM_NEWADDR requests, so the
+        // add-addr encoder builds valid fixtures for the parser.
+        let mut dump = add_addr_msg(0, 9, Ipv4Addr::new(192, 0, 2, 5), 30);
+        dump.extend_from_slice(&add_addr_msg(0, 1, Ipv4Addr::new(127, 0, 0, 1), 8));
+        assert!(!dump_has_done(&dump), "no DONE marker yet");
+
+        let mut done = header(NLMSG_DONE, 0, 0);
+        done.extend_from_slice(&0i32.to_ne_bytes());
+        dump.extend_from_slice(&finalize(done));
+        assert!(dump_has_done(&dump));
+
+        assert_eq!(
+            parse_dump_addrs(&dump, 9),
+            vec![(Ipv4Addr::new(192, 0, 2, 5), 30)]
+        );
+        assert_eq!(
+            parse_dump_addrs(&dump, 1),
+            vec![(Ipv4Addr::new(127, 0, 0, 1), 8)]
+        );
+        assert!(
+            parse_dump_addrs(&dump, 42).is_empty(),
+            "unknown index -> none"
+        );
     }
 }
