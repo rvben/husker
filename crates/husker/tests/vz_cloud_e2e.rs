@@ -337,3 +337,275 @@ async fn vz_cloud_image_boots_and_reports_ip() {
 
     eprintln!("[vz_cloud_e2e] PASS");
 }
+
+// ── Live port-forward e2e ───────────────────────────────────────────────────────
+
+/// Create a cloud VM, wait for cloud-init, and return its discovered guest IP.
+///
+/// Mirrors the boot/poll logic of the test above. Polling `GET /v1/vms/:name`
+/// also triggers lazy guest-IP discovery, so the returned IP is populated in
+/// daemon state (which `add_port_forward` reads).
+async fn create_and_wait_ready(
+    client: &reqwest::Client,
+    base: &str,
+    vm_name: &str,
+    image_path: &Path,
+) -> String {
+    let create_body = serde_json::json!({
+        "name": vm_name,
+        "cloud_image": image_path.to_str().expect("image path is valid UTF-8"),
+        "vcpu_count": 2,
+        "mem_size_mib": 1024,
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms"))
+        .json(&create_body)
+        .send()
+        .await
+        .expect("POST /v1/vms should reach daemon");
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "VM creation failed with {status}: {body_text}"
+    );
+
+    let poll_start = Instant::now();
+    let poll_budget = Duration::from_secs(300);
+    let poll_sleep = Duration::from_secs(5);
+
+    // Phase 1: wait for cloud-init to finish.
+    loop {
+        assert!(
+            poll_start.elapsed() < poll_budget,
+            "cloud-init did not complete within {}s",
+            poll_budget.as_secs()
+        );
+        let info: serde_json::Value =
+            match client.get(format!("{base}/v1/vms/{vm_name}")).send().await {
+                Ok(r) if r.status().is_success() => {
+                    r.json().await.unwrap_or(serde_json::Value::Null)
+                }
+                _ => {
+                    tokio::time::sleep(poll_sleep).await;
+                    continue;
+                }
+            };
+        if info["state"].as_str().unwrap_or("") != "running" {
+            tokio::time::sleep(poll_sleep).await;
+            continue;
+        }
+        let exec_body = serde_json::json!({
+            "command": "cloud-init",
+            "args": ["status", "--wait"],
+            "timeout_secs": 120,
+            "connect_timeout_secs": 30,
+        });
+        if let Ok(r) = client
+            .post(format!("{base}/v1/vms/{vm_name}/exec"))
+            .json(&exec_body)
+            .send()
+            .await
+            && r.status().is_success()
+        {
+            let result: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
+            if result["exit_code"].as_i64().unwrap_or(-1) == 0 {
+                break;
+            }
+        }
+        tokio::time::sleep(poll_sleep).await;
+    }
+
+    // Phase 2: wait for a discovered guest IP (the GET triggers discovery).
+    loop {
+        assert!(
+            poll_start.elapsed() < poll_budget,
+            "guest IP was not discovered within {}s",
+            poll_budget.as_secs()
+        );
+        if let Ok(r) = client.get(format!("{base}/v1/vms/{vm_name}")).send().await
+            && r.status().is_success()
+        {
+            let info: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
+            if let Some(ip) = info["guest_ip"].as_str()
+                && !ip.is_empty()
+            {
+                return ip.to_string();
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Run a command in the guest and return (exit_code, stdout).
+async fn guest_exec(
+    client: &reqwest::Client,
+    base: &str,
+    vm_name: &str,
+    command: &str,
+    args: &[&str],
+) -> (i64, String) {
+    let body = serde_json::json!({
+        "command": command,
+        "args": args,
+        "timeout_secs": 20,
+        "connect_timeout_secs": 15,
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms/{vm_name}/exec"))
+        .json(&body)
+        .send()
+        .await
+        .expect("exec should reach daemon");
+    assert!(resp.status().is_success(), "exec HTTP {}", resp.status());
+    let r: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    (
+        r["exit_code"].as_i64().unwrap_or(-1),
+        r["stdout"].as_str().unwrap_or("").to_string(),
+    )
+}
+
+/// End-to-end proof that the macOS userspace proxy forwards a host TCP port to a
+/// real service inside a VZ cloud guest, and that removal tears the listener down.
+///
+/// This is the live confirmation of the Approach A routability assumption: the
+/// host process opens a TCP connection to `guest_ip:guest_port` over the VZ NAT.
+#[tokio::test]
+#[ignore = "gated: set HUSKER_RUN_VZ_CLOUD_E2E=1 and HUSKER_VZ_CLOUD_IMAGE=<path>"]
+async fn vz_cloud_port_forward_reaches_guest() {
+    if std::env::var("HUSKER_RUN_VZ_CLOUD_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping vz_cloud_port_forward_reaches_guest: set HUSKER_RUN_VZ_CLOUD_E2E=1");
+        return;
+    }
+    let image_path = match std::env::var("HUSKER_VZ_CLOUD_IMAGE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            eprintln!("skipping: HUSKER_VZ_CLOUD_IMAGE not set");
+            return;
+        }
+    };
+    if !image_path.exists() {
+        eprintln!("skipping: HUSKER_VZ_CLOUD_IMAGE does not exist");
+        return;
+    }
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let port = free_port();
+    let _daemon = spawn_daemon(port, data_dir.path());
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let vm_name = "vz-pf-e2e";
+    let guest_ip = create_and_wait_ready(&client, &base, vm_name, &image_path).await;
+    eprintln!("[vz_pf_e2e] guest_ip={guest_ip}");
+
+    // ── Start a TCP service inside the guest (detached, survives the exec) ──────
+    const GUEST_PORT: u16 = 8088;
+    let (code, _out) = guest_exec(
+        &client,
+        &base,
+        vm_name,
+        // setsid + full stdio redirection so the server outlives the exec channel.
+        "sh",
+        &[
+            "-c",
+            &format!(
+                "setsid python3 -m http.server {GUEST_PORT} >/tmp/pf.log 2>&1 </dev/null & sleep 1; echo up"
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "failed to start guest http server");
+
+    // ── Add the port forward ───────────────────────────────────────────────────
+    let host_port = free_port();
+    let add_resp = client
+        .post(format!("{base}/v1/vms/{vm_name}/ports"))
+        .json(&serde_json::json!({ "host_port": host_port, "guest_port": GUEST_PORT }))
+        .send()
+        .await
+        .expect("POST ports should reach daemon");
+    assert_eq!(
+        add_resp.status(),
+        reqwest::StatusCode::CREATED,
+        "add port forward failed"
+    );
+    let add_json: serde_json::Value = add_resp.json().await.unwrap();
+    assert_eq!(add_json["bind_addr"], serde_json::json!("127.0.0.1"));
+
+    // ── THE PROOF: reach the guest service through the host port ────────────────
+    let url = format!("http://127.0.0.1:{host_port}/");
+    let mut reached = false;
+    for attempt in 0..15 {
+        match client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                reached = true;
+                eprintln!(
+                    "[vz_pf_e2e] reached guest via 127.0.0.1:{host_port} (attempt {attempt})"
+                );
+                break;
+            }
+            Ok(r) => eprintln!("[vz_pf_e2e] attempt {attempt}: HTTP {}", r.status()),
+            Err(e) => eprintln!("[vz_pf_e2e] attempt {attempt}: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        reached,
+        "host could not reach the guest service through the forwarded port"
+    );
+
+    // ── List shows the forward with the effective bind address ─────────────────
+    let list: serde_json::Value = client
+        .get(format!("{base}/v1/vms/{vm_name}/ports"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(list[0]["bind_addr"], serde_json::json!("127.0.0.1"));
+
+    // ── Remove the forward; the host port must stop reaching the guest ─────────
+    let del = client
+        .delete(format!("{base}/v1/vms/{vm_name}/ports/{host_port}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let mut closed = false;
+    for _ in 0..25 {
+        if client
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .is_err()
+        {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(closed, "forwarded port should stop accepting after removal");
+
+    // ── Clean up ───────────────────────────────────────────────────────────────
+    let del_vm = client
+        .delete(format!("{base}/v1/vms/{vm_name}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        del_vm.status().is_success(),
+        "DELETE vm returned {}",
+        del_vm.status()
+    );
+    eprintln!("[vz_pf_e2e] PASS");
+}
