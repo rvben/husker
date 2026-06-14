@@ -485,6 +485,14 @@ pub struct HuskerCore<B: VmmBackend> {
     /// actually runs the VM. Defaults to Firecracker.
     #[cfg(feature = "linux-net")]
     default_vmm_kind: husker_vmm::VmmKind,
+    /// Default kernel the daemon uses when a create request omits kernel_path.
+    /// Wired from the daemon config so remote clients do not need to send
+    /// client-local paths that cannot exist on the daemon host.
+    default_kernel: Option<PathBuf>,
+    /// Default rootfs the daemon uses when a create request omits rootfs_path.
+    default_rootfs: Option<PathBuf>,
+    /// Default initrd the daemon uses when a create request omits initrd_path.
+    default_initrd: Option<PathBuf>,
     runtime_dir: PathBuf,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -649,6 +657,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             lan_bridge: None,
             dns_servers,
             default_vmm_kind: husker_vmm::VmmKind::Firecracker,
+            default_kernel: None,
+            default_rootfs: None,
+            default_initrd: None,
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -672,6 +683,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             embedded_agent: &[],
+            default_kernel: None,
+            default_rootfs: None,
+            default_initrd: None,
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -685,6 +699,22 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// default) disables cloud-image support with a clear error at create time.
     pub fn with_embedded_agent(mut self, agent: &'static [u8]) -> Self {
         self.embedded_agent = agent;
+        self
+    }
+
+    /// Set the default kernel/rootfs/initrd the daemon uses when a create request
+    /// omits them. Wire these from the daemon's config so a remote client can create
+    /// VMs without sending client-local paths (which don't exist on the daemon). Each
+    /// is used only when the request omits the corresponding path.
+    pub fn with_default_images(
+        mut self,
+        kernel: Option<PathBuf>,
+        rootfs: Option<PathBuf>,
+        initrd: Option<PathBuf>,
+    ) -> Self {
+        self.default_kernel = kernel;
+        self.default_rootfs = rootfs;
+        self.default_initrd = initrd;
         self
     }
 
@@ -751,7 +781,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// avoid clobbering a foreign stopped VM).
     pub async fn create_vm_record(
         &self,
-        req: CreateVmRequest,
+        mut req: CreateVmRequest,
         tags: Option<ServiceTag>,
         replace_existing_stopped: bool,
     ) -> Result<VmRecord, CoreError> {
@@ -775,11 +805,29 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         if req.cloud_image.is_none() {
+            // Fill daemon defaults for any path the client omitted. A remote client
+            // sends only the paths the user explicitly specified; the daemon fills the
+            // rest from its own configured defaults so the paths are valid on the
+            // daemon host, not the client host.
+            if req.kernel_path.is_none() {
+                req.kernel_path = self.default_kernel.clone();
+            }
+            if req.rootfs_path.is_none() {
+                req.rootfs_path = self.default_rootfs.clone();
+            }
             let kernel = req.kernel_path.as_deref().ok_or_else(|| {
-                CoreError::InvalidArgument("kernel_path is required for direct-kernel boot".into())
+                CoreError::InvalidArgument(
+                    "no kernel specified and the daemon has no default kernel; \
+                     pass --kernel, or run `husker images pull` on the daemon host"
+                        .into(),
+                )
             })?;
             let rootfs = req.rootfs_path.as_deref().ok_or_else(|| {
-                CoreError::InvalidArgument("rootfs_path is required for direct-kernel boot".into())
+                CoreError::InvalidArgument(
+                    "no rootfs specified and the daemon has no default rootfs; \
+                     pass a rootfs path, or run `husker images pull` on the daemon host"
+                        .into(),
+                )
             })?;
             husker_storage::validate_kernel(kernel)?;
             husker_storage::validate_rootfs(rootfs)?;
@@ -1051,6 +1099,18 @@ impl<B: VmmBackend> HuskerCore<B> {
             })
         };
 
+        // Resolve initrd: prefer explicit path, then daemon default (if it exists on
+        // the daemon host), then the conventional data-dir location as a last resort.
+        // Resolved before kernel_args so the root= flag reflects the actual initrd state.
+        let initrd_path = req
+            .initrd_path
+            .clone()
+            .or_else(|| self.default_initrd.clone().filter(|p| p.exists()))
+            .or_else(|| {
+                let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
+                conventional.exists().then_some(conventional)
+            });
+
         // NAT direct-kernel VMs pass the static IP as a kernel boot parameter.
         // Cloud VMs (NAT and bridged) use cloud-init for network; kernel_args is None.
         let kernel_args = if is_cloud {
@@ -1058,7 +1118,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         } else {
             // Direct-kernel boots are always NAT (bridged requires cloud image).
             // Without an initrd the kernel must mount root itself; append root=/dev/vda rw.
-            let root = if req.initrd_path.is_none() {
+            let root = if initrd_path.is_none() {
                 " root=/dev/vda rw"
             } else {
                 ""
@@ -1078,7 +1138,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             kernel_path: config_kernel_path,
             rootfs_path: disk_path,
             kernel_args,
-            initrd_path: req.initrd_path.clone(),
+            initrd_path,
             vsock_cid: cid,
             tap_device: Some(tap_name.clone()),
             guest_mac: Some(mac),
@@ -1379,11 +1439,16 @@ impl<B: VmmBackend> HuskerCore<B> {
             )));
         }
 
-        // Resolve initrd: use explicit path, or look for conventional location
-        let initrd_path = req.initrd_path.clone().or_else(|| {
-            let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
-            conventional.exists().then_some(conventional)
-        });
+        // Resolve initrd: prefer explicit path, then daemon default (if it exists on
+        // the daemon host), then the conventional data-dir location as a last resort.
+        let initrd_path = req
+            .initrd_path
+            .clone()
+            .or_else(|| self.default_initrd.clone().filter(|p| p.exists()))
+            .or_else(|| {
+                let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
+                conventional.exists().then_some(conventional)
+            });
 
         let kernel_str = kernel.to_string_lossy().into_owned();
         let rootfs_str = rootfs.to_string_lossy().into_owned();
@@ -6020,6 +6085,116 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(
             core.list_services().unwrap().is_empty(),
             "no service should be persisted on rejection"
+        );
+    }
+
+    // ── Default-image resolution (Part A, remote-client fix) ────────────────
+
+    /// A create request with no kernel or rootfs but with daemon defaults set
+    /// must pass validation (the daemon fills in its own paths).
+    ///
+    /// Note: driving create_vm_record to completion in the non-linux test harness
+    /// requires a real VMM process, which is unavailable in unit tests. Instead we
+    /// assert that the early validation error ("no kernel specified") is NOT
+    /// returned when defaults are wired — the error boundary we can reliably exercise
+    /// without a running VMM.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn default_images_fill_missing_kernel_and_rootfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+
+        // Create minimal real files so validate_kernel / validate_rootfs pass.
+        // On macOS, validate_kernel checks the ARM64 Image magic at offset 56.
+        let kernel_path = tmp.path().join("vmlinux");
+        let mut kernel_stub = vec![0u8; 64];
+        kernel_stub[56..60].copy_from_slice(&[0x41, 0x52, 0x4d, 0x64]); // ARM64 magic LE
+        std::fs::write(&kernel_path, &kernel_stub).unwrap();
+
+        let rootfs_path = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs_path, b"rootfs").unwrap();
+
+        let core = HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        )
+        .with_default_images(
+            Some(kernel_path.clone()),
+            Some(rootfs_path.clone()),
+            None,
+        );
+
+        // A request with no explicit kernel/rootfs should not return the
+        // "no kernel specified" error; it should get past validation and
+        // fail at a later stage (VMM not running), not at the path-check.
+        let req = CreateVmRequest {
+            name: "test-defaults".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            initrd_path: None,
+            cloud_image: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            volume: None,
+            network: None,
+        };
+
+        let err = core.create_vm_record(req, None, true).await.unwrap_err();
+        // Must NOT be "no kernel specified" - that would mean defaults weren't applied.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no kernel specified"),
+            "daemon defaults should have filled the kernel; got: {msg}"
+        );
+        assert!(
+            !msg.contains("no rootfs specified"),
+            "daemon defaults should have filled the rootfs; got: {msg}"
+        );
+    }
+
+    /// A create request with no kernel/rootfs and NO daemon defaults must return
+    /// a clear InvalidArgument error — not a panic or a misleading message.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn missing_kernel_without_defaults_returns_invalid_argument() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let core = make_vz_core(state, tmp.path());
+
+        let req = CreateVmRequest {
+            name: "test-no-defaults".into(),
+            kernel_path: None,
+            rootfs_path: None,
+            initrd_path: None,
+            cloud_image: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            env: vec![],
+            vmm: None,
+            disk_size: None,
+            ssh_authorized_keys: vec![],
+            balloon: false,
+            volume: None,
+            network: None,
+        };
+
+        let err = core.create_vm_record(req, None, true).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("no kernel specified")),
+            "expected InvalidArgument with 'no kernel specified', got: {err:?}"
         );
     }
 }

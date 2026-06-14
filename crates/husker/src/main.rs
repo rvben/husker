@@ -1732,55 +1732,59 @@ fn build_vm_request_body(
             eprintln!("Using: cloud-image={}", img.display());
         }
     } else {
-        let resolved_rootfs = match args.rootfs {
-            Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
-            None => {
-                let default = config.default_rootfs.clone();
-                if !default.exists() {
-                    eprintln!(
-                        "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass a rootfs path explicitly.",
-                        default.display()
-                    );
-                    exit_with_error(output, "default rootfs not available".to_string());
-                }
-                default
-            }
-        };
-        let resolved_kernel = match args.kernel {
-            Some(path) => path,
-            None => {
-                let default = config.default_kernel.clone();
-                if !default.exists() {
-                    eprintln!(
-                        "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel explicitly.",
-                        default.display()
-                    );
-                    exit_with_error(output, "default kernel not available".to_string());
-                }
-                default
-            }
-        };
-        if let Some(ref initrd_path) = args.initrd {
-            body["initrd_path"] = serde_json::json!(initrd_path);
-        } else if let Some(ref default_initrd) = config.default_initrd
-            && default_initrd.exists()
-        {
-            body["initrd_path"] = serde_json::json!(default_initrd);
-        }
-        if output == OutputFormat::Text {
-            let initrd_str = body
-                .get("initrd_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(none)");
+        // Only include kernel/rootfs/initrd in the request when the user explicitly
+        // provided them. When omitted, the daemon resolves defaults from its own
+        // config, ensuring the paths exist on the daemon host rather than the client.
+        let explicit_rootfs = args.rootfs.map(|path| husker::resolve_rootfs_arg(path, &config.data_dir));
+        let explicit_kernel = args.kernel;
+        let explicit_initrd = args.initrd;
+
+        // When paths are omitted and the local defaults don't exist, emit a hint
+        // so users on a fresh local install know to run `husker images pull`.
+        // This is advisory only; the daemon may have its own defaults even if the
+        // client's data dir is empty (e.g. a remote daemon over ssh://).
+        // Emitted unconditionally to stderr since it is always human-facing.
+        if explicit_kernel.is_none() && !config.default_kernel.exists() {
             eprintln!(
-                "Using: kernel={} rootfs={} initrd={}",
-                resolved_kernel.display(),
-                resolved_rootfs.display(),
-                initrd_str,
+                "Default kernel not found at {}.\n\
+                 Run `husker images pull` to fetch it, or pass --kernel explicitly.",
+                config.default_kernel.display()
             );
         }
-        body["kernel_path"] = serde_json::json!(resolved_kernel);
-        body["rootfs_path"] = serde_json::json!(resolved_rootfs);
+        if explicit_rootfs.is_none() && !config.default_rootfs.exists() {
+            eprintln!(
+                "Default rootfs not found at {}.\n\
+                 Run `husker images pull` to fetch it, or pass a rootfs path explicitly.",
+                config.default_rootfs.display()
+            );
+        }
+
+        if output == OutputFormat::Text {
+            let kernel_str = explicit_kernel
+                .as_ref()
+                .map(|p: &std::path::PathBuf| p.display().to_string())
+                .unwrap_or_else(|| "(daemon default)".to_string());
+            let rootfs_str = explicit_rootfs
+                .as_ref()
+                .map(|p: &std::path::PathBuf| p.display().to_string())
+                .unwrap_or_else(|| "(daemon default)".to_string());
+            let initrd_str = explicit_initrd
+                .as_ref()
+                .map(|p: &std::path::PathBuf| p.display().to_string())
+                .unwrap_or_else(|| "(daemon default)".to_string());
+            eprintln!(
+                "Using: kernel={kernel_str} rootfs={rootfs_str} initrd={initrd_str}",
+            );
+        }
+        if let Some(ref rootfs) = explicit_rootfs {
+            body["rootfs_path"] = serde_json::json!(rootfs);
+        }
+        if let Some(ref kernel) = explicit_kernel {
+            body["kernel_path"] = serde_json::json!(kernel);
+        }
+        if let Some(ref initrd) = explicit_initrd {
+            body["initrd_path"] = serde_json::json!(initrd);
+        }
     }
 
     if balloon {
@@ -3582,45 +3586,21 @@ async fn service_command(
                 // cloud-image path: kernel and rootfs are not required
                 (None, None)
             } else {
+                // Only include rootfs/kernel when the user explicitly provided them.
                 // Rootfs resolution precedence:
                 //   1. --rootfs given: resolve through catalog (same as `husker run`)
                 //   2. --image given: treat the value as a rootfs reference (path or
                 //      bare image name) and resolve through the same catalog lookup
-                //   3. neither: fall back to the configured default_rootfs
-                let resolved_rootfs = match rootfs {
-                    Some(path) => husker::resolve_rootfs_arg(path, &config.data_dir),
-                    None => match image.as_ref().map(PathBuf::from) {
-                        Some(image_path) => {
-                            husker::resolve_rootfs_arg(image_path, &config.data_dir)
-                        }
-                        None => {
-                            let default = config.default_rootfs.clone();
-                            if !default.exists() {
-                                eprintln!(
-                                    "Default rootfs not found at {}.\nRun `husker images pull` to fetch it, or pass --rootfs, --image, or --cloud-image.",
-                                    default.display()
-                                );
-                                exit_with_error(output, "default rootfs not available".to_string());
-                            }
-                            default
-                        }
-                    },
+                //   3. neither: omit; the daemon fills from its own configured default
+                let explicit_rootfs = match rootfs {
+                    Some(path) => Some(husker::resolve_rootfs_arg(path, &config.data_dir)),
+                    None => image.as_ref().map(|img| {
+                        husker::resolve_rootfs_arg(PathBuf::from(img), &config.data_dir)
+                    }),
                 };
-                let resolved_kernel = match kernel {
-                    Some(path) => path,
-                    None => {
-                        let default = config.default_kernel.clone();
-                        if !default.exists() {
-                            eprintln!(
-                                "Default kernel not found at {}.\nRun `husker images pull` to fetch it, or pass --kernel or --cloud-image.",
-                                default.display()
-                            );
-                            exit_with_error(output, "default kernel not available".to_string());
-                        }
-                        default
-                    }
-                };
-                (Some(resolved_rootfs), Some(resolved_kernel))
+                // kernel: use explicit if given, otherwise omit (daemon resolves)
+                let explicit_kernel = kernel;
+                (explicit_rootfs, explicit_kernel)
             };
 
             let env_pairs: Vec<(String, String)> = env
@@ -3650,12 +3630,8 @@ async fn service_command(
             }
             if let Some(ref initrd_path) = initrd {
                 body["initrd_path"] = serde_json::json!(initrd_path);
-            } else if rootfs_val.is_some()
-                && let Some(ref default_initrd) = config.default_initrd
-                && default_initrd.exists()
-            {
-                body["initrd_path"] = serde_json::json!(default_initrd);
             }
+            // Initrd default is resolved by the daemon from its own config; omit here.
             if let Some(n) = vcpus {
                 body["vcpu_count"] = serde_json::json!(n);
             }
@@ -6075,7 +6051,12 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
                 .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
                 .with_lan_bridge(config.lan_bridge.clone())
-                .with_default_vmm_kind(default_kind),
+                .with_default_vmm_kind(default_kind)
+                .with_default_images(
+                    Some(config.default_kernel.clone()),
+                    Some(config.default_rootfs.clone()),
+                    config.default_initrd.clone(),
+                ),
             )
         };
         #[cfg(not(target_os = "linux"))]
@@ -6086,15 +6067,22 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                 &config.firecracker_bin,
                 &runtime_dir,
             );
-            Arc::new(husker_core::HuskerCore::new(
-                vmm,
-                state,
-                ip_allocator,
-                storage,
-                config.bridge_name.clone(),
-                config.dns_servers,
-                runtime_dir.clone(),
-            ))
+            Arc::new(
+                husker_core::HuskerCore::new(
+                    vmm,
+                    state,
+                    ip_allocator,
+                    storage,
+                    config.bridge_name.clone(),
+                    config.dns_servers,
+                    runtime_dir.clone(),
+                )
+                .with_default_images(
+                    Some(config.default_kernel.clone()),
+                    Some(config.default_rootfs.clone()),
+                    config.default_initrd.clone(),
+                ),
+            )
         };
         run_linux_daemon(
             core,
@@ -6119,7 +6107,12 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
         let core = Arc::new(
             husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
-                .with_embedded_agent(husker::EMBEDDED_AGENT),
+                .with_embedded_agent(husker::EMBEDDED_AGENT)
+                .with_default_images(
+                    Some(config.default_kernel.clone()),
+                    Some(config.default_rootfs.clone()),
+                    config.default_initrd.clone(),
+                ),
         );
 
         run_initial_service_reconcile(&core).await;
@@ -6146,7 +6139,12 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
         let core = Arc::new(
             husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
-                .with_embedded_agent(husker::EMBEDDED_AGENT),
+                .with_embedded_agent(husker::EMBEDDED_AGENT)
+                .with_default_images(
+                    Some(config.default_kernel.clone()),
+                    Some(config.default_rootfs.clone()),
+                    config.default_initrd.clone(),
+                ),
         );
 
         run_initial_service_reconcile(&core).await;
