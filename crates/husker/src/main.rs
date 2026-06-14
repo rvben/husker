@@ -125,6 +125,11 @@ enum Commands {
         #[arg(long, short = 'e')]
         env: Vec<String>,
 
+        /// Read environment variables from a KEY=VALUE file (repeatable). Keeps
+        /// secrets out of the process table and shell history; explicit -e wins.
+        #[arg(long = "env-file")]
+        env_file: Vec<PathBuf>,
+
         /// Backend to run this VM on
         #[arg(long, value_parser = ["firecracker", "qemu"])]
         vmm: Option<String>,
@@ -251,6 +256,11 @@ enum Commands {
         #[arg(long, short = 'e')]
         env: Vec<String>,
 
+        /// Read environment variables from a KEY=VALUE file (repeatable). Keeps
+        /// secrets out of the process table and shell history; explicit -e wins.
+        #[arg(long = "env-file")]
+        env_file: Vec<PathBuf>,
+
         /// Seconds to wait for the guest agent to become reachable before
         /// failing (server default: 30, or 180 for UEFI/cloud VMs)
         #[arg(long)]
@@ -295,6 +305,11 @@ enum Commands {
         /// Environment variables for the command (KEY=VALUE), repeatable
         #[arg(long, short = 'e')]
         env: Vec<String>,
+
+        /// Read environment variables from a KEY=VALUE file (repeatable). Keeps
+        /// secrets out of the process table and shell history; explicit -e wins.
+        #[arg(long = "env-file")]
+        env_file: Vec<PathBuf>,
 
         /// Backend to run this VM on
         #[arg(long, value_parser = ["firecracker", "qemu"])]
@@ -927,6 +942,49 @@ fn expand_tilde(path: &Path) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     path.to_path_buf()
+}
+
+/// Read `KEY=VALUE` lines from each env file into `KEY=VALUE` strings, matching
+/// the format of repeated `-e/--env` flags. Blank lines and `#` comments are
+/// skipped, a leading `export ` is tolerated, and the key is trimmed. A line
+/// without `=` is an error so a malformed file fails loudly rather than silently
+/// dropping a secret. Values are taken verbatim (no quote stripping or
+/// interpolation), matching `docker --env-file`.
+fn load_env_files(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading env file {}", path.display()))?;
+        for (idx, raw) in content.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}:{}: expected KEY=VALUE, got `{raw}`",
+                    path.display(),
+                    idx + 1
+                )
+            })?;
+            let key = key.trim();
+            if key.is_empty() {
+                anyhow::bail!("{}:{}: empty key in `{raw}`", path.display(), idx + 1);
+            }
+            out.push(format!("{key}={value}"));
+        }
+    }
+    Ok(out)
+}
+
+/// Combine `--env-file` contents with `-e/--env` flags. File entries come first
+/// so an explicit `-e` overrides the same key in a file (consumers resolve env
+/// last-wins).
+fn merge_env(env_files: &[PathBuf], env_flags: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut merged = load_env_files(env_files)?;
+    merged.extend(env_flags);
+    Ok(merged)
 }
 
 /// Flags shared by `run` and `job` that describe the VM to create.
@@ -1956,6 +2014,7 @@ async fn run(cli: Cli) -> Result<()> {
             memory,
             userdata,
             env,
+            env_file,
             vmm,
             cloud_image,
             disk_size,
@@ -1971,6 +2030,7 @@ async fn run(cli: Cli) -> Result<()> {
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
+            let env = merge_env(&env_file, env)?;
             let args = VmRequestArgs {
                 rootfs,
                 kernel,
@@ -2399,12 +2459,14 @@ async fn run(cli: Cli) -> Result<()> {
             name,
             workdir,
             env,
+            env_file,
             connect_timeout,
             timeout,
             command,
         } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let (cmd, args) = command.split_first().context("command required after --")?;
+            let env = merge_env(&env_file, env)?;
 
             let mut body = serde_json::json!({
                 "command": cmd,
@@ -2479,6 +2541,7 @@ async fn run(cli: Cli) -> Result<()> {
             cpus,
             memory,
             env,
+            env_file,
             vmm,
             cloud_image,
             disk_size,
@@ -2498,6 +2561,7 @@ async fn run(cli: Cli) -> Result<()> {
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
             let name =
                 name.unwrap_or_else(|| format!("job-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+            let env = merge_env(&env_file, env)?;
 
             // env goes to the EXEC request, not the create body; pass empty to the builder.
             let args = VmRequestArgs {
@@ -6677,6 +6741,70 @@ mod tests {
     use clap::Parser;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn env_file_parses_pairs_skips_comments_and_blanks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(
+            &path,
+            "# a comment\n\nFOO=bar\n  export BAZ=qux \nTOKEN=a=b=c\n  # indented comment\nPADDED_KEY =value\n",
+        )
+        .unwrap();
+
+        let pairs = load_env_files(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                "FOO=bar".to_string(),
+                // `export ` prefix stripped, key trimmed; value verbatim.
+                "BAZ=qux".to_string(),
+                // value keeps its own `=` signs.
+                "TOKEN=a=b=c".to_string(),
+                // key whitespace is trimmed; the value after `=` is taken as-is.
+                "PADDED_KEY=value".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_rejects_a_line_without_equals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "FOO=bar\nNOPE\n").unwrap();
+        let err = load_env_files(std::slice::from_ref(&path)).unwrap_err();
+        assert!(
+            err.to_string().contains("expected KEY=VALUE"),
+            "malformed line must fail loudly, got: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_env_lets_explicit_flags_override_file_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "SHARED=from_file\nONLY_FILE=1\n").unwrap();
+        // File entries come first so a later `-e` of the same key wins in a
+        // last-wins consumer.
+        let merged = merge_env(
+            std::slice::from_ref(&path),
+            vec!["SHARED=from_flag".to_string(), "ONLY_FLAG=2".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                "SHARED=from_file".to_string(),
+                "ONLY_FILE=1".to_string(),
+                "SHARED=from_flag".to_string(),
+                "ONLY_FLAG=2".to_string(),
+            ]
+        );
+        // The effective value in a last-wins map is the flag's.
+        let map: std::collections::HashMap<_, _> =
+            merged.iter().filter_map(|s| s.split_once('=')).collect();
+        assert_eq!(map["SHARED"], "from_flag");
+    }
 
     #[test]
     fn port_forward_add_has_bind_flag() {
