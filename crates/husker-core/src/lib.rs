@@ -2344,15 +2344,28 @@ impl<B: VmmBackend> HuskerCore<B> {
                 req.kernel_path.unwrap_or_default(),
             )
         } else {
+            // Fall back to the daemon's configured defaults when the client omits
+            // them, mirroring create_vm_record. The client omits unspecified paths
+            // (so a remote client does not send its own local paths), so the daemon
+            // must resolve them here too or service create would reject valid input.
             (
-                req.rootfs_path.ok_or_else(|| {
-                    CoreError::InvalidArgument(
-                        "service requires a rootfs (--image or --rootfs) or --cloud-image".into(),
-                    )
-                })?,
-                req.kernel_path.ok_or_else(|| {
-                    CoreError::InvalidArgument("service requires a kernel".into())
-                })?,
+                req.rootfs_path
+                    .or_else(|| self.default_rootfs.clone())
+                    .ok_or_else(|| {
+                        CoreError::InvalidArgument(
+                            "service requires a rootfs (--image or --rootfs) or --cloud-image, \
+                             and the daemon has no default rootfs"
+                                .into(),
+                        )
+                    })?,
+                req.kernel_path
+                    .or_else(|| self.default_kernel.clone())
+                    .ok_or_else(|| {
+                        CoreError::InvalidArgument(
+                            "service requires a kernel, and the daemon has no default kernel"
+                                .into(),
+                        )
+                    })?,
             )
         };
 
@@ -6192,5 +6205,63 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("no kernel specified")),
             "expected InvalidArgument with 'no kernel specified', got: {err:?}"
         );
+    }
+
+    /// Regression: the client omits unspecified paths, so `create_service` must
+    /// fall back to the daemon's default kernel/rootfs (like create_vm_record)
+    /// instead of rejecting the request with "service requires a kernel/rootfs".
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn create_service_uses_daemon_default_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+        };
+
+        let kernel_path = tmp.path().join("vmlinux");
+        let mut kernel_stub = vec![0u8; 64];
+        kernel_stub[56..60].copy_from_slice(&[0x41, 0x52, 0x4d, 0x64]); // ARM64 magic LE
+        std::fs::write(&kernel_path, &kernel_stub).unwrap();
+        let rootfs_path = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs_path, b"rootfs").unwrap();
+
+        let core = HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        )
+        .with_default_images(Some(kernel_path.clone()), Some(rootfs_path.clone()), None);
+
+        let req = CreateServiceRequest {
+            name: "svc-defaults".into(),
+            host_group: None,
+            desired_instances: Some(0),
+            image: None,
+            rootfs_path: None,
+            kernel_path: None,
+            initrd_path: None,
+            vcpu_count: None,
+            mem_size_mib: None,
+            userdata: None,
+            env: vec![],
+            cloud_image: None,
+            disk_size: None,
+            balloon: false,
+            volume: None,
+        };
+
+        // Must not be rejected for a missing kernel/rootfs - the daemon defaults
+        // fill them. (It may still fail later in the test harness; we only assert
+        // the path-requirement gate is not what rejected it.)
+        if let Err(e) = std::sync::Arc::new(core).create_service(req).await {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("service requires a"),
+                "daemon defaults should have filled the service kernel/rootfs; got: {msg}"
+            );
+        }
     }
 }
