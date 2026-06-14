@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.11] - 2026-06-14
+
+### Added
+
+- **macOS userspace port forwarding.** `husker port-forward` now works on macOS
+  through a userspace GuestDialer proxy (no host nftables), with a `--bind` flag
+  and a cross-platform `bind_addr` in the port-forward API.
+
+### Fixed
+
+- **Remote `run`/`job` over `ssh://` no longer send client-local image paths.**
+  The client resolved default kernel/initrd/rootfs paths from its own filesystem
+  and sent those absolute paths to the daemon, so a macOS client driving a Linux
+  daemon asked it to boot `.../kernels/Image-virt` and an `initramfs-virt.gz` that
+  do not exist there. The client now omits any path the user did not specify, and
+  the daemon resolves them from its own configured defaults
+  (`HuskerCore::with_default_images`). This also unifies initrd resolution to
+  honor the daemon's default. `version`/`list` were unaffected (no files needed).
+- **Port-forward removal is scoped to the owning VM**, with tightened conflict
+  detection.
+
 ## [0.4.10] - 2026-06-13
 
 ### Fixed
