@@ -377,8 +377,9 @@ enum Commands {
         #[arg(long = "write-back", requires = "sync_cwd")]
         write_back: bool,
 
-        /// Command and arguments (after --)
-        #[arg(last = true, required = true)]
+        /// Command and arguments (after --). Omit to run an imported OCI image's
+        /// default (its Entrypoint + Cmd), like `docker run <image>`.
+        #[arg(last = true)]
         command: Vec<String>,
     },
 
@@ -2592,6 +2593,18 @@ async fn run(cli: Cli) -> Result<()> {
                 name.unwrap_or_else(|| format!("job-{}", &uuid::Uuid::new_v4().to_string()[..8]));
             let env = merge_env(&env_file, env)?;
 
+            // An empty command runs the image's default entrypoint (resolved by
+            // the guest agent). That is meaningless with --sync-cwd, which wraps
+            // an explicit command to run in the synced tree - reject it before
+            // booting a VM.
+            if command.is_empty() && sync_cwd {
+                exit_with_error(
+                    output,
+                    "--sync-cwd needs a command after `--`; the image default is \
+                     only used without --sync-cwd",
+                );
+            }
+
             // env goes to the EXEC request, not the create body; pass empty to the builder.
             let args = VmRequestArgs {
                 rootfs,
@@ -2768,6 +2781,10 @@ async fn run(cli: Cli) -> Result<()> {
                         SYNC_OUTPUT_GUEST_PATH,
                         &retrieve_paths,
                     )
+                } else if command.is_empty() {
+                    // Run the image's default entrypoint + cmd: an empty command
+                    // tells the guest agent to resolve it from the OCI config.
+                    (String::new(), Vec::new())
                 } else {
                     (command[0].clone(), command[1..].to_vec())
                 };
@@ -8409,8 +8426,19 @@ mod tests {
     }
 
     #[test]
-    fn job_requires_trailing_command() {
-        assert!(Cli::try_parse_from(["husker", "job", "--cloud-image", "x"]).is_err());
+    fn job_command_is_optional_and_captures_trailing_args() {
+        // No trailing command parses to an empty command (run the image default).
+        let cli = Cli::try_parse_from(["husker", "job", "--cloud-image", "x"])
+            .expect("job parses without a trailing command (runs the image default)");
+        match cli.command {
+            Commands::Job { command, .. } => assert!(
+                command.is_empty(),
+                "an omitted command is empty, not an error"
+            ),
+            _ => panic!("expected Job"),
+        }
+
+        // A trailing command is captured verbatim.
         let cli = Cli::try_parse_from([
             "husker",
             "job",

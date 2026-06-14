@@ -77,6 +77,10 @@ pub enum AgentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
+    /// The program to run. An empty string means "use the imported OCI image's
+    /// default" ([`OciRuntimeConfig::argv`] = Entrypoint + Cmd), like
+    /// `docker run <image>` with no command; the agent errors if there is no
+    /// OCI config or it declares no default.
     pub command: String,
     pub args: Vec<String>,
     pub working_dir: Option<String>,
@@ -113,6 +117,17 @@ pub struct OciRuntimeConfig {
     /// `Cmd` from the image (default command / args).
     #[serde(default)]
     pub cmd: Vec<String>,
+}
+
+impl OciRuntimeConfig {
+    /// The image's default argv: `Entrypoint` followed by `Cmd`. Used when an
+    /// exec request carries no command (run the image's default, like
+    /// `docker run <image>`). Empty when the image declares neither.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = self.entrypoint.clone();
+        argv.extend(self.cmd.iter().cloned());
+        argv
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

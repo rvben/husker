@@ -471,9 +471,12 @@ fn resolve_program(command: &str, path: Option<&str>) -> String {
     command.to_string()
 }
 
-/// The resolved program, environment, and working directory for an exec.
+/// The resolved program, arguments, environment, and working directory for an
+/// exec.
+#[derive(Debug)]
 struct ExecPlan {
     program: String,
+    args: Vec<String>,
     env: Vec<(String, String)>,
     /// Whether to clear the inherited environment before applying `env`.
     /// True for OCI images (container semantics); false otherwise (legacy).
@@ -485,18 +488,37 @@ struct ExecPlan {
 /// with the image's environment + working directory (request env overriding,
 /// bare programs resolved via the image `PATH`); otherwise the agent's inherited
 /// environment is kept and only the request env is overlaid.
-fn plan_exec(req: &ExecRequest, oci: Option<&OciRuntimeConfig>) -> ExecPlan {
-    let (program, env, clear_env) = resolve_command_env(&req.command, &req.env, oci);
+///
+/// An empty `req.command` means "run the image's default" (Entrypoint + Cmd),
+/// like `docker run <image>` with no command; the request args are appended to
+/// it. Returns `Err` with a user-facing message when there is no command and the
+/// rootfs is not an OCI image (or the image declares no default argv).
+fn plan_exec(req: &ExecRequest, oci: Option<&OciRuntimeConfig>) -> Result<ExecPlan, String> {
+    let (command, mut args) = if req.command.is_empty() {
+        let argv = oci.map(|c| c.argv()).unwrap_or_default();
+        let (first, rest) = argv.split_first().ok_or_else(|| {
+            "no command given and the image declares no default entrypoint or cmd; \
+             pass a command after `--`"
+                .to_string()
+        })?;
+        (first.clone(), rest.to_vec())
+    } else {
+        (req.command.clone(), Vec::new())
+    };
+    args.extend(req.args.iter().cloned());
+
+    let (program, env, clear_env) = resolve_command_env(&command, &req.env, oci);
     let current_dir = resolve_working_dir(
         req.working_dir.as_deref(),
         oci.and_then(|c| c.working_dir.as_deref()),
     );
-    ExecPlan {
+    Ok(ExecPlan {
         program,
+        args,
         env,
         clear_env,
         current_dir,
-    }
+    })
 }
 
 /// Resolve the program path, environment, and whether to clear inherited env for
@@ -545,9 +567,12 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::Exec(req) => {
             let timeout = resolve_exec_timeout(req.timeout_secs);
-            let plan = plan_exec(&req, oci_runtime_config());
+            let plan = match plan_exec(&req, oci_runtime_config()) {
+                Ok(plan) => plan,
+                Err(message) => return AgentResponse::Error(ErrorResponse { message }),
+            };
             let mut cmd = tokio::process::Command::new(&plan.program);
-            cmd.args(&req.args)
+            cmd.args(&plan.args)
                 .current_dir(&plan.current_dir)
                 .kill_on_drop(true);
             if plan.clear_env {
@@ -829,13 +854,61 @@ mod tests {
             env: vec![("LANG".into(), "en_US".into())],
             timeout_secs: None,
         };
-        let plan = plan_exec(&req, Some(&cfg));
+        let plan = plan_exec(&req, Some(&cfg)).unwrap();
         assert!(plan.clear_env, "OCI exec runs with container-clean env");
         assert_eq!(plan.program, "/usr/local/bin/python3");
+        assert_eq!(plan.args, vec!["-V".to_string()]);
         assert_eq!(plan.current_dir, "/app", "falls back to image WorkingDir");
         // Request env overrides the image's LANG; image PATH retained.
         assert!(plan.env.contains(&("PATH".into(), "/usr/local/bin".into())));
         assert!(plan.env.contains(&("LANG".into(), "en_US".into())));
+    }
+
+    #[test]
+    fn plan_exec_empty_command_uses_image_entrypoint_and_cmd() {
+        // No command given: run the image's default (Entrypoint + Cmd), with any
+        // request args appended - like `docker run <image> [extra args]`.
+        let cfg = OciRuntimeConfig {
+            env: vec!["PATH=/usr/local/bin".into()],
+            working_dir: Some("/app".into()),
+            entrypoint: vec!["/usr/local/bin/python3".into()],
+            cmd: vec!["app.py".into()],
+        };
+        let req = ExecRequest {
+            command: String::new(),
+            args: vec!["--flag".into()],
+            working_dir: None,
+            env: vec![],
+            timeout_secs: None,
+        };
+        let plan = plan_exec(&req, Some(&cfg)).unwrap();
+        assert_eq!(plan.program, "/usr/local/bin/python3");
+        assert_eq!(
+            plan.args,
+            vec!["app.py".to_string(), "--flag".to_string()],
+            "image Cmd then the request args"
+        );
+        assert_eq!(plan.current_dir, "/app");
+    }
+
+    #[test]
+    fn plan_exec_empty_command_without_an_image_default_errors() {
+        // No command and no OCI image -> a clear error, not a panic or a blank
+        // program.
+        let req = ExecRequest {
+            command: String::new(),
+            args: vec![],
+            working_dir: None,
+            env: vec![],
+            timeout_secs: None,
+        };
+        let err = plan_exec(&req, None).unwrap_err();
+        assert!(err.contains("no command given"), "got: {err}");
+
+        // An OCI image that declares neither Entrypoint nor Cmd is the same case.
+        let empty_cfg = OciRuntimeConfig::default();
+        let err = plan_exec(&req, Some(&empty_cfg)).unwrap_err();
+        assert!(err.contains("no command given"), "got: {err}");
     }
 
     #[test]
@@ -861,9 +934,10 @@ mod tests {
             env: vec![("FOO".into(), "bar".into())],
             timeout_secs: None,
         };
-        let plan = plan_exec(&req, None);
+        let plan = plan_exec(&req, None).unwrap();
         assert!(!plan.clear_env, "non-OCI exec inherits the agent env");
         assert_eq!(plan.program, "echo", "no PATH resolution without an image");
+        assert_eq!(plan.args, vec!["hi".to_string()]);
         assert_eq!(plan.current_dir, "/tmp");
         assert_eq!(plan.env, vec![("FOO".to_string(), "bar".to_string())]);
     }

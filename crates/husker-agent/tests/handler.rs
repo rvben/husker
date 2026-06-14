@@ -143,6 +143,33 @@ async fn exec_times_out_on_long_running_command() {
 }
 
 #[tokio::test]
+async fn exec_empty_command_without_an_oci_image_errors_clearly() {
+    // An empty command means "run the image default", but a plain rootfs (no
+    // /etc/husker/oci-config.json) has none: the agent returns a clear error
+    // instead of panicking or spawning an empty program.
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::Exec(ExecRequest {
+        command: String::new(),
+        args: vec![],
+        working_dir: None,
+        env: vec![],
+        timeout_secs: None,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::Error(e) => assert!(
+            e.message.contains("no command given"),
+            "expected a clear no-default error, got: {}",
+            e.message
+        ),
+        other => panic!("expected Error response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn exec_returns_promptly_when_a_backgrounded_child_holds_the_pipe() {
     // A foreground command that exits while a backgrounded process inherits its
     // stdout must not keep `exec` blocked: once the foreground command is done we
