@@ -336,6 +336,29 @@ fn validate_resource_name(kind: &str, name: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Map an OCI/Docker reference to a deterministic catalog image name, so repeat
+/// `run`/`job` of the same reference reuse the cached import. Characters not
+/// allowed in a resource name become `-` (e.g. `python:3.12-alpine` ->
+/// `python-3.12-alpine`, `ghcr.io/o/r:v1` -> `ghcr.io-o-r-v1`).
+fn oci_ref_to_catalog_name(reference: &str) -> String {
+    reference
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Whether a `run`/`job` rootfs argument is path-shaped (so a typo'd path is
+/// reported as a missing file, not mistaken for an image reference).
+fn looks_like_path(arg: &str) -> bool {
+    arg.starts_with('/') || arg.starts_with("./") || arg.starts_with("../")
+}
+
 /// Build the canonical instance name for a service ordinal.
 fn instance_name(service: &str, ordinal: u32) -> String {
     format!("{service}-{ordinal}")
@@ -778,6 +801,45 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.create_vm_record(req, None, true).await
     }
 
+    /// Resolve a `run`/`job` rootfs argument to a host path. Accepts a literal
+    /// path (used as-is), a catalog image name (resolved to its file), or an
+    /// OCI/Docker reference (auto-imported on first use, then cached). A bare
+    /// unknown name is a clear error rather than a confusing missing-file one.
+    async fn resolve_rootfs_arg(
+        &self,
+        arg: &std::path::Path,
+    ) -> Result<std::path::PathBuf, CoreError> {
+        // An existing file is a literal path.
+        if arg.is_file() {
+            return Ok(arg.to_path_buf());
+        }
+        let s = arg.to_string_lossy().to_string();
+        // A path-shaped argument that does not exist: leave it for the rootfs
+        // validator to report clearly (don't treat a mistyped path as an image).
+        if looks_like_path(&s) {
+            return Ok(arg.to_path_buf());
+        }
+        // A known catalog image name.
+        if let Ok(img) = self.state.get_image_by_name(&s) {
+            return Ok(std::path::PathBuf::from(img.file_path));
+        }
+        // An OCI/Docker reference (`repo:tag` or `host/path[:tag]`): import + cache.
+        if s.contains(':') || s.contains('/') {
+            let name = oci_ref_to_catalog_name(&s);
+            if let Ok(img) = self.state.get_image_by_name(&name) {
+                return Ok(std::path::PathBuf::from(img.file_path));
+            }
+            info!(reference = %s, name = %name, "auto-importing OCI image for run/job");
+            let rec = self.import_oci_image(&name, &s).await?;
+            return Ok(std::path::PathBuf::from(rec.file_path));
+        }
+        // A bare name that is not a path and not in the catalog.
+        Err(CoreError::InvalidArgument(format!(
+            "'{s}' is not a rootfs path, a catalog image, or an OCI reference; \
+             pass a path, a catalog image name, or a reference like 'repo:tag'"
+        )))
+    }
+
     /// Internal/advanced: prefer `create_vm`. Used by the reconciler to stamp service ownership.
     ///
     /// `tags` stamps service ownership atomically onto the new VM record.
@@ -819,6 +881,13 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             if req.rootfs_path.is_none() {
                 req.rootfs_path = self.default_rootfs.clone();
+            }
+            // Resolve a catalog image name or an OCI/Docker reference in the rootfs
+            // argument to a real host path (auto-importing an OCI ref on first use),
+            // so `husker run myimg` / `husker job python:3.12-alpine` work without
+            // knowing the on-disk catalog layout.
+            if let Some(rootfs) = req.rootfs_path.take() {
+                req.rootfs_path = Some(self.resolve_rootfs_arg(&rootfs).await?);
             }
             let kernel = req.kernel_path.as_deref().ok_or_else(|| {
                 CoreError::InvalidArgument(
@@ -4208,6 +4277,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oci_ref_to_catalog_name_sanitizes_deterministically() {
+        assert_eq!(
+            oci_ref_to_catalog_name("python:3.12-alpine"),
+            "python-3.12-alpine"
+        );
+        assert_eq!(oci_ref_to_catalog_name("ghcr.io/o/r:v1"), "ghcr.io-o-r-v1");
+        assert_eq!(oci_ref_to_catalog_name("alpine"), "alpine");
+        // Deterministic (so repeat runs of the same ref reuse the cached import).
+        assert_eq!(
+            oci_ref_to_catalog_name("python:3.12-alpine"),
+            oci_ref_to_catalog_name("python:3.12-alpine")
+        );
+    }
+
+    #[test]
+    fn looks_like_path_distinguishes_paths_from_refs() {
+        assert!(looks_like_path("/var/lib/husker/x.ext4"));
+        assert!(looks_like_path("./rel.ext4"));
+        assert!(looks_like_path("../up.ext4"));
+        // Image names and OCI refs are not path-shaped.
+        assert!(!looks_like_path("myimg"));
+        assert!(!looks_like_path("python:3.12-alpine"));
+        assert!(!looks_like_path("ghcr.io/o/r:v1"));
+    }
+
     #[cfg(feature = "linux-net")]
     #[test]
     fn resolve_vmm_kind_uses_daemon_default_when_unspecified() {
@@ -4343,6 +4438,66 @@ mod tests {
         .with_uefi_firmware(code.clone(), vars.clone());
         assert_eq!(core.ovmf_code_path, code);
         assert_eq!(core.ovmf_vars_template_path, vars);
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn resolve_rootfs_arg_handles_paths_names_and_unknowns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let core = HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            husker_storage::StorageConfig {
+                data_dir: tmp.path().to_path_buf(),
+            },
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        );
+
+        // A catalog image name resolves to its file path.
+        core.state
+            .insert_image(&ImageRecord {
+                id: Uuid::new_v4(),
+                name: "myimg".into(),
+                source_path: "oci://x".into(),
+                file_path: "/var/lib/husker/images/catalog/myimg.ext4".into(),
+                format: "ext4".into(),
+                kind: "rootfs".into(),
+                boot_init: Some("/usr/local/bin/husker-agent".into()),
+                size_bytes: 1,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert_eq!(
+            core.resolve_rootfs_arg(std::path::Path::new("myimg"))
+                .await
+                .unwrap(),
+            std::path::PathBuf::from("/var/lib/husker/images/catalog/myimg.ext4")
+        );
+
+        // An existing file is used as-is.
+        let real = tmp.path().join("real.ext4");
+        std::fs::write(&real, b"x").unwrap();
+        assert_eq!(core.resolve_rootfs_arg(&real).await.unwrap(), real);
+
+        // A path-shaped argument that doesn't exist is passed through (the rootfs
+        // validator reports it), not treated as an image reference.
+        let ghost = std::path::Path::new("/no/such/file.ext4");
+        assert_eq!(core.resolve_rootfs_arg(ghost).await.unwrap(), ghost);
+
+        // A bare unknown name is a clear error.
+        let err = core
+            .resolve_rootfs_arg(std::path::Path::new("nope"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidArgument(_)), "got {err:?}");
     }
 
     #[cfg(feature = "linux-net")]
