@@ -987,6 +987,35 @@ fn merge_env(env_files: &[PathBuf], env_flags: Vec<String>) -> anyhow::Result<Ve
     Ok(merged)
 }
 
+/// Best-effort boot-failure hint for a VM that never became ready: the tail of
+/// its guest serial console plus a pointer to the full log, so a `job` that
+/// times out waiting for boot is diagnosable without the user knowing to reach
+/// for `husker logs`. Returns a string with a leading newline (or a shorter
+/// pointer if the console is empty or unreachable).
+async fn serial_boot_hint(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_token: Option<&str>,
+    name: &str,
+) -> String {
+    let url = format!("{api_url}/v1/vms/{name}/logs?source=serial&tail=20");
+    let body = match with_api_auth(client.get(&url), api_token).send().await {
+        Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
+        _ => String::new(),
+    };
+    let tail = body.trim_end();
+    if tail.is_empty() {
+        return format!(
+            "\nhint: the guest serial console has no output yet; \
+             run `husker logs --source serial {name}` to inspect it"
+        );
+    }
+    format!(
+        "\n--- guest serial console (tail) ---\n{tail}\n\
+         hint: run `husker logs --source serial {name}` for the full guest console"
+    )
+}
+
 /// Flags shared by `run` and `job` that describe the VM to create.
 #[derive(Debug, Default)]
 struct VmRequestArgs {
@@ -2685,7 +2714,9 @@ async fn run(cli: Cli) -> Result<()> {
                         break;
                     }
                     if std::time::Instant::now() + backoff >= deadline {
-                        anyhow::bail!("timed out waiting for VM '{name}' to become ready");
+                        let hint =
+                            serial_boot_hint(&client, &api_url, api_token.as_deref(), &name).await;
+                        anyhow::bail!("timed out waiting for VM '{name}' to become ready{hint}");
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(2));

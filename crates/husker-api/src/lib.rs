@@ -2958,7 +2958,7 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "secret_crypto_error",
             err.to_string(),
         ),
-        CoreError::Agent(husker_core::AgentError::NotReady(_)) => (
+        CoreError::Agent(husker_core::AgentError::NotReady { .. }) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_not_ready",
             err.to_string(),
@@ -3013,7 +3013,7 @@ fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) 
         | CoreError::Vmm(husker_vmm::VmmError::ApiError(_))
         | CoreError::Agent(husker_core::AgentError::Connection(_))
         | CoreError::Agent(husker_core::AgentError::VsockConnectRejected(_))
-        | CoreError::Agent(husker_core::AgentError::NotReady(_)) => (
+        | CoreError::Agent(husker_core::AgentError::NotReady { .. }) => (
             StatusCode::SERVICE_UNAVAILABLE,
             error_response_with_hint(
                 "agent_not_ready",
@@ -4760,9 +4760,10 @@ mod tests {
         let (status, _) = map_error(CoreError::InvalidArgument("bad value".into()));
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
-        let (status, _) = map_error(CoreError::Agent(AgentError::NotReady(Duration::from_secs(
-            5,
-        ))));
+        let (status, _) = map_error(CoreError::Agent(AgentError::NotReady {
+            timeout: Duration::from_secs(5),
+            detail: String::new(),
+        }));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
         let (status, _) = map_error(CoreError::Agent(AgentError::UnexpectedResponse));

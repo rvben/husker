@@ -20,8 +20,14 @@ pub enum AgentError {
     UnexpectedResponse,
     #[error("agent returned error: {0}")]
     Agent(String),
-    #[error("agent not ready after {0:?}")]
-    NotReady(Duration),
+    #[error("agent not ready after {timeout:?}{detail}")]
+    NotReady {
+        timeout: Duration,
+        /// Diagnostic context appended to the message (e.g. the guest serial
+        /// console tail and a pointer to the full log). Empty when the lower
+        /// level that produced the error has no access to the VM's logs.
+        detail: String,
+    },
 }
 
 /// Factory for creating agent connections.
@@ -87,7 +93,10 @@ impl AgentClient {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Err(AgentError::NotReady(timeout));
+                return Err(AgentError::NotReady {
+                    timeout,
+                    detail: String::new(),
+                });
             }
 
             tokio::time::sleep(interval).await;

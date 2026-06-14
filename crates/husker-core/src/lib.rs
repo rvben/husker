@@ -529,6 +529,9 @@ pub struct HuskerCore<B: VmmBackend> {
 /// Per-attempt timeout for agent connect+ping in readiness loops.
 const AGENT_PING_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Lines of guest serial console appended to a boot/agent-readiness failure.
+const BOOT_FAILURE_SERIAL_TAIL_LINES: usize = 20;
+
 /// Default agent-readiness wait (seconds) for direct-kernel microVMs.
 pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 120;
 
@@ -3184,12 +3187,36 @@ impl<B: VmmBackend> HuskerCore<B> {
                 Err(_) => debug!(%name, "agent ping attempt timed out, retrying"),
             }
             if tokio::time::Instant::now() + backoff >= deadline {
-                return Err(CoreError::Agent(crate::agent_client::AgentError::NotReady(
-                    timeout,
-                )));
+                return Err(CoreError::Agent(
+                    crate::agent_client::AgentError::NotReady {
+                        timeout,
+                        detail: self.boot_failure_detail(name),
+                    },
+                ));
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+
+    /// Diagnostic suffix for a boot/agent-readiness failure: the tail of the
+    /// guest serial console plus a pointer to the full log. Appended to
+    /// readiness errors so a failed boot is diagnosable from the error alone,
+    /// instead of leaving the user to discover `husker logs` on their own.
+    /// Returns an empty string if the VM record is gone (nothing to point at).
+    fn boot_failure_detail(&self, name: &str) -> String {
+        let Ok(path) = self.serial_log_path(name) else {
+            return String::new();
+        };
+        match tail_last_lines(&path, BOOT_FAILURE_SERIAL_TAIL_LINES) {
+            Some(tail) => format!(
+                "\n--- guest serial console (last {BOOT_FAILURE_SERIAL_TAIL_LINES} lines) ---\n{tail}\n\
+                 hint: run `husker logs --source serial {name}` for the full guest console",
+            ),
+            None => format!(
+                "\nhint: the guest serial console has no output yet; \
+                 run `husker logs --source serial {name}` to inspect it",
+            ),
         }
     }
 
@@ -4244,6 +4271,20 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
     }
 }
 
+/// Return the last `max_lines` non-empty-trailing lines of a file, or `None`
+/// when the file is missing or has no content. Used to attach the guest serial
+/// console tail to boot-failure errors.
+fn tail_last_lines(path: &std::path::Path, max_lines: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    Some(lines[start..].join("\n"))
+}
+
 /// Remove a file, treating a missing file as success. Cleanup paths use this so
 /// a file that was never created (or already gone) does not produce a spurious
 /// warning. Returns `Err` only for real failures (e.g. permission denied).
@@ -4620,6 +4661,27 @@ mod tests {
         )
         .with_embedded_agent(b"fake-agent");
         assert_eq!(core.embedded_agent, b"fake-agent");
+    }
+
+    #[test]
+    fn tail_last_lines_returns_last_n_and_handles_missing_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing file -> None (no spurious tail for a never-created log).
+        assert!(tail_last_lines(&dir.path().join("missing.log"), 5).is_none());
+
+        // Empty / whitespace-only file -> None.
+        let empty = dir.path().join("empty.log");
+        std::fs::write(&empty, "\n\n  \n").unwrap();
+        assert!(tail_last_lines(&empty, 5).is_none());
+
+        // More lines than requested -> only the last N, trailing blank trimmed.
+        let many = dir.path().join("many.log");
+        std::fs::write(&many, "a\nb\nc\nd\ne\n").unwrap();
+        assert_eq!(tail_last_lines(&many, 2).unwrap(), "d\ne");
+
+        // Fewer lines than requested -> all of them.
+        assert_eq!(tail_last_lines(&many, 20).unwrap(), "a\nb\nc\nd\ne");
     }
 
     #[tokio::test]
