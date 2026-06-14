@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.12] - 2026-06-14
+
+### Fixed
+
+- **`husker service create` without explicit kernel/rootfs works again.** 0.4.11
+  made the client omit unspecified image paths so the daemon resolves its own
+  defaults, but `create_service` still required explicit kernel/rootfs and
+  rejected the request before the daemon-side defaulting ran. It now resolves the
+  daemon defaults in the service path too, matching `run`/`job`.
+
 ## [0.4.11] - 2026-06-14
 
 ### Added
