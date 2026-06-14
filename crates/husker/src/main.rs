@@ -93,7 +93,8 @@ enum Commands {
 
     /// Create and boot a new VM
     Run {
-        /// Path to rootfs ext4 image (defaults to the configured default_rootfs)
+        /// Rootfs: a path, a catalog image name, or an OCI ref like
+        /// `python:3.12-alpine` (auto-imported). Defaults to default_rootfs.
         rootfs: Option<PathBuf>,
 
         /// VM name
@@ -267,7 +268,8 @@ enum Commands {
 
     /// Boot a VM, run one command, destroy the VM, exit with its exit code
     Job {
-        /// Path to rootfs ext4 image (defaults to the configured default_rootfs)
+        /// Rootfs: a path, a catalog image name, or an OCI ref like
+        /// `python:3.12-alpine` (auto-imported). Defaults to default_rootfs.
         rootfs: Option<PathBuf>,
 
         /// VM name (default: job-<random>)
@@ -731,6 +733,9 @@ enum ImageAction {
     Delete {
         /// Image name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
     /// Fetch default kernel + initramfs + rootfs for this host into the data dir
     Pull {
@@ -1263,6 +1268,36 @@ fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
         eprintln!("{structured}");
     }
     std::process::exit(err.exit_code);
+}
+
+/// Gate a destructive command on confirmation: a no-op when `yes` is set;
+/// otherwise prompt when stdin is a TTY, or refuse (exit
+/// `CONFIRMATION_REQUIRED`) when it is not. Shared by `destroy` and
+/// `image delete` so destructive commands behave consistently.
+fn require_confirmation(prompt: &str, yes: bool, format: OutputFormat) {
+    use std::io::IsTerminal;
+    if yes {
+        return;
+    }
+    if std::io::stdin().is_terminal() {
+        eprint!("{prompt} [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).ok();
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            eprintln!("Aborted.");
+            std::process::exit(0);
+        }
+    } else {
+        exit_with_error(
+            format,
+            ApiFailure {
+                message: format!("{prompt} requires confirmation"),
+                code: Some("confirmation_required".into()),
+                exit_code: exit_code::CONFIRMATION_REQUIRED,
+                hint: Some("Re-run with --yes to confirm.".into()),
+            },
+        );
+    }
 }
 
 /// Build the machine-readable CLI contract emitted by `husker schema`.
@@ -2304,32 +2339,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Destroy { name, yes } => {
-            // Destructive command: require --yes when stdin is not a TTY.
-            // When stdin is a TTY, prompt interactively unless --yes was given.
-            use std::io::IsTerminal;
-            if !yes {
-                if std::io::stdin().is_terminal() {
-                    // Interactive: prompt the user.
-                    eprint!("Destroy VM '{name}'? [y/N] ");
-                    let mut answer = String::new();
-                    std::io::stdin().read_line(&mut answer).ok();
-                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                        eprintln!("Aborted.");
-                        std::process::exit(0);
-                    }
-                } else {
-                    // Non-interactive without --yes: refuse and exit non-zero.
-                    exit_with_error(
-                        output,
-                        ApiFailure {
-                            message: format!("Destroying VM '{name}' requires confirmation"),
-                            code: Some("confirmation_required".into()),
-                            exit_code: exit_code::CONFIRMATION_REQUIRED,
-                            hint: Some("Re-run with --yes to confirm.".into()),
-                        },
-                    );
-                }
-            }
+            require_confirmation(&format!("Destroy VM '{name}'?"), yes, output);
 
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
@@ -4317,7 +4327,8 @@ async fn image_command(
                 exit_with_error(output, msg);
             }
         }
-        ImageAction::Delete { name } => {
+        ImageAction::Delete { name, yes } => {
+            require_confirmation(&format!("Delete image '{name}'?"), yes, output);
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/images/{name}")),
                 api_token.as_deref(),
