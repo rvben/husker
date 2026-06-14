@@ -303,22 +303,49 @@ pub fn configure_network(cfg: &NetConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `/etc/resolv.conf`, replacing it if it is a symlink (Debian/Ubuntu point
-/// it into `/run`, which the supervisor mounts as an empty tmpfs). The NAT
-/// gateway usually serves DNS; public resolvers are a fallback.
+/// Decide the `/etc/resolv.conf` contents to write, or `None` to keep the
+/// existing file. A real file that already lists a `nameserver` was seeded by
+/// the daemon (its configured `dns_servers`) and is preserved; a symlink
+/// (Debian/Ubuntu point it into `/run`, an empty tmpfs here), a missing file, or
+/// one with no nameserver is replaced with the gateway plus public resolvers.
+fn resolv_conf_decision(existing: Option<&str>, gateway: Option<Ipv4Addr>) -> Option<String> {
+    if let Some(content) = existing
+        && content
+            .lines()
+            .any(|l| l.trim_start().starts_with("nameserver"))
+    {
+        return None; // preserve the daemon-seeded resolv.conf
+    }
+    let mut out = String::new();
+    if let Some(gw) = gateway {
+        out.push_str(&format!("nameserver {gw}\n"));
+    }
+    out.push_str("nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+    Some(out)
+}
+
+/// Write `/etc/resolv.conf` unless the daemon already seeded one (see
+/// [`resolv_conf_decision`]). The NAT gateway usually serves DNS; public
+/// resolvers are a fallback.
 pub fn write_resolv_conf(gateway: Option<Ipv4Addr>) {
     let path = Path::new("/etc/resolv.conf");
-    if let Ok(meta) = std::fs::symlink_metadata(path)
-        && meta.file_type().is_symlink()
-    {
+    let is_symlink = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    // Only a real file can be a daemon-seeded config; a symlink points into the
+    // empty /run tmpfs and is treated as absent.
+    let existing = if is_symlink {
+        None
+    } else {
+        std::fs::read_to_string(path).ok()
+    };
+    let Some(content) = resolv_conf_decision(existing.as_deref(), gateway) else {
+        return; // preserve the seeded file
+    };
+    if is_symlink {
         let _ = std::fs::remove_file(path);
     }
     let _ = std::fs::create_dir_all("/etc");
-    let mut content = String::new();
-    if let Some(gw) = gateway {
-        content.push_str(&format!("nameserver {gw}\n"));
-    }
-    content.push_str("nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
     if let Err(e) = std::fs::write(path, content) {
         warn!("could not write /etc/resolv.conf: {e}");
     }
@@ -500,5 +527,25 @@ mod tests {
         // Non-contiguous mask is rejected.
         assert_eq!(netmask_to_prefix("255.0.255.0"), None);
         assert_eq!(netmask_to_prefix("255.255.255"), None);
+    }
+
+    #[test]
+    fn resolv_conf_decision_preserves_seeded_dns() {
+        let gw = Some("192.0.2.1".parse::<Ipv4Addr>().unwrap());
+        // A daemon-seeded file with a nameserver is preserved.
+        assert_eq!(
+            resolv_conf_decision(Some("nameserver 198.51.100.53\n"), gw),
+            None
+        );
+        // A file without a nameserver (or empty) is replaced with the default.
+        let written = resolv_conf_decision(Some("# comment only\n"), gw).unwrap();
+        assert!(written.contains("nameserver 192.0.2.1"));
+        assert!(written.contains("nameserver 1.1.1.1"));
+        // Missing file -> default written (gateway first, then public).
+        let written = resolv_conf_decision(None, gw).unwrap();
+        assert!(written.starts_with("nameserver 192.0.2.1\n"));
+        // No gateway -> public resolvers only.
+        let written = resolv_conf_decision(None, None).unwrap();
+        assert_eq!(written, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
     }
 }
