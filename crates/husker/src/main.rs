@@ -1043,9 +1043,12 @@ async fn serial_boot_hint(
              run `husker logs --source serial {name}` to inspect it"
         );
     }
+    let module_hint = husker_core::kernel_module_mismatch_hint(tail)
+        .map(|h| format!("\nhint: {h}"))
+        .unwrap_or_default();
     format!(
         "\n--- guest serial console (tail) ---\n{tail}\n\
-         hint: run `husker logs --source serial {name}` for the full guest console"
+         hint: run `husker logs --source serial {name}` for the full guest console{module_hint}"
     )
 }
 

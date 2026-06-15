@@ -3209,10 +3209,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             return String::new();
         };
         match tail_last_lines(&path, BOOT_FAILURE_SERIAL_TAIL_LINES) {
-            Some(tail) => format!(
-                "\n--- guest serial console (last {BOOT_FAILURE_SERIAL_TAIL_LINES} lines) ---\n{tail}\n\
-                 hint: run `husker logs --source serial {name}` for the full guest console",
-            ),
+            Some(tail) => {
+                let module_hint = kernel_module_mismatch_hint(&tail)
+                    .map(|h| format!("\nhint: {h}"))
+                    .unwrap_or_default();
+                format!(
+                    "\n--- guest serial console (last {BOOT_FAILURE_SERIAL_TAIL_LINES} lines) ---\n{tail}\n\
+                     hint: run `husker logs --source serial {name}` for the full guest console{module_hint}",
+                )
+            }
             None => format!(
                 "\nhint: the guest serial console has no output yet; \
                  run `husker logs --source serial {name}` to inspect it",
@@ -4271,6 +4276,22 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
     }
 }
 
+/// If a serial-console tail shows a kernel/module ABI mismatch - stale baked
+/// `.ko` files that disagree with the running kernel after a kernel refresh -
+/// return a targeted remediation hint. This failure otherwise surfaces only as a
+/// generic "agent not ready" timeout (the guest never brings up vsock), which is
+/// opaque without reading the serial log.
+pub fn kernel_module_mismatch_hint(tail: &str) -> Option<&'static str> {
+    let mismatched = tail.contains("disagrees about version of symbol")
+        || tail.contains("module_layout")
+        || tail.contains("Invalid module format");
+    mismatched.then_some(
+        "the guest's baked kernel modules do not match the running kernel \
+         (a kernel refresh likely invalidated them); rebuild the rootfs against \
+         the current kernel",
+    )
+}
+
 /// Return the last `max_lines` non-empty-trailing lines of a file, or `None`
 /// when the file is missing or has no content. Used to attach the guest serial
 /// console tail to boot-failure errors.
@@ -4661,6 +4682,20 @@ mod tests {
         )
         .with_embedded_agent(b"fake-agent");
         assert_eq!(core.embedded_agent, b"fake-agent");
+    }
+
+    #[test]
+    fn kernel_module_mismatch_hint_detects_abi_failures() {
+        // The classic stale-baked-module signatures.
+        assert!(
+            kernel_module_mismatch_hint("vsock: disagrees about version of symbol module_layout")
+                .is_some()
+        );
+        assert!(kernel_module_mismatch_hint("insmod: ERROR: Invalid module format").is_some());
+        // A normal boot tail produces no module hint.
+        assert!(
+            kernel_module_mismatch_hint("husker-init: skipped virtio_blk (built-in)").is_none()
+        );
     }
 
     #[test]
