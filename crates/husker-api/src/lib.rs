@@ -345,6 +345,12 @@ pub struct ExecRequest {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Secrets to inject as environment variables, mapping an env-var name to the
+    /// name of a stored secret. The daemon resolves each to its plaintext (it
+    /// holds the key) and adds it to `env`, so the value never crosses the client,
+    /// process table, or shell history. A secret overrides `env` on a key clash.
+    #[serde(default)]
+    pub secret_env: HashMap<String, String>,
     /// Seconds to wait for the guest agent to become reachable. Defaults to
     /// `DEFAULT_EXEC_CONNECT_TIMEOUT_SECS` (or the extended cloud-image timeout
     /// for EFI/UEFI VMs, which boot slower) and is clamped to a sane range.
@@ -2088,7 +2094,16 @@ async fn exec_vm<B: VmmBackend + 'static>(
             ),
         ));
     }
-    if !exec_env_allowed(&req.env, &policy) {
+    // Resolve secret references to plaintext inside the daemon (it holds the
+    // key), so only secret NAMES are ever sent by the client - the value never
+    // appears in argv, the process table, or shell history. A secret overrides
+    // `env` on a key clash.
+    let mut resolved_env = req.env.clone();
+    for (env_key, secret_name) in &req.secret_env {
+        let revealed = core.reveal_secret(secret_name).map_err(map_error)?;
+        resolved_env.insert(env_key.clone(), revealed.value);
+    }
+    if !exec_env_allowed(&resolved_env, &policy) {
         return Err((
             StatusCode::FORBIDDEN,
             error_response_with_hint(
@@ -2103,7 +2118,8 @@ async fn exec_vm<B: VmmBackend + 'static>(
         vm = %name,
         command = %req.command,
         args_count = req.args.len(),
-        env_count = req.env.len(),
+        env_count = resolved_env.len(),
+        secret_count = req.secret_env.len(),
         has_working_dir = req.working_dir.is_some()
     );
     let record = core.get_vm(&name).map_err(map_error)?;
@@ -2118,8 +2134,7 @@ async fn exec_vm<B: VmmBackend + 'static>(
         .await
         .map_err(map_agent_connect_error)?;
     let args: Vec<&str> = req.args.iter().map(String::as_str).collect();
-    let env: Vec<(&str, &str)> = req
-        .env
+    let env: Vec<(&str, &str)> = resolved_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
@@ -4200,6 +4215,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn exec_vm_missing_secret_returns_404_before_vm_lookup() {
+        // A --secret reference to a non-existent secret is rejected with a
+        // secret-specific 404, and the resolution happens before the VM lookup
+        // (so even a missing VM surfaces the secret error first).
+        let app = router(test_core());
+        let body = serde_json::json!({
+            "command": "echo",
+            "args": ["hi"],
+            "secret_env": { "TOKEN": "does-not-exist" }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms/nonexistent/exec")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("secret"),
+            "expected a secret-not-found error, got: {text}"
+        );
     }
 
     #[tokio::test]

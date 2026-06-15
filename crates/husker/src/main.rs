@@ -271,6 +271,12 @@ enum Commands {
         #[arg(long = "env-file")]
         env_file: Vec<PathBuf>,
 
+        /// Inject a stored secret as an env var: NAME (exposed as $NAME) or
+        /// ENVVAR=secret-name (renamed), repeatable. The value is resolved inside
+        /// the daemon and never appears in argv, `ps`, or shell history.
+        #[arg(long = "secret")]
+        secret: Vec<String>,
+
         /// Seconds to wait for the guest agent to become reachable before
         /// failing (server default: 30, or 180 for UEFI/cloud VMs)
         #[arg(long)]
@@ -320,6 +326,12 @@ enum Commands {
         /// secrets out of the process table and shell history; explicit -e wins.
         #[arg(long = "env-file")]
         env_file: Vec<PathBuf>,
+
+        /// Inject a stored secret as an env var: NAME (exposed as $NAME) or
+        /// ENVVAR=secret-name (renamed), repeatable. The value is resolved inside
+        /// the daemon and never appears in argv, `ps`, or shell history.
+        #[arg(long = "secret")]
+        secret: Vec<String>,
 
         /// DNS server for this VM's /etc/resolv.conf (repeatable). Scoped to this
         /// VM only, unlike the daemon-wide dns_servers config.
@@ -1052,6 +1064,43 @@ fn parse_add_host(spec: &str) -> anyhow::Result<(String, String)> {
     ip.parse::<std::net::IpAddr>()
         .map_err(|_| anyhow::anyhow!("--add-host `{spec}` has an invalid IP `{ip}`"))?;
     Ok((host.to_string(), ip.to_string()))
+}
+
+/// Parse a `--secret` value into `(env_var_name, secret_name)`. Accepts bare
+/// `NAME` (the secret is exposed under its own name) or `ENVVAR=secret-name`
+/// (renamed). The split is on the first `=`.
+fn parse_secret_ref(spec: &str) -> anyhow::Result<(String, String)> {
+    match spec.split_once('=') {
+        Some((env_var, name)) => {
+            let env_var = env_var.trim();
+            let name = name.trim();
+            if env_var.is_empty() || name.is_empty() {
+                anyhow::bail!("--secret expects NAME or ENVVAR=secret-name, got `{spec}`");
+            }
+            Ok((env_var.to_string(), name.to_string()))
+        }
+        None => {
+            let name = spec.trim();
+            if name.is_empty() {
+                anyhow::bail!("--secret expects a secret name");
+            }
+            Ok((name.to_string(), name.to_string()))
+        }
+    }
+}
+
+/// Build the `secret_env` request map (env-var name -> stored secret name) from
+/// repeated `--secret` flags. The daemon resolves each name to its value; the
+/// CLI never sees plaintext.
+fn build_secret_env(
+    specs: &[String],
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let mut map = serde_json::Map::new();
+    for spec in specs {
+        let (env_var, name) = parse_secret_ref(spec)?;
+        map.insert(env_var, serde_json::Value::String(name));
+    }
+    Ok(map)
 }
 
 /// Validate `--dns` values as IP addresses, returning them unchanged.
@@ -2733,6 +2782,7 @@ async fn run(cli: Cli) -> Result<()> {
             workdir,
             env,
             env_file,
+            secret,
             connect_timeout,
             timeout,
             command,
@@ -2740,6 +2790,7 @@ async fn run(cli: Cli) -> Result<()> {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let (cmd, args) = command.split_first().context("command required after --")?;
             let env = merge_env(&env_file, env)?;
+            let secret_env = build_secret_env(&secret)?;
 
             let mut body = serde_json::json!({
                 "command": cmd,
@@ -2755,6 +2806,9 @@ async fn run(cli: Cli) -> Result<()> {
                 .collect();
             if !env_map.is_empty() {
                 body["env"] = serde_json::Value::Object(env_map);
+            }
+            if !secret_env.is_empty() {
+                body["secret_env"] = serde_json::Value::Object(secret_env);
             }
             if let Some(secs) = connect_timeout {
                 body["connect_timeout_secs"] = serde_json::json!(secs);
@@ -2815,6 +2869,7 @@ async fn run(cli: Cli) -> Result<()> {
             memory,
             env,
             env_file,
+            secret,
             dns,
             add_host,
             vmm,
@@ -2837,6 +2892,7 @@ async fn run(cli: Cli) -> Result<()> {
             let name =
                 name.unwrap_or_else(|| format!("job-{}", &uuid::Uuid::new_v4().to_string()[..8]));
             let env = merge_env(&env_file, env)?;
+            let secret_env = build_secret_env(&secret)?;
             // Validate DNS/host overrides before booting a VM.
             validate_dns(&dns)?;
             let add_host = add_host
@@ -3062,12 +3118,15 @@ async fn run(cli: Cli) -> Result<()> {
                         Some((k.to_string(), v.to_string()))
                     })
                     .collect();
-                let exec_body = serde_json::json!({
+                let mut exec_body = serde_json::json!({
                     "command": exec_command,
                     "args": exec_args,
                     "env": env_map,
                     "timeout_secs": timeout,
                 });
+                if !secret_env.is_empty() {
+                    exec_body["secret_env"] = serde_json::Value::Object(secret_env.clone());
+                }
                 let resp = api_request(
                     with_api_auth(
                         client.post(format!("{api_url}/v1/vms/{name}/exec")),
@@ -7114,6 +7173,34 @@ mod tests {
         let map: std::collections::HashMap<_, _> =
             merged.iter().filter_map(|s| s.split_once('=')).collect();
         assert_eq!(map["SHARED"], "from_flag");
+    }
+
+    #[test]
+    fn parse_secret_ref_accepts_bare_name_and_rename() {
+        // Bare NAME -> env var of the same name.
+        assert_eq!(
+            parse_secret_ref("api_token").unwrap(),
+            ("api_token".to_string(), "api_token".to_string())
+        );
+        // ENVVAR=secret-name -> renamed; whitespace trimmed.
+        assert_eq!(
+            parse_secret_ref(" API_TOKEN = gh-pat ").unwrap(),
+            ("API_TOKEN".to_string(), "gh-pat".to_string())
+        );
+        // Errors: empty value, empty side of the rename.
+        assert!(parse_secret_ref("").is_err());
+        assert!(parse_secret_ref("=gh-pat").is_err());
+        assert!(parse_secret_ref("API_TOKEN=").is_err());
+    }
+
+    #[test]
+    fn build_secret_env_maps_envvar_to_secret_name() {
+        let map =
+            build_secret_env(&["TOKEN".to_string(), "DB_PASS=db-password".to_string()]).unwrap();
+        assert_eq!(map.get("TOKEN").unwrap(), "TOKEN");
+        assert_eq!(map.get("DB_PASS").unwrap(), "db-password");
+        // The map carries only names, never values.
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
