@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.15] - 2026-06-15
+
+### Added
+
+- **`--secret` injects a stored secret into a command's environment.**
+  `husker exec/job --secret NAME` (or `--secret ENVVAR=secret-name` to rename)
+  exposes a secret from husker's encrypted store as an environment variable. The
+  client sends only the secret name; the daemon (which holds the key) resolves it
+  to plaintext and adds it to the exec environment, so the value never appears in
+  argv, the host process table, or shell history. A secret overrides a plain
+  `-e`/`--env-file` value on a key clash, the exec env allowlist is enforced
+  against the resolved keys, and a missing secret fails before the VM is touched.
+  This completes the secrets subsystem, which was previously encrypt-at-rest only
+  with no guest injection.
+
+### Fixed
+
+- **Stale baked kernel modules are named in boot diagnostics.** A rootfs whose
+  baked `.ko` files disagree with the running kernel (a kernel refresh
+  invalidated them) brings up no vsock, so the only prior symptom was a generic
+  "agent not ready" timeout. When the serial-console tail shows the ABI-mismatch
+  signature, the boot-failure hint now says to rebuild the rootfs against the
+  current kernel.
+
 ## [0.4.14] - 2026-06-14
 
 A round of OCI/job usability fixes found while dogfooding the OCI-boot work.
