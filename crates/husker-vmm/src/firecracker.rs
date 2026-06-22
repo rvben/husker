@@ -40,22 +40,38 @@ struct RootfsAlias {
     active: bool,
 }
 
+/// Path of the backup that [`RootfsAlias`] stashes a source rootfs into while a
+/// fork holds it aliased to the fork's clone during `/snapshot/load`.
+fn fork_src_backup_path(source_rootfs: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.fork-src-bak", source_rootfs.display()))
+}
+
+/// Recover a source rootfs stranded by a fork that died after stashing the real
+/// disk aside (`<source_rootfs>.fork-src-bak`) but before restoring it, which
+/// leaves `source_rootfs` as a stale symlink to a fork clone. Drops the symlink
+/// and renames the backup back over it. Returns whether a recovery happened;
+/// a no-op (and `Ok(false)`) when no backup exists. Call at daemon startup for
+/// every VM's rootfs, before any resume could open a stale-symlinked source.
+pub fn recover_aliased_rootfs(source_rootfs: &Path) -> std::io::Result<bool> {
+    let backup = fork_src_backup_path(source_rootfs);
+    if !backup.exists() {
+        return Ok(false);
+    }
+    let _ = std::fs::remove_file(source_rootfs);
+    std::fs::rename(&backup, source_rootfs)?;
+    Ok(true)
+}
+
 impl RootfsAlias {
     fn install(source_rootfs: &Path, fork_rootfs: &Path) -> Result<Self, VmmError> {
-        let backup = PathBuf::from(format!("{}.fork-src-bak", source_rootfs.display()));
         // Crash recovery: a leftover backup means a previous fork died after the
         // rename but before the undo, leaving `source_rootfs` as a stale symlink to
-        // a fork clone and the real rootfs in `backup`. Restore the real rootfs
-        // before re-aliasing, so the source disk is never lost or overwritten.
-        if backup.exists() {
-            let _ = std::fs::remove_file(source_rootfs);
-            std::fs::rename(&backup, source_rootfs).map_err(|e| {
-                VmmError::ProcessError(format!(
-                    "fork: recover stranded source rootfs from {}: {e}",
-                    backup.display()
-                ))
-            })?;
-        }
+        // a fork clone and the real rootfs in `backup`. Restore it before
+        // re-aliasing, so the source disk is never lost or overwritten.
+        recover_aliased_rootfs(source_rootfs).map_err(|e| {
+            VmmError::ProcessError(format!("fork: recover stranded source rootfs: {e}"))
+        })?;
+        let backup = fork_src_backup_path(source_rootfs);
         std::fs::rename(source_rootfs, &backup)
             .map_err(|e| VmmError::ProcessError(format!("fork: stash source rootfs aside: {e}")))?;
         if let Err(e) = std::os::unix::fs::symlink(fork_rootfs, source_rootfs) {
@@ -800,7 +816,18 @@ impl VmmBackend for FirecrackerBackend {
                     "iface_id": "eth0",
                     "host_dev_name": tap,
                 }]);
-                Some(RootfsAlias::install(source_rootfs, fork_rootfs)?)
+                match RootfsAlias::install(source_rootfs, fork_rootfs) {
+                    Ok(alias) => Some(alias),
+                    Err(e) => {
+                        // The FC process was already spawned; clean up its runtime
+                        // files (the process itself dies via kill_on_drop) so a
+                        // failed alias does not leak the socket and logs.
+                        let _ = tokio::fs::remove_file(&socket_path).await;
+                        let _ = tokio::fs::remove_file(&serial_log_path).await;
+                        let _ = tokio::fs::remove_file(&boot_log_path).await;
+                        return Err(e);
+                    }
+                }
             }
             None => None,
         };
@@ -881,6 +908,46 @@ impl VmmBackend for FirecrackerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recover_aliased_rootfs_restores_real_disk_over_stale_symlink() {
+        // Simulate a fork that crashed mid-load: source is a stale symlink to a
+        // fork clone, and the real rootfs sits in the `.fork-src-bak` backup.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("rootfs.ext4");
+        let clone = dir.path().join("fork-clone.ext4");
+        let backup = fork_src_backup_path(&source);
+        std::fs::write(&clone, b"fork-disk").unwrap();
+        std::fs::write(&backup, b"real-source-disk").unwrap();
+        std::os::unix::fs::symlink(&clone, &source).unwrap();
+
+        let recovered = recover_aliased_rootfs(&source).unwrap();
+
+        assert!(recovered, "a stranded backup must be reported as recovered");
+        assert!(!backup.exists(), "backup must be consumed");
+        assert!(
+            !std::fs::symlink_metadata(&source)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "source must no longer be a symlink"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"real-source-disk",
+            "source must hold the real disk again, not the fork clone"
+        );
+    }
+
+    #[test]
+    fn recover_aliased_rootfs_is_noop_without_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("rootfs.ext4");
+        std::fs::write(&source, b"intact").unwrap();
+        let recovered = recover_aliased_rootfs(&source).unwrap();
+        assert!(!recovered, "no backup means nothing to recover");
+        assert_eq!(std::fs::read(&source).unwrap(), b"intact");
+    }
 
     #[test]
     fn parse_firecracker_version_extracts_semver() {

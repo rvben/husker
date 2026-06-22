@@ -24,6 +24,9 @@ struct Calls {
 struct RecordingVmm {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     calls: Mutex<Calls>,
+    /// When set, `snapshot_vm` returns an error, to exercise capture-failure
+    /// rollback in suspend.
+    fail_snapshot: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingVmm {
@@ -31,6 +34,7 @@ impl RecordingVmm {
         Arc::new(Self {
             vms: Mutex::new(HashMap::new()),
             calls: Mutex::new(Calls::default()),
+            fail_snapshot: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -82,10 +86,17 @@ impl VmmBackend for SharedRecordingVmm {
     }
 
     async fn snapshot_vm(&self, id: Uuid, dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
+        self.0.calls.lock().unwrap().snapshot.push(id);
+        if self
+            .0
+            .fail_snapshot
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(VmmError::ProcessError("injected snapshot failure".into()));
+        }
         std::fs::create_dir_all(&dst.dir).unwrap();
         std::fs::write(&dst.memory, b"mem").unwrap();
         std::fs::write(&dst.vmstate, b"state").unwrap();
-        self.0.calls.lock().unwrap().snapshot.push(id);
         Ok(SnapshotMeta {
             backend: "firecracker".into(),
             vmm_version: "test".into(),
@@ -235,6 +246,194 @@ fn core_with_running_vm_backend(
     ));
 
     (core, inner, id, tmp)
+}
+
+/// Build a core plus a handle to its state store and a VM in an arbitrary
+/// persisted `state`, so reconciliation/recovery paths can be set up directly.
+fn core_store_with_vm(
+    name: &str,
+    state: &str,
+) -> (Arc<HuskerCore<SharedRecordingVmm>>, Uuid, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = RecordingVmm::new();
+    let vmm = SharedRecordingVmm(Arc::clone(&inner));
+    let state_store = husker_state::StateStore::open_memory().unwrap();
+    let storage = husker_storage::StorageConfig {
+        data_dir: tmp.path().to_path_buf(),
+    };
+    let now = chrono::Utc::now();
+    let id = Uuid::new_v4();
+    let record = husker_state::VmRecord {
+        id,
+        name: name.into(),
+        state: state.into(),
+        pid: None,
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
+        vmm: "firecracker".into(),
+        boot_mode: "direct".into(),
+        balloon: false,
+        volume: None,
+        network: "nat".into(),
+    };
+    state_store.insert_vm(&record).unwrap();
+
+    #[cfg(feature = "linux-net")]
+    let core = Arc::new(HuskerCore::new(
+        vmm,
+        state_store,
+        husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+        storage,
+        "husker0".into(),
+        vec!["8.8.8.8".into()],
+        tmp.path().join("run"),
+    ));
+    #[cfg(not(feature = "linux-net"))]
+    let core = Arc::new(HuskerCore::new(
+        vmm,
+        state_store,
+        storage,
+        tmp.path().join("run"),
+    ));
+    (core, id, tmp)
+}
+
+/// Read a VM's persisted state via the core's plain (non-refreshed) listing.
+fn vm_state(core: &HuskerCore<SharedRecordingVmm>, id: Uuid) -> String {
+    core.list_vms()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.id == id)
+        .map(|v| v.state)
+        .unwrap_or_else(|| "<missing>".into())
+}
+
+/// Write a valid suspend slot (manifest + vmstate + memory) for `id`.
+fn write_valid_suspend_slot(data_dir: &std::path::Path, id: Uuid) {
+    let slot = data_dir.join("suspend").join(id.to_string());
+    std::fs::create_dir_all(&slot).unwrap();
+    std::fs::write(slot.join("memory"), b"mem").unwrap();
+    std::fs::write(slot.join("vmstate"), b"state").unwrap();
+    std::fs::write(
+        slot.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "full",
+            "backend": "firecracker",
+            "vmm_version": "test",
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+            "vsock_cid": 3,
+            "rootfs_path": "/images/rootfs.ext4",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_completes_interrupted_suspend() {
+    // A daemon crash after the memory is freed but before the state write leaves
+    // the VM in "suspending" with a valid slot. Reconciliation must finish the
+    // transition to "suspended" so the VM stays resumable (not unrecoverable).
+    let (core, id, tmp) = core_store_with_vm("vmint", "suspending");
+    write_valid_suspend_slot(tmp.path(), id);
+
+    let n = core.reconcile_suspended_vms().await.unwrap();
+    assert_eq!(n, 1, "one interrupted suspend should be reconciled");
+
+    assert_eq!(
+        vm_state(&core, id),
+        "suspended",
+        "a 'suspending' VM with a valid slot must become 'suspended'"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_drops_suspending_without_slot() {
+    // "suspending" with no valid slot means the snapshot never completed; the
+    // memory state is unrecoverable, so the VM must fall back to "stopped"
+    // (consistent, re-runnable) rather than be stuck in "suspending" forever.
+    let (core, id, _tmp) = core_store_with_vm("vmnoslot", "suspending");
+
+    let n = core.reconcile_suspended_vms().await.unwrap();
+    assert_eq!(n, 1, "the orphaned suspending VM should be reconciled");
+
+    assert_eq!(
+        vm_state(&core, id),
+        "stopped",
+        "a 'suspending' VM without a valid slot must fall back to 'stopped'"
+    );
+}
+
+#[tokio::test]
+async fn recover_stranded_fork_rootfs_restores_source_disk() {
+    // A fork that crashed mid-load leaves the source VM's rootfs as a stale
+    // symlink to the fork clone, with the real disk in `.fork-src-bak`. Startup
+    // recovery must restore the real disk at the exact path fork uses, so a
+    // later resume does not load the wrong disk.
+    let (core, id, tmp) = core_store_with_vm("vmsrc", "suspended");
+    let vm_dir = tmp.path().join("vms").join("vmsrc");
+    std::fs::create_dir_all(&vm_dir).unwrap();
+    let rootfs = vm_dir.join("rootfs.ext4");
+    let clone = tmp.path().join("clone.ext4");
+    let backup = vm_dir.join("rootfs.ext4.fork-src-bak");
+    std::fs::write(&clone, b"fork-disk").unwrap();
+    std::fs::write(&backup, b"real-source-disk").unwrap();
+    std::os::unix::fs::symlink(&clone, &rootfs).unwrap();
+    let _ = id;
+
+    let n = core.recover_stranded_fork_rootfs();
+    assert_eq!(n, 1, "one stranded source rootfs should be recovered");
+    assert!(!backup.exists(), "backup must be consumed");
+    assert_eq!(
+        std::fs::read(&rootfs).unwrap(),
+        b"real-source-disk",
+        "source rootfs must hold the real disk, not the fork clone"
+    );
+}
+
+#[tokio::test]
+async fn suspend_capture_failure_restores_original_state() {
+    // If capture fails after the VM is moved to the transient "suspending" state,
+    // suspend must roll the state back (and resume the VMM) so the VM is left
+    // exactly as it was - never stranded in "suspending" with no slot.
+    let (core, vmm, id, tmp) = core_with_running_vm("vmfail");
+    vmm.fail_snapshot
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let err = core.suspend_vm("vmfail").await.unwrap_err();
+    assert!(
+        err.to_string().contains("injected"),
+        "expected the injected snapshot failure, got: {err}"
+    );
+
+    assert_eq!(
+        vm_state(&core, id),
+        "running",
+        "a failed suspend must restore the original 'running' state, not leave 'suspending'"
+    );
+    let slot = tmp.path().join("suspend").join(id.to_string());
+    assert!(
+        !slot.exists(),
+        "a failed suspend must not leave a slot behind"
+    );
+    assert!(
+        vmm.calls.lock().unwrap().paused.contains(&id),
+        "the VM was paused during the attempt"
+    );
 }
 
 #[tokio::test]

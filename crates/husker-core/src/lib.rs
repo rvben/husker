@@ -1710,6 +1710,11 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// `resume_vm` can restore the same identity in place. Idempotent.
     pub async fn suspend_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "suspending VM");
+        // Serialize against a concurrent resume/fork of this VM: fork moves the
+        // source's rootfs aside during `/snapshot/load` and reuses its vsock path,
+        // so suspend/resume/fork on one name must not interleave. `fork_vm` takes
+        // this same lock on the source name.
+        let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         match record.state.as_str() {
             "running" | "paused" => {}
@@ -1737,56 +1742,127 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         let paused_by_us = record.state == "running";
-        if paused_by_us {
-            self.vmm.pause_vm(record.id).await?;
-        }
+        let original_state = record.state.clone();
+
+        // Persist the transient "suspending" state up front, BEFORE pausing or
+        // capturing anything. A crash anywhere in the capture window then leaves a
+        // "suspending" VM that startup `reconcile_suspended_vms` resolves from the
+        // on-disk slot (a complete slot -> "suspended", an incomplete one ->
+        // "stopped"), instead of a "running"/"paused" row that startup downgrades
+        // to "stopped" even though a complete, resumable slot exists on disk.
+        self.state.update_vm_state(record.id, "suspending")?;
 
         let slot = self.suspend_slot_dir(record.id);
-        tokio::fs::create_dir_all(&slot)
-            .await
-            .map_err(|e| CoreError::Io(format!("create suspend slot: {e}")))?;
         let paths = SnapshotPaths::in_dir(&slot);
 
-        let meta = match self.vmm.snapshot_vm(record.id, &paths).await {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&slot).await;
-                if paused_by_us {
-                    let _ = self.vmm.resume_vm(record.id).await;
-                }
-                return Err(e.into());
+        // Capture the full state (pause -> snapshot -> manifest). On any failure,
+        // roll the DB state back to what it was and resume the VMM if we paused it,
+        // so a failed suspend is a no-op for the caller.
+        let capture = async {
+            if paused_by_us {
+                self.vmm.pause_vm(record.id).await?;
             }
+            tokio::fs::create_dir_all(&slot)
+                .await
+                .map_err(|e| CoreError::Io(format!("create suspend slot: {e}")))?;
+            let meta = self.vmm.snapshot_vm(record.id, &paths).await?;
+            let manifest = serde_json::json!({
+                "kind": "full",
+                "backend": meta.backend,
+                "vmm_version": meta.vmm_version,
+                "vcpu_count": record.vcpu_count,
+                "mem_size_mib": record.mem_size_mib,
+                "vsock_cid": record.vsock_cid,
+                "rootfs_path": record.rootfs_path,
+            });
+            write_file_atomic(
+                &paths.manifest,
+                &serde_json::to_vec_pretty(&manifest).expect("manifest serializes"),
+            )
+            .await
+            .map_err(|e| CoreError::Io(format!("write suspend manifest: {e}")))?;
+            Ok::<(), CoreError>(())
         };
-
-        let manifest = serde_json::json!({
-            "kind": "full",
-            "backend": meta.backend,
-            "vmm_version": meta.vmm_version,
-            "vcpu_count": record.vcpu_count,
-            "mem_size_mib": record.mem_size_mib,
-            "vsock_cid": record.vsock_cid,
-            "rootfs_path": record.rootfs_path,
-        });
-        if let Err(e) = tokio::fs::write(
-            &paths.manifest,
-            serde_json::to_vec_pretty(&manifest).expect("manifest serializes"),
-        )
-        .await
-        {
+        if let Err(e) = capture.await {
             let _ = tokio::fs::remove_dir_all(&slot).await;
             if paused_by_us {
                 let _ = self.vmm.resume_vm(record.id).await;
             }
-            return Err(CoreError::Io(format!("write suspend manifest: {e}")));
+            let _ = self.state.update_vm_state(record.id, &original_state);
+            return Err(e);
         }
 
-        // NOTE: the process is terminated before the state write. If the state
-        // update fails, the record stays "running" with no live process; recovery
-        // is via destroy. This matches the partial-failure tradeoff in create paths.
+        // The slot is complete and durable; freeing the memory and the final state
+        // write are both covered by reconcile (state is already "suspending").
         self.vmm.destroy_vm(record.id).await?;
         self.state.update_vm_state(record.id, "suspended")?;
         info!(%name, "VM suspended");
         Ok(())
+    }
+
+    /// Recover VMs interrupted mid-suspend on a previous daemon run.
+    ///
+    /// A VM in the transient `"suspending"` state was past its snapshot + manifest
+    /// write (so its guest memory may already be freed) when the daemon stopped.
+    /// If a complete suspend slot is on disk the VM is resumable, so finish the
+    /// transition to `"suspended"`; otherwise the capture never completed and the
+    /// memory state is unrecoverable, so fall back to `"stopped"` (the rootfs is
+    /// intact, so the VM can be re-run). Returns the number of VMs reconciled.
+    /// Call at daemon startup, before serving requests.
+    pub async fn reconcile_suspended_vms(&self) -> Result<usize, CoreError> {
+        let mut reconciled = 0;
+        for vm in self.state.list_vms()? {
+            if vm.state != "suspending" {
+                continue;
+            }
+            let paths = SnapshotPaths::in_dir(self.suspend_slot_dir(vm.id));
+            let slot_complete = tokio::fs::try_exists(&paths.manifest)
+                .await
+                .unwrap_or(false)
+                && tokio::fs::try_exists(&paths.memory).await.unwrap_or(false)
+                && tokio::fs::try_exists(&paths.vmstate).await.unwrap_or(false);
+            let recovered_to = if slot_complete {
+                "suspended"
+            } else {
+                let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(vm.id)).await;
+                "stopped"
+            };
+            self.state.update_vm_state(vm.id, recovered_to)?;
+            warn!(vm = %vm.name, recovered_to, "reconciled interrupted suspend");
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
+    /// Recover source rootfs disks left stranded by a fork that crashed mid-load
+    /// on a prior daemon run. Such a fork leaves the source's `rootfs.ext4` as a
+    /// stale symlink to the fork clone, with the real disk in a
+    /// `rootfs.ext4.fork-src-bak` backup. Restore each one before any resume can
+    /// open the stale symlink and boot the source against the wrong disk. Run at
+    /// daemon startup. Returns the number recovered.
+    pub fn recover_stranded_fork_rootfs(&self) -> usize {
+        let vms = match self.state.list_vms() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to list VMs for stranded-fork rootfs recovery");
+                return 0;
+            }
+        };
+        let mut recovered = 0;
+        for vm in vms {
+            let rootfs = self.storage.vm_dir(&vm.name).join("rootfs.ext4");
+            match husker_vmm::firecracker::recover_aliased_rootfs(&rootfs) {
+                Ok(true) => {
+                    warn!(vm = %vm.name, "recovered source rootfs stranded by an interrupted fork");
+                    recovered += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(vm = %vm.name, error = %e, "failed to recover stranded fork source rootfs")
+                }
+            }
+        }
+        recovered
     }
 
     /// Restore a suspended VM in place (same id/IP/CID/MAC).
@@ -1831,6 +1907,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// - `running`: idempotent no-op.
     pub async fn resume_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "resuming VM");
+        // Serialize against a concurrent fork/suspend of this VM (see `suspend_vm`):
+        // restoring a suspended source must not interleave with a fork that has the
+        // source's rootfs aliased to a clone during `/snapshot/load`.
+        let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         match record.state.as_str() {
             "paused" => {
@@ -1923,6 +2003,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                 Ok(rec)
             }
             Err(e) => {
+                // Log the reason server-side: fork failures previously surfaced
+                // only in the HTTP 500 body, leaving the daemon journal silent.
+                warn!(%source_name, %fork_name, error = %e, "fork failed; rolling back");
                 self.rollback_create(resources).await;
                 Err(e)
             }
@@ -2072,6 +2155,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await;
             match attempt {
                 Ok(()) => return Ok(()),
+                // The agent connected but did not understand the reconfigure
+                // request (EOF / wrong reply): it predates `ReconfigureNetwork`
+                // and is too old for fork. Retrying for the full 10s deadline
+                // cannot help, so fail fast with an actionable message instead of
+                // an opaque "unexpected response from agent" after a long stall.
+                Err(CoreError::Agent(AgentError::UnexpectedResponse)) => {
+                    return Err(CoreError::InvalidArgument(
+                        "fork requires live network reconfiguration, but the guest \
+                         agent does not support it; rebuild the source VM's rootfs \
+                         with a current husker-agent, then suspend it again before \
+                         forking"
+                            .into(),
+                    ));
+                }
                 Err(e) => {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(e);
@@ -4317,9 +4414,57 @@ async fn remove_file_best_effort(path: &std::path::Path) -> std::io::Result<()> 
     }
 }
 
+/// Write `contents` to `path` atomically and durably: write to a sibling
+/// `<path>.tmp`, fsync it, rename it over `path`, then fsync the parent
+/// directory. A crash can leave the temp file (harmless) but never a
+/// partially-written `path`. Used for the suspend manifest, whose truncation
+/// would otherwise make a suspended VM unrecoverable.
+async fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    {
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(contents).await?;
+        f.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    // Best-effort directory fsync so the rename survives power loss.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn write_file_atomic_writes_content_and_removes_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        write_file_atomic(&path, b"hello").await.unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"hello");
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::Path::new(&tmp).exists(),
+            "atomic write must not leave its temp file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_atomic_overwrites_existing_completely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.json");
+        tokio::fs::write(&path, b"old-and-longer").await.unwrap();
+        write_file_atomic(&path, b"new").await.unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
+    }
 
     #[cfg(feature = "linux-net")]
     #[test]

@@ -6612,6 +6612,24 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
     core: &Arc<husker_core::HuskerCore<B>>,
 ) {
+    // Recover any source rootfs left stranded by a fork that crashed mid-load,
+    // BEFORE the suspend reconcile (which can leave VMs resumable): a later
+    // resume must not open a stale symlink to a fork clone.
+    let recovered_disks = core.recover_stranded_fork_rootfs();
+    if recovered_disks > 0 {
+        tracing::info!(
+            recovered_disks,
+            "recovered source rootfs disks stranded by interrupted forks"
+        );
+    }
+    // Recover any VM interrupted mid-suspend on the previous run, so a VM whose
+    // memory was freed before its state write is finished to "suspended"
+    // (resumable) instead of being lost. Runs on every platform branch.
+    match core.reconcile_suspended_vms().await {
+        Ok(n) if n > 0 => tracing::info!(reconciled = n, "recovered interrupted suspends"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "failed to reconcile interrupted suspends"),
+    }
     match core.list_services() {
         Ok(services) => {
             for svc in &services {
