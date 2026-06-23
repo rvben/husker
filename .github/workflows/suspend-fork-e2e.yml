@@ -8,14 +8,17 @@ name: Suspend/Fork E2E
 # tests cannot reach.
 #
 # This requires nested KVM + Firecracker + TAP privileges, which GitHub-hosted
-# runners do not provide, so it runs on a self-hosted runner labelled
-# (self-hosted, husker, linux) with passwordless sudo. Manual trigger only until
-# that runner is registered; add a `schedule:` (nightly) once it exists.
+# runners do not provide, so it runs on the self-hosted runner labelled
+# (self-hosted, husker, linux) with passwordless sudo, a root Rust toolchain,
+# Firecracker, and nftables. Runs nightly and on manual dispatch.
 #
 # The gate runs an isolated daemon (own bridge/subnet/CID range, temp data dir +
 # port), so it is safe alongside any production daemon on the same host.
 on:
   workflow_dispatch:
+  schedule:
+    # Nightly; staggered an hour after oci-boot-e2e (one runner, runs serially).
+    - cron: "30 4 * * *"
 
 jobs:
   suspend-fork-e2e:
@@ -23,9 +26,16 @@ jobs:
     runs-on: [self-hosted, husker, linux]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      # Builds run as the runner user; the gate elevates with sudo internally for
-      # the daemon's TAP/Firecracker operations. PATH is preserved so cargo is
-      # found under sudo.
+      # The gate runs entirely as root (HOME=/root) on the runner's root
+      # toolchain, with an out-of-tree CARGO_TARGET_DIR so the ubuntu-owned
+      # checkout stays free of root-owned build artifacts (next run's `git clean`
+      # stays clean). PATH carries cargo plus the admin tools (nft/ip/firecracker)
+      # the daemon shells out to.
       - name: Suspend/fork e2e gate
-        run: sudo -E env "PATH=$PATH" HUSKER_RUN_SUSPEND_FORK_E2E=1 make test-suspend-fork-e2e-gated
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            HUSKER_RUN_SUSPEND_FORK_E2E=1 \
+            make test-suspend-fork-e2e-gated

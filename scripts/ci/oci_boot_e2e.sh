@@ -16,6 +16,9 @@ set -euo pipefail
 # A built-in-driver kernel (vsock/virtio =y) is fetched from the latest images
 # release unless HUSKER_E2E_KERNEL points at one.
 #
+# Runs on its own bridge/subnet/CID range and a temp data dir + port, so it is
+# safe to run alongside a production daemon on the same host.
+#
 # Run via: HUSKER_RUN_OCI_BOOT_E2E=1 make test-oci-boot-e2e-gated
 
 PORT="${HUSKER_OCI_E2E_PORT:-17799}"
@@ -24,6 +27,7 @@ DATA_DIR="$(mktemp -d)"
 WORK="$(mktemp -d)"
 LOG="$(mktemp)"
 PID=""
+BRIDGE="huskeroce2e"
 VM="ocie2e-$$"
 IMG="ocie2e-alpine-$$"
 
@@ -31,13 +35,14 @@ log() { echo "[oci-boot-e2e] $*"; }
 
 cleanup() {
   if [[ -n "${PID}" ]]; then
+    # SIGTERM -> the daemon drains VMs and tears down its own bridge + TAPs + NAT.
     kill "${PID}" 2>/dev/null || true
     wait "${PID}" 2>/dev/null || true
   fi
-  # Remove any test TAP devices left behind (keep the husker0 bridge).
-  for t in $(ip -br link show 2>/dev/null | grep -oE '^husker[0-9]+' | grep -v '^husker0$'); do
-    ip link delete "${t}" 2>/dev/null || true
-  done
+  # Best-effort: only ever touch THIS run's isolated bridge, never husker0 or any
+  # production TAP. The daemon's SIGTERM teardown already removes its own TAPs;
+  # a generic `husker[0-9]+` sweep here would delete live production taps.
+  ip link delete "${BRIDGE}" 2>/dev/null || true
   rm -rf "${DATA_DIR}" "${WORK}"
   rm -f "${LOG}"
 }
@@ -65,9 +70,13 @@ TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 H="${TARGET_DIR}/debug/husker"
 [[ -x "${H}" ]] || { echo "expected ${H} after build" >&2; exit 1; }
 
-# 3. Start the daemon.
-log "starting daemon on ${BASE}"
+# 3. Start an isolated daemon (own bridge/subnet/CID range, temp data dir + port),
+#    so it never collides with any production daemon on this host.
+log "starting isolated daemon on ${BASE} (bridge ${BRIDGE})"
 HUSKER_DATA_DIR="${DATA_DIR}" HUSKER_DEFAULT_KERNEL="${KERNEL}" \
+  HUSKER_BRIDGE_NAME="${BRIDGE}" \
+  HUSKER_BRIDGE_SUBNET="172.30.0.0/24" \
+  HUSKER_CID_BASE="210" \
   RUST_LOG="${RUST_LOG:-husker=info,husker_api=info}" \
   "${H}" daemon --listen "127.0.0.1:${PORT}" >"${LOG}" 2>&1 &
 PID=$!

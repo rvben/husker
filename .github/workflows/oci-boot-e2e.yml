@@ -6,11 +6,18 @@ name: OCI Boot E2E
 # Firecracker VM.
 #
 # This requires nested KVM + Firecracker + TAP privileges, which GitHub-hosted
-# runners do not provide, so it runs on a self-hosted runner labelled
-# (self-hosted, husker, linux) with passwordless sudo. Manual trigger only until
-# that runner is registered; add a `schedule:` (nightly) once it exists.
+# runners do not provide, so it runs on the self-hosted runner labelled
+# (self-hosted, husker, linux) with passwordless sudo, a root Rust toolchain
+# (incl. the x86_64-musl target) + musl-gcc, Firecracker, and nftables. Runs
+# nightly and on manual dispatch.
+#
+# The gate runs an isolated daemon (own bridge/subnet/CID range, temp data dir +
+# port), so it is safe alongside any production daemon on the same host.
 on:
   workflow_dispatch:
+  schedule:
+    # Nightly; staggered an hour before suspend-fork-e2e (one runner, serial).
+    - cron: "30 3 * * *"
 
 jobs:
   oci-boot-e2e:
@@ -18,13 +25,20 @@ jobs:
     runs-on: [self-hosted, husker, linux]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # Builds run as the runner user (its toolchain); the gate elevates with
-      # sudo internally for the daemon's TAP/Firecracker operations. PATH is
-      # preserved so cargo is found under sudo.
+      # The gate runs entirely as root (HOME=/root) on the runner's root
+      # toolchain (which has the x86_64-musl target). An out-of-tree
+      # CARGO_TARGET_DIR keeps the ubuntu-owned checkout free of root-owned build
+      # artifacts; since that moves the musl agent out of build.rs's default
+      # search path, HUSKER_EMBED_AGENT_BIN points the daemon build at it. PATH
+      # carries cargo plus the admin tools (nft/ip/firecracker) the daemon uses.
       - name: OCI boot e2e gate
-        run: sudo -E env "PATH=$PATH" HUSKER_RUN_OCI_BOOT_E2E=1 make test-oci-boot-e2e-gated
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            HUSKER_EMBED_AGENT_BIN=/var/tmp/husker-e2e-target/x86_64-unknown-linux-musl/agent/husker-agent \
+            HUSKER_RUN_OCI_BOOT_E2E=1 \
+            make test-oci-boot-e2e-gated
