@@ -178,6 +178,13 @@ test-oci-boot-e2e-gated: ## Gated OCI-import boot e2e (Linux/KVM/Firecracker)
 		echo "Skipping OCI boot e2e (set HUSKER_RUN_OCI_BOOT_E2E=1; needs Linux/KVM/Firecracker/root)"; \
 	fi
 
+test-suspend-fork-e2e-gated: ## Gated suspend+fork e2e (Linux/KVM/Firecracker)
+	@if [ "$${HUSKER_RUN_SUSPEND_FORK_E2E:-0}" = "1" ]; then \
+		bash scripts/ci/suspend_fork_e2e.sh; \
+	else \
+		echo "Skipping suspend+fork e2e (set HUSKER_RUN_SUSPEND_FORK_E2E=1; needs Linux/KVM/Firecracker/root)"; \
+	fi
+
 # API/CLI contract tests (OpenAPI + CLI output schema stability)
 test-contracts:
 	cargo test -p husker-api --test openapi_contract
