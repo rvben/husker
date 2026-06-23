@@ -451,12 +451,34 @@ pub struct ReconcileOutcome {
     pub failed: Vec<(String, String)>,
 }
 
+/// SIGKILL a VM's recorded VMM process if it is still alive and still *this*
+/// VM's process.
+///
+/// Both backends embed the VM id in their argv (firecracker `--api-sock
+/// <runtime>/<id>.sock`; qemu `-qmp`/`-serial`/`-pidfile` `<runtime>/<id>.*`), so
+/// the id in the live `/proc/<pid>/cmdline` confirms the pid is this VM's VMM and
+/// not an unrelated process that recycled it. A dead or recycled pid is never
+/// touched. Linux-only (uses /proc + signals). Returns whether a process was
+/// killed.
+#[cfg(target_os = "linux")]
+fn reap_vmm_if_orphaned(id: Uuid, pid: u32) -> bool {
+    let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    cmdline.contains(&id.to_string()) && unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_vmm_if_orphaned(_id: Uuid, _pid: u32) -> bool {
+    false
+}
+
 /// Kill VMM child processes orphaned by a previous daemon that exited without
-/// cleanup (SIGKILL/OOM). At startup, any VM still marked `running`/`paused` in
-/// the DB is an orphan (a clean shutdown drains + marks them stopped). For each,
-/// SIGKILL its recorded pid only if it is still a live `qemu-system` process
-/// (so a recycled PID is never touched). Must run BEFORE mark_stale_vms_stopped.
-/// Returns the number reaped.
+/// cleanup (SIGKILL/OOM/power loss). At startup, any VM still marked
+/// `running`/`paused` in the DB is an orphan (a clean shutdown drains + marks
+/// them stopped). Both Firecracker and QEMU are foreground children that survive
+/// an uncleaned daemon exit (`kill_on_drop` only fires on a graceful drop and
+/// there is no death signal), so each is SIGKILLed via [`reap_vmm_if_orphaned`],
+/// which only touches a pid whose live cmdline still names this VM. Must run
+/// BEFORE mark_stale_vms_stopped. Returns the number reaped.
 #[cfg(target_os = "linux")]
 pub fn reap_orphaned_vmms(state: &husker_state::StateStore) -> usize {
     let vms = match state.list_vms() {
@@ -472,46 +494,12 @@ pub fn reap_orphaned_vmms(state: &husker_state::StateStore) -> usize {
             continue;
         }
         let Some(pid) = vm.pid else { continue };
-        // /proc/<pid>/cmdline confirms liveness + identity; only a live
-        // qemu-system process is killed (never a recycled non-qemu PID).
-        let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        if cmdline.contains("qemu-system") && unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0
-        {
+        if reap_vmm_if_orphaned(vm.id, pid) {
             reaped += 1;
-            warn!(pid, vm = %vm.name, "reaped orphaned qemu process from a prior daemon");
+            warn!(pid, vm = %vm.name, "reaped orphaned VMM process from a prior daemon");
         }
     }
     reaped
-}
-
-/// SIGKILL the firecracker process recorded for a VM interrupted mid-suspend, if
-/// it is still alive and still *this* VM's process.
-///
-/// A hard crash (SIGKILL / OOM / power loss) in the window between the snapshot +
-/// manifest write and `destroy_vm` can leave the paused firecracker reparented
-/// and alive, still bound to this VM's rootfs / vsock / CID / TAP. The general
-/// `reap_orphaned_vmms` does not catch it: that targets `running`/`paused` rows
-/// (a mid-suspend VM is `suspending`) and only qemu. Reaping it before
-/// [`Core::reconcile_suspended_vms`] trusts the on-disk slot stops a later
-/// resume/fork from booting a second VMM against the same resources. The VM id in
-/// the live `/proc/<pid>/cmdline` (firecracker runs with `--api-sock
-/// <runtime>/<id>.sock`) confirms identity, so a dead or recycled pid is never
-/// touched. Suspend is Firecracker-only, hence Linux-only. Returns whether a
-/// process was killed.
-#[cfg(target_os = "linux")]
-fn reap_suspending_orphan(id: Uuid, name: &str, pid: Option<u32>) -> bool {
-    let Some(pid) = pid else { return false };
-    let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    if cmdline.contains(&id.to_string()) && unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0 {
-        warn!(pid, vm = %name, "reaped firecracker orphaned by an interrupted suspend");
-        return true;
-    }
-    false
-}
-
-#[cfg(not(target_os = "linux"))]
-fn reap_suspending_orphan(_id: Uuid, _name: &str, _pid: Option<u32>) -> bool {
-    false
 }
 
 /// Core orchestrator that ties together all subsystems.
@@ -1849,7 +1837,13 @@ impl<B: VmmBackend> HuskerCore<B> {
             // pre-crash firecracker alive (reparented), still bound to this VM's
             // rootfs/vsock/CID/TAP. Reap it before trusting the slot, so a later
             // resume/fork cannot race a surviving VMM over the same resources.
-            reap_suspending_orphan(vm.id, &vm.name, vm.pid);
+            // (`reap_orphaned_vmms` does not: it targets running/paused, not
+            // suspending.)
+            if let Some(pid) = vm.pid
+                && reap_vmm_if_orphaned(vm.id, pid)
+            {
+                warn!(pid, vm = %vm.name, "reaped firecracker orphaned by an interrupted suspend");
+            }
             let paths = SnapshotPaths::in_dir(self.suspend_slot_dir(vm.id));
             let slot_complete = tokio::fs::try_exists(&paths.manifest)
                 .await
@@ -4519,11 +4513,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn reap_suspending_orphan_kills_only_the_identified_process() {
+    fn reap_vmm_if_orphaned_kills_only_the_identified_process() {
         use std::process::{Command, Stdio};
 
-        // A live process whose argv carries the VM id (as firecracker's
-        // `--api-sock <runtime>/<id>.sock` does) is identified and killed. `read`
+        // A live process whose argv carries the VM id (as both backends do via
+        // their per-VM socket/pidfile paths) is identified and killed. `read`
         // blocks on the piped stdin without forking, so the shell's own cmdline
         // carries the id (no child to orphan).
         let id = Uuid::new_v4();
@@ -4535,7 +4529,7 @@ mod tests {
             .expect("spawn victim");
         wait_until_cmdline_contains(victim.id(), &id.to_string());
         assert!(
-            reap_suspending_orphan(id, "victim", Some(victim.id())),
+            reap_vmm_if_orphaned(id, victim.id()),
             "a live process whose cmdline names the VM id must be reaped"
         );
         let status = victim.wait().expect("wait victim");
@@ -4555,7 +4549,7 @@ mod tests {
             .expect("spawn bystander");
         wait_until_cmdline_contains(bystander.id(), "read");
         assert!(
-            !reap_suspending_orphan(other_id, "bystander", Some(bystander.id())),
+            !reap_vmm_if_orphaned(other_id, bystander.id()),
             "a process whose cmdline does not name the VM id must not be touched"
         );
         assert!(

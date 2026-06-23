@@ -6407,7 +6407,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     {
         let reaped = husker_core::reap_orphaned_vmms(&state);
         if reaped > 0 {
-            tracing::info!(reaped, "reaped orphaned qemu processes from a prior run");
+            tracing::info!(reaped, "reaped orphaned VMM processes from a prior run");
         }
     }
 
