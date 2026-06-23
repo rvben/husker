@@ -383,30 +383,15 @@ async fn vm_lifecycle() {
 #[tokio::test]
 #[ignore]
 async fn vm_suspend_resume() {
+    require_e2e!();
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:7777";
 
-    // 1. Create a VM
-    let create_body = serde_json::json!({
-        "name": "e2e-suspend",
-        "kernel_path": "/var/lib/husker/kernels/vmlinux",
-        "rootfs_path": "/var/lib/husker/images/ubuntu-22.04.ext4",
-        "vcpu_count": 1,
-        "mem_size_mib": 128,
-    });
-    let resp = client
-        .post(format!("{base}/v1/vms"))
-        .json(&create_body)
-        .send()
-        .await
-        .expect("create should succeed");
-    assert_eq!(resp.status(), 201);
-    let vm: serde_json::Value = resp.json().await.unwrap();
+    // 1. Create a VM and wait for its agent (uses the resolved default images,
+    //    same as the production CLI - not a hardcoded path).
+    let vm = create_and_wait_for_vm(&client, base, "e2e-suspend").await;
     assert_eq!(vm["name"], "e2e-suspend");
     assert!(vm["id"].as_str().is_some());
-
-    // 2. Wait for the guest to boot and the agent to become ready
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // 3. Suspend -> state transitions to "suspended"
     let resp = client
@@ -506,6 +491,120 @@ async fn vm_suspend_resume() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// Suspend a VM then fork it: the fork must come up RUNNING with a FRESH network
+/// identity (different guest IP and vsock CID than the source), reachable via its
+/// re-homed agent, while the source stays suspended. Exercises the full
+/// Firecracker snapshot -> CoW reflink clone -> `/snapshot/load` with
+/// `network_overrides` -> live netlink reconfigure path that mock-based unit
+/// tests cannot reach.
+///
+/// Requires:
+/// - HUSKER_RUN_IGNORED_E2E=1
+/// - Running `husker daemon` on localhost:7777
+/// - Linux host with KVM, Firecracker >= 1.12.0, NAT networking
+/// - A rootfs whose husker-agent supports network reconfigure (a current image)
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn vm_suspend_fork() {
+    require_e2e!();
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:7777";
+
+    let src = "e2e-fork-src";
+    let child = "e2e-fork-child";
+    predelete_vm(&client, base, child).await;
+
+    // 1. Create the source VM and wait for its agent.
+    let source = create_and_wait_for_vm(&client, base, src).await;
+    let src_ip = source["guest_ip"].as_str().unwrap_or_default().to_string();
+    let src_cid = source["vsock_cid"].as_u64();
+    assert!(!src_ip.is_empty(), "source must have a guest IP");
+
+    // 2. Suspend the source (fork requires a suspended source).
+    let resp = client
+        .post(format!("{base}/v1/vms/{src}/suspend"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "suspend should succeed");
+
+    // 3. Fork the suspended source into a new VM.
+    let resp = client
+        .post(format!("{base}/v1/vms/{src}/fork"))
+        .json(&serde_json::json!({ "fork_name": child }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 201, "fork failed: {body}");
+    let fork: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // 4. The fork is RUNNING with a FRESH identity (distinct IP and CID).
+    assert_eq!(fork["state"], "running", "fork must be running");
+    let fork_ip = fork["guest_ip"].as_str().unwrap_or_default().to_string();
+    assert!(!fork_ip.is_empty(), "fork must have a guest IP");
+    assert_ne!(
+        fork_ip, src_ip,
+        "fork must get a fresh guest IP, not the source's"
+    );
+    if let (Some(s), Some(f)) = (src_cid, fork["vsock_cid"].as_u64()) {
+        assert_ne!(f, s, "fork must get a fresh vsock CID");
+    }
+
+    // 5. The fork is a live, reachable guest: its re-homed agent answers exec.
+    poll_until_agent_ready(&client, base, child).await;
+    let resp = client
+        .post(format!("{base}/v1/vms/{child}/exec"))
+        .json(&serde_json::json!({ "command": "echo", "args": ["forked"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert!(
+        result["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("forked")
+    );
+
+    // 6. The fork's eth0 carries its fresh IP (network was re-homed live).
+    let check = serde_json::json!({
+        "command": "sh",
+        "args": ["-c", format!("ip -4 addr show eth0 | grep -qw {fork_ip}")],
+    });
+    let resp = client
+        .post(format!("{base}/v1/vms/{child}/exec"))
+        .json(&check)
+        .send()
+        .await
+        .unwrap();
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        result["exit_code"], 0,
+        "fork's eth0 must carry its fresh IP {fork_ip}"
+    );
+
+    // 7. Source and fork coexist: the source stays suspended.
+    let resp = client
+        .get(format!("{base}/v1/vms/{src}"))
+        .send()
+        .await
+        .unwrap();
+    let info: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        info["state"], "suspended",
+        "source must stay suspended after fork"
+    );
+
+    // 8. Cleanup both.
+    destroy_vm(&client, base, child).await;
+    destroy_vm(&client, base, src).await;
 }
 
 /// Verify that creating a VM with a duplicate name returns 409 Conflict.
