@@ -6994,12 +6994,49 @@ fn ssh_tunnel_args(target: &SshTarget, local_port: u16, remote_port: u16) -> Vec
     args
 }
 
+/// PID of the live `ssh` tunnel child (`0` = none), read by the atexit hook.
+static SSH_TUNNEL_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Record the ssh tunnel's pid and install the atexit teardown hook once.
+fn register_ssh_tunnel_for_atexit(pid: i32) {
+    SSH_TUNNEL_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| unsafe {
+        libc::atexit(kill_ssh_tunnel_atexit);
+    });
+}
+
+/// atexit hook: SIGKILL the ssh tunnel child if one is still recorded. husker
+/// exits most paths via `std::process::exit` (to skip tokio runtime shutdown),
+/// which bypasses `SshTunnel`'s `Drop`. Without this, the orphaned `ssh -N` keeps
+/// husker's inherited stderr open, so a piped/captured invocation hangs on a
+/// never-closing pipe (and the tunnel + forwarded port leak). `SshTunnel::drop`
+/// clears the pid first, so a clean exit never targets a reused pid here.
+extern "C" fn kill_ssh_tunnel_atexit() {
+    let pid = SSH_TUNNEL_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        // Safety: kill(2) is async-signal-safe and valid from an atexit handler.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
 /// A live SSH local-forward tunnel to a remote husker daemon. The `ssh` child is
 /// killed on drop (`kill_on_drop`), so the tunnel lives exactly as long as this
-/// guard is held.
+/// guard is held. A `std::process::exit` bypasses that drop, so the tunnel pid is
+/// also registered for an atexit teardown (see `register_ssh_tunnel_for_atexit`).
 struct SshTunnel {
     child: tokio::process::Child,
     local_port: u16,
+}
+
+impl Drop for SshTunnel {
+    fn drop(&mut self) {
+        // Clear the atexit pid before the Child's kill_on_drop tears ssh down, so
+        // the atexit hook cannot later SIGKILL a reused pid on a clean exit.
+        SSH_TUNNEL_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl SshTunnel {
@@ -7019,6 +7056,9 @@ impl SshTunnel {
         let child = cmd
             .spawn()
             .context("spawning ssh for the ssh:// tunnel (is the ssh client installed?)")?;
+        if let Some(pid) = child.id() {
+            register_ssh_tunnel_for_atexit(pid as i32);
+        }
         let mut tunnel = SshTunnel { child, local_port };
         tunnel.wait_ready().await?;
         Ok(tunnel)
