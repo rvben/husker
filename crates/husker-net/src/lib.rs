@@ -237,7 +237,9 @@ pub async fn create_bridge(
     // to avoid leaving a zombie bridge.
     if let Err(e) = configure_bridge(name, gateway_ip, prefix_len).await {
         warn!(bridge = name, "bridge setup failed, cleaning up interface");
-        let _ = run_cmd("ip", &["link", "del", name]).await;
+        if let Err(cleanup) = run_cmd("ip", &["link", "del", name]).await {
+            warn!(bridge = name, error = %cleanup, "failed to delete bridge during rollback");
+        }
         return Err(e);
     }
 
@@ -315,7 +317,9 @@ pub async fn create_tap(name: &str) -> Result<(), NetError> {
 
     if let Err(e) = run_cmd("ip", &["link", "set", "dev", name, "up"]).await {
         warn!(tap = name, "TAP link-up failed, cleaning up device");
-        let _ = run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await;
+        if let Err(cleanup) = run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await {
+            warn!(tap = name, error = %cleanup, "failed to delete TAP during rollback");
+        }
         return Err(e);
     }
 
@@ -519,7 +523,12 @@ pub async fn remove_port_forward(
 
     let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
-        Err(_) => return Ok(()),
+        // A missing table means there are no rules to remove (success). Any other
+        // read failure is logged so it does not vanish silently.
+        Err(e) => {
+            debug!(table = %table, error = %e, "nft list failed; assuming no port-forward rules to remove");
+            return Ok(());
+        }
     };
 
     let comment_tag = format!("husker-pf:{}:{}", tap_name, host_port);
@@ -560,7 +569,12 @@ pub async fn remove_all_port_forwards(tap_name: &str, bridge_name: &str) -> Resu
     let table = nft_table_for_bridge(bridge_name);
     let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
-        Err(_) => return Ok(()),
+        // A missing table means there are no rules to remove (success). Any other
+        // read failure is logged so it does not vanish silently.
+        Err(e) => {
+            debug!(table = %table, error = %e, "nft list failed; assuming no port-forward rules to remove");
+            return Ok(());
+        }
     };
 
     let prefix = format!("husker-pf:{tap_name}:");

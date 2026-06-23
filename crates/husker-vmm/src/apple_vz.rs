@@ -560,6 +560,10 @@ impl VmmBackend for AppleVzBackend {
         Ok(info)
     }
 
+    /// Best-effort, asynchronous shutdown: requests a guest stop and marks the VM
+    /// `Stopped`, but the VZVirtualMachine may still be winding down. Callers must
+    /// not assume it has exited (mirrors the QEMU and Firecracker backends;
+    /// `destroy_vm` force-stops).
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
         let (vm, queue) = {
             let instances = self.instances.lock().await;

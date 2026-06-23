@@ -248,6 +248,34 @@ impl QemuKvmBackend {
         // and device errors, distinct from the guest serial console which `-serial
         // file:` captures) go to a per-VM log for diagnostics.
         let boot_log_path = self.boot_log(id);
+
+        // Remove the per-VM artifacts (OVMF copy, logs, sockets) if create() bails
+        // before the instance is tracked, so a failed log open or spawn does not
+        // leak files. Disarmed once the tracked QemuInstance owns them.
+        struct PartialCreateGuard {
+            paths: Vec<std::path::PathBuf>,
+            armed: bool,
+        }
+        impl Drop for PartialCreateGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    for p in &self.paths {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
+        }
+        let mut artifacts = PartialCreateGuard {
+            paths: vec![
+                self.qmp_socket(id),
+                self.pidfile(id),
+                self.serial_log(id),
+                boot_log_path.clone(),
+                self.ovmf_vars_copy(id),
+            ],
+            armed: true,
+        };
+
         let log_out = std::fs::File::create(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("create qemu log: {e}")))?;
         let log_err = log_out
@@ -279,12 +307,8 @@ impl QemuKvmBackend {
             // QEMU's own startup/device errors.
             let serial_tail = crate::tail_lines(&self.serial_log(id), 20);
             let boot_tail = crate::tail_lines(&boot_log_path, 20);
-            // `process` drops here (kill_on_drop) -> QEMU killed.
-            let _ = std::fs::remove_file(self.qmp_socket(id));
-            let _ = std::fs::remove_file(self.pidfile(id));
-            let _ = std::fs::remove_file(self.serial_log(id));
-            let _ = std::fs::remove_file(&boot_log_path);
-            let _ = std::fs::remove_file(self.ovmf_vars_copy(id));
+            // `process` drops here (kill_on_drop) -> QEMU killed; `artifacts` drops
+            // on return and removes the per-VM files (after the tails are read).
             let mut msg = String::from("QMP socket did not appear within 5s");
             crate::append_log_tails(&mut msg, serial_tail, boot_tail, "qemu boot log");
             return Err(VmmError::ProcessError(msg));
@@ -311,6 +335,8 @@ impl QemuKvmBackend {
                 balloon: config.balloon,
             },
         );
+        // The tracked instance now owns these files; do not delete them on drop.
+        artifacts.armed = false;
         Ok(info)
     }
 
