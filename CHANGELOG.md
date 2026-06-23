@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+
+## [0.4.16](https://github.com/rvben/husker/compare/v0.4.15...v0.4.16) - 2026-06-23
+
+### Fixed
+
+- **deps**: bump quinn-proto to 0.11.15 (RUSTSEC-2026-0185) ([b7f0221](https://github.com/rvben/husker/commit/b7f0221aba27a0974f375f7f0f359544be1b4e85))
+- **cli**: kill the ssh:// tunnel on process::exit so piped invocations don't hang ([c76e38a](https://github.com/rvben/husker/commit/c76e38a20412866073c2663ea85921713a3979ee))
+- **core,vmm**: harden suspend/fork crash-safety and fork error handling ([05678e7](https://github.com/rvben/husker/commit/05678e7105b30f8eb2ba9f724a3426ef85abe647))
+
 ## [0.4.15] - 2026-06-15
 
 ### Added
