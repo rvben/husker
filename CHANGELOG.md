@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.4.17](https://github.com/rvben/husker/compare/v0.4.16...v0.4.17) - 2026-06-23
+
+### Fixed
+
+- **core**: reap an orphaned firecracker too, via one id-checked VMM reaper. Both backends orphan identically on an uncleaned daemon exit, so the startup reaper and the interrupted-suspend recovery now SIGKILL a surviving firecracker (not just qemu), gated on the VM id in the live process cmdline ([7721be0](https://github.com/rvben/husker/commit/7721be0e9158caccb399c8b06ae9076f3f3d6f5b))
+- **core**: reap a firecracker orphaned by an interrupted suspend before recovery, so a later resume/fork cannot boot a second VMM against the same rootfs, vsock, CID, and TAP ([6b1b9e2](https://github.com/rvben/husker/commit/6b1b9e2f903e29def3fc20314f6f84dd3e8d25b2))
+
 ## [0.4.16](https://github.com/rvben/husker/compare/v0.4.15...v0.4.16) - 2026-06-23
 
 ### Fixed
