@@ -32,6 +32,10 @@ pub enum StateError {
     ServiceNotFoundByName(String),
     #[error("service already exists: {0}")]
     ServiceAlreadyExists(String),
+    #[error("pool not found by name: {0}")]
+    PoolNotFoundByName(String),
+    #[error("pool already exists: {0}")]
+    PoolAlreadyExists(String),
     #[error("snapshot not found: {0}")]
     SnapshotNotFound(Uuid),
     #[error("snapshot not found by name: {0}")]
@@ -159,6 +163,26 @@ pub struct ServiceRecord {
     pub balloon: bool,
     /// Name of the persistent volume attached to instances of this service, or None.
     pub volume: Option<String>,
+}
+
+/// Persistent hot-pool record. A pool is a pre-warmed, suspended template VM
+/// that `run`/`job` fork fresh, isolated VMs from in sub-second instead of cold
+/// booting. Direct-kernel / Firecracker only (fork is Firecracker-only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolRecord {
+    pub id: Uuid,
+    pub name: String,
+    /// The suspended template VM that members are forked from.
+    pub template_vm_id: Uuid,
+    /// Concrete rootfs path the template booted from (the base image).
+    pub rootfs_path: String,
+    /// Concrete kernel path the template booted from.
+    pub kernel_path: String,
+    pub initrd_path: Option<String>,
+    pub vcpu_count: Option<u32>,
+    pub mem_size_mib: Option<u32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Persistent snapshot record.
@@ -301,6 +325,19 @@ impl StateStore {
                 cloud_image TEXT,
                 disk_size INTEGER,
                 balloon INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS pools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                template_vm_id TEXT NOT NULL,
+                rootfs_path TEXT NOT NULL,
+                kernel_path TEXT NOT NULL,
+                initrd_path TEXT,
+                vcpu_count INTEGER,
+                mem_size_mib INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -808,6 +845,79 @@ impl StateStore {
         )?;
         if deleted == 0 {
             return Err(StateError::ServiceNotFound(id));
+        }
+        Ok(())
+    }
+
+    // ── Pools ─────────────────────────────────────────────────────────
+
+    /// Insert a new pool record.
+    pub fn insert_pool(&self, record: &PoolRecord) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO pools (id, name, template_vm_id, rootfs_path, kernel_path,
+                                initrd_path, vcpu_count, mem_size_mib, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id.to_string(),
+                record.name,
+                record.template_vm_id.to_string(),
+                record.rootfs_path,
+                record.kernel_path,
+                record.initrd_path,
+                record.vcpu_count,
+                record.mem_size_mib,
+                record.created_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                StateError::PoolAlreadyExists(record.name.clone())
+            }
+            _ => StateError::Database(e),
+        })?;
+        Ok(())
+    }
+
+    /// Get a pool by name.
+    pub fn get_pool_by_name(&self, name: &str) -> Result<PoolRecord, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, template_vm_id, rootfs_path, kernel_path, initrd_path,
+                    vcpu_count, mem_size_mib, created_at, updated_at
+             FROM pools WHERE name = ?1",
+            params![name],
+            row_to_pool_record,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StateError::PoolNotFoundByName(name.into()),
+            other => StateError::Database(other),
+        })
+    }
+
+    /// List all pools, oldest first.
+    pub fn list_pools(&self) -> Result<Vec<PoolRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, template_vm_id, rootfs_path, kernel_path, initrd_path,
+                    vcpu_count, mem_size_mib, created_at, updated_at
+             FROM pools ORDER BY created_at",
+        )?;
+        let records = stmt
+            .query_map([], row_to_pool_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Delete a pool record by name.
+    pub fn delete_pool_by_name(&self, name: &str) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute("DELETE FROM pools WHERE name = ?1", params![name])?;
+        if deleted == 0 {
+            return Err(StateError::PoolNotFoundByName(name.into()));
         }
         Ok(())
     }
@@ -1504,6 +1614,25 @@ fn row_to_service_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRec
             raw != 0
         },
         volume: row.get(17)?,
+    })
+}
+
+fn row_to_pool_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PoolRecord> {
+    let id_str: String = row.get(0)?;
+    let template_vm_id_str: String = row.get(2)?;
+    let created_str: String = row.get(8)?;
+    let updated_str: String = row.get(9)?;
+    Ok(PoolRecord {
+        id: parse_uuid(&id_str)?,
+        name: row.get(1)?,
+        template_vm_id: parse_uuid(&template_vm_id_str)?,
+        rootfs_path: row.get(3)?,
+        kernel_path: row.get(4)?,
+        initrd_path: row.get(5)?,
+        vcpu_count: row.get(6)?,
+        mem_size_mib: row.get(7)?,
+        created_at: parse_datetime(&created_str)?,
+        updated_at: parse_datetime(&updated_str)?,
     })
 }
 
@@ -2958,6 +3087,50 @@ mod tests {
 
         let fetched = store.get_service_by_name("vol-svc").unwrap();
         assert_eq!(fetched.volume.as_deref(), Some("svc-data"));
+    }
+
+    #[test]
+    fn pool_crud_roundtrips() {
+        let store = StateStore::open_memory().unwrap();
+        let template = Uuid::new_v4();
+        let rec = PoolRecord {
+            id: Uuid::new_v4(),
+            name: "web".into(),
+            template_vm_id: template,
+            rootfs_path: "/img/base.ext4".into(),
+            kernel_path: "/img/vmlinux".into(),
+            initrd_path: Some("/img/initrd.gz".into()),
+            vcpu_count: Some(2),
+            mem_size_mib: Some(512),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.insert_pool(&rec).unwrap();
+
+        let got = store.get_pool_by_name("web").unwrap();
+        assert_eq!(got.name, "web");
+        assert_eq!(got.template_vm_id, template);
+        assert_eq!(got.rootfs_path, "/img/base.ext4");
+        assert_eq!(got.initrd_path.as_deref(), Some("/img/initrd.gz"));
+        assert_eq!(got.vcpu_count, Some(2));
+        assert_eq!(got.mem_size_mib, Some(512));
+        assert_eq!(store.list_pools().unwrap().len(), 1);
+
+        assert!(matches!(
+            store.insert_pool(&rec),
+            Err(StateError::PoolAlreadyExists(n)) if n == "web"
+        ));
+
+        store.delete_pool_by_name("web").unwrap();
+        assert!(matches!(
+            store.get_pool_by_name("web"),
+            Err(StateError::PoolNotFoundByName(_))
+        ));
+        assert!(store.list_pools().unwrap().is_empty());
+        assert!(matches!(
+            store.delete_pool_by_name("web"),
+            Err(StateError::PoolNotFoundByName(_))
+        ));
     }
 
     #[test]

@@ -455,6 +455,12 @@ enum Commands {
         action: ServiceAction,
     },
 
+    /// Manage hot pools: pre-warmed VM templates that run/job fork sub-second
+    Pool {
+        #[command(subcommand)]
+        action: PoolAction,
+    },
+
     /// Manage VM snapshots
     #[command(alias = "snap")]
     Snapshot {
@@ -690,6 +696,45 @@ enum ServiceAction {
     /// Delete a service by name
     Delete {
         /// Service name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolAction {
+    /// Create a hot pool: boot a template from the base image, warm it, suspend it
+    Create {
+        /// Pool name
+        name: String,
+        /// Base rootfs (path, catalog name, or OCI ref); daemon default if omitted
+        rootfs: Option<PathBuf>,
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+        #[arg(long)]
+        vcpus: Option<u32>,
+        #[arg(long)]
+        memory: Option<u32>,
+    },
+    /// List hot pools
+    List,
+    /// Show a hot pool
+    Get {
+        /// Pool name
+        name: String,
+    },
+    /// Check a fresh VM out of a pool (fork the template into a new running VM)
+    Checkout {
+        /// Pool name
+        name: String,
+        /// Name for the new VM (generated from the pool name if omitted)
+        #[arg(long = "name")]
+        vm_name: Option<String>,
+    },
+    /// Delete a hot pool and its template
+    Delete {
+        /// Pool name
         name: String,
     },
 }
@@ -1880,6 +1925,8 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "host-group get"
             | "service list"
             | "service get"
+            | "pool list"
+            | "pool get"
             | "snapshot list"
             | "snapshot get"
             | "image list"
@@ -1929,6 +1976,10 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "service delete" => vec!["status", "action", "name", "outcome"],
         "service get" => vec!["status", "action", "service", "instances"],
         "service list" => vec!["status", "action", "services"],
+        "pool create" | "pool get" => vec!["status", "action", "pool"],
+        "pool list" => vec!["status", "action", "pools"],
+        "pool checkout" => vec!["status", "action", "vm"],
+        "pool delete" => vec!["status", "action", "name"],
         "volume create" | "volume get" => vec!["status", "action", "volume"],
         "volume delete" => vec!["status", "action", "name"],
         "volume list" => vec!["status", "action", "volumes"],
@@ -3358,6 +3409,11 @@ async fn run(cli: Cli) -> Result<()> {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             host_group_command(api_url, api_token, action, output).await
         }
+        Commands::Pool { action } => {
+            let config = load_config(config_path.as_deref());
+            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
+            pool_command(api_url, api_token, action, output, config).await
+        }
         Commands::Service { action } => {
             let config = load_config(config_path.as_deref());
             let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
@@ -3991,6 +4047,186 @@ async fn host_group_command(
                 );
             } else {
                 let msg = api_error(resp, &format!("host group '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn pool_command(
+    api_url: String,
+    api_token: Option<String>,
+    action: PoolAction,
+    output: OutputFormat,
+    config: Config,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    match action {
+        PoolAction::Create {
+            name,
+            rootfs,
+            kernel,
+            initrd,
+            vcpus,
+            memory,
+        } => {
+            let mut body = serde_json::json!({ "name": &name });
+            if let Some(path) = rootfs {
+                body["rootfs_path"] =
+                    serde_json::json!(husker::resolve_rootfs_arg(path, &config.data_dir));
+            }
+            if let Some(k) = kernel {
+                body["kernel_path"] = serde_json::json!(k);
+            }
+            if let Some(i) = initrd {
+                body["initrd_path"] = serde_json::json!(i);
+            }
+            if let Some(n) = vcpus {
+                body["vcpu_count"] = serde_json::json!(n);
+            }
+            if let Some(m) = memory {
+                body["mem_size_mib"] = serde_json::json!(m);
+            }
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/pools")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+            if resp.status().is_success() {
+                let pool: serde_json::Value = resp.json().await?;
+                if output == OutputFormat::Text {
+                    println!("Created pool {}", pool["name"].as_str().unwrap_or("-"));
+                } else {
+                    print_output(
+                        output,
+                        &serde_json::json!({"status":"ok","action":"pool-create","pool":pool}),
+                        "",
+                    );
+                }
+            } else {
+                let msg = api_error(resp, &format!("pool '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        PoolAction::List => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/pools")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if !resp.status().is_success() {
+                let msg = api_error(resp, "listing pools").await;
+                exit_with_error(output, msg);
+            }
+            let pools: Vec<serde_json::Value> = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({"status":"ok","action":"pool-list","pools":pools}),
+                    "",
+                );
+            } else if pools.is_empty() {
+                println!("No pools found");
+            } else {
+                println!("{:<20} {:<44} {:>8}", "NAME", "ROOTFS", "MEMORY");
+                for p in &pools {
+                    let mem = p["mem_size_mib"]
+                        .as_u64()
+                        .map(|m| format!("{m}M"))
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{:<20} {:<44} {:>8}",
+                        p["name"].as_str().unwrap_or("-"),
+                        p["rootfs_path"].as_str().unwrap_or("-"),
+                        mem,
+                    );
+                }
+            }
+        }
+        PoolAction::Get { name } => {
+            let resp = api_request(with_api_auth(
+                client.get(format!("{api_url}/v1/pools/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if !resp.status().is_success() {
+                let msg = api_error(resp, &format!("pool '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+            let pool: serde_json::Value = resp.json().await?;
+            if output == OutputFormat::Json {
+                print_output(
+                    output,
+                    &serde_json::json!({"status":"ok","action":"pool-get","pool":pool}),
+                    "",
+                );
+            } else {
+                let s = |key: &str| pool[key].as_str().unwrap_or("-").to_string();
+                println!("Name:     {}", s("name"));
+                println!("Rootfs:   {}", s("rootfs_path"));
+                println!("Kernel:   {}", s("kernel_path"));
+                println!("Template: {}", s("template_vm_id"));
+                if let Some(m) = pool["mem_size_mib"].as_u64() {
+                    println!("Memory:   {m}M");
+                }
+                if let Some(c) = pool["vcpu_count"].as_u64() {
+                    println!("vCPUs:    {c}");
+                }
+            }
+        }
+        PoolAction::Checkout { name, vm_name } => {
+            let body = serde_json::json!({ "vm_name": vm_name });
+            let resp = api_request(
+                with_api_auth(
+                    client.post(format!("{api_url}/v1/pools/{name}/checkout")),
+                    api_token.as_deref(),
+                )
+                .json(&body),
+            )
+            .await?;
+            if resp.status().is_success() {
+                let vm: serde_json::Value = resp.json().await?;
+                if output == OutputFormat::Text {
+                    println!(
+                        "Checked out {} from pool {} ({})",
+                        vm["name"].as_str().unwrap_or("-"),
+                        name,
+                        vm["guest_ip"].as_str().unwrap_or("-"),
+                    );
+                } else {
+                    print_output(
+                        output,
+                        &serde_json::json!({"status":"ok","action":"pool-checkout","vm":vm}),
+                        "",
+                    );
+                }
+            } else {
+                let msg = api_error(resp, &format!("pool '{name}'")).await;
+                exit_with_error(output, msg);
+            }
+        }
+        PoolAction::Delete { name } => {
+            let resp = api_request(with_api_auth(
+                client.delete(format!("{api_url}/v1/pools/{name}")),
+                api_token.as_deref(),
+            ))
+            .await?;
+            if resp.status().is_success() {
+                if output == OutputFormat::Text {
+                    println!("Deleted pool {name}");
+                } else {
+                    print_output(
+                        output,
+                        &serde_json::json!({"status":"ok","action":"pool-delete","name":name}),
+                        "",
+                    );
+                }
+            } else {
+                let msg = api_error(resp, &format!("pool '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }

@@ -18,8 +18,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub use husker_state::{
-    HostGroupRecord, ImageRecord, SecretRecord, ServiceRecord, SnapshotRecord, VmRecord,
-    VolumeRecord,
+    HostGroupRecord, ImageRecord, PoolRecord, SecretRecord, ServiceRecord, SnapshotRecord,
+    VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 
@@ -45,6 +45,10 @@ pub enum CoreError {
     ServiceNotFound(String),
     #[error("service already exists: {0}")]
     ServiceAlreadyExists(String),
+    #[error("pool not found: {0}")]
+    PoolNotFound(String),
+    #[error("pool already exists: {0}")]
+    PoolAlreadyExists(String),
     #[error("snapshot not found: {0}")]
     SnapshotNotFound(String),
     #[error("snapshot already exists: {0}")]
@@ -196,6 +200,27 @@ pub struct CreateServiceRequest {
     /// Named persistent volume to attach to each instance as the second disk.
     #[serde(default)]
     pub volume: Option<String>,
+}
+
+/// Parameters for creating a hot pool: a pre-warmed, suspended template VM that
+/// `run`/`job` fork fresh VMs from. Direct-kernel / Firecracker only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CreatePoolRequest {
+    pub name: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub rootfs_path: Option<PathBuf>,
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub kernel_path: Option<PathBuf>,
+    #[serde(default)]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub initrd_path: Option<PathBuf>,
+    #[serde(default)]
+    pub vcpu_count: Option<u32>,
+    #[serde(default)]
+    pub mem_size_mib: Option<u32>,
 }
 
 /// Parameters for creating a snapshot.
@@ -2085,10 +2110,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             .clone_rootfs(&source_rootfs, &fork_rootfs)
             .await?;
 
-        // Restore the fork from the source's snapshot, bound to its own TAP.
+        // Restore the fork from the source's snapshot, bound to its own TAP and
+        // its own vsock UDS path (via FC `vsock_override`), so the source can be
+        // forked many times concurrently without a host-socket collision.
         let fork_id = Uuid::new_v4();
         let src_snapshot = SnapshotPaths::in_dir(self.suspend_slot_dir(source.id));
-        let source_vsock_path = self.runtime_dir.join(format!("{}.vsock", source.id));
         let info = self
             .vmm
             .restore_vm(
@@ -2102,7 +2128,6 @@ impl<B: VmmBackend> HuskerCore<B> {
                     tap_device: tap_name.clone(),
                     source_rootfs,
                     fork_rootfs,
-                    source_vsock_path,
                 },
             )
             .await?;
@@ -2699,6 +2724,139 @@ impl<B: VmmBackend> HuskerCore<B> {
             other => CoreError::State(other),
         })?;
         Ok(outcome)
+    }
+
+    // ── Hot pools ─────────────────────────────────────────────────────
+
+    /// Create a hot pool: boot a template VM from the base image, wait for its
+    /// guest agent, suspend it to disk, and record the pool. `run`/`job --pool
+    /// <name>` then fork this template into fresh, isolated VMs in sub-second.
+    ///
+    /// The template is a normal (suspended) VM named after the pool. Firecracker
+    /// only (suspend needs full-state snapshot support). On any failure after the
+    /// template is created it is destroyed, so the pool name is free again.
+    pub async fn create_pool(&self, req: CreatePoolRequest) -> Result<PoolRecord, CoreError> {
+        validate_resource_name("pool", &req.name)?;
+        if self.state.get_pool_by_name(&req.name).is_ok() {
+            return Err(CoreError::PoolAlreadyExists(req.name.clone()));
+        }
+
+        let template = self
+            .create_vm(CreateVmRequest {
+                name: req.name.clone(),
+                kernel_path: req.kernel_path.clone(),
+                rootfs_path: req.rootfs_path.clone(),
+                vcpu_count: req.vcpu_count,
+                mem_size_mib: req.mem_size_mib,
+                initrd_path: req.initrd_path.clone(),
+                userdata: None,
+                env: Vec::new(),
+                vmm: None,
+                cloud_image: None,
+                disk_size: None,
+                ssh_authorized_keys: Vec::new(),
+                balloon: false,
+                volume: None,
+                network: None,
+            })
+            .await
+            .map_err(|e| match e {
+                CoreError::VmAlreadyExists(_) => CoreError::PoolAlreadyExists(req.name.clone()),
+                other => other,
+            })?;
+
+        // Warm to agent-ready, then suspend = the pool template. Roll back the
+        // half-built template on any failure so the pool name stays reusable.
+        let warm_and_suspend = async {
+            self.agent_connect_ready(&req.name, default_ready_timeout("direct"))
+                .await?;
+            self.suspend_vm(&req.name).await
+        };
+        if let Err(e) = warm_and_suspend.await {
+            let _ = self.destroy_vm(&req.name).await;
+            return Err(e);
+        }
+
+        let now = chrono::Utc::now();
+        let record = PoolRecord {
+            id: Uuid::new_v4(),
+            name: req.name.clone(),
+            template_vm_id: template.id,
+            rootfs_path: template.rootfs_path.clone(),
+            kernel_path: template.kernel_path.clone(),
+            initrd_path: req
+                .initrd_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            vcpu_count: req.vcpu_count,
+            mem_size_mib: req.mem_size_mib,
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(e) = self.state.insert_pool(&record) {
+            let _ = self.destroy_vm(&req.name).await;
+            return Err(match e {
+                husker_state::StateError::PoolAlreadyExists(_) => {
+                    CoreError::PoolAlreadyExists(req.name.clone())
+                }
+                other => CoreError::State(other),
+            });
+        }
+        info!(pool = %req.name, "hot pool created");
+        Ok(record)
+    }
+
+    /// List all hot pools.
+    pub fn list_pools(&self) -> Result<Vec<PoolRecord>, CoreError> {
+        Ok(self.state.list_pools()?)
+    }
+
+    /// Get a hot pool by name.
+    pub fn get_pool(&self, name: &str) -> Result<PoolRecord, CoreError> {
+        self.state.get_pool_by_name(name).map_err(|e| match e {
+            husker_state::StateError::PoolNotFoundByName(_) => CoreError::PoolNotFound(name.into()),
+            other => CoreError::State(other),
+        })
+    }
+
+    /// Check a fresh VM out of a pool: fork the suspended template into a new,
+    /// isolated VM with its own identity (CoW rootfs, fresh IP/CID/MAC), in
+    /// sub-second. The template stays suspended and reusable. Firecracker only.
+    pub async fn checkout_pool(
+        &self,
+        pool_name: &str,
+        vm_name: Option<&str>,
+    ) -> Result<VmRecord, CoreError> {
+        // Surface a clear pool-not-found before touching the template.
+        self.get_pool(pool_name)?;
+        // Default the member name to "<pool>-<short id>" when unspecified.
+        let generated;
+        let name = match vm_name {
+            Some(n) => n,
+            None => {
+                let suffix = Uuid::new_v4().simple().to_string();
+                generated = format!("{pool_name}-{}", &suffix[..8]);
+                &generated
+            }
+        };
+        // The template VM is named after the pool; fork it into a fresh VM.
+        self.fork_vm(pool_name, name).await
+    }
+
+    /// Delete a hot pool: destroy its template VM, then remove the record.
+    pub async fn delete_pool(&self, name: &str) -> Result<(), CoreError> {
+        self.get_pool(name)?;
+        match self.destroy_vm(name).await {
+            Ok(()) => {}
+            Err(CoreError::VmNotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        self.state.delete_pool_by_name(name).map_err(|e| match e {
+            husker_state::StateError::PoolNotFoundByName(_) => CoreError::PoolNotFound(name.into()),
+            other => CoreError::State(other),
+        })?;
+        info!(pool = %name, "hot pool deleted");
+        Ok(())
     }
 
     /// Create a snapshot from a stopped VM.

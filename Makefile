@@ -185,6 +185,13 @@ test-suspend-fork-e2e-gated: ## Gated suspend+fork e2e (Linux/KVM/Firecracker)
 		echo "Skipping suspend+fork e2e (set HUSKER_RUN_SUSPEND_FORK_E2E=1; needs Linux/KVM/Firecracker/root)"; \
 	fi
 
+test-pool-e2e-gated: ## Gated hot-pool concurrent-checkout e2e (Linux/KVM/Firecracker)
+	@if [ "$${HUSKER_RUN_POOL_E2E:-0}" = "1" ]; then \
+		bash scripts/ci/pool_e2e.sh; \
+	else \
+		echo "Skipping pool e2e (set HUSKER_RUN_POOL_E2E=1; needs Linux/KVM/Firecracker/root)"; \
+	fi
+
 # API/CLI contract tests (OpenAPI + CLI output schema stability)
 test-contracts:
 	cargo test -p husker-api --test openapi_contract

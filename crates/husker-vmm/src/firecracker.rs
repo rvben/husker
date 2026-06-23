@@ -114,9 +114,11 @@ pub struct FirecrackerBackend {
     instances: Arc<Mutex<HashMap<Uuid, FcInstance>>>,
 }
 
-/// Minimum Firecracker version `husker fork` needs: the `network_overrides`
-/// field on `/snapshot/load`, added in 1.12.0 (PR #4731).
-const FORK_MIN_FIRECRACKER: (u32, u32, u32) = (1, 12, 0);
+/// Minimum Firecracker version `husker fork` needs: `network_overrides` (1.12.0,
+/// PR #4731) to rebind the host TAP, plus `vsock_override` (1.16.0, PR #5323) to
+/// give each fork its own vsock socket so concurrent forks of one snapshot do
+/// not collide on the host UDS. The later of the two requirements wins.
+const FORK_MIN_FIRECRACKER: (u32, u32, u32) = (1, 16, 0);
 
 /// Parse Firecracker's `--version` output into `(major, minor, patch)`. The
 /// first line looks like `Firecracker v1.16.0`; the first whitespace token that
@@ -152,8 +154,8 @@ impl FirecrackerBackend {
     }
 
     /// Fail with a clear message when the installed Firecracker is too old to
-    /// fork (it would otherwise reject the `network_overrides` field with an
-    /// opaque 400). Run `firecracker --version` and compare.
+    /// fork (it would otherwise reject the `network_overrides` / `vsock_override`
+    /// fields with an opaque 400). Run `firecracker --version` and compare.
     async fn assert_firecracker_supports_fork(&self) -> Result<(), VmmError> {
         let output = tokio::process::Command::new(&self.firecracker_bin)
             .arg("--version")
@@ -176,9 +178,9 @@ impl FirecrackerBackend {
             let (mi, mj, mp) = FORK_MIN_FIRECRACKER;
             let (a, b, c) = version;
             return Err(VmmError::Unsupported(format!(
-                "husker fork requires Firecracker >= {mi}.{mj}.{mp} (it overrides the host TAP \
-                 on snapshot restore via `network_overrides`, added in {mi}.{mj}.{mp}); found \
-                 {a}.{b}.{c}. Upgrade firecracker."
+                "husker fork requires Firecracker >= {mi}.{mj}.{mp} (it rebinds the host TAP and \
+                 the vsock socket on snapshot restore via `network_overrides` + `vsock_override`); \
+                 found {a}.{b}.{c}. Upgrade firecracker."
             )));
         }
         Ok(())
@@ -704,29 +706,20 @@ impl VmmBackend for FirecrackerBackend {
         src: &SnapshotPaths,
         target: RestoreTarget,
     ) -> Result<VmInfo, VmmError> {
-        // Common identity plus per-target specifics. `Resume` keeps the original
-        // identity and its own vsock path; `Fork` brings up a new VM bound to a
-        // fresh TAP, reusing the snapshot's embedded vsock path and aliasing the
-        // embedded source rootfs to the fork's clone during load.
-        let (id, name, vcpu_count, mem_size_mib, vsock_cid, vsock_path, fork) = match target {
+        // Common identity plus per-target specifics. Each restore binds its OWN
+        // vsock UDS path (`<runtime>/<id>.vsock`) and overrides the snapshot's
+        // embedded path via `vsock_override` (below), so concurrent forks of one
+        // snapshot never collide on the host socket. `Fork` additionally rebinds
+        // the NIC to a fresh TAP and aliases the embedded source rootfs to the
+        // fork's clone during load.
+        let (id, name, vcpu_count, mem_size_mib, vsock_cid, fork) = match target {
             RestoreTarget::Resume {
                 id,
                 name,
                 vcpu_count,
                 mem_size_mib,
                 vsock_cid,
-            } => {
-                let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
-                (
-                    id,
-                    name,
-                    vcpu_count,
-                    mem_size_mib,
-                    vsock_cid,
-                    vsock_path,
-                    None,
-                )
-            }
+            } => (id, name, vcpu_count, mem_size_mib, vsock_cid, None),
             RestoreTarget::Fork {
                 id,
                 name,
@@ -736,17 +729,16 @@ impl VmmBackend for FirecrackerBackend {
                 tap_device,
                 source_rootfs,
                 fork_rootfs,
-                source_vsock_path,
             } => (
                 id,
                 name,
                 vcpu_count,
                 mem_size_mib,
                 vsock_cid,
-                source_vsock_path,
                 Some((tap_device, source_rootfs, fork_rootfs)),
             ),
         };
+        let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
 
         // A fork rebinds the guest NIC to a fresh host TAP via the
         // `network_overrides` field on `/snapshot/load`, which Firecracker only
@@ -801,14 +793,17 @@ impl VmmBackend for FirecrackerBackend {
 
         let snapshot = Self::path_to_str(&src.vmstate, "vmstate")?;
         let mem = Self::path_to_str(&src.memory, "memory")?;
-        // Resume reattaches the guest's NIC to the host TAP named in the snapshot
-        // (which still exists, since suspend keeps host networking) with no
-        // overrides. Fork rebinds the NIC to its own fresh TAP and aliases the
-        // embedded source rootfs to the fork's clone for the duration of the load.
+        // `vsock_override` rebinds the vsock to this VM's own socket path: a resumed
+        // VM rebinds its own, a fork gets a fresh one (so concurrent forks of one
+        // snapshot do not collide). Resume keeps the snapshot's NIC; fork rebinds
+        // the NIC to its own fresh TAP and aliases the embedded source rootfs to
+        // the fork's clone for the duration of the load.
+        let vsock_path_str = Self::path_to_str(&vsock_path, "vsock_path")?;
         let mut load_body = serde_json::json!({
             "snapshot_path": snapshot,
             "mem_file_path": mem,
             "resume_vm": true,
+            "vsock_override": { "uds_path": vsock_path_str },
         });
         let _alias = match &fork {
             Some((tap, source_rootfs, fork_rootfs)) => {
@@ -984,8 +979,11 @@ mod tests {
             (1, 11, 0) < FORK_MIN_FIRECRACKER,
             "v1.11.0 is too old to fork"
         );
-        assert!((1, 12, 0) >= FORK_MIN_FIRECRACKER, "v1.12.0 is the floor");
-        assert!((1, 16, 0) >= FORK_MIN_FIRECRACKER, "v1.16.0 supports fork");
+        assert!(
+            (1, 15, 0) < FORK_MIN_FIRECRACKER,
+            "v1.15.0 lacks vsock_override"
+        );
+        assert!((1, 16, 0) >= FORK_MIN_FIRECRACKER, "v1.16.0 is the floor");
     }
 
     #[test]

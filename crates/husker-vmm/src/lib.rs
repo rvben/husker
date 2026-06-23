@@ -317,9 +317,6 @@ pub enum RestoreTarget {
         source_rootfs: PathBuf,
         /// The fork's reflink clone that the alias points at.
         fork_rootfs: PathBuf,
-        /// The vsock socket path embedded in the snapshot (the fork binds it; the
-        /// source stays suspended so the path is free).
-        source_vsock_path: PathBuf,
     },
 }
 

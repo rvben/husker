@@ -23,11 +23,11 @@ use utoipa::OpenApi;
 use utoipa::ToSchema;
 
 use husker_core::{
-    CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
-    CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest, ExportImageRequest,
-    ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord, ImportImageRequest,
-    RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata, ServiceRecord, ShellEvent,
-    SnapshotRecord, VmRecord, VolumeRecord,
+    CoreError, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest,
+    CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest,
+    ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
+    ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
+    ServiceRecord, ShellEvent, SnapshotRecord, VmRecord, VolumeRecord,
 };
 use husker_vmm::VmmBackend;
 
@@ -132,6 +132,35 @@ pub struct ServiceMutationResponse {
 pub struct ServiceDeleteResponse {
     pub name: String,
     pub outcome: ReconcileOutcomeResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PoolResponse {
+    pub id: String,
+    pub name: String,
+    pub template_vm_id: String,
+    pub rootfs_path: String,
+    pub kernel_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initrd_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcpu_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_size_mib: Option<u32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CheckoutPoolRequest {
+    /// Name for the checked-out VM. Generated from the pool name if omitted.
+    #[serde(default)]
+    pub vm_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PoolDeleteResponse {
+    pub name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -792,6 +821,12 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
             get(get_service::<B>).delete(delete_service::<B>),
         )
         .route("/v1/services/{name}/scale", post(scale_service::<B>))
+        .route("/v1/pools", get(list_pools::<B>).post(create_pool::<B>))
+        .route(
+            "/v1/pools/{name}",
+            get(get_pool::<B>).delete(delete_pool::<B>),
+        )
+        .route("/v1/pools/{name}/checkout", post(checkout_pool::<B>))
         .route("/v1/images", get(list_images::<B>).post(import_image::<B>))
         .route("/v1/images/import-oci", post(import_oci_image::<B>))
         .route(
@@ -1009,6 +1044,7 @@ fn is_protected_route(method: &Method, path: &str) -> bool {
 
     if !(path.starts_with("/v1/vms")
         || path.starts_with("/v1/services")
+        || path.starts_with("/v1/pools")
         || path.starts_with("/v1/host-groups")
         || path.starts_with("/v1/images")
         || path.starts_with("/v1/snapshots"))
@@ -2900,6 +2936,66 @@ async fn remove_port_forward_handler<B: VmmBackend + 'static>(
 
 // ── Error Mapping ─────────────────────────────────────────────────────
 
+// ── Pool handlers ─────────────────────────────────────────────────────
+
+async fn list_pools<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Result<Json<Vec<PoolResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let pools = core.list_pools().map_err(map_error)?;
+    Ok(Json(pools.into_iter().map(pool_to_response).collect()))
+}
+
+async fn create_pool<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Json(req): Json<CreatePoolRequest>,
+) -> Result<(StatusCode, Json<PoolResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let pool = core.create_pool(req).await.map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(pool_to_response(pool))))
+}
+
+async fn get_pool<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<PoolResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let pool = core.get_pool(&name).map_err(map_error)?;
+    Ok(Json(pool_to_response(pool)))
+}
+
+async fn delete_pool<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<PoolDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    core.delete_pool(&name).await.map_err(map_error)?;
+    Ok(Json(PoolDeleteResponse { name }))
+}
+
+async fn checkout_pool<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    Json(req): Json<CheckoutPoolRequest>,
+) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let vm = core
+        .checkout_pool(&name, req.vm_name.as_deref())
+        .await
+        .map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(record_to_response(vm))))
+}
+
+fn pool_to_response(r: PoolRecord) -> PoolResponse {
+    PoolResponse {
+        id: r.id.to_string(),
+        name: r.name,
+        template_vm_id: r.template_vm_id.to_string(),
+        rootfs_path: r.rootfs_path,
+        kernel_path: r.kernel_path,
+        initrd_path: r.initrd_path,
+        vcpu_count: r.vcpu_count,
+        mem_size_mib: r.mem_size_mib,
+        created_at: r.created_at.to_rfc3339(),
+        updated_at: r.updated_at.to_rfc3339(),
+    }
+}
+
 fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
     let (status, code, message) = match &err {
         CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, "vm_not_found", err.to_string()),
@@ -2911,6 +3007,7 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::ServiceNotFound(_) => {
             (StatusCode::NOT_FOUND, "service_not_found", err.to_string())
         }
+        CoreError::PoolNotFound(_) => (StatusCode::NOT_FOUND, "pool_not_found", err.to_string()),
         CoreError::ImageNotFound(_) => (StatusCode::NOT_FOUND, "image_not_found", err.to_string()),
         CoreError::SecretNotFound(_) => {
             (StatusCode::NOT_FOUND, "secret_not_found", err.to_string())
@@ -2942,6 +3039,9 @@ fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "service_already_exists",
             err.to_string(),
         ),
+        CoreError::PoolAlreadyExists(_) => {
+            (StatusCode::CONFLICT, "pool_already_exists", err.to_string())
+        }
         CoreError::ImageAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "image_already_exists",

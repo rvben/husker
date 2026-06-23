@@ -1,0 +1,41 @@
+name: Pool E2E
+
+# Release gate for hot pools on a real Firecracker VM: create a pool (boot a
+# template, warm it, suspend it), then check out TWO members CONCURRENTLY, each a
+# fresh running VM with a distinct network identity (guest IP + vsock CID), both
+# reachable at the same time. This is the 1:N path the single-fork suspend-fork
+# gate cannot reach - it exercises FC `vsock_override` so concurrent forks of one
+# snapshot do not collide on the host vsock socket.
+#
+# This requires nested KVM + Firecracker + TAP privileges, which GitHub-hosted
+# runners do not provide, so it runs on the self-hosted runner labelled
+# (self-hosted, husker, linux) with passwordless sudo, a root Rust toolchain,
+# Firecracker, and nftables. Runs nightly and on manual dispatch.
+#
+# The gate runs an isolated daemon (own bridge/subnet/CID range, temp data dir +
+# port), so it is safe alongside any production daemon on the same host.
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly; staggered after the other FC e2e gates (one runner, runs serially).
+    - cron: "30 5 * * *"
+
+jobs:
+  pool-e2e:
+    name: Pool E2E (self-hosted, KVM)
+    runs-on: [self-hosted, husker, linux]
+    steps:
+      - uses: actions/checkout@v6
+      # The gate runs entirely as root (HOME=/root) on the runner's root
+      # toolchain, with an out-of-tree CARGO_TARGET_DIR so the ubuntu-owned
+      # checkout stays free of root-owned build artifacts (next run's `git clean`
+      # stays clean). PATH carries cargo plus the admin tools (nft/ip/firecracker)
+      # the daemon shells out to.
+      - name: Pool e2e gate
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            HUSKER_RUN_POOL_E2E=1 \
+            make test-pool-e2e-gated
