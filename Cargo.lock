@@ -889,7 +889,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "husker"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "husker-agent"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "anyhow",
  "husker-agent-proto",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "husker-agent-proto"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "proptest",
  "serde",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "husker-api"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "async-stream",
  "axum",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "husker-cloudinit"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "fatfs",
  "husker-agent-proto",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "husker-core"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "chrono",
  "husker-agent",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "husker-net"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "proptest",
  "serde_json",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "husker-oci"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "axum",
  "flate2",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "husker-state"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "husker-storage"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "reflink-copy",
  "serde",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "husker-vmm"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "block2",
  "dispatch2",

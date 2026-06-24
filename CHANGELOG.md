@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.4.18](https://github.com/rvben/husker/compare/v0.4.17...v0.4.18) - 2026-06-24
+
+### Added
+
+- **core**: hot pools - pre-warmed, suspended template VMs that `husker pool checkout` (and `run`/`job --pool`) fork into fresh, isolated VMs in about a second instead of a 6-8s cold boot, inheriting the template's warm guest state. A single template forks concurrently many times via Firecracker `vsock_override`. New `pool create/list/get/checkout/delete` (CLI + REST). ([b8df6f4](https://github.com/rvben/husker/commit/b8df6f40cba8a53892ce92003b602a037e057998))
+- **cli**: `run --pool` / `job --pool` draw a VM from a hot pool for a sub-second pool-backed run or sandboxed job. ([5674e5b](https://github.com/rvben/husker/commit/5674e5bde630f7d872d7d1b118750e36f1d54a89))
+
+### Fixed
+
+- **vmm,net**: clean up qemu per-VM artifacts on a failed create, and log bridge/TAP/port-forward cleanup failures instead of swallowing them. ([eec7320](https://github.com/rvben/husker/commit/eec7320c7763757efc9d944b34e11c6e439c4f25))
+- **core**: log rotation reads exactly the bytes to keep, fixing a rare truncation to fewer bytes than requested. ([161d9e2](https://github.com/rvben/husker/commit/161d9e2f202add092f86b38af52b38c03f3ae906))
+
 ## [0.4.17](https://github.com/rvben/husker/compare/v0.4.16...v0.4.17) - 2026-06-23
 
 ### Fixed
