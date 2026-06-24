@@ -58,7 +58,11 @@ ROOTFS="${HUSKER_E2E_ROOTFS:-}"
 INITRD="${HUSKER_E2E_INITRD:-}"
 if [[ -z "${KERNEL}" || -z "${ROOTFS}" || -z "${INITRD}" ]]; then
   log "resolving the latest images-* release"
-  TAG="$(curl -fsSL 'https://api.github.com/repos/rvben/husker/releases?per_page=100' \
+  # Authenticate the GitHub API call when a token is present (CI sets GITHUB_TOKEN)
+  # to dodge the 60/hr unauthenticated rate limit.
+  gh_auth=()
+  [[ -n "${GITHUB_TOKEN:-}" ]] && gh_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  TAG="$(curl -fsSL "${gh_auth[@]}" 'https://api.github.com/repos/rvben/husker/releases?per_page=100' \
          | grep -oE 'images-[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)"
   [[ -n "${TAG}" ]] || { echo "could not find an images-* release" >&2; exit 1; }
   log "using images from ${TAG}"

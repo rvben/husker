@@ -34,11 +34,14 @@ jobs:
       # search path, HUSKER_EMBED_AGENT_BIN points the daemon build at it. PATH
       # carries cargo plus the admin tools (nft/ip/firecracker) the daemon uses.
       - name: OCI boot e2e gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           sudo env \
             HOME=/root \
             PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            GITHUB_TOKEN="$GITHUB_TOKEN" \
             HUSKER_EMBED_AGENT_BIN=/var/tmp/husker-e2e-target/x86_64-unknown-linux-musl/agent/husker-agent \
             HUSKER_RUN_OCI_BOOT_E2E=1 \
             make test-oci-boot-e2e-gated
