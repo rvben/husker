@@ -101,6 +101,11 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
 
+        /// Draw a fresh VM from a hot pool (fork its template) instead of booting
+        /// from a rootfs. The pool's template defines the image and resources.
+        #[arg(long)]
+        pool: Option<String>,
+
         /// Path to kernel (vmlinux)
         #[arg(long)]
         kernel: Option<PathBuf>,
@@ -301,6 +306,11 @@ enum Commands {
         /// VM name (default: job-<random>)
         #[arg(long)]
         name: Option<String>,
+
+        /// Draw the job's VM from a hot pool (fork its template) for a
+        /// sub-second start instead of a cold boot. The pool defines the image.
+        #[arg(long)]
+        pool: Option<String>,
 
         /// Path to kernel (vmlinux)
         #[arg(long)]
@@ -2337,6 +2347,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Run {
             rootfs,
             name,
+            pool,
             kernel,
             initrd,
             cpus,
@@ -2368,44 +2379,87 @@ async fn run(cli: Cli) -> Result<()> {
                 .iter()
                 .map(|s| parse_add_host(s))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let args = VmRequestArgs {
-                rootfs,
-                kernel,
-                initrd,
-                cpus,
-                memory,
-                vmm,
-                cloud_image,
-                disk_size,
-                ssh_key,
-                env,
-                balloon,
-                volume,
-                network: net,
-            };
-            let mut body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
-
-            if let Some(ref userdata_path) = userdata {
-                let script = std::fs::read_to_string(userdata_path).with_context(|| {
-                    format!("reading userdata script {}", userdata_path.display())
-                })?;
-                body["userdata"] = serde_json::json!(script);
-            }
-
-            #[cfg(all(target_os = "linux", feature = "linux-net"))]
-            if needs_firecracker_preflight(&body) {
-                ensure_firecracker(&config).await?;
-            }
 
             let client = reqwest::Client::new();
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/vms")),
-                    api_token.as_deref(),
+            let resp = if let Some(pool) = pool {
+                // Draw a fresh VM from a hot pool: fork its template into `name`.
+                // The pool's template defines the image and resources, so the
+                // boot/config flags do not apply - reject them rather than
+                // silently ignore them.
+                if rootfs.is_some()
+                    || kernel.is_some()
+                    || initrd.is_some()
+                    || cpus.is_some()
+                    || memory.is_some()
+                    || vmm.is_some()
+                    || cloud_image.is_some()
+                    || disk_size.is_some()
+                    || volume.is_some()
+                    || net.is_some()
+                    || profile.is_some()
+                    || balloon
+                    || userdata.is_some()
+                    || !ssh_key.is_empty()
+                    || !env.is_empty()
+                    || !dns.is_empty()
+                    || !add_host.is_empty()
+                {
+                    exit_with_error(
+                        output,
+                        format!(
+                            "--pool cannot be combined with rootfs/boot/config flags \
+                             (pool '{pool}' defines the VM); pass only --name"
+                        ),
+                    );
+                }
+                api_request(
+                    with_api_auth(
+                        client.post(format!("{api_url}/v1/pools/{pool}/checkout")),
+                        api_token.as_deref(),
+                    )
+                    .json(&serde_json::json!({ "vm_name": &name })),
                 )
-                .json(&body),
-            )
-            .await?;
+                .await?
+            } else {
+                let args = VmRequestArgs {
+                    rootfs,
+                    kernel,
+                    initrd,
+                    cpus,
+                    memory,
+                    vmm,
+                    cloud_image,
+                    disk_size,
+                    ssh_key,
+                    env,
+                    balloon,
+                    volume,
+                    network: net,
+                };
+                let mut body =
+                    build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
+
+                if let Some(ref userdata_path) = userdata {
+                    let script = std::fs::read_to_string(userdata_path).with_context(|| {
+                        format!("reading userdata script {}", userdata_path.display())
+                    })?;
+                    body["userdata"] = serde_json::json!(script);
+                }
+
+                #[cfg(all(target_os = "linux", feature = "linux-net"))]
+                if needs_firecracker_preflight(&body) {
+                    ensure_firecracker(&config).await?;
+                }
+
+                api_request(
+                    with_api_auth(
+                        client.post(format!("{api_url}/v1/vms")),
+                        api_token.as_deref(),
+                    )
+                    .json(&body),
+                )
+                .await?
+            };
 
             if !resp.status().is_success() {
                 let mut full = api_error(resp, &format!("VM '{name}'")).await;
@@ -2917,6 +2971,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Job {
             rootfs,
             name,
+            pool,
             kernel,
             initrd,
             cpus,
@@ -2966,23 +3021,58 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
 
-            // env goes to the EXEC request, not the create body; pass empty to the builder.
-            let args = VmRequestArgs {
-                rootfs,
-                kernel,
-                initrd,
-                cpus,
-                memory,
-                vmm,
-                cloud_image,
-                disk_size,
-                ssh_key,
-                env: Vec::new(),
-                balloon,
-                volume,
-                network: net,
+            // With --pool the job's VM is forked from the pool's template, so there
+            // is no create body and the image/boot flags do not apply (env/secret
+            // still go to the exec). Otherwise build the create body (env goes to
+            // the EXEC request, not the body; pass empty to the builder).
+            let body = if let Some(ref pool) = pool {
+                if rootfs.is_some()
+                    || kernel.is_some()
+                    || initrd.is_some()
+                    || cpus.is_some()
+                    || memory.is_some()
+                    || vmm.is_some()
+                    || cloud_image.is_some()
+                    || disk_size.is_some()
+                    || volume.is_some()
+                    || net.is_some()
+                    || profile.is_some()
+                    || balloon
+                    || !ssh_key.is_empty()
+                {
+                    exit_with_error(
+                        output,
+                        format!(
+                            "--pool cannot be combined with rootfs/boot flags (pool '{pool}' \
+                             defines the VM image); pass only --name and the command"
+                        ),
+                    );
+                }
+                None
+            } else {
+                let args = VmRequestArgs {
+                    rootfs,
+                    kernel,
+                    initrd,
+                    cpus,
+                    memory,
+                    vmm,
+                    cloud_image,
+                    disk_size,
+                    ssh_key,
+                    env: Vec::new(),
+                    balloon,
+                    volume,
+                    network: net,
+                };
+                Some(build_vm_request_body(
+                    &name,
+                    args,
+                    profile.as_deref(),
+                    &config,
+                    output,
+                )?)
             };
-            let body = build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
 
             let client = reqwest::Client::new();
 
@@ -3009,15 +3099,26 @@ async fn run(cli: Cli) -> Result<()> {
             };
 
             let work = async {
-                // 1. Create the VM.
-                let resp = api_request(
-                    with_api_auth(
-                        client.post(format!("{api_url}/v1/vms")),
-                        api_token.as_deref(),
+                // 1. Create the VM: fork it from the pool, or boot from the body.
+                let resp = if let Some(ref pool) = pool {
+                    api_request(
+                        with_api_auth(
+                            client.post(format!("{api_url}/v1/pools/{pool}/checkout")),
+                            api_token.as_deref(),
+                        )
+                        .json(&serde_json::json!({ "vm_name": &name })),
                     )
-                    .json(&body),
-                )
-                .await?;
+                    .await?
+                } else {
+                    api_request(
+                        with_api_auth(
+                            client.post(format!("{api_url}/v1/vms")),
+                            api_token.as_deref(),
+                        )
+                        .json(body.as_ref().expect("non-pool job builds a create body")),
+                    )
+                    .await?
+                };
                 if !resp.status().is_success() {
                     let msg = api_error(resp, &format!("VM '{name}'")).await;
                     exit_with_error(output, msg);
