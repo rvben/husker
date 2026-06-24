@@ -1047,6 +1047,7 @@ fn is_protected_route(method: &Method, path: &str) -> bool {
         || path.starts_with("/v1/pools")
         || path.starts_with("/v1/host-groups")
         || path.starts_with("/v1/images")
+        || path.starts_with("/v1/volumes")
         || path.starts_with("/v1/snapshots"))
     {
         return false;
@@ -4464,6 +4465,16 @@ mod tests {
         assert!(is_protected_route(&Method::GET, "/v1/vms/example/logs"));
         assert!(is_protected_route(&Method::GET, "/v1/vms/example/ready"));
         assert!(is_protected_route(&Method::GET, "/v1/metrics"));
+        // Volumes hold persistent user data; create/delete must require a token
+        // when one is configured (reads stay public like other resource lists).
+        assert!(!is_protected_route(&Method::GET, "/v1/volumes"));
+        assert!(is_protected_route(&Method::POST, "/v1/volumes"));
+        assert!(is_protected_route(&Method::DELETE, "/v1/volumes/data"));
+        // Pools are a mutating resource family too.
+        assert!(!is_protected_route(&Method::GET, "/v1/pools"));
+        assert!(is_protected_route(&Method::POST, "/v1/pools"));
+        assert!(is_protected_route(&Method::DELETE, "/v1/pools/web"));
+        assert!(is_protected_route(&Method::POST, "/v1/pools/web/checkout"));
     }
 
     #[tokio::test]
@@ -4592,6 +4603,36 @@ mod tests {
         let response = app
             .oneshot(
                 Request::post("/v1/images")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_volume_delete_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let response = app
+            .oneshot(
+                Request::delete("/v1/volumes/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_volume_create_without_token() {
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        let body = serde_json::json!({ "name": "data", "size_mib": 1024 });
+        let response = app
+            .oneshot(
+                Request::post("/v1/volumes")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
