@@ -120,10 +120,29 @@ async fn clone_rootfs_impl(source: &Path, dest: &Path) -> Result<(), StorageErro
     // `reflink_or_copy` returns `None` when the reflink (copy-on-write) clone
     // succeeded and `Some(bytes)` when it had to fall back to a full byte copy
     // because the filesystem lacks reflink support (e.g. ext4).
-    let copied = tokio::task::spawn_blocking(move || reflink_copy::reflink_or_copy(&src, &dst))
-        .await
-        .map_err(|e| StorageError::CommandFailed(format!("spawn_blocking join: {e}")))?
-        .map_err(StorageError::Io)?;
+    let result =
+        tokio::task::spawn_blocking(move || reflink_copy::reflink_or_copy(&src, &dst)).await;
+    let copied = match result {
+        Ok(Ok(copied)) => copied,
+        // A failed clone can leave a partial/zero-length dest behind that a
+        // later op would mistake for a valid rootfs; remove it before
+        // propagating so the crate never leaves a half-made image on disk.
+        // EXCEPT when reflink_or_copy refused to overwrite a pre-existing
+        // destination (AlreadyExists): that file is not ours and deleting it
+        // would be data loss (export_image clones to user-supplied paths).
+        Ok(Err(io_err)) => {
+            if io_err.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = tokio::fs::remove_file(dest).await;
+            }
+            return Err(StorageError::Io(io_err));
+        }
+        Err(join_err) => {
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(StorageError::CommandFailed(format!(
+                "spawn_blocking join: {join_err}"
+            )));
+        }
+    };
 
     if should_warn_reflink_fallback(copied, &REFLINK_FALLBACK_WARNED) {
         warn!(
@@ -185,17 +204,18 @@ pub async fn resize_disk(path: &Path, new_size_bytes: u64) -> Result<(), Storage
 ///
 /// Returns the number of bytes the guest OS sees as the disk's capacity,
 /// regardless of how much host space the qcow2 file actually occupies.
-pub fn qcow2_virtual_size(path: &Path) -> Result<u64, StorageError> {
+pub async fn qcow2_virtual_size(path: &Path) -> Result<u64, StorageError> {
     if !path.exists() {
         return Err(StorageError::InvalidCloudImage(format!(
             "cloud image not found: {}",
             path.display()
         )));
     }
-    let out = std::process::Command::new("qemu-img")
+    let out = tokio::process::Command::new("qemu-img")
         .args(["info", "--output=json"])
         .arg(path)
         .output()
+        .await
         .map_err(|e| StorageError::QemuImg(format!("qemu-img spawn failed: {e}")))?;
     if !out.status.success() {
         return Err(StorageError::QemuImg(format!(
@@ -330,6 +350,31 @@ pub fn validate_cloud_image(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Create a sparse file of `size_bytes` at `path`, failing if it already exists.
+///
+/// Uses `create_new` (O_EXCL) so two concurrent builders for the same path
+/// cannot clobber each other: an existing path yields the friendly
+/// `VolumeImage` "already exists" error rather than a raw I/O error, and the
+/// loser of a race never truncates the winner's file.
+fn create_sparse_file(path: &Path, size_bytes: u64) -> Result<(), StorageError> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                StorageError::VolumeImage(format!(
+                    "volume image already exists: {}",
+                    path.display()
+                ))
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+    file.set_len(size_bytes)?;
+    Ok(())
+}
+
 /// Create a sparse ext4 volume image at `path` with the given size.
 ///
 /// The file is first created as a sparse file (only metadata occupies disk
@@ -339,22 +384,12 @@ pub fn validate_cloud_image(path: &Path) -> Result<(), StorageError> {
 ///
 /// `path` must not already exist; returns `StorageError::VolumeImage` if it does.
 pub async fn create_volume_image(path: &Path, size_bytes: u64) -> Result<(), StorageError> {
-    if path.exists() {
-        return Err(StorageError::VolumeImage(format!(
-            "volume image already exists: {}",
-            path.display()
-        )));
-    }
-
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Create a sparse file of the requested size.
-    {
-        let file = std::fs::File::create(path)?;
-        file.set_len(size_bytes)?;
-    }
+    // Create a sparse file of the requested size (fails if it already exists).
+    create_sparse_file(path, size_bytes)?;
 
     // Format with mkfs.ext4.
     let output = tokio::process::Command::new("mkfs.ext4")
@@ -394,19 +429,10 @@ pub async fn build_ext4_from_dir(
     path: &Path,
     size_bytes: u64,
 ) -> Result<(), StorageError> {
-    if path.exists() {
-        return Err(StorageError::VolumeImage(format!(
-            "image already exists: {}",
-            path.display()
-        )));
-    }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    {
-        let file = std::fs::File::create(path)?;
-        file.set_len(size_bytes)?;
-    }
+    create_sparse_file(path, size_bytes)?;
     let output = tokio::process::Command::new("mkfs.ext4")
         .arg("-F")
         .arg("-q")
@@ -712,8 +738,8 @@ mod tests {
 
     // ── qemu-img helpers ─────────────────────────────────────────────
 
-    #[test]
-    fn qcow2_virtual_size_reads_size() {
+    #[tokio::test]
+    async fn qcow2_virtual_size_reads_size() {
         if !qemu_img_available() {
             eprintln!("skipping: qemu-img not installed");
             return;
@@ -725,7 +751,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let size = qcow2_virtual_size(&img).unwrap();
+        let size = qcow2_virtual_size(&img).await.unwrap();
         assert_eq!(size, 64 * 1024 * 1024);
     }
 

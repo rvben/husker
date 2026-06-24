@@ -1411,7 +1411,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             // Guard against shrinking: if the caller requests a disk_size smaller
             // than the image's virtual size, reject before starting the conversion.
             if let Some(size) = req.disk_size {
-                let virtual_size = husker_storage::qcow2_virtual_size(&image_path)?;
+                let virtual_size = husker_storage::qcow2_virtual_size(&image_path).await?;
                 if size < virtual_size {
                     return Err(CoreError::InvalidArgument(format!(
                         "--disk-size {size} is smaller than the image's virtual size \

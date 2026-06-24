@@ -88,6 +88,10 @@ async fn clone_rootfs_fails_when_dest_exists() {
     // reflink_or_copy does not overwrite existing files
     let err = clone_rootfs(&source, &dest).await.unwrap_err();
     assert!(matches!(err, StorageError::Io(_)));
+    // The pre-existing destination is not ours: a failed clone must leave it
+    // untouched (export_image clones to user-supplied paths, so deleting it
+    // here would be silent data loss).
+    assert_eq!(std::fs::read(&dest).unwrap(), b"old content");
 }
 
 #[tokio::test]
