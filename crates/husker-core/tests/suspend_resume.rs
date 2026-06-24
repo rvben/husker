@@ -703,7 +703,10 @@ async fn create_pool_rejects_duplicate_name() {
 async fn delete_pool_destroys_template_and_removes_record() {
     let (core, vmm, _tmp) = core_with_pool("web");
     core.delete_pool("web").await.unwrap();
-    assert!(matches!(core.get_pool("web"), Err(CoreError::PoolNotFound(_))));
+    assert!(matches!(
+        core.get_pool("web"),
+        Err(CoreError::PoolNotFound(_))
+    ));
     assert!(core.list_pools().unwrap().is_empty());
     assert_eq!(
         vmm.calls.lock().unwrap().destroyed.len(),
