@@ -4431,27 +4431,32 @@ const LOG_ROTATE_KEEP: u64 = 5 * 1024 * 1024; // 5 MiB
 /// Small data-loss window between read and truncate is acceptable
 /// for diagnostic serial console output.
 async fn rotate_log_file(path: &std::path::Path, keep_bytes: u64) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-
     let file_len = tokio::fs::metadata(path).await?.len();
     if file_len <= keep_bytes {
         return Ok(());
     }
 
-    let mut file = tokio::fs::File::open(path).await?;
-    file.seek(std::io::SeekFrom::Start(file_len - keep_bytes))
-        .await?;
-    let mut buf = Vec::with_capacity(keep_bytes as usize);
-    file.read_to_end(&mut buf).await?;
-    drop(file);
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await?;
-    file.write_all(&buf).await?;
-    Ok(())
+    // Read the tail and rewrite it with std::fs in a blocking task. `read_exact`
+    // into a sized buffer reads exactly `keep_bytes`; tokio's async `File` can
+    // short-read after a `seek` (its `read_to_end` then stops early and keeps
+    // fewer bytes than requested), so the synchronous path is deterministic.
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut buf = vec![0u8; keep_bytes as usize];
+        let mut src = std::fs::File::open(&path)?;
+        src.seek(SeekFrom::Start(file_len - keep_bytes))?;
+        src.read_exact(&mut buf)?;
+        drop(src);
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        dst.write_all(&buf)?;
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Prepare a cloud-image boot disk: validate the base image and OVMF firmware exist,
