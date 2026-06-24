@@ -9293,6 +9293,28 @@ mod tests {
     }
 
     #[test]
+    fn run_and_job_pool_parses() {
+        let run = Cli::try_parse_from(["husker", "run", "--pool", "web", "--name", "r1"])
+            .expect("run --pool parses");
+        match run.command {
+            Commands::Run { pool, name, .. } => {
+                assert_eq!(pool.as_deref(), Some("web"));
+                assert_eq!(name.as_deref(), Some("r1"));
+            }
+            _ => panic!("expected Run"),
+        }
+        let job = Cli::try_parse_from(["husker", "job", "--pool", "web", "--", "echo", "hi"])
+            .expect("job --pool parses");
+        match job.command {
+            Commands::Job { pool, command, .. } => {
+                assert_eq!(pool.as_deref(), Some("web"));
+                assert_eq!(command, vec!["echo", "hi"]);
+            }
+            _ => panic!("expected Job"),
+        }
+    }
+
+    #[test]
     fn run_net_bridged_parses() {
         let cli = Cli::try_parse_from([
             "husker",

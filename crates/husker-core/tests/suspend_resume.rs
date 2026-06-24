@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use husker_core::HuskerCore;
+use husker_core::{CoreError, CreatePoolRequest, HuskerCore};
 use husker_vmm::{
     RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
 };
@@ -569,4 +569,154 @@ async fn destroy_on_suspended_cleans_up() {
         "VM should be gone after destroy"
     );
     assert!(!slot.exists(), "slot should be removed by destroy");
+}
+
+// ── Hot pools ──────────────────────────────────────────────────────────────
+// The warm + fork happy path of create_pool/checkout_pool needs a live agent and
+// a real create_vm, which the RecordingVmm stubs out (that path is covered by the
+// real-Firecracker pool e2e gate). These cover the orchestration the mock CAN
+// reach: CRUD, error mapping, and the delete teardown.
+
+/// Build a core with a hot pool already recorded: a suspended template VM named
+/// after the pool plus the pool row pointing at it.
+fn core_with_pool(
+    pool_name: &str,
+) -> (
+    Arc<HuskerCore<SharedRecordingVmm>>,
+    Arc<RecordingVmm>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = RecordingVmm::new();
+    let vmm = SharedRecordingVmm(Arc::clone(&inner));
+    let state_store = husker_state::StateStore::open_memory().unwrap();
+    let storage = husker_storage::StorageConfig {
+        data_dir: tmp.path().to_path_buf(),
+    };
+    let now = chrono::Utc::now();
+    let template_id = Uuid::new_v4();
+    let template = husker_state::VmRecord {
+        id: template_id,
+        name: pool_name.into(),
+        state: "suspended".into(),
+        pid: None,
+        vcpu_count: 1,
+        mem_size_mib: 512,
+        vsock_cid: 3,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/base.ext4".into(),
+        created_at: now,
+        updated_at: now,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
+        vmm: "firecracker".into(),
+        boot_mode: "direct".into(),
+        balloon: false,
+        volume: None,
+        network: "nat".into(),
+    };
+    state_store.insert_vm(&template).unwrap();
+    state_store
+        .insert_pool(&husker_state::PoolRecord {
+            id: Uuid::new_v4(),
+            name: pool_name.into(),
+            template_vm_id: template_id,
+            rootfs_path: "/images/base.ext4".into(),
+            kernel_path: "/boot/vmlinux".into(),
+            initrd_path: None,
+            vcpu_count: Some(1),
+            mem_size_mib: Some(512),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+    inner.vms.lock().unwrap().insert(
+        template_id,
+        VmInfo {
+            id: template_id,
+            name: pool_name.into(),
+            state: VmState::Running,
+            pid: Some(1),
+            vcpu_count: 1,
+            mem_size_mib: 512,
+            vsock_cid: 3,
+        },
+    );
+
+    #[cfg(feature = "linux-net")]
+    let core = Arc::new(HuskerCore::new(
+        vmm,
+        state_store,
+        husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+        storage,
+        "husker0".into(),
+        vec!["8.8.8.8".into()],
+        tmp.path().join("run"),
+    ));
+    #[cfg(not(feature = "linux-net"))]
+    let core = Arc::new(HuskerCore::new(
+        vmm,
+        state_store,
+        storage,
+        tmp.path().join("run"),
+    ));
+    (core, inner, tmp)
+}
+
+fn create_pool_req(name: &str) -> CreatePoolRequest {
+    CreatePoolRequest {
+        name: name.into(),
+        rootfs_path: Some("/images/base.ext4".into()),
+        kernel_path: None,
+        initrd_path: None,
+        vcpu_count: None,
+        mem_size_mib: None,
+    }
+}
+
+#[tokio::test]
+async fn pool_get_and_list() {
+    let (core, _vmm, _tmp) = core_with_pool("web");
+    let got = core.get_pool("web").unwrap();
+    assert_eq!(got.name, "web");
+    assert_eq!(got.rootfs_path, "/images/base.ext4");
+    assert_eq!(core.list_pools().unwrap().len(), 1);
+    assert!(matches!(core.get_pool("nope"), Err(CoreError::PoolNotFound(n)) if n == "nope"));
+}
+
+#[tokio::test]
+async fn create_pool_rejects_duplicate_name() {
+    let (core, _vmm, _tmp) = core_with_pool("web");
+    // The duplicate guard fires before the VMM is touched, so this is reachable
+    // even though create_vm is stubbed.
+    let err = core.create_pool(create_pool_req("web")).await.unwrap_err();
+    assert!(matches!(err, CoreError::PoolAlreadyExists(n) if n == "web"));
+}
+
+#[tokio::test]
+async fn delete_pool_destroys_template_and_removes_record() {
+    let (core, vmm, _tmp) = core_with_pool("web");
+    core.delete_pool("web").await.unwrap();
+    assert!(matches!(core.get_pool("web"), Err(CoreError::PoolNotFound(_))));
+    assert!(core.list_pools().unwrap().is_empty());
+    assert_eq!(
+        vmm.calls.lock().unwrap().destroyed.len(),
+        1,
+        "the template VM must be destroyed when the pool is deleted"
+    );
+}
+
+#[tokio::test]
+async fn delete_pool_unknown_is_not_found() {
+    let (core, _vmm, _tmp) = core_with_pool("web");
+    assert!(matches!(
+        core.delete_pool("nope").await,
+        Err(CoreError::PoolNotFound(n)) if n == "nope"
+    ));
 }
