@@ -239,6 +239,25 @@ pub struct StateStore {
     conn: Mutex<Connection>,
 }
 
+/// Apply an idempotent `ALTER TABLE ... ADD COLUMN` migration.
+///
+/// SQLite reports "duplicate column name" when the column already exists (the
+/// common case on an up-to-date database); that is the expected idempotent
+/// no-op and is ignored. Any other error (I/O, read-only filesystem,
+/// corruption) is propagated so a genuine migration failure surfaces at startup
+/// instead of resurfacing later as a cryptic "no such column" on the first query.
+fn add_column(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl StateStore {
     /// Open or create the state database.
     pub fn open(path: &Path) -> Result<Self, StateError> {
@@ -377,86 +396,54 @@ impl StateStore {
             );",
         )?;
 
-        // Migration: add userdata columns (idempotent via suppressed errors)
-        let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata TEXT", []);
-        let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata_status TEXT", []);
-        let _ = conn.execute("ALTER TABLE vms ADD COLUMN userdata_env TEXT", []);
-
-        // Migration: tag VMs with their owning service (idempotent).
-        let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_id TEXT", []);
-        let _ = conn.execute("ALTER TABLE vms ADD COLUMN service_ordinal INTEGER", []);
-
-        // Migration: record which VMM backend created each VM (idempotent).
-        let _ = conn.execute(
+        // Idempotent `ADD COLUMN` migrations. `add_column` treats the
+        // "duplicate column name" error (column already present on an
+        // up-to-date database) as a no-op and propagates any other error, so a
+        // real failure surfaces here at startup rather than as a cryptic
+        // "no such column" on the first query. Columns whose CREATE TABLE above
+        // already defines them are re-listed here so older databases that
+        // predate the column still get it; the duplicate-name no-op covers the
+        // fresh-database case.
+        const ADD_COLUMNS: &[&str] = &[
+            // userdata execution columns
+            "ALTER TABLE vms ADD COLUMN userdata TEXT",
+            "ALTER TABLE vms ADD COLUMN userdata_status TEXT",
+            "ALTER TABLE vms ADD COLUMN userdata_env TEXT",
+            // owning-service tag
+            "ALTER TABLE vms ADD COLUMN service_id TEXT",
+            "ALTER TABLE vms ADD COLUMN service_ordinal INTEGER",
+            // VMM backend that created the VM
             "ALTER TABLE vms ADD COLUMN vmm TEXT NOT NULL DEFAULT 'firecracker'",
-            [],
-        );
-
-        // Migration: record the boot mode (idempotent). NOT NULL DEFAULT keeps
-        // ADD COLUMN working on populated tables and back-fills legacy rows.
-        let _ = conn.execute(
+            // boot mode; NOT NULL DEFAULT back-fills legacy rows
             "ALTER TABLE vms ADD COLUMN boot_mode TEXT NOT NULL DEFAULT 'direct'",
-            [],
-        );
-
-        // Migration: add kind column to the image catalog (idempotent).
-        // NOT NULL DEFAULT keeps ADD COLUMN working on populated tables and
-        // back-fills legacy rows as "rootfs".
-        let _ = conn.execute(
+            // image catalog: kind + agent-supervisor boot init=
             "ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'rootfs'",
-            [],
-        );
-
-        // Migration: kernel init= for the image (agent-supervisor boot for
-        // imported OCI images). Nullable; legacy rows default to NULL (default
-        // boot path).
-        let _ = conn.execute("ALTER TABLE images ADD COLUMN boot_init TEXT", []);
-
-        // Migration: service VM template columns (idempotent).
-        // NOT NULL with DEFAULT '' so ADD COLUMN succeeds on tables with rows.
-        let _ = conn.execute(
+            "ALTER TABLE images ADD COLUMN boot_init TEXT",
+            // service VM template columns; NOT NULL DEFAULT '' for populated tables
             "ALTER TABLE services ADD COLUMN kernel_path TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE services ADD COLUMN rootfs_path TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN initrd_path TEXT", []);
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN vcpu_count INTEGER", []);
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN mem_size_mib INTEGER", []);
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN userdata TEXT", []);
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN userdata_env TEXT", []);
-
-        // Migration: cloud-image service columns (idempotent).
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN cloud_image TEXT", []);
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN disk_size INTEGER", []);
-        let _ = conn.execute(
+            "ALTER TABLE services ADD COLUMN initrd_path TEXT",
+            "ALTER TABLE services ADD COLUMN vcpu_count INTEGER",
+            "ALTER TABLE services ADD COLUMN mem_size_mib INTEGER",
+            "ALTER TABLE services ADD COLUMN userdata TEXT",
+            "ALTER TABLE services ADD COLUMN userdata_env TEXT",
+            // cloud-image service columns
+            "ALTER TABLE services ADD COLUMN cloud_image TEXT",
+            "ALTER TABLE services ADD COLUMN disk_size INTEGER",
             "ALTER TABLE services ADD COLUMN balloon INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-
-        // Migration: balloon flag for VMs (idempotent). DEFAULT 0 backfills
-        // legacy rows so they read as false (no balloon device was installed).
-        let _ = conn.execute(
+            // balloon flag for VMs; DEFAULT 0 reads legacy rows as false
             "ALTER TABLE vms ADD COLUMN balloon INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-
-        // Migration: persistent volume attachment columns (idempotent).
-        // NULL means no volume is attached.
-        let _ = conn.execute("ALTER TABLE vms ADD COLUMN volume TEXT", []);
-        let _ = conn.execute("ALTER TABLE services ADD COLUMN volume TEXT", []);
-
-        // Migration: record the network mode (idempotent). NOT NULL DEFAULT keeps
-        // ADD COLUMN working on populated tables and back-fills legacy rows.
-        let _ = conn.execute(
+            // persistent volume attachment (NULL = none)
+            "ALTER TABLE vms ADD COLUMN volume TEXT",
+            "ALTER TABLE services ADD COLUMN volume TEXT",
+            // network mode; NOT NULL DEFAULT back-fills legacy rows
             "ALTER TABLE vms ADD COLUMN network TEXT NOT NULL DEFAULT 'nat'",
-            [],
-        );
-
-        // Migration: userspace-proxy bind address for port forwards (idempotent).
-        let _ = conn.execute("ALTER TABLE port_forwards ADD COLUMN bind_addr TEXT", []);
+            // userspace-proxy bind address for port forwards
+            "ALTER TABLE port_forwards ADD COLUMN bind_addr TEXT",
+        ];
+        for sql in ADD_COLUMNS {
+            add_column(&conn, sql)?;
+        }
 
         Ok(())
     }
@@ -1703,6 +1690,19 @@ fn row_to_volume_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VolumeRecor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_column_ignores_duplicate_but_propagates_real_errors() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT);").unwrap();
+        // First add succeeds.
+        add_column(&conn, "ALTER TABLE t ADD COLUMN extra TEXT").unwrap();
+        // Re-adding the same column is the idempotent no-op (duplicate column).
+        add_column(&conn, "ALTER TABLE t ADD COLUMN extra TEXT").unwrap();
+        // A genuine error (the table does not exist) must propagate, not be
+        // swallowed the way the old `let _ = conn.execute(...)` did.
+        assert!(add_column(&conn, "ALTER TABLE missing ADD COLUMN x TEXT").is_err());
+    }
 
     fn make_record(name: &str) -> VmRecord {
         VmRecord {
