@@ -58,7 +58,12 @@ pub fn nft_table_for_bridge(bridge: &str) -> String {
 
 struct AllocatorState {
     next_index: u32,
+    /// Released indices below `next_index`, reused before fresh ones.
     freed: BTreeSet<u32>,
+    /// Indices at or above `next_index` reserved out of band (seeded from
+    /// persisted VMs on startup). `allocate` skips these as it advances, so it
+    /// never hands out an in-use IP without materializing the intervening gap.
+    reserved: BTreeSet<u32>,
 }
 
 /// Allocates individual guest IPs from a shared subnet.
@@ -97,6 +102,7 @@ impl IpAllocator {
             state: Mutex::new(AllocatorState {
                 next_index: 0,
                 freed: BTreeSet::new(),
+                reserved: BTreeSet::new(),
             }),
         }
     }
@@ -122,12 +128,18 @@ impl IpAllocator {
             state.freed.remove(&idx);
             idx
         } else {
-            if state.next_index >= self.max_index {
-                return Err(NetError::PoolExhausted);
+            // Advance to the next fresh index, skipping any reserved (seeded as
+            // in-use) above the high-water mark.
+            loop {
+                if state.next_index >= self.max_index {
+                    return Err(NetError::PoolExhausted);
+                }
+                let idx = state.next_index;
+                state.next_index += 1;
+                if !state.reserved.remove(&idx) {
+                    break idx;
+                }
             }
-            let idx = state.next_index;
-            state.next_index += 1;
-            idx
         };
 
         let guest_ip = Ipv4Addr::from(self.base + 2 + index);
@@ -144,17 +156,54 @@ impl IpAllocator {
         }
 
         let index = guest_u32 - self.base - 2;
-        let mut state = self.state.lock().unwrap();
-
-        if index >= state.next_index || index >= self.max_index {
+        if index >= self.max_index {
             return Err(NetError::NotAllocated(guest_ip));
         }
+        let mut state = self.state.lock().unwrap();
 
-        if !state.freed.insert(index) {
+        if index < state.next_index {
+            // Allocated below the high-water: make it available for reuse.
+            if !state.freed.insert(index) {
+                return Err(NetError::NotAllocated(guest_ip));
+            }
+        } else if !state.reserved.remove(&index) {
+            // At/above the high-water and not reserved: never allocated.
             return Err(NetError::NotAllocated(guest_ip));
         }
 
         debug!(index, %guest_ip, "released guest IP");
+        Ok(())
+    }
+
+    /// Reserve a specific guest IP so `allocate` will not hand it out.
+    ///
+    /// The allocator is in-memory and resets to empty on daemon restart; this
+    /// lets startup rebuild its state from persisted VMs (each VM's recorded
+    /// `guest_ip` is reserved) so a new allocation cannot collide with a still
+    /// known IP and `release` of a pre-restart IP succeeds. The intervening
+    /// indices are never materialized, so reserving a high IP in a large subnet
+    /// stays cheap. Returns `NotAllocated` for an IP outside this subnet.
+    pub fn reserve(&self, guest_ip: Ipv4Addr) -> Result<(), NetError> {
+        let guest_u32 = u32::from(guest_ip);
+        if guest_u32 < self.base + 2 {
+            return Err(NetError::NotAllocated(guest_ip));
+        }
+        let index = guest_u32 - self.base - 2;
+        if index >= self.max_index {
+            return Err(NetError::NotAllocated(guest_ip));
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if index < state.next_index {
+            // Below the high-water: mark in use by taking it out of the freed
+            // (available) set if present.
+            state.freed.remove(&index);
+        } else {
+            // At/above the high-water: record it so `allocate` skips it without
+            // enumerating the (possibly huge) gap of intervening indices.
+            state.reserved.insert(index);
+        }
+        debug!(index, %guest_ip, "reserved guest IP");
         Ok(())
     }
 }
@@ -523,10 +572,17 @@ pub async fn remove_port_forward(
 
     let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
-        // A missing table means there are no rules to remove (success). Any other
-        // read failure is logged so it does not vanish silently.
+        // A missing table (nft "No such file or directory") means there are no
+        // rules to remove, which is success. Surface any OTHER failure (nft not
+        // installed, permission denied) at warn so it does not vanish silently
+        // while leaving orphaned DNAT rules behind.
         Err(e) => {
-            debug!(table = %table, error = %e, "nft list failed; assuming no port-forward rules to remove");
+            if matches!(&e, NetError::CommandFailed { message, .. } if message.contains("No such file or directory"))
+            {
+                debug!(table = %table, "nft table absent; no port-forward rules to remove");
+            } else {
+                warn!(table = %table, error = %e, "nft list failed during port-forward removal; rules may remain");
+            }
             return Ok(());
         }
     };
@@ -569,10 +625,17 @@ pub async fn remove_all_port_forwards(tap_name: &str, bridge_name: &str) -> Resu
     let table = nft_table_for_bridge(bridge_name);
     let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
-        // A missing table means there are no rules to remove (success). Any other
-        // read failure is logged so it does not vanish silently.
+        // A missing table (nft "No such file or directory") means there are no
+        // rules to remove, which is success. Surface any OTHER failure (nft not
+        // installed, permission denied) at warn so it does not vanish silently
+        // while leaving orphaned DNAT rules behind.
         Err(e) => {
-            debug!(table = %table, error = %e, "nft list failed; assuming no port-forward rules to remove");
+            if matches!(&e, NetError::CommandFailed { message, .. } if message.contains("No such file or directory"))
+            {
+                debug!(table = %table, "nft table absent; no port-forward rules to remove");
+            } else {
+                warn!(table = %table, error = %e, "nft list failed during port-forward removal; rules may remain");
+            }
             return Ok(());
         }
     };
@@ -955,6 +1018,56 @@ default via 192.168.1.1 dev eth0 proto dhcp metric 100
 
         let guest3 = alloc.allocate().unwrap();
         assert_eq!(guest3, Ipv4Addr::new(172, 20, 0, 4));
+    }
+
+    #[test]
+    fn reserve_excludes_ip_and_allows_later_release() {
+        // RFC 5737 documentation range; gateway is .1, guests start at .2 (index 0).
+        let alloc = IpAllocator::new(Ipv4Addr::new(203, 0, 113, 0), 24);
+        let ip2 = Ipv4Addr::new(203, 0, 113, 2); // index 0
+        let ip5 = Ipv4Addr::new(203, 0, 113, 5); // index 3
+
+        // Reserve out of order, modelling seeding from persisted VMs on restart.
+        alloc.reserve(ip5).unwrap();
+        alloc.reserve(ip2).unwrap();
+
+        // allocate() must never hand out a reserved (in-use) IP.
+        let handed: Vec<_> = (0..5).map(|_| alloc.allocate().unwrap()).collect();
+        assert!(!handed.contains(&ip2), "reserved .2 handed out: {handed:?}");
+        assert!(!handed.contains(&ip5), "reserved .5 handed out: {handed:?}");
+
+        // A reserved IP can still be released (its VM destroyed) and then reused.
+        alloc.release(ip5).unwrap();
+        assert_eq!(alloc.allocate().unwrap(), ip5);
+    }
+
+    #[test]
+    fn reserve_rejects_ip_outside_subnet() {
+        let alloc = IpAllocator::new(Ipv4Addr::new(203, 0, 113, 0), 24);
+        // .1 is the gateway (below the first guest), and a different subnet is
+        // out of range; both must be rejected, not silently mis-indexed.
+        assert!(alloc.reserve(Ipv4Addr::new(203, 0, 113, 1)).is_err());
+        assert!(alloc.reserve(Ipv4Addr::new(198, 51, 100, 7)).is_err());
+    }
+
+    #[test]
+    fn reserve_above_high_water_is_skipped_and_reusable() {
+        // Reserving an index far above the start must not enumerate the gap (it
+        // is recorded as reserved and skipped by allocate), and releasing it
+        // later returns it to the pool.
+        let alloc = IpAllocator::new(Ipv4Addr::new(203, 0, 113, 0), 24);
+        let reserved = Ipv4Addr::new(203, 0, 113, 200); // index 198
+        alloc.reserve(reserved).unwrap();
+
+        // Drain the pool: the reserved address is never handed out.
+        let handed: Vec<_> = std::iter::repeat_with(|| alloc.allocate().unwrap())
+            .take(252)
+            .collect();
+        assert!(!handed.contains(&reserved));
+
+        // Once its VM is destroyed, the reserved IP can be released and reused.
+        alloc.release(reserved).unwrap();
+        assert_eq!(alloc.allocate().unwrap(), reserved);
     }
 
     #[test]

@@ -6776,6 +6776,28 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         let (base, prefix_len) = parse_cidr(&config.bridge_subnet)?;
         let ip_allocator = husker_net::IpAllocator::new(base, prefix_len);
 
+        // The allocator is in-memory and starts empty on each restart. Rebuild
+        // its state from persisted VMs so a new allocation cannot collide with an
+        // IP still recorded for an existing VM, and so releasing such an IP on
+        // destroy succeeds. IPs outside this subnet (e.g. bridged-mode VMs) are
+        // rejected by reserve() and skipped.
+        if let Ok(vms) = state.list_vms() {
+            let mut reserved = 0usize;
+            for vm in &vms {
+                if let Some(ip) = vm
+                    .guest_ip
+                    .as_deref()
+                    .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                    && ip_allocator.reserve(ip).is_ok()
+                {
+                    reserved += 1;
+                }
+            }
+            if reserved > 0 {
+                tracing::info!(reserved, "seeded IP allocator from persisted VMs");
+            }
+        }
+
         // Clean up any stale bridge from a previous run
         let _ = husker_net::delete_bridge(&config.bridge_name).await;
 
