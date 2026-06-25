@@ -267,6 +267,34 @@ async fn write_then_read_file() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn write_file_applies_requested_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("script.sh").to_string_lossy().into_owned();
+
+    let request = AgentRequest::WriteFile(WriteFileRequest {
+        path: file_path.clone(),
+        data: base64_encode(b"#!/bin/sh\necho hi\n"),
+        mode: Some(0o755),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    assert!(
+        matches!(response, AgentResponse::WriteFile(_)),
+        "expected WriteFile success, got {response:?}"
+    );
+
+    // The requested mode must actually land on the file: a silently dropped
+    // chmod (e.g. on an executable userdata script) is a real failure.
+    let mode = std::fs::metadata(&file_path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+}
+
 #[tokio::test]
 async fn read_file_rejects_oversized_file() {
     // Safety: no other test reads this env var concurrently.

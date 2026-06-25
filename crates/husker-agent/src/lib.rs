@@ -79,6 +79,11 @@ where
     let master_raw = master.as_raw_fd();
 
     let mut cmd = tokio::process::Command::new(&program);
+    // Kill the shell on any drop of `child` (e.g. a write_message error when the
+    // client disconnects mid-session), so it is never orphaned in the guest;
+    // matches the exec path. Without this, tokio's Child::drop neither kills nor
+    // reaps the process.
+    cmd.kill_on_drop(true);
     if clear_env {
         cmd.env_clear();
     }
@@ -654,13 +659,18 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                         #[cfg(unix)]
                         if let Some(mode) = req.mode {
                             use std::os::unix::fs::PermissionsExt;
-                            if let Err(e) = tokio::fs::set_permissions(
-                                &req.path,
-                                std::fs::Permissions::from_mode(mode),
-                            )
-                            .await
+                            // Set the mode on the open fd (fchmod), not by
+                            // re-resolving the path, and surface a failure to the
+                            // caller instead of warning: a silently dropped mode
+                            // (e.g. on an executable userdata script) would
+                            // otherwise be reported as a successful write.
+                            if let Err(e) = file
+                                .set_permissions(std::fs::Permissions::from_mode(mode))
+                                .await
                             {
-                                warn!("failed to set permissions on {}: {e}", req.path);
+                                return AgentResponse::Error(ErrorResponse {
+                                    message: format!("set mode on {} failed: {e}", req.path),
+                                });
                             }
                         }
                         AgentResponse::WriteFile(WriteFileResponse { bytes_written: len })
