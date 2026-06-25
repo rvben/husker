@@ -560,6 +560,11 @@ pub enum WsShellOutput {
         get_service,
         delete_service,
         scale_service,
+        list_pools,
+        create_pool,
+        get_pool,
+        delete_pool,
+        checkout_pool,
         list_images,
         import_image,
         import_oci_image,
@@ -608,6 +613,10 @@ pub enum WsShellOutput {
         ServiceDetailResponse,
         ServiceMutationResponse,
         ServiceDeleteResponse,
+        PoolResponse,
+        CreatePoolRequest,
+        CheckoutPoolRequest,
+        PoolDeleteResponse,
         ReconcileOutcomeResponse,
         ReconcileFailure,
         SnapshotResponse,
@@ -647,6 +656,7 @@ pub enum WsShellOutput {
         (name = "vms", description = "VM lifecycle management"),
         (name = "host_groups", description = "Host group management"),
         (name = "services", description = "Service model resources"),
+        (name = "pools", description = "Hot pool resources"),
         (name = "images", description = "Image catalog resources"),
         (name = "volumes", description = "Persistent volume resources"),
         (name = "secrets", description = "Encrypted secret resources"),
@@ -2939,6 +2949,15 @@ async fn remove_port_forward_handler<B: VmmBackend + 'static>(
 
 // ── Pool handlers ─────────────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/v1/pools",
+    tag = "pools",
+    responses(
+        (status = 200, description = "List of hot pools", body = Vec<PoolResponse>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn list_pools<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
 ) -> Result<Json<Vec<PoolResponse>>, (StatusCode, Json<ErrorResponse>)> {
@@ -2946,6 +2965,17 @@ async fn list_pools<B: VmmBackend + 'static>(
     Ok(Json(pools.into_iter().map(pool_to_response).collect()))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/pools",
+    tag = "pools",
+    request_body = CreatePoolRequest,
+    responses(
+        (status = 201, description = "Pool created", body = PoolResponse),
+        (status = 409, description = "Pool already exists", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse)
+    )
+)]
 async fn create_pool<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Json(req): Json<CreatePoolRequest>,
@@ -2954,6 +2984,16 @@ async fn create_pool<B: VmmBackend + 'static>(
     Ok((StatusCode::CREATED, Json(pool_to_response(pool))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/pools/{name}",
+    tag = "pools",
+    params(("name" = String, Path, description = "Pool name")),
+    responses(
+        (status = 200, description = "Pool details", body = PoolResponse),
+        (status = 404, description = "Pool not found", body = ErrorResponse)
+    )
+)]
 async fn get_pool<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -2962,6 +3002,16 @@ async fn get_pool<B: VmmBackend + 'static>(
     Ok(Json(pool_to_response(pool)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/pools/{name}",
+    tag = "pools",
+    params(("name" = String, Path, description = "Pool name")),
+    responses(
+        (status = 200, description = "Pool deleted", body = PoolDeleteResponse),
+        (status = 404, description = "Pool not found", body = ErrorResponse)
+    )
+)]
 async fn delete_pool<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -2970,6 +3020,17 @@ async fn delete_pool<B: VmmBackend + 'static>(
     Ok(Json(PoolDeleteResponse { name }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/pools/{name}/checkout",
+    tag = "pools",
+    params(("name" = String, Path, description = "Pool name")),
+    request_body = CheckoutPoolRequest,
+    responses(
+        (status = 201, description = "Fresh VM forked from the pool", body = VmResponse),
+        (status = 404, description = "Pool not found", body = ErrorResponse)
+    )
+)]
 async fn checkout_pool<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
