@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.4.20](https://github.com/rvben/husker/compare/v0.4.19...v0.4.20) - 2026-06-25
+
+### Fixed
+
+- **net**: seed the in-memory IP allocator from persisted VMs at startup. The allocator reset to empty on every daemon restart, so it could re-hand-out an IP still recorded for an existing VM (bridge IP conflict) and fail to release a pre-restart IP. It now reserves existing VMs' addresses on startup, like the CID allocator. Also surface nftables port-forward cleanup failures at `warn` instead of swallowing them. ([379bab6](https://github.com/rvben/husker/commit/379bab6e77be7da0d931cf4bcc4ae9500eadd854))
+- **vmm**: remove the boot and serial log files when a restore/fork times out waiting for the Firecracker socket (previously two files leaked per failed restore), and bound the vsock CONNECT handshake with a 10s timeout so a stuck VMM cannot hang an exec/shell request indefinitely. ([983e0f4](https://github.com/rvben/husker/commit/983e0f4d70279e7d4708d0d73df8ff5d20e2d992))
+- **agent**: kill the interactive shell process when the client disconnects mid-session (it was orphaned in the guest), and report a failed file-mode change instead of returning success - an executable userdata script could otherwise be silently written non-executable. ([c33c3c9](https://github.com/rvben/husker/commit/c33c3c9ee18f3e57e026d0319652604f5655e749))
+
 ## [0.4.19](https://github.com/rvben/husker/compare/v0.4.18...v0.4.19) - 2026-06-25
 
 ### Fixed
