@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.4.19](https://github.com/rvben/husker/compare/v0.4.18...v0.4.19) - 2026-06-25
+
+### Fixed
+
+- **api**: require an API token for volume create/delete. `/v1/volumes` was missing from the protected-route allowlist, so a daemon started with `--api-token` still accepted unauthenticated `POST /v1/volumes` and `DELETE /v1/volumes/{name}` (the latter destroys a persistent volume). ([5024ed2](https://github.com/rvben/husker/commit/5024ed2d5219aba433fedd8e10c5d136c907018d))
+- **state**: surface real database-migration errors instead of swallowing them. The idempotent `ADD COLUMN` migrations discarded every error to ignore the expected duplicate-column case, which also hid genuine I/O or corruption failures behind a later cryptic "no such column" on the first query. ([a5e0de0](https://github.com/rvben/husker/commit/a5e0de00761aa763d865d66f565c243d0f4c2269))
+- **storage**: harden the volume/clone/qcow2 paths. `qcow2_virtual_size` no longer blocks the async executor, volume images are created with `O_EXCL` so concurrent builders cannot corrupt each other, and a failed clone removes only a partial destination (never a pre-existing file). ([bb6c0a2](https://github.com/rvben/husker/commit/bb6c0a22c721080543f838f9adaf1052af3048a9))
+
 ## [0.4.18](https://github.com/rvben/husker/compare/v0.4.17...v0.4.18) - 2026-06-24
 
 ### Added
