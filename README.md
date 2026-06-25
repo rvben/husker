@@ -81,6 +81,46 @@ If you want to use your own images, pass `--kernel` and the rootfs path:
 husker run /path/to/rootfs.ext4 --kernel /path/to/vmlinux
 ```
 
+## Hot Pools
+
+A **pool** is a pre-warmed, suspended template VM that husker forks fresh,
+isolated VMs from in about a second, instead of a 6-8s cold boot. Each fork
+inherits the template's already-booted state (kernel up, guest agent running,
+whatever you installed), so checkouts are fast and start from a known-good
+baseline. Hot pools build on Firecracker's snapshot/restore (Linux).
+
+```bash
+# Create a pool: boots a template VM once, warms it, then suspends it.
+husker pool create web --vcpus 2 --memory 512
+
+# Fork a fresh, isolated VM out of the pool (~1s).
+husker pool checkout web --name task-42
+husker exec task-42 -- ./run-tests.sh
+husker destroy task-42
+
+# Inspect and tear down.
+husker pool list
+husker pool get web
+husker pool delete web
+```
+
+A single pool can be checked out many times concurrently: each fork gets its own
+IP, vsock CID, and copy-on-write rootfs, fully isolated from its siblings and
+from the template (the template stays suspended and is never mutated).
+
+`run` and `job` can draw straight from a pool with `--pool`, the fast path for
+sandboxing untrusted or agentic work. The image and boot flags come from the
+pool's template, so pass only `--name` (plus `job`'s `--sync-cwd`/`--out`) and
+your command:
+
+```bash
+# One-shot: fork from the pool, run the command, then destroy the VM.
+husker job --pool web -- make test
+
+# Long-lived: fork from the pool instead of cold-booting.
+husker run --pool web --name preview
+```
+
 ## Configuration
 
 Copy `config.example.toml` to one of the discovery paths:
