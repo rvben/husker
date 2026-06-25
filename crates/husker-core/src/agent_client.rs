@@ -58,6 +58,12 @@ impl AgentClient {
                 | husker_vmm::vsock::VsockConnectError::HandshakeRead(e) => {
                     AgentError::Connection(e)
                 }
+                husker_vmm::vsock::VsockConnectError::HandshakeTimeout(d) => {
+                    AgentError::Connection(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("vsock handshake timed out after {d:?}"),
+                    ))
+                }
             })?;
         Ok(AgentConnection { stream })
     }

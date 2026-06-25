@@ -748,6 +748,13 @@ impl VmmBackend for FirecrackerBackend {
             self.assert_firecracker_supports_fork().await?;
         }
 
+        // Convert the snapshot/memory/vsock paths to &str up front, before
+        // creating any runtime files, so a (rare) non-UTF-8 path returns without
+        // leaking the socket and log files created below.
+        let snapshot = Self::path_to_str(&src.vmstate, "vmstate")?;
+        let mem = Self::path_to_str(&src.memory, "memory")?;
+        let vsock_path_str = Self::path_to_str(&vsock_path, "vsock_path")?;
+
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
         let boot_log_path = self.runtime_dir.join(format!("{id}.boot.log"));
         let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
@@ -786,19 +793,21 @@ impl VmmBackend for FirecrackerBackend {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         if !socket_path.exists() {
+            // The FC process dies via kill_on_drop; remove the runtime files it
+            // left so a timed-out restore does not leak the socket and logs.
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            let _ = tokio::fs::remove_file(&serial_log_path).await;
+            let _ = tokio::fs::remove_file(&boot_log_path).await;
             return Err(VmmError::ProcessError(
                 "Firecracker socket did not appear within 5s".into(),
             ));
         }
 
-        let snapshot = Self::path_to_str(&src.vmstate, "vmstate")?;
-        let mem = Self::path_to_str(&src.memory, "memory")?;
         // `vsock_override` rebinds the vsock to this VM's own socket path: a resumed
         // VM rebinds its own, a fork gets a fresh one (so concurrent forks of one
         // snapshot do not collide). Resume keeps the snapshot's NIC; fork rebinds
         // the NIC to its own fresh TAP and aliases the embedded source rootfs to
         // the fork's clone for the duration of the load.
-        let vsock_path_str = Self::path_to_str(&vsock_path, "vsock_path")?;
         let mut load_body = serde_json::json!({
             "snapshot_path": snapshot,
             "mem_file_path": mem,

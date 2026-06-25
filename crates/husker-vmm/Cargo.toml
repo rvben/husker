@@ -44,7 +44,7 @@ dispatch2 = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
