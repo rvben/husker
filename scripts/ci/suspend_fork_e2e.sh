@@ -30,10 +30,25 @@ WORK="$(mktemp -d)"
 LOG="$(mktemp)"
 PID=""
 BRIDGE="huskersfe2e"
+CID_BASE=200
 SRC="sfe2e-src-$$"
 CHILD="sfe2e-child-$$"
 
 log() { echo "[suspend-fork-e2e] $*"; }
+
+# Remove this run's isolated bridge and any TAP devices in its own CID range.
+# Idempotent and scoped to this e2e's range (CID_BASE..CID_BASE+9) - it never
+# touches husker0 or the production runner TAPs. A bridge delete does NOT cascade
+# to its TAPs, and a SIGKILL (e.g. the host running out of disk) skips the EXIT
+# trap, so a stranded TAP from a prior run would fail this run's `ip tuntap add`
+# with "Device or resource busy". Run defensively at startup and again on exit.
+reset_net() {
+  ip link delete "${BRIDGE}" 2>/dev/null || true
+  local cid
+  for cid in $(seq "${CID_BASE}" "$((CID_BASE + 9))"); do
+    ip link delete "husker${cid}" 2>/dev/null || true
+  done
+}
 
 cleanup() {
   if [[ -n "${PID}" ]]; then
@@ -41,8 +56,7 @@ cleanup() {
     kill "${PID}" 2>/dev/null || true
     wait "${PID}" 2>/dev/null || true
   fi
-  # Best-effort: only ever touch THIS run's isolated bridge, never husker0.
-  ip link delete "${BRIDGE}" 2>/dev/null || true
+  reset_net
   rm -rf "${DATA_DIR}" "${WORK}"
   rm -f "${LOG}"
 }
@@ -81,12 +95,14 @@ H="${TARGET_DIR}/debug/husker"
 
 # 3. Start an isolated daemon (own bridge/subnet/CID range, temp data dir + port),
 #    so it never collides with any production daemon on this host.
+# Defensively clear anything a prior aborted run left behind so reruns start clean.
+reset_net
 log "starting isolated daemon on ${BASE} (bridge ${BRIDGE})"
 HUSKER_DATA_DIR="${DATA_DIR}" \
   HUSKER_DEFAULT_KERNEL="${KERNEL}" \
   HUSKER_BRIDGE_NAME="${BRIDGE}" \
   HUSKER_BRIDGE_SUBNET="172.31.0.0/24" \
-  HUSKER_CID_BASE="200" \
+  HUSKER_CID_BASE="${CID_BASE}" \
   RUST_LOG="${RUST_LOG:-husker=info,husker_api=info}" \
   "${H}" daemon --listen "127.0.0.1:${PORT}" >"${LOG}" 2>&1 &
 PID=$!
