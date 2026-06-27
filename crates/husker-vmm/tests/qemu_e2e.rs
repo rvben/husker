@@ -344,3 +344,126 @@ async fn qemu_host_share_visible_in_guest() {
         "proof.txt contents mismatch - virtiofs write-back carried wrong data"
     );
 }
+
+/// Boot via the INITRAMFS mount path - the daemon's path for a full rootfs that
+/// has its own init. There is NO `husker.init=1`, so the agent does not run as a
+/// supervisor and the share must be mounted by the initramfs `/init` (which reads
+/// `husker.share=` from `/proc/cmdline`) before `switch_root`. This guards the
+/// regression where the initramfs read `/proc/cmdline` with a `cat` that was not
+/// symlinked into the image, so the mount loop silently ran on empty input and no
+/// share ever mounted on the daemon job-boot path.
+#[tokio::test]
+#[ignore = "needs KVM + vhost-vsock + qemu + a husker initramfs; gated by HUSKER_RUN_IGNORED_E2E"]
+async fn qemu_host_share_via_initramfs() {
+    if std::env::var("HUSKER_RUN_IGNORED_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping qemu_host_share_via_initramfs: set HUSKER_RUN_IGNORED_E2E=1");
+        return;
+    }
+    let kernel = std::env::var("HUSKER_E2E_KERNEL").expect("HUSKER_E2E_KERNEL");
+    let rootfs = std::env::var("HUSKER_E2E_ROOTFS").expect("HUSKER_E2E_ROOTFS");
+    // The initramfs IS the mount mechanism on this path, so require it here.
+    let initrd: std::path::PathBuf = std::env::var("HUSKER_E2E_INITRD")
+        .expect("HUSKER_E2E_INITRD (the initramfs performs the share mount on this path)")
+        .into();
+    let vsock_cid: u32 = std::env::var("HUSKER_E2E_CID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(44);
+
+    let share_dir = tempfile::tempdir().unwrap();
+    let sentinel = "husker-initramfs-virtiofs-ok";
+    std::fs::write(share_dir.path().join("hello.txt"), sentinel).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+
+    // No `husker.init=1`: the rootfs runs its own init, so the initramfs `/init`
+    // is what mounts the `husker.share=` virtiofs share before switch_root.
+    let config = husker_vmm::VmConfig {
+        name: "e2e-share-initrd".into(),
+        vcpu_count: 1,
+        mem_size_mib: 512,
+        kernel_path: kernel.into(),
+        rootfs_path: rootfs.into(),
+        kernel_args: Some("console=ttyS0 husker.share=fs0=/share".into()),
+        initrd_path: Some(initrd),
+        vsock_cid,
+        tap_device: None,
+        guest_mac: None,
+        vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
+        seed_path: None,
+        balloon: false,
+        volume_path: None,
+        host_shares: vec![husker_vmm::HostShare {
+            host: share_dir.path().to_path_buf(),
+            guest: "/share".into(),
+            read_only: false,
+            tag: "fs0".into(),
+        }],
+    };
+    let info = backend.create_vm(config).await.expect("create_vm");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(200);
+    let mut connected = false;
+    let mut exec_result: Option<husker_agent_proto::ExecResponse> = None;
+
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(mut s) = backend.vsock_connect(info.id, 52).await {
+            use husker_agent_proto::{
+                AgentRequest, AgentResponse, ExecRequest, read_message, write_message,
+            };
+            if write_message(&mut s, &AgentRequest::Ping).await.is_ok() {
+                let resp: Result<Option<AgentResponse>, _> = read_message(&mut s).await;
+                if let Ok(Some(AgentResponse::Pong)) = resp {
+                    connected = true;
+                    if let Ok(mut s2) = backend.vsock_connect(info.id, 52).await {
+                        let req = AgentRequest::Exec(ExecRequest {
+                            command: "sh".into(),
+                            args: vec![
+                                "-c".into(),
+                                "cat /share/hello.txt > /share/proof.txt \
+                                 && cat /share/hello.txt"
+                                    .into(),
+                            ],
+                            working_dir: None,
+                            env: Vec::new(),
+                            timeout_secs: Some(10),
+                        });
+                        if write_message(&mut s2, &req).await.is_ok()
+                            && let Ok(Some(AgentResponse::Exec(r))) = read_message(&mut s2).await
+                        {
+                            exec_result = Some(r);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    }
+
+    backend.destroy_vm(info.id).await.unwrap();
+
+    assert!(connected, "agent vsock unreachable on port 52");
+    let exec = exec_result.expect("exec request did not complete");
+    assert_eq!(
+        exec.exit_code, 0,
+        "guest command exited non-zero; stderr: {}",
+        exec.stderr
+    );
+    assert_eq!(
+        exec.stdout.trim(),
+        sentinel,
+        "initramfs did not mount the share (host->guest read failed)"
+    );
+    let proof = std::fs::read_to_string(share_dir.path().join("proof.txt"))
+        .expect("proof.txt not found on host - initramfs virtiofs mount/write-back failed");
+    assert_eq!(
+        proof.trim(),
+        sentinel,
+        "proof.txt contents mismatch - virtiofs write-back carried wrong data"
+    );
+}
