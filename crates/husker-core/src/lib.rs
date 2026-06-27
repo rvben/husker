@@ -701,6 +701,7 @@ pub fn default_ready_timeout(boot_mode: &str) -> std::time::Duration {
 fn resolve_vmm_kind(
     req_vmm: Option<&str>,
     is_cloud: bool,
+    has_host_shares: bool,
     default: husker_vmm::VmmKind,
 ) -> Result<husker_vmm::VmmKind, CoreError> {
     if is_cloud {
@@ -708,6 +709,10 @@ fn resolve_vmm_kind(
     }
     match req_vmm {
         Some(s) => s.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm),
+        // Host bind-mounts use virtiofs, which only the QEMU backend supports.
+        // Auto-select it when the caller did not pin a backend, instead of
+        // resolving to the (Firecracker) default and failing on its guard.
+        None if has_host_shares => Ok(husker_vmm::VmmKind::Qemu),
         None => Ok(default),
     }
 }
@@ -1268,8 +1273,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Resolve the backend kind once and persist it, so the record reflects the
         // backend the dispatcher actually runs (an omitted `--vmm` resolves to the
         // daemon default, not a hardcoded Firecracker).
-        let resolved_vmm_kind =
-            resolve_vmm_kind(req.vmm.as_deref(), is_cloud, self.default_vmm_kind)?;
+        let resolved_vmm_kind = resolve_vmm_kind(
+            req.vmm.as_deref(),
+            is_cloud,
+            !req.mounts.is_empty(),
+            self.default_vmm_kind,
+        )?;
 
         // For direct-kernel boot: resolve the kernel now (validation already ran in
         // create_vm_record; try_create_vm may also be called from tests that skip it).
@@ -4893,11 +4902,11 @@ mod tests {
         // persisted record matches the backend the dispatcher actually runs.
         // (Previously this was hardcoded to Firecracker, mislabeling the VM.)
         assert_eq!(
-            resolve_vmm_kind(None, false, VmmKind::Qemu).unwrap(),
+            resolve_vmm_kind(None, false, false, VmmKind::Qemu).unwrap(),
             VmmKind::Qemu
         );
         assert_eq!(
-            resolve_vmm_kind(None, false, VmmKind::Firecracker).unwrap(),
+            resolve_vmm_kind(None, false, false, VmmKind::Firecracker).unwrap(),
             VmmKind::Firecracker
         );
     }
@@ -4907,11 +4916,29 @@ mod tests {
     fn resolve_vmm_kind_explicit_request_overrides_default() {
         use husker_vmm::VmmKind;
         assert_eq!(
-            resolve_vmm_kind(Some("firecracker"), false, VmmKind::Qemu).unwrap(),
+            resolve_vmm_kind(Some("firecracker"), false, false, VmmKind::Qemu).unwrap(),
             VmmKind::Firecracker
         );
         // An unparseable backend string is rejected, not silently defaulted.
-        assert!(resolve_vmm_kind(Some("xen"), false, VmmKind::Qemu).is_err());
+        assert!(resolve_vmm_kind(Some("xen"), false, false, VmmKind::Qemu).is_err());
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn resolve_vmm_kind_auto_selects_qemu_for_host_shares() {
+        use husker_vmm::VmmKind;
+        // No --vmm but host bind-mounts present: must resolve to QEMU (virtiofs),
+        // not the Firecracker default whose guard rejects shares.
+        assert_eq!(
+            resolve_vmm_kind(None, false, true, VmmKind::Firecracker).unwrap(),
+            VmmKind::Qemu
+        );
+        // An explicit backend still wins even with shares (the FC guard then
+        // surfaces a clear error rather than being silently overridden).
+        assert_eq!(
+            resolve_vmm_kind(Some("firecracker"), false, true, VmmKind::Qemu).unwrap(),
+            VmmKind::Firecracker
+        );
     }
 
     #[cfg(feature = "linux-net")]
@@ -4920,7 +4947,7 @@ mod tests {
         use husker_vmm::VmmKind;
         // Cloud-image boot is QEMU-only regardless of the daemon default.
         assert_eq!(
-            resolve_vmm_kind(None, true, VmmKind::Firecracker).unwrap(),
+            resolve_vmm_kind(None, true, false, VmmKind::Firecracker).unwrap(),
             VmmKind::Qemu
         );
     }
