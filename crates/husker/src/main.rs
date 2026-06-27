@@ -1060,6 +1060,10 @@ struct Profile {
 
 /// Convert a client-side `Profile` (PathBuf fields) into a `DaemonProfile`
 /// (String fields) suitable for storing in HuskerCore and serving via the API.
+///
+/// `ssh_keys` is not carried into `DaemonProfile` because the daemon cannot
+/// hand clients readable key files. Clients must supply SSH keys via a local
+/// profile or an explicit `--ssh-key` flag.
 fn profile_to_daemon(p: &Profile) -> husker_core::DaemonProfile {
     husker_core::DaemonProfile {
         cloud_image: p
@@ -1072,11 +1076,6 @@ fn profile_to_daemon(p: &Profile) -> husker_core::DaemonProfile {
         cpus: p.cpus,
         memory: p.memory,
         disk_size: p.disk_size.clone(),
-        ssh_keys: p
-            .ssh_keys
-            .iter()
-            .map(|b| b.to_string_lossy().into_owned())
-            .collect(),
         vmm: p.vmm.clone(),
         env: p.env.clone(),
         balloon: p.balloon,
@@ -1088,6 +1087,10 @@ fn profile_to_daemon(p: &Profile) -> husker_core::DaemonProfile {
 
 /// Convert a `DaemonProfile` received from the daemon API into a client-side
 /// `Profile` for local use in `apply_profile`.
+///
+/// `ssh_keys` is left empty because `DaemonProfile` does not carry key paths
+/// (they exist on the daemon host, not the client). SSH keys for cloud-init
+/// must come from a local profile or an explicit `--ssh-key` flag.
 fn daemon_to_profile(d: husker_core::DaemonProfile) -> Profile {
     Profile {
         cloud_image: d.cloud_image.map(PathBuf::from),
@@ -1097,7 +1100,7 @@ fn daemon_to_profile(d: husker_core::DaemonProfile) -> Profile {
         cpus: d.cpus,
         memory: d.memory,
         disk_size: d.disk_size,
-        ssh_keys: d.ssh_keys.into_iter().map(PathBuf::from).collect(),
+        ssh_keys: Vec::new(),
         vmm: d.vmm,
         env: d.env,
         balloon: d.balloon,
@@ -1140,17 +1143,42 @@ async fn fetch_daemon_profiles(
         .collect()
 }
 
+/// Whether the winning profile entry came from the local config or the daemon.
+///
+/// Used by `build_vm_request_body` to decide whether path fields (rootfs,
+/// kernel, initrd) should be resolved against the client filesystem. Local
+/// profiles are resolved; daemon profiles are sent as-is so bare catalog names
+/// (e.g. "alpine-x86_64.ext4") reach the daemon unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileOrigin {
+    Local,
+    Daemon,
+}
+
 /// Merge daemon profiles (base) with local profiles (overlay). Local entries
 /// win on name conflicts so per-user tweaks always override daemon defaults.
+///
+/// Returns the merged profile map alongside an origin map that records, for
+/// each profile name, whether the winning entry is `Local` or `Daemon`. A
+/// local profile that overrides a same-named daemon profile is `Local`-origin;
+/// only profiles that came purely from the daemon are `Daemon`-origin.
 fn merge_profiles(
     daemon: std::collections::HashMap<String, Profile>,
     local: &std::collections::HashMap<String, Profile>,
-) -> std::collections::HashMap<String, Profile> {
+) -> (
+    std::collections::HashMap<String, Profile>,
+    std::collections::HashMap<String, ProfileOrigin>,
+) {
     let mut merged = daemon;
+    let mut origins: std::collections::HashMap<String, ProfileOrigin> = merged
+        .keys()
+        .map(|k| (k.clone(), ProfileOrigin::Daemon))
+        .collect();
     for (name, profile) in local {
         merged.insert(name.clone(), profile.clone());
+        origins.insert(name.clone(), ProfileOrigin::Local);
     }
-    merged
+    (merged, origins)
 }
 
 /// Expand a leading `~/` against $HOME (profile ssh_keys convenience).
@@ -2221,14 +2249,17 @@ impl Default for Config {
 /// user errors, matching the existing run-handler behavior.
 ///
 /// `profiles` is the effective profile map (daemon profiles merged with local,
-/// local taking precedence). Pass `&config.profiles` when no daemon fetch is
-/// performed or when offline.
+/// local taking precedence). `origins` records whether each profile's winning
+/// entry is `Local` or `Daemon`; this drives whether path fields are resolved
+/// against the client filesystem. Pass `&config.profiles` with an empty origins
+/// map when no daemon fetch is performed or when offline (all paths resolve
+/// client-side as usual).
 fn build_vm_request_body(
     name: &str,
     mut args: VmRequestArgs,
     profile: Option<&str>,
     profiles: &std::collections::HashMap<String, Profile>,
-    daemon_profile_names: &std::collections::HashSet<String>,
+    origins: &std::collections::HashMap<String, ProfileOrigin>,
     config: &Config,
     output: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
@@ -2319,13 +2350,13 @@ fn build_vm_request_body(
         //
         // Rootfs resolution: CLI-supplied or local-profile rootfs values are run
         // through resolve_rootfs_arg so a bare image name expands to the client's
-        // data_dir/images/<name>. Daemon-profile rootfs values must NOT be resolved
-        // this way: a bare catalog name like "alpine-x86_64.ext4" from the daemon
-        // must reach the daemon unchanged; resolving it against the client filesystem
-        // could produce a client-local absolute path the daemon cannot use.
+        // data_dir/images/<name>. Daemon-origin profile rootfs values must NOT be
+        // resolved this way: a bare catalog name like "alpine-x86_64.ext4" from the
+        // daemon must reach the daemon unchanged. A local profile that overrides a
+        // same-named daemon profile is LOCAL-origin and DOES get resolved.
         let profile_rootfs_from_daemon = !cli_had_rootfs
             && profile
-                .map(|p| daemon_profile_names.contains(p))
+                .map(|p| origins.get(p) == Some(&ProfileOrigin::Daemon))
                 .unwrap_or(false);
         let explicit_rootfs = args.rootfs.map(|path| {
             if profile_rootfs_from_daemon {
@@ -2592,9 +2623,8 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let daemon_profiles =
                     fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await;
-                let daemon_profile_names: std::collections::HashSet<String> =
-                    daemon_profiles.keys().cloned().collect();
-                let merged_profiles = merge_profiles(daemon_profiles, &config.profiles);
+                let (merged_profiles, profile_origins) =
+                    merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
                     rootfs,
                     kernel,
@@ -2616,7 +2646,7 @@ async fn run(cli: Cli) -> Result<()> {
                     args,
                     profile.as_deref(),
                     &merged_profiles,
-                    &daemon_profile_names,
+                    &profile_origins,
                     &config,
                     output,
                 )?;
@@ -3236,9 +3266,8 @@ async fn run(cli: Cli) -> Result<()> {
                 let profile_client = reqwest::Client::new();
                 let daemon_profiles =
                     fetch_daemon_profiles(&profile_client, &api_url, api_token.as_deref()).await;
-                let daemon_profile_names: std::collections::HashSet<String> =
-                    daemon_profiles.keys().cloned().collect();
-                let merged_profiles = merge_profiles(daemon_profiles, &config.profiles);
+                let (merged_profiles, profile_origins) =
+                    merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
                     rootfs,
                     kernel,
@@ -3260,7 +3289,7 @@ async fn run(cli: Cli) -> Result<()> {
                     args,
                     profile.as_deref(),
                     &merged_profiles,
-                    &daemon_profile_names,
+                    &profile_origins,
                     &config,
                     output,
                 )?)
@@ -3945,13 +3974,15 @@ async fn run(cli: Cli) -> Result<()> {
                     .build()?;
                 let daemon_profiles =
                     fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await;
-                let merged = merge_profiles(daemon_profiles.clone(), &config.profiles);
+                let daemon_offline = daemon_profiles.is_empty();
+                let (merged, profile_origins) = merge_profiles(daemon_profiles, &config.profiles);
 
                 if output == OutputFormat::Json {
                     let json_merged: std::collections::HashMap<_, _> = merged
                         .iter()
                         .map(|(name, p)| {
-                            let origin = if config.profiles.contains_key(name) {
+                            let origin = if profile_origins.get(name) == Some(&ProfileOrigin::Local)
+                            {
                                 "local"
                             } else {
                                 "daemon"
@@ -4008,7 +4039,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                         println!("{:20}  {}", name, parts.join("  "));
                     }
-                    if daemon_profiles.is_empty() {
+                    if daemon_offline {
                         println!(
                             "\n(daemon profiles unavailable - offline or daemon does not support GET /v1/profiles)"
                         );
@@ -10213,12 +10244,17 @@ mod tests {
                 ..Profile::default()
             },
         );
-        let merged = merge_profiles(daemon, &local);
+        let (merged, origins) = merge_profiles(daemon, &local);
         assert_eq!(merged["rust"].cpus, Some(2), "local cpus override daemon");
         assert_eq!(
             merged["rust"].memory,
             Some(1024),
             "local memory overrides daemon"
+        );
+        assert_eq!(
+            origins["rust"],
+            ProfileOrigin::Local,
+            "local override of same-named daemon profile must be Local-origin"
         );
     }
 
@@ -10234,12 +10270,17 @@ mod tests {
             },
         );
         let local: std::collections::HashMap<String, Profile> = Default::default();
-        let merged = merge_profiles(daemon, &local);
+        let (merged, origins) = merge_profiles(daemon, &local);
         assert!(
             merged.contains_key("py"),
             "daemon-only profile must be visible"
         );
         assert_eq!(merged["py"].cpus, Some(2));
+        assert_eq!(
+            origins["py"],
+            ProfileOrigin::Daemon,
+            "daemon-only profile must be Daemon-origin"
+        );
     }
 
     #[test]
@@ -10255,10 +10296,15 @@ mod tests {
                 ..Profile::default()
             },
         );
-        let merged = merge_profiles(daemon, &local);
+        let (merged, origins) = merge_profiles(daemon, &local);
         assert!(
             merged.contains_key("dev"),
             "local profile must survive offline daemon"
+        );
+        assert_eq!(
+            origins["dev"],
+            ProfileOrigin::Local,
+            "local-only profile must be Local-origin"
         );
     }
 
@@ -10278,8 +10324,8 @@ mod tests {
                 ..Profile::default()
             },
         );
-        let mut daemon_names = std::collections::HashSet::new();
-        daemon_names.insert("py".into());
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("py".into(), ProfileOrigin::Daemon);
 
         let args = VmRequestArgs::default();
         let body = build_vm_request_body(
@@ -10287,7 +10333,7 @@ mod tests {
             args,
             Some("py"),
             &profiles,
-            &daemon_names,
+            &origins,
             &Config::default(),
             OutputFormat::Json,
         )
@@ -10296,6 +10342,45 @@ mod tests {
             body["rootfs_path"],
             serde_json::json!("alpine-x86_64.ext4"),
             "daemon profile rootfs must stay opaque and not be resolved against client data_dir"
+        );
+    }
+
+    #[test]
+    fn local_override_of_daemon_profile_rootfs_is_resolved_client_side() {
+        // Regression for the name-membership bug: a LOCAL profile that overrides
+        // a same-named daemon profile must be treated as Local-origin. Its rootfs
+        // must go through resolve_rootfs_arg, not pass through opaque.
+        // We use an absolute path so resolve_rootfs_arg returns it unchanged
+        // (no data_dir expansion needed) and we can assert it is present.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "rust".into(),
+            Profile {
+                rootfs: Some(PathBuf::from("/local/override/rootfs.ext4")),
+                cpus: Some(4),
+                ..Profile::default()
+            },
+        );
+        // Local wins: origin is Local even though "rust" was also a daemon name.
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("rust".into(), ProfileOrigin::Local);
+
+        let args = VmRequestArgs::default();
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            Some("rust"),
+            &profiles,
+            &origins,
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        // The local-profile rootfs must appear in the body (resolved client-side).
+        assert_eq!(
+            body["rootfs_path"],
+            serde_json::json!("/local/override/rootfs.ext4"),
+            "local-origin profile rootfs must be resolved client-side, not passed through opaque"
         );
     }
 
@@ -10313,8 +10398,8 @@ mod tests {
                 ..Profile::default()
             },
         );
-        let mut daemon_names = std::collections::HashSet::new();
-        daemon_names.insert("py".into());
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("py".into(), ProfileOrigin::Daemon);
 
         // Pass an explicit rootfs that doesn't exist; resolve_rootfs_arg returns it
         // unchanged when neither the path itself nor data_dir/images/<name> exists.
@@ -10327,7 +10412,7 @@ mod tests {
             args,
             Some("py"),
             &profiles,
-            &daemon_names,
+            &origins,
             &Config::default(),
             OutputFormat::Json,
         )

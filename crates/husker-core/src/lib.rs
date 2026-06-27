@@ -101,6 +101,11 @@ pub enum CoreError {
 /// Fields mirror the client-side `Profile` type. All fields are optional;
 /// explicit CLI flags always override profile values. Path fields use `String`
 /// rather than `PathBuf` so the type is serializable without format ambiguity.
+///
+/// `ssh_keys` is intentionally absent: the daemon cannot hand clients readable
+/// key files, and client code must not attempt to read daemon-host paths.
+/// SSH keys for cloud-init must come from a local profile or an explicit
+/// `--ssh-key` flag.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct DaemonProfile {
@@ -111,8 +116,6 @@ pub struct DaemonProfile {
     pub cpus: Option<u32>,
     pub memory: Option<u32>,
     pub disk_size: Option<String>,
-    #[serde(default)]
-    pub ssh_keys: Vec<String>,
     pub vmm: Option<String>,
     #[serde(default)]
     pub env: Vec<String>,
@@ -7284,5 +7287,23 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(p.rootfs.is_none());
         assert!(p.env.is_empty());
         assert!(p.mounts.is_empty());
+    }
+
+    #[test]
+    fn daemon_profile_does_not_serialize_ssh_keys() {
+        // DaemonProfile must not expose ssh_keys in the API response. Key paths
+        // live on the daemon host and cannot be read by clients. Clients must
+        // supply SSH keys via a local profile or an explicit --ssh-key flag.
+        let p = crate::DaemonProfile {
+            cpus: Some(2),
+            rootfs: Some("alpine".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).expect("serializes");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        assert!(
+            v.get("ssh_keys").is_none(),
+            "DaemonProfile must not include ssh_keys in the serialized API response"
+        );
     }
 }
