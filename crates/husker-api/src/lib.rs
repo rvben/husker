@@ -1990,7 +1990,10 @@ async fn create_vm<B: VmmBackend + 'static>(
                 StatusCode::FORBIDDEN,
                 error_response_with_hint(
                     "policy_mount_path_denied",
-                    format!("host path '{}' is not allowed for mount", share.host.display()),
+                    format!(
+                        "host path '{}' is not allowed for mount",
+                        share.host.display()
+                    ),
                     "set allowed_mount_host_paths in daemon config",
                 ),
             ));

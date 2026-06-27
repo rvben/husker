@@ -1255,7 +1255,8 @@ mod tests {
             "plain -m must be absent with shares: {joined}"
         );
         assert!(
-            joined.contains("q35,memory-backend=mem0") || joined.contains("virt,memory-backend=mem0"),
+            joined.contains("q35,memory-backend=mem0")
+                || joined.contains("virt,memory-backend=mem0"),
             "machine must have memory-backend attached: {joined}"
         );
     }

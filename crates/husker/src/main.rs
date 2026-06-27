@@ -9730,9 +9730,8 @@ mod tests {
             mount: vec!["/a:/x".into()],
             ..VmRequestArgs::default()
         };
-        let body =
-            build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
-                .unwrap();
+        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
+            .unwrap();
         assert_eq!(body["mounts"], serde_json::json!(["/a:/x"]));
     }
 
@@ -9742,9 +9741,8 @@ mod tests {
             mount: vec![],
             ..VmRequestArgs::default()
         };
-        let body =
-            build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
-                .unwrap();
+        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
+            .unwrap();
         assert!(body.get("mounts").is_none());
     }
 }

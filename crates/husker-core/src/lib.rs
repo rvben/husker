@@ -7102,12 +7102,22 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     fn parse_mount_spec_defaults_and_ro() {
         let s = parse_mount_spec("/srv/work", 0).unwrap();
         assert_eq!(
-            (s.host.as_path(), s.guest.as_str(), s.read_only, s.tag.as_str()),
+            (
+                s.host.as_path(),
+                s.guest.as_str(),
+                s.read_only,
+                s.tag.as_str()
+            ),
             (std::path::Path::new("/srv/work"), "/mnt/work", false, "fs0")
         );
         let s = parse_mount_spec("/srv/work:/build:ro", 2).unwrap();
         assert_eq!(
-            (s.host.as_path(), s.guest.as_str(), s.read_only, s.tag.as_str()),
+            (
+                s.host.as_path(),
+                s.guest.as_str(),
+                s.read_only,
+                s.tag.as_str()
+            ),
             (std::path::Path::new("/srv/work"), "/build", true, "fs2")
         );
     }

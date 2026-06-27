@@ -13,21 +13,21 @@
 //!
 //! `HUSKER_E2E_ROOTFS` is written to (cache=writeback); point it at a disposable copy.
 //!
-//! `qemu_host_share_visible_in_guest` additionally requires:
-//!   - `virtiofsd` on `PATH` (package `virtiofsd` or `qemu-virtiofsd` on most distros)
-//!   - A kernel with `CONFIG_VIRTIO_FS=y` (or as a module loaded via initramfs)
-//!   - The guest agent running as PID 1 in supervisor mode. The test sets
-//!     `init=<HUSKER_E2E_AGENT_BIN>` (default `/usr/local/bin/husker-agent`) so
-//!     the rootfs does not need a separate init system, but it must contain the
-//!     agent binary at that path (the standard husker rootfs does).
-//!   Run (CID 43 avoids collision with qemu_boots_and_vsock's default CID 42):
-//!     HUSKER_RUN_IGNORED_E2E=1 \
-//!     HUSKER_E2E_KERNEL=/var/lib/husker/kernels/vmlinux \
-//!     HUSKER_E2E_ROOTFS=/tmp/test-rootfs.ext4 \
-//!     HUSKER_E2E_INITRD=/var/lib/husker/kernels/initramfs-x86_64-virt.gz \
-//!     HUSKER_E2E_CID=43 \
-//!     cargo test -p husker-vmm --test qemu_e2e qemu_host_share_visible_in_guest \
-//!       -- --ignored --nocapture
+//! `qemu_host_share_visible_in_guest` additionally requires `virtiofsd` on
+//! `PATH` (package `virtiofsd` or `qemu-virtiofsd`), a kernel with
+//! `CONFIG_VIRTIO_FS=y` (or the module in the initramfs), and the guest agent
+//! running as PID 1 in supervisor mode. The test sets
+//! `init=<HUSKER_E2E_AGENT_BIN>` (default `/usr/local/bin/husker-agent`) so the
+//! rootfs needs no separate init system, but it must contain the agent binary at
+//! that path (the standard husker rootfs does).
+//!
+//! Run it (CID 43 avoids collision with qemu_boots_and_vsock's default CID 42):
+//!   HUSKER_RUN_IGNORED_E2E=1 \
+//!   HUSKER_E2E_KERNEL=/var/lib/husker/kernels/vmlinux \
+//!   HUSKER_E2E_ROOTFS=/tmp/test-rootfs.ext4 \
+//!   HUSKER_E2E_INITRD=/var/lib/husker/kernels/initramfs-x86_64-virt.gz \
+//!   HUSKER_E2E_CID=43 \
+//!   cargo test -p husker-vmm --test qemu_e2e qemu_host_share_visible_in_guest -- --ignored --nocapture
 #![cfg(target_os = "linux")]
 
 use husker_vmm::VmmBackend;
@@ -223,9 +223,7 @@ async fn qemu_uefi_boots_cloud_image() {
 #[ignore = "needs KVM + virtiofsd + vhost-vsock + qemu + images; gated by HUSKER_RUN_IGNORED_E2E"]
 async fn qemu_host_share_visible_in_guest() {
     if std::env::var("HUSKER_RUN_IGNORED_E2E").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping qemu_host_share_visible_in_guest: set HUSKER_RUN_IGNORED_E2E=1"
-        );
+        eprintln!("skipping qemu_host_share_visible_in_guest: set HUSKER_RUN_IGNORED_E2E=1");
         return;
     }
     let kernel = std::env::var("HUSKER_E2E_KERNEL").expect("HUSKER_E2E_KERNEL");
@@ -250,9 +248,8 @@ async fn qemu_host_share_visible_in_guest() {
     // kernel_args: run the agent as PID 1 in supervisor mode (husker.init=1)
     // so it mounts virtiofs shares declared in the cmdline before accepting
     // vsock connections.
-    let kernel_args = format!(
-        "console=ttyS0 init={agent_bin} husker.init=1 husker.share=fs0=/share"
-    );
+    let kernel_args =
+        format!("console=ttyS0 init={agent_bin} husker.init=1 husker.share=fs0=/share");
     let config = husker_vmm::VmConfig {
         name: "e2e-share".into(),
         vcpu_count: 1,
@@ -309,9 +306,7 @@ async fn qemu_host_share_visible_in_guest() {
                             timeout_secs: Some(10),
                         });
                         if write_message(&mut s2, &req).await.is_ok() {
-                            if let Ok(Some(AgentResponse::Exec(r))) =
-                                read_message(&mut s2).await
-                            {
+                            if let Ok(Some(AgentResponse::Exec(r))) = read_message(&mut s2).await {
                                 exec_result = Some(r);
                             }
                         }
@@ -330,8 +325,7 @@ async fn qemu_host_share_visible_in_guest() {
     assert!(connected, "agent vsock unreachable on port 52");
     let exec = exec_result.expect("exec request did not complete");
     assert_eq!(
-        exec.exit_code,
-        0,
+        exec.exit_code, 0,
         "guest command exited non-zero; stderr: {}",
         exec.stderr
     );

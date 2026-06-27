@@ -382,10 +382,10 @@ pub fn parse_shares(cmdline: &str) -> Vec<(String, String, bool)> {
 /// absent. Failures are logged but do not abort the guest.
 fn mount_virtiofs(tag: &str, path: &str, ro: bool) -> io::Result<()> {
     let _ = std::fs::create_dir_all(path);
-    let source =
-        CString::new(tag).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tag contains NUL"))?;
-    let target =
-        CString::new(path).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let source = CString::new(tag)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tag contains NUL"))?;
+    let target = CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let fstype = CString::new("virtiofs").expect("static fstype has no NUL");
     let flags: libc::c_ulong = if ro { libc::MS_RDONLY } else { 0 };
     // SAFETY: all three pointers are valid CStrings held for the call; flags
@@ -547,7 +547,12 @@ mod tests {
 
     #[test]
     fn parse_shares_empty_when_no_shares() {
-        assert!(parse_shares("console=ttyS0 husker.init=1 ip=10.0.0.1::10.0.0.0:255.255.255.0::eth0:off").is_empty());
+        assert!(
+            parse_shares(
+                "console=ttyS0 husker.init=1 ip=10.0.0.1::10.0.0.0:255.255.255.0::eth0:off"
+            )
+            .is_empty()
+        );
     }
 
     #[test]

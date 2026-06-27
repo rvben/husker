@@ -135,7 +135,11 @@ impl VmmBackend for LinuxDispatchBackend {
     }
 
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
-        let kind = select_vmm_kind(config.vmm, !config.host_shares.is_empty(), self.default_kind);
+        let kind = select_vmm_kind(
+            config.vmm,
+            !config.host_shares.is_empty(),
+            self.default_kind,
+        );
         let info = match kind {
             VmmKind::Firecracker => self.firecracker.create_vm(config).await?,
             VmmKind::Qemu => self.qemu.create_vm(config).await?,
@@ -256,8 +260,14 @@ mod tests {
 
     #[test]
     fn auto_selects_qemu_for_shares_when_vmm_unset() {
-        assert_eq!(select_vmm_kind(None, true, VmmKind::Firecracker), VmmKind::Qemu);
-        assert_eq!(select_vmm_kind(None, false, VmmKind::Firecracker), VmmKind::Firecracker);
+        assert_eq!(
+            select_vmm_kind(None, true, VmmKind::Firecracker),
+            VmmKind::Qemu
+        );
+        assert_eq!(
+            select_vmm_kind(None, false, VmmKind::Firecracker),
+            VmmKind::Firecracker
+        );
         assert_eq!(
             select_vmm_kind(Some(VmmKind::Firecracker), true, VmmKind::Qemu),
             VmmKind::Firecracker
