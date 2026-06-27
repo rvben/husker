@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 
 
+
+## [0.4.22](https://github.com/rvben/husker/compare/v0.4.21...v0.4.22) - 2026-06-27
+
+### Fixed
+
+- **husker-core**: auto-select qemu when host bind-mounts are present ([5123a19](https://github.com/rvben/husker/commit/5123a194134f2a8eae230e54aab8212077e6cfef))
+- **guest**: symlink cat in initramfs so the virtiofs share-mount runs ([eeee01c](https://github.com/rvben/husker/commit/eeee01c390f772f6cfc38a4e14c1beb9cc16b94b))
+
 ## [0.4.21](https://github.com/rvben/husker/compare/v0.4.20...v0.4.21) - 2026-06-27
 
 ### Added
