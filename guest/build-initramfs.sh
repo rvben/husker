@@ -80,8 +80,10 @@ mkdir -p "$INITRAMFS"/{bin,dev,lib/modules/"$KVER",mnt/root,proc,sys}
 cp "$WORK_DIR/bb/bin/busybox.static" "$INITRAMFS/bin/busybox"
 chmod 755 "$INITRAMFS/bin/busybox"
 
-# Create symlinks for commands used by init
-for cmd in mount umount mkdir insmod sh switch_root; do
+# Create symlinks for commands used by init. `cat` is required to read
+# /proc/cmdline (init= detection and the husker.share= virtiofs mount loop); it
+# was missing, so those reads silently produced nothing ("cat: not found").
+for cmd in cat mount umount mkdir insmod sh switch_root; do
     ln -s busybox "$INITRAMFS/bin/$cmd"
 done
 # insmod is also expected at /sbin/insmod by some paths
@@ -135,6 +137,10 @@ done
 
 cat > "$INITRAMFS/init" << 'INIT_EOF'
 #!/bin/sh
+# Set PATH so bare applet names (cat, mount, ...) resolve to the BusyBox symlinks.
+# Without it, `cat /proc/cmdline` fails ("cat: not found"), which silently breaks
+# both the init= detection and the husker.share= virtiofs mount loop below.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 /bin/mount -t proc proc /proc
 /bin/mount -t sysfs sys /sys
 /bin/mount -t devtmpfs devtmpfs /dev
@@ -143,7 +149,7 @@ cat > "$INITRAMFS/init" << 'INIT_EOF'
 # images via init=/usr/local/bin/husker-agent so the agent supervisor becomes
 # PID 1); default to /sbin/init for everything else.
 INIT=/sbin/init
-for tok in $(cat /proc/cmdline); do
+for tok in $(/bin/cat /proc/cmdline); do
     case "$tok" in
     init=*) INIT="${tok#init=}" ;;
     esac
@@ -206,7 +212,7 @@ done
 # Mount virtiofs shares declared in the kernel cmdline.
 # Format: husker.share=<tag>=<guest_path>[:ro]
 # The mounts target /mnt/root<path> so they survive switch_root.
-for tok in $(cat /proc/cmdline); do
+for tok in $(/bin/cat /proc/cmdline); do
     case "$tok" in
     husker.share=*)
         spec="${tok#husker.share=}"
