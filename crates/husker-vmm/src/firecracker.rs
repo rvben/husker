@@ -497,6 +497,12 @@ impl VmmBackend for FirecrackerBackend {
     }
 
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+        if !config.host_shares.is_empty() {
+            return Err(VmmError::Unsupported(
+                "host bind-mounts (--mount) are not supported on Firecracker; use --vmm qemu"
+                    .into(),
+            ));
+        }
         if !matches!(config.boot, crate::BootMode::DirectKernel) {
             return Err(VmmError::InvalidConfig(
                 "Firecracker only supports BootMode::DirectKernel".into(),
@@ -1378,6 +1384,43 @@ mod tests {
         assert!(
             matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("balloon")),
             "expected InvalidConfig mentioning balloon, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn firecracker_rejects_host_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FirecrackerBackend::new("firecracker", dir.path());
+
+        let mut config = VmConfig {
+            name: "test-shares".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_path: "/tmp/vmlinux".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            kernel_args: None,
+            initrd_path: None,
+            vsock_cid: 4,
+            tap_device: None,
+            guest_mac: None,
+            vmm: None,
+            boot: crate::BootMode::DirectKernel,
+            seed_path: None,
+            balloon: false,
+            volume_path: None,
+            host_shares: Vec::new(),
+        };
+        config.host_shares = vec![crate::HostShare {
+            host: "/srv/work".into(),
+            guest: "/work".into(),
+            read_only: false,
+            tag: "fs0".into(),
+        }];
+
+        let err = backend.create_vm(config).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
         );
     }
 }
