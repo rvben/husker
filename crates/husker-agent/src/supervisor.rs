@@ -360,6 +360,52 @@ pub fn ensure_hosts() {
     }
 }
 
+/// Parse `husker.share=<tag>=<guest_path>[:ro]` tokens from the kernel cmdline.
+/// Returns a vec of `(tag, guest_path, read_only)` triples, one per share.
+pub fn parse_shares(cmdline: &str) -> Vec<(String, String, bool)> {
+    cmdline
+        .split_whitespace()
+        .filter_map(|t| t.strip_prefix("husker.share="))
+        .filter_map(|v| {
+            let (tag, rest) = v.split_once('=')?;
+            let (path, ro) = match rest.strip_suffix(":ro") {
+                Some(p) => (p, true),
+                None => (rest, false),
+            };
+            Some((tag.to_string(), path.to_string(), ro))
+        })
+        .collect()
+}
+
+/// Mount a single virtiofs share. The `tag` is the virtiofs device tag exposed
+/// by the host; `path` is the guest mount point. Creates the directory if
+/// absent. Failures are logged but do not abort the guest.
+fn mount_virtiofs(tag: &str, path: &str, ro: bool) -> io::Result<()> {
+    let _ = std::fs::create_dir_all(path);
+    let source =
+        CString::new(tag).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tag contains NUL"))?;
+    let target =
+        CString::new(path).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let fstype = CString::new("virtiofs").expect("static fstype has no NUL");
+    let flags: libc::c_ulong = if ro { libc::MS_RDONLY } else { 0 };
+    // SAFETY: all three pointers are valid CStrings held for the call; flags
+    // encode read-only when requested; data pointer is null (no fs-specific options).
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Reboot the guest immediately. Used when a critical init step fails: the host
 /// observes the VM exit and reports it, rather than the guest half-booting and
 /// accepting vsock while workloads mysteriously fail. Never returns.
@@ -406,6 +452,16 @@ pub fn run(cmdline: &str) -> ! {
             Err(e) => warn!("guest network setup degraded: {e}"),
         },
         None => info!("no ip= on cmdline; skipping static network setup"),
+    }
+
+    // Mount virtiofs shares declared in the kernel cmdline. A failure is
+    // best-effort: logged and skipped so the workload still starts with reduced
+    // access rather than not at all.
+    for (tag, path, ro) in parse_shares(cmdline) {
+        match mount_virtiofs(&tag, &path, ro) {
+            Ok(()) => info!("mounted virtiofs share {tag} on {path}"),
+            Err(e) => warn!("could not mount virtiofs share {tag} on {path}: {e}"),
+        }
     }
 
     supervise()
@@ -476,6 +532,23 @@ fn supervise() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_shares_reads_tag_path_ro() {
+        let cl = "console=ttyS0 husker.init=1 husker.share=fs0=/work husker.share=fs1=/data:ro";
+        assert_eq!(
+            parse_shares(cl),
+            vec![
+                ("fs0".to_string(), "/work".to_string(), false),
+                ("fs1".to_string(), "/data".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_shares_empty_when_no_shares() {
+        assert!(parse_shares("console=ttyS0 husker.init=1 ip=10.0.0.1::10.0.0.0:255.255.255.0::eth0:off").is_empty());
+    }
 
     #[test]
     fn mount_plan_marks_proc_and_dev_critical() {

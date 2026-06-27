@@ -203,6 +203,33 @@ for m in $MDIR/*.ko; do
     /bin/busybox cp "$m" /mnt/root/lib/modules/ 2>/dev/null || true
 done
 
+# Mount virtiofs shares declared in the kernel cmdline.
+# Format: husker.share=<tag>=<guest_path>[:ro]
+# The mounts target /mnt/root<path> so they survive switch_root.
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+    husker.share=*)
+        spec="${tok#husker.share=}"
+        tag="${spec%%=*}"
+        rest="${spec#*=}"
+        case "$rest" in
+        *:ro)
+            gpath="${rest%:ro}"
+            /bin/mkdir -p /mnt/root$gpath
+            /bin/mount -t virtiofs -o ro "$tag" /mnt/root$gpath 2>/dev/null || \
+                echo "husker-init: WARNING could not mount virtiofs $tag on $gpath (ro)"
+            ;;
+        *)
+            gpath="$rest"
+            /bin/mkdir -p /mnt/root$gpath
+            /bin/mount -t virtiofs "$tag" /mnt/root$gpath 2>/dev/null || \
+                echo "husker-init: WARNING could not mount virtiofs $tag on $gpath"
+            ;;
+        esac
+        ;;
+    esac
+done
+
 # Clean up
 /bin/umount /proc
 /bin/umount /sys
