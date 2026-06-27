@@ -305,10 +305,10 @@ async fn qemu_host_share_visible_in_guest() {
                             env: Vec::new(),
                             timeout_secs: Some(10),
                         });
-                        if write_message(&mut s2, &req).await.is_ok() {
-                            if let Ok(Some(AgentResponse::Exec(r))) = read_message(&mut s2).await {
-                                exec_result = Some(r);
-                            }
+                        if write_message(&mut s2, &req).await.is_ok()
+                            && let Ok(Some(AgentResponse::Exec(r))) = read_message(&mut s2).await
+                        {
+                            exec_result = Some(r);
                         }
                     }
                     break;
