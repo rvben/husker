@@ -1112,35 +1112,61 @@ fn daemon_to_profile(d: husker_core::DaemonProfile) -> Profile {
 
 /// Fetch the daemon's configured profiles from `GET /v1/profiles`.
 ///
-/// Returns an empty map on any error (network failure, daemon offline, older
-/// daemon without the endpoint) so callers can fall back to local profiles.
+/// Returns `Ok(empty map)` on recoverable non-errors: connection failures
+/// (daemon offline, DNS, timeout) and HTTP 404 (older daemon without the
+/// endpoint). Callers treat these as "no daemon profiles available" and fall
+/// back to local profiles only.
+///
+/// Returns `Err` for conditions where the daemon IS reachable but actively
+/// rejected or failed the request: HTTP 401/403 (auth failure) and 5xx (server
+/// error). These indicate a real misconfiguration and must be surfaced to the
+/// user rather than silently producing an empty profile list.
 async fn fetch_daemon_profiles(
     client: &reqwest::Client,
     api_url: &str,
     api_token: Option<&str>,
-) -> std::collections::HashMap<String, Profile> {
+) -> anyhow::Result<std::collections::HashMap<String, Profile>> {
     let req = with_api_auth(client.get(format!("{api_url}/v1/profiles")), api_token);
-    let Ok(resp) = req.send().await else {
-        return Default::default();
+    let resp = match req.send().await {
+        Ok(r) => r,
+        // Connection-level failures (refused, DNS, timeout): daemon is offline
+        // or unreachable. Fall back to local profiles silently.
+        Err(_) => return Ok(Default::default()),
     };
-    if !resp.status().is_success() {
-        return Default::default();
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        // HTTP 404: daemon is reachable but does not expose /v1/profiles
+        // (older version). Fall back to local profiles silently.
+        return Ok(Default::default());
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status.is_server_error()
+    {
+        return Err(anyhow::anyhow!(
+            "daemon rejected profiles request: {status} - check your api_token and daemon configuration"
+        ));
+    }
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "unexpected response from daemon profiles endpoint: {status}"
+        ));
     }
     let Ok(body) = resp.json::<serde_json::Value>().await else {
-        return Default::default();
+        return Ok(Default::default());
     };
     let Some(profiles_val) = body.get("profiles") else {
-        return Default::default();
+        return Ok(Default::default());
     };
     let Ok(daemon_map) = serde_json::from_value::<
         std::collections::HashMap<String, husker_core::DaemonProfile>,
     >(profiles_val.clone()) else {
-        return Default::default();
+        return Ok(Default::default());
     };
-    daemon_map
+    Ok(daemon_map
         .into_iter()
         .map(|(k, v)| (k, daemon_to_profile(v)))
-        .collect()
+        .collect())
 }
 
 /// Whether the winning profile entry came from the local config or the daemon.
@@ -2111,6 +2137,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "secret reveal"
             | "context list"
             | "context show"
+            | "profile list"
     );
     let output_fields: Vec<&'static str> = match path {
         "balloon" => vec!["status", "action", "vm", "amount_mib"],
@@ -2160,6 +2187,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "context show" => vec!["current", "api_url"],
         "context add" => vec!["status", "action", "name", "api_url"],
         "context use" | "context remove" => vec!["status", "action", "name"],
+        "profile list" => vec!["status", "action", "profiles"],
         _ => vec![],
     };
     (!read_only, output_fields)
@@ -2622,7 +2650,10 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?
             } else {
                 let daemon_profiles =
-                    fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await;
+                    match fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await {
+                        Ok(p) => p,
+                        Err(e) => exit_with_error(output, e.to_string()),
+                    };
                 let (merged_profiles, profile_origins) =
                     merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
@@ -3265,7 +3296,12 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let profile_client = reqwest::Client::new();
                 let daemon_profiles =
-                    fetch_daemon_profiles(&profile_client, &api_url, api_token.as_deref()).await;
+                    match fetch_daemon_profiles(&profile_client, &api_url, api_token.as_deref())
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => exit_with_error(output, e.to_string()),
+                    };
                 let (merged_profiles, profile_origins) =
                     merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
@@ -3973,7 +4009,10 @@ async fn run(cli: Cli) -> Result<()> {
                     .timeout(std::time::Duration::from_secs(3))
                     .build()?;
                 let daemon_profiles =
-                    fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await;
+                    match fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await {
+                        Ok(p) => p,
+                        Err(e) => exit_with_error(output, e.to_string()),
+                    };
                 let daemon_offline = daemon_profiles.is_empty();
                 let (merged, profile_origins) = merge_profiles(daemon_profiles, &config.profiles);
 
@@ -10445,5 +10484,131 @@ mod tests {
         assert_eq!(p2.cpus, Some(4));
         assert_eq!(p2.memory, Some(8192));
         assert_eq!(p2.rootfs, Some(PathBuf::from("rust")));
+    }
+
+    // ── fetch_daemon_profiles error classification ────────────────────────
+
+    /// Spin up a one-shot TCP server that returns a fixed HTTP response to the
+    /// first connection, then return the base URL so callers can pass it to
+    /// `fetch_daemon_profiles`.
+    async fn profiles_server(status: &str, body: &str) -> String {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        let body_len = body.len();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = stream.read(&mut req).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{body}"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_profiles_surfaces_401_as_error() {
+        let base_url = profiles_server("401 Unauthorized", "").await;
+        let client = reqwest::Client::new();
+        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        assert!(
+            result.is_err(),
+            "401 from daemon profiles endpoint must surface as an error, not silent fallback"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("401") || msg.contains("rejected"),
+            "error message should mention the rejection, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_profiles_surfaces_403_as_error() {
+        let base_url = profiles_server("403 Forbidden", "").await;
+        let client = reqwest::Client::new();
+        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        assert!(
+            result.is_err(),
+            "403 from daemon profiles endpoint must surface as an error, not silent fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_profiles_surfaces_500_as_error() {
+        let base_url = profiles_server("500 Internal Server Error", "").await;
+        let client = reqwest::Client::new();
+        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        assert!(
+            result.is_err(),
+            "5xx from daemon profiles endpoint must surface as an error, not silent fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_profiles_falls_back_silently_on_404() {
+        let base_url = profiles_server("404 Not Found", "").await;
+        let client = reqwest::Client::new();
+        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        assert!(
+            result.is_ok(),
+            "404 (old daemon without /v1/profiles) must fall back silently, not error"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "404 fallback must yield an empty profile map"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_profiles_falls_back_silently_on_connection_refused() {
+        // Port 9 is the discard port; connections are refused on most systems.
+        // The key property is that the address is not listening, so send() fails
+        // at the connection layer rather than returning an HTTP response.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let result = fetch_daemon_profiles(&client, "http://127.0.0.1:9", None).await;
+        assert!(
+            result.is_ok(),
+            "connection-level failure must fall back silently, not error"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "connection-failure fallback must yield an empty profile map"
+        );
+    }
+
+    // ── schema_command_annotations: profile list ─────────────────────────
+
+    #[test]
+    fn schema_annotation_profile_list_is_non_mutating() {
+        let (mutating, _fields) = schema_command_annotations("profile list");
+        assert!(
+            !mutating,
+            "profile list is a read-only introspection command and must not be marked mutating"
+        );
+    }
+
+    #[test]
+    fn schema_annotation_profile_list_has_output_fields() {
+        let (_mutating, fields) = schema_command_annotations("profile list");
+        assert!(
+            fields.contains(&"status"),
+            "profile list output must include 'status'"
+        );
+        assert!(
+            fields.contains(&"action"),
+            "profile list output must include 'action'"
+        );
+        assert!(
+            fields.contains(&"profiles"),
+            "profile list output must include 'profiles'"
+        );
     }
 }
