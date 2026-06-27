@@ -803,12 +803,12 @@ enum SnapshotAction {
         /// Optional initrd path
         #[arg(long)]
         initrd: Option<PathBuf>,
-        /// Number of vCPUs
-        #[arg(long, default_value_t = 1)]
-        cpus: u32,
-        /// Memory in MiB
-        #[arg(long, default_value_t = 128)]
-        memory: u32,
+        /// Number of vCPUs (omit to use the daemon's configured default)
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory in MiB (omit to use the daemon's configured default)
+        #[arg(long)]
+        memory: Option<u32>,
     },
     /// Delete a snapshot by name
     Delete {
@@ -2228,9 +2228,15 @@ fn build_vm_request_body(
     mut args: VmRequestArgs,
     profile: Option<&str>,
     profiles: &std::collections::HashMap<String, Profile>,
+    daemon_profile_names: &std::collections::HashSet<String>,
     config: &Config,
     output: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
+    // Capture which path fields were set by the caller (CLI) before profile fills them.
+    // Used below to distinguish CLI-supplied rootfs (resolve) from daemon-profile
+    // rootfs (keep opaque so a bare catalog name reaches the daemon unchanged).
+    let cli_had_rootfs = args.rootfs.is_some();
+
     if let Some(p) = profile {
         match profiles.get(p) {
             Some(prof) => apply_profile(&mut args, prof),
@@ -2310,9 +2316,24 @@ fn build_vm_request_body(
         // Only include kernel/rootfs/initrd in the request when the user explicitly
         // provided them. When omitted, the daemon resolves defaults from its own
         // config, ensuring the paths exist on the daemon host rather than the client.
-        let explicit_rootfs = args
-            .rootfs
-            .map(|path| husker::resolve_rootfs_arg(path, &config.data_dir));
+        //
+        // Rootfs resolution: CLI-supplied or local-profile rootfs values are run
+        // through resolve_rootfs_arg so a bare image name expands to the client's
+        // data_dir/images/<name>. Daemon-profile rootfs values must NOT be resolved
+        // this way: a bare catalog name like "alpine-x86_64.ext4" from the daemon
+        // must reach the daemon unchanged; resolving it against the client filesystem
+        // could produce a client-local absolute path the daemon cannot use.
+        let profile_rootfs_from_daemon = !cli_had_rootfs
+            && profile
+                .map(|p| daemon_profile_names.contains(p))
+                .unwrap_or(false);
+        let explicit_rootfs = args.rootfs.map(|path| {
+            if profile_rootfs_from_daemon {
+                path
+            } else {
+                husker::resolve_rootfs_arg(path, &config.data_dir)
+            }
+        });
         let explicit_kernel = args.kernel;
         let explicit_initrd = args.initrd;
 
@@ -2571,6 +2592,8 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let daemon_profiles =
                     fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await;
+                let daemon_profile_names: std::collections::HashSet<String> =
+                    daemon_profiles.keys().cloned().collect();
                 let merged_profiles = merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
                     rootfs,
@@ -2593,6 +2616,7 @@ async fn run(cli: Cli) -> Result<()> {
                     args,
                     profile.as_deref(),
                     &merged_profiles,
+                    &daemon_profile_names,
                     &config,
                     output,
                 )?;
@@ -3212,6 +3236,8 @@ async fn run(cli: Cli) -> Result<()> {
                 let profile_client = reqwest::Client::new();
                 let daemon_profiles =
                     fetch_daemon_profiles(&profile_client, &api_url, api_token.as_deref()).await;
+                let daemon_profile_names: std::collections::HashSet<String> =
+                    daemon_profiles.keys().cloned().collect();
                 let merged_profiles = merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
                     rootfs,
@@ -3234,6 +3260,7 @@ async fn run(cli: Cli) -> Result<()> {
                     args,
                     profile.as_deref(),
                     &merged_profiles,
+                    &daemon_profile_names,
                     &config,
                     output,
                 )?)
@@ -8704,8 +8731,42 @@ mod tests {
                 assert_eq!(name, "restored-vm");
                 assert_eq!(kernel, PathBuf::from("/tmp/vmlinux"));
                 assert!(initrd.is_none());
-                assert_eq!(cpus, 2);
-                assert_eq!(memory, 256);
+                assert_eq!(cpus, Some(2));
+                assert_eq!(memory, Some(256));
+            }
+            _ => panic!("expected snapshot restore command"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_restore_omits_cpus_memory_when_unspecified() {
+        // When --cpus and --memory are absent, the parsed values are None so the
+        // serialized body sends null, letting the daemon apply its configured default.
+        let cli = Cli::try_parse_from([
+            "husker",
+            "snapshot",
+            "restore",
+            "snap-1",
+            "--name",
+            "restored-vm",
+            "--kernel",
+            "/tmp/vmlinux",
+        ])
+        .expect("snapshot restore without cpus/memory parses");
+        match cli.command {
+            Commands::Snapshot {
+                action: SnapshotAction::Restore { cpus, memory, .. },
+            } => {
+                assert!(
+                    cpus.is_none(),
+                    "cpus must be None when --cpus is not passed, \
+                     so the daemon default applies rather than forcing 1"
+                );
+                assert!(
+                    memory.is_none(),
+                    "memory must be None when --memory is not passed, \
+                     so the daemon default applies rather than forcing 128 MiB"
+                );
             }
             _ => panic!("expected snapshot restore command"),
         }
@@ -9996,6 +10057,7 @@ mod tests {
             args,
             None,
             &Default::default(),
+            &Default::default(),
             &Config::default(),
             OutputFormat::Json,
         )
@@ -10013,6 +10075,7 @@ mod tests {
             "vm",
             args,
             None,
+            &Default::default(),
             &Default::default(),
             &Config::default(),
             OutputFormat::Json,
@@ -10032,6 +10095,7 @@ mod tests {
             "vm",
             args,
             None,
+            &Default::default(),
             &Default::default(),
             &Config::default(),
             OutputFormat::Json,
@@ -10060,6 +10124,7 @@ mod tests {
             args,
             None,
             &Default::default(),
+            &Default::default(),
             &Config::default(),
             OutputFormat::Json,
         )
@@ -10086,6 +10151,7 @@ mod tests {
             args,
             Some("rust"),
             &profiles,
+            &Default::default(),
             &Config::default(),
             OutputFormat::Json,
         )
@@ -10116,6 +10182,7 @@ mod tests {
             args,
             Some("rust"),
             &profiles,
+            &Default::default(),
             &Config::default(),
             OutputFormat::Json,
         )
@@ -10192,6 +10259,85 @@ mod tests {
         assert!(
             merged.contains_key("dev"),
             "local profile must survive offline daemon"
+        );
+    }
+
+    // ── Issue 1: daemon profile rootfs path resolution ─────────────────
+
+    #[test]
+    fn daemon_profile_rootfs_not_resolved_against_client_data_dir() {
+        // A bare rootfs name in a daemon profile (e.g. "alpine-x86_64.ext4") must
+        // reach the daemon as-is. resolve_rootfs_arg would expand it to a
+        // client-local absolute path the daemon cannot use if the client happens
+        // to have a same-named file under its data_dir/images/.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "py".into(),
+            Profile {
+                rootfs: Some(PathBuf::from("alpine-x86_64.ext4")),
+                ..Profile::default()
+            },
+        );
+        let mut daemon_names = std::collections::HashSet::new();
+        daemon_names.insert("py".into());
+
+        let args = VmRequestArgs::default();
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            Some("py"),
+            &profiles,
+            &daemon_names,
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(
+            body["rootfs_path"],
+            serde_json::json!("alpine-x86_64.ext4"),
+            "daemon profile rootfs must stay opaque and not be resolved against client data_dir"
+        );
+    }
+
+    #[test]
+    fn cli_explicit_rootfs_is_still_resolved_when_daemon_profile_is_active() {
+        // When the user passes --rootfs explicitly on the CLI AND selects a daemon
+        // profile, the explicitly-provided rootfs goes through resolve_rootfs_arg as
+        // usual (it is a client-side path). Only rootfs values *filled by* a daemon
+        // profile skip resolution.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "py".into(),
+            Profile {
+                cpus: Some(2),
+                ..Profile::default()
+            },
+        );
+        let mut daemon_names = std::collections::HashSet::new();
+        daemon_names.insert("py".into());
+
+        // Pass an explicit rootfs that doesn't exist; resolve_rootfs_arg returns it
+        // unchanged when neither the path itself nor data_dir/images/<name> exists.
+        let args = VmRequestArgs {
+            rootfs: Some(PathBuf::from("/explicit/path/rootfs.ext4")),
+            ..VmRequestArgs::default()
+        };
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            Some("py"),
+            &profiles,
+            &daemon_names,
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        // The CLI-explicit path should appear in the body (resolve returns it
+        // unchanged since the file does not exist locally).
+        assert_eq!(
+            body["rootfs_path"],
+            serde_json::json!("/explicit/path/rootfs.ext4"),
+            "CLI-explicit rootfs must still be sent even when a daemon profile is selected"
         );
     }
 
