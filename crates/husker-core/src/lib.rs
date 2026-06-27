@@ -1487,6 +1487,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 seed_path: Some(seed_path),
                 balloon: req.balloon,
                 volume_path: None,
+                host_shares: vec![],
             };
 
             let info = self.vmm.create_vm(vm_config).await?;
@@ -1589,6 +1590,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             seed_path: None,
             balloon: req.balloon,
             volume_path,
+            host_shares: vec![],
         };
 
         let info = self.vmm.create_vm(vm_config).await?;

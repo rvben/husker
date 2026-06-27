@@ -174,6 +174,10 @@ enum Commands {
         #[arg(long)]
         volume: Option<String>,
 
+        /// Bind-mount a host directory into the guest as host:guest[:ro] (repeatable)
+        #[arg(long)]
+        mount: Vec<String>,
+
         /// Network mode: nat (default, husker-managed NAT) or bridged (attach VM to the
         /// configured lan_bridge; cloud-image only, Linux only)
         #[arg(long, value_parser = ["nat", "bridged"])]
@@ -381,6 +385,10 @@ enum Commands {
         /// Attach a named persistent volume as the second disk (/dev/vdb)
         #[arg(long)]
         volume: Option<String>,
+
+        /// Bind-mount a host directory into the guest as host:guest[:ro] (repeatable)
+        #[arg(long)]
+        mount: Vec<String>,
 
         /// Network mode: nat (default, husker-managed NAT) or bridged (attach VM to the
         /// configured lan_bridge; cloud-image only, Linux only)
@@ -1019,6 +1027,8 @@ struct Profile {
     env: Vec<String>,
     balloon: Option<bool>,
     volume: Option<String>,
+    #[serde(default)]
+    mounts: Vec<String>,
     network: Option<String>,
 }
 
@@ -1335,6 +1345,7 @@ struct VmRequestArgs {
     env: Vec<String>,
     balloon: bool,
     volume: Option<String>,
+    mount: Vec<String>,
     network: Option<String>,
 }
 
@@ -1361,6 +1372,9 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
         args.balloon = p.balloon.unwrap_or(false);
     }
     args.volume = args.volume.take().or_else(|| p.volume.clone());
+    if args.mount.is_empty() {
+        args.mount = p.mounts.clone();
+    }
     args.network = args.network.take().or_else(|| p.network.clone());
 }
 
@@ -2227,6 +2241,10 @@ fn build_vm_request_body(
         body["volume"] = serde_json::json!(vol);
     }
 
+    if !args.mount.is_empty() {
+        body["mounts"] = serde_json::json!(args.mount);
+    }
+
     if let Some(ref net) = args.network {
         body["network"] = serde_json::json!(net);
     }
@@ -2363,6 +2381,7 @@ async fn run(cli: Cli) -> Result<()> {
             ssh_key,
             balloon,
             volume,
+            mount,
             net,
             profile,
         } => {
@@ -2434,6 +2453,7 @@ async fn run(cli: Cli) -> Result<()> {
                     env,
                     balloon,
                     volume,
+                    mount,
                     network: net,
                 };
                 let mut body =
@@ -2987,6 +3007,7 @@ async fn run(cli: Cli) -> Result<()> {
             ssh_key,
             balloon,
             volume,
+            mount,
             net,
             profile,
             timeout,
@@ -3063,6 +3084,7 @@ async fn run(cli: Cli) -> Result<()> {
                     env: Vec::new(),
                     balloon,
                     volume,
+                    mount,
                     network: net,
                 };
                 Some(build_vm_request_body(
@@ -9659,5 +9681,57 @@ mod tests {
             cfg.profiles["bridged-svc"].network.as_deref(),
             Some("bridged")
         );
+    }
+
+    #[test]
+    fn cli_parses_repeatable_mount() {
+        let cli = Cli::try_parse_from([
+            "husker", "job", "--mount", "/a:/x", "--mount", "/b:/y:ro", "--", "true",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Job { mount, .. } => {
+                assert_eq!(mount, vec!["/a:/x".to_string(), "/b:/y:ro".to_string()])
+            }
+            _ => panic!("expected Job"),
+        }
+    }
+
+    #[test]
+    fn profile_fills_mounts_when_cli_empty() {
+        let mut args = VmRequestArgs {
+            mount: vec![],
+            ..VmRequestArgs::default()
+        };
+        let p = Profile {
+            mounts: vec!["/a:/x".into()],
+            ..Profile::default()
+        };
+        apply_profile(&mut args, &p);
+        assert_eq!(args.mount, vec!["/a:/x".to_string()]);
+    }
+
+    #[test]
+    fn request_body_includes_mounts() {
+        let args = VmRequestArgs {
+            mount: vec!["/a:/x".into()],
+            ..VmRequestArgs::default()
+        };
+        let body =
+            build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
+                .unwrap();
+        assert_eq!(body["mounts"], serde_json::json!(["/a:/x"]));
+    }
+
+    #[test]
+    fn request_body_omits_mounts_when_empty() {
+        let args = VmRequestArgs {
+            mount: vec![],
+            ..VmRequestArgs::default()
+        };
+        let body =
+            build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
+                .unwrap();
+        assert!(body.get("mounts").is_none());
     }
 }
