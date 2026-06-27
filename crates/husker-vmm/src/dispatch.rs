@@ -111,6 +111,20 @@ impl LinuxDispatchBackend {
     }
 }
 
+/// Selects the VMM backend kind for a new VM.
+///
+/// When no backend was explicitly requested and the VM has host shares,
+/// QEMU is chosen because Firecracker does not support virtiofs. An
+/// explicit `requested` value is always honored, even when shares are present,
+/// so Firecracker's own unsupported-feature error remains reachable.
+fn select_vmm_kind(requested: Option<VmmKind>, has_host_shares: bool, default: VmmKind) -> VmmKind {
+    if requested.is_none() && has_host_shares {
+        VmmKind::Qemu
+    } else {
+        requested.unwrap_or(default)
+    }
+}
+
 impl VmmBackend for LinuxDispatchBackend {
     type VsockStream = LinuxVsockStream;
 
@@ -121,7 +135,7 @@ impl VmmBackend for LinuxDispatchBackend {
     }
 
     async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
-        let kind = config.vmm.unwrap_or(self.default_kind);
+        let kind = select_vmm_kind(config.vmm, !config.host_shares.is_empty(), self.default_kind);
         let info = match kind {
             VmmKind::Firecracker => self.firecracker.create_vm(config).await?,
             VmmKind::Qemu => self.qemu.create_vm(config).await?,
@@ -238,6 +252,20 @@ mod tests {
         let mut buf = [0u8; 4];
         right.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn auto_selects_qemu_for_shares_when_vmm_unset() {
+        assert_eq!(select_vmm_kind(None, true, VmmKind::Firecracker), VmmKind::Qemu);
+        assert_eq!(select_vmm_kind(None, false, VmmKind::Firecracker), VmmKind::Firecracker);
+        assert_eq!(
+            select_vmm_kind(Some(VmmKind::Firecracker), true, VmmKind::Qemu),
+            VmmKind::Firecracker
+        );
+        assert_eq!(
+            select_vmm_kind(Some(VmmKind::Qemu), false, VmmKind::Firecracker),
+            VmmKind::Qemu
+        );
     }
 
     // An id not in the route map must return VmNotFound before touching any backend.
