@@ -1984,6 +1984,7 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
             balloon: false,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -2028,6 +2029,7 @@ async fn concurrent_create_same_name_one_winner() {
                 balloon: false,
                 volume: None,
                 network: None,
+                mounts: Vec::new(),
             })
             .await
         })
@@ -2165,6 +2167,7 @@ mod kernel_args_composition {
             balloon: false,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
         .expect("create_vm should succeed");
@@ -2214,6 +2217,7 @@ mod kernel_args_composition {
             balloon: false,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
         .expect("create_vm should succeed");

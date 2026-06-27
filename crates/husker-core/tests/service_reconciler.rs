@@ -372,6 +372,7 @@ async fn reconcile_foreign_running_collision() {
         balloon: false,
         volume: None,
         network: None,
+        mounts: Vec::new(),
     })
     .await
     .unwrap();
@@ -424,6 +425,7 @@ async fn reconcile_foreign_stopped_collision() {
         balloon: false,
         volume: None,
         network: None,
+        mounts: Vec::new(),
     })
     .await
     .unwrap();
@@ -486,6 +488,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 balloon: false,
                 volume: None,
                 network: None,
+                mounts: Vec::new(),
             },
             Some(ServiceTag {
                 service_id: id,
@@ -515,6 +518,7 @@ async fn reconcile_dedupes_duplicate_ordinal() {
                 balloon: false,
                 volume: None,
                 network: None,
+                mounts: Vec::new(),
             },
             Some(ServiceTag {
                 service_id: id,
@@ -886,6 +890,7 @@ async fn set_balloon_rejects_vm_without_balloon_device() {
         balloon: false,
         volume: None,
         network: None,
+        mounts: Vec::new(),
     })
     .await
     .unwrap();
@@ -919,6 +924,7 @@ async fn set_balloon_rejects_stopped_vm() {
         balloon: true,
         volume: None,
         network: None,
+        mounts: Vec::new(),
     })
     .await
     .unwrap();
@@ -968,6 +974,7 @@ async fn set_balloon_happy_path_forwards_to_vmm() {
             balloon: true,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
         .unwrap();
