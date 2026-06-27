@@ -70,11 +70,18 @@ impl QemuKvmBackend {
         #[cfg(not(target_arch = "aarch64"))]
         let machine = "q35";
 
+        // When host shares are present, guest RAM must be a shareable memfd object
+        // (required for virtiofs). q35 and virt both accept memory-backend= on the
+        // -machine arg, so attach it there instead of using a separate -numa node.
+        let machine_arg = if config.host_shares.is_empty() {
+            machine.to_string()
+        } else {
+            format!("{machine},memory-backend=mem0")
+        };
+
         let mut args: Vec<String> = vec![
             "-machine".into(),
-            machine.into(),
-            "-m".into(),
-            config.mem_size_mib.to_string(),
+            machine_arg,
             "-smp".into(),
             config.vcpu_count.to_string(),
             "-nographic".into(),
@@ -97,6 +104,18 @@ impl QemuKvmBackend {
             "-device".into(),
             format!("vhost-vsock-pci,guest-cid={}", config.vsock_cid),
         ];
+
+        // Plain -m for VMs without host shares; shared memfd when shares are present.
+        if config.host_shares.is_empty() {
+            args.push("-m".into());
+            args.push(config.mem_size_mib.to_string());
+        } else {
+            args.push("-object".into());
+            args.push(format!(
+                "memory-backend-memfd,id=mem0,size={}M,share=on",
+                config.mem_size_mib
+            ));
+        }
 
         // Memory balloon device (machine-level, independent of boot mode).
         if config.balloon {
@@ -1119,5 +1138,45 @@ mod tests {
             matches!(err, VmmError::InvalidConfig(ref msg) if msg.contains("Efi") && msg.contains("QEMU")),
             "expected InvalidConfig mentioning Efi and QEMU, got: {err}"
         );
+    }
+
+    // ── shared memory backend (virtiofs prerequisite) ─────────────────────
+
+    #[test]
+    fn qemu_uses_shared_memory_backend_when_shares_present() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.mem_size_mib = 2048;
+        cfg.host_shares = vec![crate::HostShare {
+            host: "/srv/work".into(),
+            guest: "/work".into(),
+            read_only: false,
+            tag: "fs0".into(),
+        }];
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("memory-backend-memfd,id=mem0,size=2048M,share=on"),
+            "{joined}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-m"),
+            "plain -m must be absent with shares: {joined}"
+        );
+        assert!(
+            joined.contains("q35,memory-backend=mem0") || joined.contains("virt,memory-backend=mem0"),
+            "machine must have memory-backend attached: {joined}"
+        );
+    }
+
+    #[test]
+    fn qemu_uses_plain_memory_without_shares() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.mem_size_mib = 512;
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
+        let i = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(args[i + 1], "512");
+        assert!(!args.join(" ").contains("memory-backend-memfd"));
     }
 }
