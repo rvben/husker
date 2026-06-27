@@ -26,6 +26,37 @@ pub(crate) struct QemuInstance {
     pub(crate) process: tokio::process::Child,
     /// Whether the balloon device was installed at boot.
     pub(crate) balloon: bool,
+    /// One virtiofsd child per host share (parallel to `virtiofsd_socks`).
+    /// `kill_on_drop(true)` ensures they are terminated when the instance is removed.
+    pub(crate) virtiofsds: Vec<tokio::process::Child>,
+    /// Unix socket paths created by each virtiofsd; removed on destroy.
+    pub(crate) virtiofsd_socks: Vec<PathBuf>,
+}
+
+/// Locate the virtiofsd binary: try `virtiofsd` on PATH, then well-known fallbacks.
+fn virtiofsd_bin() -> &'static str {
+    const FALLBACKS: &[&str] = &["/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd"];
+    for path in FALLBACKS {
+        if std::path::Path::new(path).exists() {
+            return path;
+        }
+    }
+    "virtiofsd"
+}
+
+/// Poll for a Unix socket path to appear, mirroring the QMP socket-wait loop.
+/// Bounded to 50 * 100ms = 5 seconds.
+async fn wait_for_socket(path: &std::path::Path) -> Result<(), VmmError> {
+    for _ in 0..50 {
+        if path.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(VmmError::ProcessError(format!(
+        "virtiofsd socket did not appear within 5s: {}",
+        path.display()
+    )))
 }
 
 /// QEMU/KVM VMM backend. One `qemu-system` child process per VM.
@@ -55,6 +86,9 @@ impl QemuKvmBackend {
     }
     fn boot_log(&self, id: Uuid) -> PathBuf {
         self.runtime_dir.join(format!("{id}.boot.log"))
+    }
+    fn virtiofs_sock(&self, id: Uuid, n: usize) -> PathBuf {
+        self.runtime_dir.join(format!("{id}-fs{n}.sock"))
     }
 
     /// Per-VM writable OVMF variable store (a copy of the firmware VARS template).
@@ -224,6 +258,16 @@ impl QemuKvmBackend {
             args.push(format!("virtio-net-pci,netdev=net0,mac={mac}"));
         }
 
+        // virtiofs: one chardev socket + vhost-user-fs-pci device per host share.
+        // The matching virtiofsd processes are spawned in `create()` before QEMU.
+        for (n, share) in config.host_shares.iter().enumerate() {
+            let sock = self.virtiofs_sock(id, n);
+            args.push("-chardev".into());
+            args.push(format!("socket,id=fs{n},path={}", sock.display()));
+            args.push("-device".into());
+            args.push(format!("vhost-user-fs-pci,chardev=fs{n},tag={}", share.tag));
+        }
+
         Ok(args)
     }
 
@@ -301,6 +345,32 @@ impl QemuKvmBackend {
             .try_clone()
             .map_err(|e| VmmError::ProcessError(format!("clone qemu log handle: {e}")))?;
 
+        // Spawn one virtiofsd per host share before QEMU so the vhost-user sockets
+        // exist when QEMU enumerates its devices. kill_on_drop(true) ensures the
+        // children are killed if create() returns an error (Vec drops with the scope).
+        let mut virtiofsds: Vec<tokio::process::Child> = Vec::new();
+        let mut virtiofsd_socks: Vec<PathBuf> = Vec::new();
+        for (n, share) in config.host_shares.iter().enumerate() {
+            let sock = self.virtiofs_sock(id, n);
+            // Register the socket path in the cleanup guard before creating it, so
+            // a failure partway through still removes the already-created sockets.
+            artifacts.paths.push(sock.clone());
+            let mut cmd = tokio::process::Command::new(virtiofsd_bin());
+            cmd.arg(format!("--socket-path={}", sock.display()))
+                .arg(format!("--shared-dir={}", share.host.display()))
+                .arg("--sandbox=none")
+                .kill_on_drop(true);
+            if share.read_only {
+                cmd.arg("--readonly");
+            }
+            let child = cmd
+                .spawn()
+                .map_err(|e| VmmError::ProcessError(format!("spawn virtiofsd: {e}")))?;
+            wait_for_socket(&sock).await?;
+            virtiofsd_socks.push(sock);
+            virtiofsds.push(child);
+        }
+
         let process = tokio::process::Command::new(&self.binary)
             .args(&args)
             .stdin(std::process::Stdio::null())
@@ -352,6 +422,8 @@ impl QemuKvmBackend {
                 boot_log_path,
                 process,
                 balloon: config.balloon,
+                virtiofsds,
+                virtiofsd_socks,
             },
         );
         // The tracked instance now owns these files; do not delete them on drop.
@@ -385,11 +457,20 @@ impl QemuKvmBackend {
         let mut instances = self.instances.lock().await;
         let mut inst = instances.remove(&id).ok_or(VmmError::VmNotFound(id))?;
         let _ = inst.process.kill().await;
+        // Kill virtiofsd children explicitly; kill_on_drop provides a backstop when
+        // inst drops at the end of this block, but an explicit kill lets us await
+        // the signal delivery and keeps the shutdown deterministic.
+        for vfd in &mut inst.virtiofsds {
+            let _ = vfd.kill().await;
+        }
         let _ = tokio::fs::remove_file(&inst.qmp_path).await;
         let _ = tokio::fs::remove_file(&inst.pidfile_path).await;
         let _ = tokio::fs::remove_file(&inst.serial_log_path).await;
         let _ = tokio::fs::remove_file(&inst.boot_log_path).await;
         let _ = tokio::fs::remove_file(self.ovmf_vars_copy(id)).await;
+        for sock in &inst.virtiofsd_socks {
+            let _ = tokio::fs::remove_file(sock).await;
+        }
         Ok(())
     }
 
@@ -680,6 +761,8 @@ mod tests {
                 boot_log_path: dir.path().join("x.boot.log"),
                 process: tokio::process::Command::new("true").spawn().unwrap(),
                 balloon: false,
+                virtiofsds: vec![],
+                virtiofsd_socks: vec![],
             },
         );
         let mut cfg = sample_config();
@@ -717,6 +800,8 @@ mod tests {
                 boot_log_path: dir.path().join("a.boot.log"),
                 process: tokio::process::Command::new("true").spawn().unwrap(),
                 balloon: false,
+                virtiofsds: vec![],
+                virtiofsd_socks: vec![],
             },
         );
         be.destroy(id).await.unwrap();
@@ -747,6 +832,8 @@ mod tests {
                 boot_log_path: dir.path().join("d.boot.log"),
                 process,
                 balloon: false,
+                virtiofsds: vec![],
+                virtiofsd_socks: vec![],
             },
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -904,6 +991,8 @@ mod tests {
                 boot_log_path: dir.path().join("u.boot.log"),
                 process: tokio::process::Command::new("true").spawn().unwrap(),
                 balloon: false,
+                virtiofsds: vec![],
+                virtiofsd_socks: vec![],
             },
         );
         be.destroy(id).await.unwrap();
@@ -1009,6 +1098,8 @@ mod tests {
                 boot_log_path: dir.path().join("nb.boot.log"),
                 process: tokio::process::Command::new("true").spawn().unwrap(),
                 balloon: false,
+                virtiofsds: vec![],
+                virtiofsd_socks: vec![],
             },
         );
         let err = be.set_balloon_impl(id, 64).await.unwrap_err();
@@ -1178,5 +1269,45 @@ mod tests {
         let i = args.iter().position(|a| a == "-m").expect("-m present");
         assert_eq!(args[i + 1], "512");
         assert!(!args.join(" ").contains("memory-backend-memfd"));
+    }
+
+    // ── virtiofs device args ──────────────────────────────────────────────
+
+    #[test]
+    fn qemu_emits_vhost_user_fs_device_per_share() {
+        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.host_shares = vec![
+            crate::HostShare {
+                host: "/srv/a".into(),
+                guest: "/a".into(),
+                read_only: false,
+                tag: "fs0".into(),
+            },
+            crate::HostShare {
+                host: "/srv/b".into(),
+                guest: "/b".into(),
+                read_only: true,
+                tag: "fs1".into(),
+            },
+        ];
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
+        let j = args.join(" ");
+        assert!(
+            j.contains("vhost-user-fs-pci,chardev=fs0,tag=fs0"),
+            "missing fs0 device: {j}"
+        );
+        assert!(
+            j.contains("vhost-user-fs-pci,chardev=fs1,tag=fs1"),
+            "missing fs1 device: {j}"
+        );
+        assert!(j.contains("socket,id=fs0"), "missing fs0 chardev: {j}");
+        assert!(j.contains("socket,id=fs1"), "missing fs1 chardev: {j}");
+        // No shares -> no vhost-user-fs args (regression guard).
+        let args_no_shares = be.build_args(Uuid::nil(), &sample_config()).unwrap();
+        assert!(
+            !args_no_shares.iter().any(|a| a.contains("vhost-user-fs")),
+            "vhost-user-fs must be absent without shares: {args_no_shares:?}"
+        );
     }
 }
