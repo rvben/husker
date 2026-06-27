@@ -12,6 +12,22 @@
 //!   cargo test -p husker-vmm --test qemu_e2e -- --ignored --nocapture
 //!
 //! `HUSKER_E2E_ROOTFS` is written to (cache=writeback); point it at a disposable copy.
+//!
+//! `qemu_host_share_visible_in_guest` additionally requires:
+//!   - `virtiofsd` on `PATH` (package `virtiofsd` or `qemu-virtiofsd` on most distros)
+//!   - A kernel with `CONFIG_VIRTIO_FS=y` (or as a module loaded via initramfs)
+//!   - The guest agent running as PID 1 in supervisor mode. The test sets
+//!     `init=<HUSKER_E2E_AGENT_BIN>` (default `/usr/local/bin/husker-agent`) so
+//!     the rootfs does not need a separate init system, but it must contain the
+//!     agent binary at that path (the standard husker rootfs does).
+//!   Run (CID 43 avoids collision with qemu_boots_and_vsock's default CID 42):
+//!     HUSKER_RUN_IGNORED_E2E=1 \
+//!     HUSKER_E2E_KERNEL=/var/lib/husker/kernels/vmlinux \
+//!     HUSKER_E2E_ROOTFS=/tmp/test-rootfs.ext4 \
+//!     HUSKER_E2E_INITRD=/var/lib/husker/kernels/initramfs-x86_64-virt.gz \
+//!     HUSKER_E2E_CID=43 \
+//!     cargo test -p husker-vmm --test qemu_e2e qemu_host_share_visible_in_guest \
+//!       -- --ignored --nocapture
 #![cfg(target_os = "linux")]
 
 use husker_vmm::VmmBackend;
@@ -192,5 +208,145 @@ async fn qemu_uefi_boots_cloud_image() {
             || serial.to_lowercase().contains("grub")
             || serial.to_lowercase().contains("login:"),
         "serial log lacked UEFI/GRUB/login evidence:\n{serial}"
+    );
+}
+
+/// Boot a QEMU VM with a virtiofs host share and prove that a file written by
+/// the host is visible inside the guest AND that the guest can write back
+/// through the share to the host.
+///
+/// The test writes a sentinel file into a host-side temp dir, boots the VM with
+/// that dir shared as `/share` (tag `fs0`), sends an `Exec` that copies
+/// `/share/hello.txt` to `/share/proof.txt`, tears down the VM, then asserts
+/// on the host that `proof.txt` exists and has the expected content.
+#[tokio::test]
+#[ignore = "needs KVM + virtiofsd + vhost-vsock + qemu + images; gated by HUSKER_RUN_IGNORED_E2E"]
+async fn qemu_host_share_visible_in_guest() {
+    if std::env::var("HUSKER_RUN_IGNORED_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping qemu_host_share_visible_in_guest: set HUSKER_RUN_IGNORED_E2E=1"
+        );
+        return;
+    }
+    let kernel = std::env::var("HUSKER_E2E_KERNEL").expect("HUSKER_E2E_KERNEL");
+    let rootfs = std::env::var("HUSKER_E2E_ROOTFS").expect("HUSKER_E2E_ROOTFS");
+    let initrd_path = std::env::var("HUSKER_E2E_INITRD").ok().map(Into::into);
+    let vsock_cid: u32 = std::env::var("HUSKER_E2E_CID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(43);
+    // Path of the husker-agent binary inside the guest rootfs.
+    let agent_bin = std::env::var("HUSKER_E2E_AGENT_BIN")
+        .unwrap_or_else(|_| "/usr/local/bin/husker-agent".into());
+
+    // Write a known sentinel into the host-side share directory before boot.
+    let share_dir = tempfile::tempdir().unwrap();
+    let sentinel = "husker-virtiofs-ok";
+    std::fs::write(share_dir.path().join("hello.txt"), sentinel).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+
+    // kernel_args: run the agent as PID 1 in supervisor mode (husker.init=1)
+    // so it mounts virtiofs shares declared in the cmdline before accepting
+    // vsock connections.
+    let kernel_args = format!(
+        "console=ttyS0 init={agent_bin} husker.init=1 husker.share=fs0=/share"
+    );
+    let config = husker_vmm::VmConfig {
+        name: "e2e-share".into(),
+        vcpu_count: 1,
+        mem_size_mib: 512,
+        kernel_path: kernel.into(),
+        rootfs_path: rootfs.into(),
+        kernel_args: Some(kernel_args),
+        initrd_path,
+        vsock_cid,
+        tap_device: None,
+        guest_mac: None,
+        vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
+        seed_path: None,
+        balloon: false,
+        volume_path: None,
+        host_shares: vec![husker_vmm::HostShare {
+            host: share_dir.path().to_path_buf(),
+            guest: "/share".into(),
+            read_only: false,
+            tag: "fs0".into(),
+        }],
+    };
+    let info = backend.create_vm(config).await.expect("create_vm");
+
+    // Poll for vsock connectivity with the same bounded backoff as the other tests.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(200);
+    let mut connected = false;
+    let mut exec_result: Option<husker_agent_proto::ExecResponse> = None;
+
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(mut s) = backend.vsock_connect(info.id, 52).await {
+            use husker_agent_proto::{
+                AgentRequest, AgentResponse, ExecRequest, read_message, write_message,
+            };
+            if write_message(&mut s, &AgentRequest::Ping).await.is_ok() {
+                let resp: Result<Option<AgentResponse>, _> = read_message(&mut s).await;
+                if let Ok(Some(AgentResponse::Pong)) = resp {
+                    connected = true;
+                    // Agent is up and the share should be mounted. Open a fresh
+                    // connection for the exec so the ping response is fully drained.
+                    if let Ok(mut s2) = backend.vsock_connect(info.id, 52).await {
+                        let req = AgentRequest::Exec(ExecRequest {
+                            command: "sh".into(),
+                            args: vec![
+                                "-c".into(),
+                                "cat /share/hello.txt > /share/proof.txt \
+                                 && cat /share/hello.txt"
+                                    .into(),
+                            ],
+                            working_dir: None,
+                            env: Vec::new(),
+                            timeout_secs: Some(10),
+                        });
+                        if write_message(&mut s2, &req).await.is_ok() {
+                            if let Ok(Some(AgentResponse::Exec(r))) =
+                                read_message(&mut s2).await
+                            {
+                                exec_result = Some(r);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    }
+
+    // Always destroy before asserting so a failure does not leak the VM.
+    backend.destroy_vm(info.id).await.unwrap();
+
+    assert!(connected, "agent vsock unreachable on port 52");
+    let exec = exec_result.expect("exec request did not complete");
+    assert_eq!(
+        exec.exit_code,
+        0,
+        "guest command exited non-zero; stderr: {}",
+        exec.stderr
+    );
+    // stdout of `cat /share/hello.txt` must equal the sentinel (host->guest read).
+    assert_eq!(
+        exec.stdout.trim(),
+        sentinel,
+        "guest stdout mismatch - host->guest read failed"
+    );
+    // The proof file written by the guest must be visible on the host (guest->host write).
+    let proof = std::fs::read_to_string(share_dir.path().join("proof.txt"))
+        .expect("proof.txt not found on host - virtiofs write-back failed");
+    assert_eq!(
+        proof.trim(),
+        sentinel,
+        "proof.txt contents mismatch - virtiofs write-back carried wrong data"
     );
 }
