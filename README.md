@@ -149,6 +149,9 @@ Current scope is direct-kernel boot (same kernel + rootfs model as the Firecrack
 backend), with the guest agent reachable over vsock. Cloud-image boot via UEFI/OVMF
 is also supported - see the Cloud Images section below.
 
+The QEMU backend also enables **host bind-mounts** via virtiofs: share a host directory
+into the guest in real time with `--mount <host>:<guest>[:ro]`. See [docs/host-mounts.md](docs/host-mounts.md).
+
 **Guest kernel requirement:** the QEMU backend uses the `q35` machine, which puts the
 root disk, NIC, and vsock device on the PCI bus, so the guest kernel must have
 `CONFIG_VIRTIO_PCI` (and an initramfs if `virtio_blk` is a module). The default husker
@@ -185,7 +188,7 @@ range. The guest IP appears in `husker info ubuntu` once the agent reports it (t
 within 20-30 seconds of first boot). Connect with `husker shell ubuntu` or via SSH once
 the IP is known.
 
-**Not yet supported on macOS with cloud images:** `--volume`, `--balloon`, and services
+**Not yet supported on macOS with cloud images:** `--volume`, `--mount`, `--balloon`, and services
 (`husker service`). Bridged networking (`--net bridged`) is Linux-only.
 
 ## Alternatives

@@ -1,0 +1,88 @@
+# Host Bind-Mounts (`--mount`)
+
+`husker run` and `husker job` can share a host directory into a VM over
+[virtiofs](https://virtio-fs.gitlab.io/), making live host files available
+inside the guest without copying.
+
+## When to use `--mount` vs `--sync-cwd`
+
+| | `--mount` | `--sync-cwd` |
+|---|---|---|
+| Mechanism | virtiofs (live share, no copy) | git-aware rsync into the VM |
+| Host changes visible in guest? | Yes, immediately | No - snapshot at launch |
+| Guest writes visible on host? | Yes, immediately | Only via `--out` / `--write-back` |
+| QEMU only? | Yes | No |
+| Works with `--pool`? | Yes (QEMU pool) | Yes |
+
+Use `--mount` when the guest needs to read or write host files in real time
+(e.g. a Rust build that writes to the host source tree or a long-running
+service that watches a config file). Use `--sync-cwd` when you want
+isolation and controlled write-back.
+
+## Syntax
+
+```
+husker job --vmm qemu --mount <host>:<guest>[:ro] -- <cmd>
+husker run  --vmm qemu --mount <host>:<guest>[:ro] --name <vm>
+```
+
+- `<host>` - absolute path on the host that the daemon is allowed to share
+- `<guest>` - mount point inside the VM (created if absent)
+- `:ro` - optional suffix to mount the share read-only in the guest
+- The flag is repeatable; each use adds one share.
+- Default guest path when `<guest>` is omitted: `/mnt/<host-basename>`.
+
+## Example: Rust iterative build
+
+Build a Rust project inside a fresh QEMU VM, with the source tree live-shared
+from the host and a persistent cargo cache volume:
+
+```bash
+husker job \
+  --profile rust \
+  --vmm qemu \
+  --mount "$(pwd):/work" \
+  --volume cargo-cache \
+  -- sh -c 'cd /work && cargo build --release'
+```
+
+- `--profile rust` selects a pre-configured VM preset (CPUs, memory, image).
+- `--mount "$(pwd):/work"` shares the current directory into `/work` in the guest.
+- `--volume cargo-cache` attaches a named persistent disk so Cargo's registry and
+  compiled deps survive across jobs.
+- The build artifacts land in `$(pwd)/target/` on the host in real time.
+
+## Security
+
+The daemon gates host paths through the `allowed_mount_host_paths` list in
+`config.toml`. An empty list (the default) denies all mounts - no path can be
+shared unless the operator explicitly opts it in:
+
+```toml
+[daemon]
+allowed_mount_host_paths = ["/home/ci/workspace", "/data/builds"]
+```
+
+Paths are matched as exact prefixes: a configured path of `/home/ci/workspace`
+allows any sub-path under it. Paths outside the allowlist are rejected by the
+daemon before the VM starts.
+
+For untrusted or agentic jobs, mount only the paths the job strictly needs. Do
+not add broad directories like `/home` or `/` to the allowlist.
+
+## Known limitations
+
+**QEMU only.** Firecracker does not support virtiofs; `--mount` requires
+`--vmm qemu`. Auto-selecting QEMU when `--mount` is present is not yet
+implemented, so you must pass `--vmm qemu` explicitly today.
+
+**Cloud-image (UEFI) VMs.** When booting with `--cloud-image`, the virtiofs
+device is attached to the VM but the guest does not receive the
+`husker.share=` kernel command-line token (UEFI boot has no kernel command
+line). The guest-agent auto-mount path therefore does not trigger. Use the
+direct-kernel OCI rootfs path (`husker images pull`) for host shares; cloud
+images do not benefit from `--mount` in the current release.
+
+**QEMU direct-kernel boot requires a PVH/bzImage kernel.** The husker default
+images work. Firecracker-format `vmlinux` flat binaries will not boot under
+QEMU - use `husker images pull` to fetch the correct kernel for your arch.

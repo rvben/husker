@@ -174,7 +174,8 @@ enum Commands {
         #[arg(long)]
         volume: Option<String>,
 
-        /// Bind-mount a host directory into the guest as host:guest[:ro] (repeatable)
+        /// Bind-mount a host directory into the guest over virtiofs as host:guest[:ro]
+        /// (repeatable; QEMU only - pass --vmm qemu)
         #[arg(long)]
         mount: Vec<String>,
 
@@ -386,7 +387,8 @@ enum Commands {
         #[arg(long)]
         volume: Option<String>,
 
-        /// Bind-mount a host directory into the guest as host:guest[:ro] (repeatable)
+        /// Bind-mount a host directory into the guest over virtiofs as host:guest[:ro]
+        /// (repeatable; QEMU only - pass --vmm qemu)
         #[arg(long)]
         mount: Vec<String>,
 
