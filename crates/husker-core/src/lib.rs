@@ -96,6 +96,33 @@ pub enum CoreError {
     Agent(#[from] AgentError),
 }
 
+/// A named VM preset as exposed by the daemon via its API.
+///
+/// Fields mirror the client-side `Profile` type. All fields are optional;
+/// explicit CLI flags always override profile values. Path fields use `String`
+/// rather than `PathBuf` so the type is serializable without format ambiguity.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct DaemonProfile {
+    pub cloud_image: Option<String>,
+    pub rootfs: Option<String>,
+    pub kernel: Option<String>,
+    pub initrd: Option<String>,
+    pub cpus: Option<u32>,
+    pub memory: Option<u32>,
+    pub disk_size: Option<String>,
+    #[serde(default)]
+    pub ssh_keys: Vec<String>,
+    pub vmm: Option<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    pub balloon: Option<bool>,
+    pub volume: Option<String>,
+    #[serde(default)]
+    pub mounts: Vec<String>,
+    pub network: Option<String>,
+}
+
 /// Parameters for creating a new VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -657,6 +684,8 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Default vCPU count applied when a create request omits vcpu_count.
     /// Falls back to the built-in 1 when unset.
     default_cpus: Option<u32>,
+    /// Named VM presets exposed to clients via GET /v1/profiles.
+    profiles: std::collections::HashMap<String, DaemonProfile>,
     runtime_dir: PathBuf,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -839,6 +868,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_initrd: None,
             default_memory: None,
             default_cpus: None,
+            profiles: std::collections::HashMap::new(),
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -867,6 +897,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_initrd: None,
             default_memory: None,
             default_cpus: None,
+            profiles: std::collections::HashMap::new(),
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -908,10 +939,24 @@ impl<B: VmmBackend> HuskerCore<B> {
         self
     }
 
+    /// Set the named VM presets served to clients via GET /v1/profiles.
+    pub fn with_profiles(
+        mut self,
+        profiles: std::collections::HashMap<String, DaemonProfile>,
+    ) -> Self {
+        self.profiles = profiles;
+        self
+    }
+
     /// Return the daemon-configured default memory (MiB) and vCPU count.
     /// Both are `None` when not configured (the built-in 128 / 1 fallback applies).
     pub fn default_resources(&self) -> (Option<u32>, Option<u32>) {
         (self.default_memory, self.default_cpus)
+    }
+
+    /// Return the named VM presets stored in this daemon instance.
+    pub fn profiles(&self) -> &std::collections::HashMap<String, DaemonProfile> {
+        &self.profiles
     }
 
     /// Set the default backend kind used when a create request omits `--vmm`.
@@ -7213,5 +7258,31 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(parse_mount_spec("/host:/guest:rw", 0).is_err());
         // Host path with ".." component.
         assert!(parse_mount_spec("/host/../etc:/guest", 0).is_err());
+    }
+
+    #[test]
+    fn daemon_profile_serializes_roundtrip() {
+        let p = crate::DaemonProfile {
+            cpus: Some(4),
+            memory: Some(8192),
+            rootfs: Some("rust".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).expect("serializes");
+        let p2: crate::DaemonProfile = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(p2.cpus, Some(4));
+        assert_eq!(p2.memory, Some(8192));
+        assert_eq!(p2.rootfs.as_deref(), Some("rust"));
+        assert!(p2.cloud_image.is_none());
+    }
+
+    #[test]
+    fn daemon_profile_default_is_all_none() {
+        let p = crate::DaemonProfile::default();
+        assert!(p.cpus.is_none());
+        assert!(p.memory.is_none());
+        assert!(p.rootfs.is_none());
+        assert!(p.env.is_empty());
+        assert!(p.mounts.is_empty());
     }
 }

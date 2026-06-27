@@ -25,7 +25,7 @@ use utoipa::ToSchema;
 use husker_core::{
     CoreError, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest,
     CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest,
-    ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
+    DaemonProfile, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
     ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
     ServiceRecord, ShellEvent, SnapshotRecord, VmRecord, VolumeRecord,
 };
@@ -517,6 +517,12 @@ pub struct ReadyResponse {
     pub ready: bool,
 }
 
+/// Named VM presets configured in the daemon and served to clients.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProfilesResponse {
+    pub profiles: HashMap<String, DaemonProfile>,
+}
+
 // ── Logs Types ───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -555,6 +561,7 @@ pub enum WsShellOutput {
     ),
     paths(
         health,
+        list_profiles,
         list_host_groups,
         create_host_group,
         get_host_group,
@@ -640,6 +647,8 @@ pub enum WsShellOutput {
         HealthResponse,
         VmCounts,
         ReadyResponse,
+        ProfilesResponse,
+        DaemonProfile,
         LogsQuery,
         WsShellInput,
         WsShellOutput,
@@ -670,7 +679,8 @@ pub enum WsShellOutput {
         (name = "shell", description = "Interactive shell sessions"),
         (name = "logs", description = "Serial console output"),
         (name = "ports", description = "Port forwarding"),
-        (name = "health", description = "Service health")
+        (name = "health", description = "Service health"),
+        (name = "profiles", description = "Named VM presets")
     )
 )]
 struct ApiDoc;
@@ -911,7 +921,8 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/shell", get(shell_ws::<B>))
         .route("/v1/vms/{name}/logs", get(get_logs::<B>))
         .route("/v1/vms/{name}/ready", get(get_ready::<B>))
-        .route("/v1/metrics", get(metrics_handler::<B>));
+        .route("/v1/metrics", get(metrics_handler::<B>))
+        .route("/v1/profiles", get(list_profiles::<B>));
 
     let router = router
         .route(
@@ -1218,6 +1229,22 @@ pub struct DaemonCapabilities {
     pub port_forward: bool,
     /// `--net bridged` (attach VMs to the LAN bridge). linux-net builds only.
     pub bridged_net: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/profiles",
+    tag = "profiles",
+    responses(
+        (status = 200, description = "Named VM presets configured in the daemon", body = ProfilesResponse)
+    )
+)]
+async fn list_profiles<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Json<ProfilesResponse> {
+    Json(ProfilesResponse {
+        profiles: core.profiles().clone(),
+    })
 }
 
 #[utoipa::path(

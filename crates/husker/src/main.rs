@@ -553,6 +553,13 @@ enum Commands {
         action: ConfigAction,
     },
 
+    /// Manage VM resource profiles (list effective profiles and their origin)
+    #[command(visible_alias = "profiles")]
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+
     /// Manage saved daemon targets (named http:// or ssh:// URLs) and switch
     /// between them, e.g. a local Apple VZ daemon and a remote Linux daemon
     #[command(alias = "ctx")]
@@ -570,6 +577,13 @@ enum Commands {
 enum ConfigAction {
     /// Validate the configuration file
     Check,
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// List effective profiles showing each one's origin (daemon or local config)
+    #[command(visible_alias = "ls")]
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1042,6 +1056,101 @@ struct Profile {
     #[serde(default)]
     mounts: Vec<String>,
     network: Option<String>,
+}
+
+/// Convert a client-side `Profile` (PathBuf fields) into a `DaemonProfile`
+/// (String fields) suitable for storing in HuskerCore and serving via the API.
+fn profile_to_daemon(p: &Profile) -> husker_core::DaemonProfile {
+    husker_core::DaemonProfile {
+        cloud_image: p
+            .cloud_image
+            .as_ref()
+            .map(|b| b.to_string_lossy().into_owned()),
+        rootfs: p.rootfs.as_ref().map(|b| b.to_string_lossy().into_owned()),
+        kernel: p.kernel.as_ref().map(|b| b.to_string_lossy().into_owned()),
+        initrd: p.initrd.as_ref().map(|b| b.to_string_lossy().into_owned()),
+        cpus: p.cpus,
+        memory: p.memory,
+        disk_size: p.disk_size.clone(),
+        ssh_keys: p
+            .ssh_keys
+            .iter()
+            .map(|b| b.to_string_lossy().into_owned())
+            .collect(),
+        vmm: p.vmm.clone(),
+        env: p.env.clone(),
+        balloon: p.balloon,
+        volume: p.volume.clone(),
+        mounts: p.mounts.clone(),
+        network: p.network.clone(),
+    }
+}
+
+/// Convert a `DaemonProfile` received from the daemon API into a client-side
+/// `Profile` for local use in `apply_profile`.
+fn daemon_to_profile(d: husker_core::DaemonProfile) -> Profile {
+    Profile {
+        cloud_image: d.cloud_image.map(PathBuf::from),
+        rootfs: d.rootfs.map(PathBuf::from),
+        kernel: d.kernel.map(PathBuf::from),
+        initrd: d.initrd.map(PathBuf::from),
+        cpus: d.cpus,
+        memory: d.memory,
+        disk_size: d.disk_size,
+        ssh_keys: d.ssh_keys.into_iter().map(PathBuf::from).collect(),
+        vmm: d.vmm,
+        env: d.env,
+        balloon: d.balloon,
+        volume: d.volume,
+        mounts: d.mounts,
+        network: d.network,
+    }
+}
+
+/// Fetch the daemon's configured profiles from `GET /v1/profiles`.
+///
+/// Returns an empty map on any error (network failure, daemon offline, older
+/// daemon without the endpoint) so callers can fall back to local profiles.
+async fn fetch_daemon_profiles(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_token: Option<&str>,
+) -> std::collections::HashMap<String, Profile> {
+    let req = with_api_auth(client.get(format!("{api_url}/v1/profiles")), api_token);
+    let Ok(resp) = req.send().await else {
+        return Default::default();
+    };
+    if !resp.status().is_success() {
+        return Default::default();
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return Default::default();
+    };
+    let Some(profiles_val) = body.get("profiles") else {
+        return Default::default();
+    };
+    let Ok(daemon_map) = serde_json::from_value::<
+        std::collections::HashMap<String, husker_core::DaemonProfile>,
+    >(profiles_val.clone()) else {
+        return Default::default();
+    };
+    daemon_map
+        .into_iter()
+        .map(|(k, v)| (k, daemon_to_profile(v)))
+        .collect()
+}
+
+/// Merge daemon profiles (base) with local profiles (overlay). Local entries
+/// win on name conflicts so per-user tweaks always override daemon defaults.
+fn merge_profiles(
+    daemon: std::collections::HashMap<String, Profile>,
+    local: &std::collections::HashMap<String, Profile>,
+) -> std::collections::HashMap<String, Profile> {
+    let mut merged = daemon;
+    for (name, profile) in local {
+        merged.insert(name.clone(), profile.clone());
+    }
+    merged
 }
 
 /// Expand a leading `~/` against $HOME (profile ssh_keys convenience).
@@ -2110,18 +2219,23 @@ impl Default for Config {
 /// Resolve profile + defaults + guards into the create-VM JSON body.
 /// Shared by `run` and `job`. Exits the process (via exit_with_error) on
 /// user errors, matching the existing run-handler behavior.
+///
+/// `profiles` is the effective profile map (daemon profiles merged with local,
+/// local taking precedence). Pass `&config.profiles` when no daemon fetch is
+/// performed or when offline.
 fn build_vm_request_body(
     name: &str,
     mut args: VmRequestArgs,
     profile: Option<&str>,
+    profiles: &std::collections::HashMap<String, Profile>,
     config: &Config,
     output: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
     if let Some(p) = profile {
-        match config.profiles.get(p) {
+        match profiles.get(p) {
             Some(prof) => apply_profile(&mut args, prof),
             None => {
-                let mut names: Vec<&String> = config.profiles.keys().collect();
+                let mut names: Vec<&String> = profiles.keys().collect();
                 names.sort();
                 let list = if names.is_empty() {
                     "none defined".to_string()
@@ -2455,6 +2569,9 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?
             } else {
+                let daemon_profiles =
+                    fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await;
+                let merged_profiles = merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
                     rootfs,
                     kernel,
@@ -2471,8 +2588,14 @@ async fn run(cli: Cli) -> Result<()> {
                     mount,
                     network: net,
                 };
-                let mut body =
-                    build_vm_request_body(&name, args, profile.as_deref(), &config, output)?;
+                let mut body = build_vm_request_body(
+                    &name,
+                    args,
+                    profile.as_deref(),
+                    &merged_profiles,
+                    &config,
+                    output,
+                )?;
 
                 if let Some(ref userdata_path) = userdata {
                     let script = std::fs::read_to_string(userdata_path).with_context(|| {
@@ -3086,6 +3209,10 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 None
             } else {
+                let profile_client = reqwest::Client::new();
+                let daemon_profiles =
+                    fetch_daemon_profiles(&profile_client, &api_url, api_token.as_deref()).await;
+                let merged_profiles = merge_profiles(daemon_profiles, &config.profiles);
                 let args = VmRequestArgs {
                     rootfs,
                     kernel,
@@ -3106,6 +3233,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &name,
                     args,
                     profile.as_deref(),
+                    &merged_profiles,
                     &config,
                     output,
                 )?)
@@ -3779,6 +3907,87 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
                 check_config(config_path.as_deref())
+            }
+        },
+        Commands::Profile { action } => match action {
+            ProfileAction::List => {
+                let config = load_config(config_path.as_deref());
+                let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build()?;
+                let daemon_profiles =
+                    fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await;
+                let merged = merge_profiles(daemon_profiles.clone(), &config.profiles);
+
+                if output == OutputFormat::Json {
+                    let json_merged: std::collections::HashMap<_, _> = merged
+                        .iter()
+                        .map(|(name, p)| {
+                            let origin = if config.profiles.contains_key(name) {
+                                "local"
+                            } else {
+                                "daemon"
+                            };
+                            (
+                                name.clone(),
+                                serde_json::json!({
+                                    "origin": origin,
+                                    "cpus": p.cpus,
+                                    "memory": p.memory,
+                                    "rootfs": p.rootfs,
+                                    "kernel": p.kernel,
+                                    "cloud_image": p.cloud_image,
+                                }),
+                            )
+                        })
+                        .collect();
+                    print_output(
+                        output,
+                        &serde_json::json!({
+                            "status": "ok",
+                            "action": "profile-list",
+                            "profiles": json_merged,
+                        }),
+                        "",
+                    );
+                } else if merged.is_empty() {
+                    println!("No profiles defined (daemon or local).");
+                    println!(
+                        "Add profiles to ~/.config/husker/config.toml or to the daemon config."
+                    );
+                } else {
+                    let mut names: Vec<&String> = merged.keys().collect();
+                    names.sort();
+                    for name in names {
+                        let p = &merged[name];
+                        let origin = if config.profiles.contains_key(name) {
+                            "local"
+                        } else {
+                            "daemon"
+                        };
+                        let mut parts = vec![format!("[{}]", origin)];
+                        if let Some(n) = p.cpus {
+                            parts.push(format!("cpus={n}"));
+                        }
+                        if let Some(m) = p.memory {
+                            parts.push(format!("memory={m}MiB"));
+                        }
+                        if let Some(ref r) = p.rootfs {
+                            parts.push(format!("rootfs={}", r.display()));
+                        }
+                        if let Some(ref c) = p.cloud_image {
+                            parts.push(format!("cloud-image={}", c.display()));
+                        }
+                        println!("{:20}  {}", name, parts.join("  "));
+                    }
+                    if daemon_profiles.is_empty() {
+                        println!(
+                            "\n(daemon profiles unavailable - offline or daemon does not support GET /v1/profiles)"
+                        );
+                    }
+                }
+                Ok(())
             }
         },
         Commands::Context { .. } => {
@@ -6918,7 +7127,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
                 )
-                .with_default_resources(config.default_memory, config.default_cpus),
+                .with_default_resources(config.default_memory, config.default_cpus)
+                .with_profiles(
+                    config
+                        .profiles
+                        .iter()
+                        .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
+                        .collect(),
+                ),
             )
         };
         #[cfg(not(target_os = "linux"))]
@@ -6944,7 +7160,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
                 )
-                .with_default_resources(config.default_memory, config.default_cpus),
+                .with_default_resources(config.default_memory, config.default_cpus)
+                .with_profiles(
+                    config
+                        .profiles
+                        .iter()
+                        .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
+                        .collect(),
+                ),
             )
         };
         run_linux_daemon(
@@ -6976,7 +7199,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
                 )
-                .with_default_resources(config.default_memory, config.default_cpus),
+                .with_default_resources(config.default_memory, config.default_cpus)
+                .with_profiles(
+                    config
+                        .profiles
+                        .iter()
+                        .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
+                        .collect(),
+                ),
         );
 
         run_initial_service_reconcile(&core).await;
@@ -7009,7 +7239,14 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
                 )
-                .with_default_resources(config.default_memory, config.default_cpus),
+                .with_default_resources(config.default_memory, config.default_cpus)
+                .with_profiles(
+                    config
+                        .profiles
+                        .iter()
+                        .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
+                        .collect(),
+                ),
         );
 
         run_initial_service_reconcile(&core).await;
@@ -9754,8 +9991,15 @@ mod tests {
             mount: vec!["/a:/x".into()],
             ..VmRequestArgs::default()
         };
-        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
-            .unwrap();
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            None,
+            &Default::default(),
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
         assert_eq!(body["mounts"], serde_json::json!(["/a:/x"]));
     }
 
@@ -9765,75 +10009,99 @@ mod tests {
             mount: vec![],
             ..VmRequestArgs::default()
         };
-        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
-            .unwrap();
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            None,
+            &Default::default(),
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
         assert!(body.get("mounts").is_none());
     }
 
-    // --- Feature: configurable daemon-level default resources ---
+    // ── Feature 1: default resource resolution ─────────────────────────
 
     #[test]
-    fn request_body_sends_null_cpus_and_memory_when_unset() {
-        // With no profile and no explicit CLI flags the client sends null so the
-        // daemon can apply its own configured defaults.
+    fn request_body_sends_null_vcpu_and_memory_when_unset() {
+        // When no CLI flag or profile sets cpus/memory, the body sends null so the
+        // daemon can apply its own defaults (daemon default > built-in 128/1).
         let args = VmRequestArgs::default();
-        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
-            .unwrap();
-        assert_eq!(
-            body["vcpu_count"],
-            serde_json::Value::Null,
-            "vcpu_count must be null when not set by CLI or profile"
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            None,
+            &Default::default(),
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        assert!(
+            body["vcpu_count"].is_null(),
+            "vcpu_count must be null when unset so the daemon default applies"
         );
-        assert_eq!(
-            body["mem_size_mib"],
-            serde_json::Value::Null,
-            "mem_size_mib must be null when not set by CLI or profile"
+        assert!(
+            body["mem_size_mib"].is_null(),
+            "mem_size_mib must be null when unset so the daemon default applies"
         );
     }
 
     #[test]
     fn request_body_sends_explicit_cli_cpus_and_memory() {
-        // Explicit CLI flags are forwarded verbatim; the daemon must honour them
-        // over any daemon-level defaults.
+        // CLI flag wins: explicit values are preserved in the body.
         let args = VmRequestArgs {
-            cpus: Some(4),
-            memory: Some(2048),
+            cpus: Some(8),
+            memory: Some(4096),
             ..VmRequestArgs::default()
         };
-        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
-            .unwrap();
-        assert_eq!(body["vcpu_count"], serde_json::json!(4));
-        assert_eq!(body["mem_size_mib"], serde_json::json!(2048));
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            None,
+            &Default::default(),
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(body["vcpu_count"], serde_json::json!(8));
+        assert_eq!(body["mem_size_mib"], serde_json::json!(4096));
     }
 
     #[test]
-    fn profile_fills_cpus_and_memory_when_cli_omits_them() {
-        // A profile that specifies cpus/memory should propagate into the request
-        // when no explicit CLI flags were passed.
-        let mut config = Config::default();
-        config.profiles.insert(
-            "heavy".to_string(),
+    fn profile_fills_cpus_and_memory_when_cli_unset() {
+        // Profile wins over unset CLI: memory/cpus from profile reach the body.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "rust".into(),
             Profile {
-                cpus: Some(8),
+                cpus: Some(4),
                 memory: Some(8192),
                 ..Profile::default()
             },
         );
         let args = VmRequestArgs::default();
-        let body =
-            build_vm_request_body("vm", args, Some("heavy"), &config, OutputFormat::Json).unwrap();
-        assert_eq!(body["vcpu_count"], serde_json::json!(8));
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            Some("rust"),
+            &profiles,
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(body["vcpu_count"], serde_json::json!(4));
         assert_eq!(body["mem_size_mib"], serde_json::json!(8192));
     }
 
     #[test]
-    fn explicit_cli_cpus_and_memory_win_over_profile() {
-        // Explicit CLI values must not be overwritten by profile values.
-        let mut config = Config::default();
-        config.profiles.insert(
-            "heavy".to_string(),
+    fn cli_flag_wins_over_profile_cpus_and_memory() {
+        // Explicit CLI flag overrides profile: body contains CLI value.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "rust".into(),
             Profile {
-                cpus: Some(8),
+                cpus: Some(4),
                 memory: Some(8192),
                 ..Profile::default()
             },
@@ -9843,17 +10111,108 @@ mod tests {
             memory: Some(512),
             ..VmRequestArgs::default()
         };
-        let body =
-            build_vm_request_body("vm", args, Some("heavy"), &config, OutputFormat::Json).unwrap();
-        assert_eq!(
-            body["vcpu_count"],
-            serde_json::json!(2),
-            "explicit --cpus must win over profile cpus"
+        let body = build_vm_request_body(
+            "vm",
+            args,
+            Some("rust"),
+            &profiles,
+            &Config::default(),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(body["vcpu_count"], serde_json::json!(2));
+        assert_eq!(body["mem_size_mib"], serde_json::json!(512));
+    }
+
+    // ── Feature 2: profile merge logic ────────────────────────────────
+
+    #[test]
+    fn merge_profiles_local_wins_on_conflict() {
+        let mut daemon = std::collections::HashMap::new();
+        daemon.insert(
+            "rust".into(),
+            Profile {
+                cpus: Some(4),
+                memory: Some(8192),
+                ..Profile::default()
+            },
         );
-        assert_eq!(
-            body["mem_size_mib"],
-            serde_json::json!(512),
-            "explicit --memory must win over profile memory"
+        let mut local = std::collections::HashMap::new();
+        local.insert(
+            "rust".into(),
+            Profile {
+                cpus: Some(2),
+                memory: Some(1024),
+                ..Profile::default()
+            },
         );
+        let merged = merge_profiles(daemon, &local);
+        assert_eq!(merged["rust"].cpus, Some(2), "local cpus override daemon");
+        assert_eq!(
+            merged["rust"].memory,
+            Some(1024),
+            "local memory overrides daemon"
+        );
+    }
+
+    #[test]
+    fn merge_profiles_daemon_only_profile_is_accessible() {
+        let mut daemon = std::collections::HashMap::new();
+        daemon.insert(
+            "py".into(),
+            Profile {
+                cpus: Some(2),
+                memory: Some(4096),
+                ..Profile::default()
+            },
+        );
+        let local: std::collections::HashMap<String, Profile> = Default::default();
+        let merged = merge_profiles(daemon, &local);
+        assert!(
+            merged.contains_key("py"),
+            "daemon-only profile must be visible"
+        );
+        assert_eq!(merged["py"].cpus, Some(2));
+    }
+
+    #[test]
+    fn merge_profiles_offline_falls_back_to_local() {
+        // Empty daemon map (e.g. offline) merges cleanly; local profiles survive.
+        let daemon: std::collections::HashMap<String, Profile> = Default::default();
+        let mut local = std::collections::HashMap::new();
+        local.insert(
+            "dev".into(),
+            Profile {
+                cpus: Some(1),
+                memory: Some(512),
+                ..Profile::default()
+            },
+        );
+        let merged = merge_profiles(daemon, &local);
+        assert!(
+            merged.contains_key("dev"),
+            "local profile must survive offline daemon"
+        );
+    }
+
+    #[test]
+    fn profile_to_daemon_and_back_roundtrip() {
+        let p = Profile {
+            cpus: Some(4),
+            memory: Some(8192),
+            rootfs: Some(PathBuf::from("rust")),
+            env: vec!["RUST_LOG=debug".into()],
+            ..Profile::default()
+        };
+        let d = profile_to_daemon(&p);
+        assert_eq!(d.cpus, Some(4));
+        assert_eq!(d.memory, Some(8192));
+        assert_eq!(d.rootfs.as_deref(), Some("rust"));
+        assert_eq!(d.env, vec!["RUST_LOG=debug"]);
+
+        let p2 = daemon_to_profile(d);
+        assert_eq!(p2.cpus, Some(4));
+        assert_eq!(p2.memory, Some(8192));
+        assert_eq!(p2.rootfs, Some(PathBuf::from("rust")));
     }
 }
