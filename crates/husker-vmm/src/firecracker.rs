@@ -1037,6 +1037,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            host_shares: Vec::new(),
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["name"], "test");
@@ -1172,6 +1173,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            host_shares: Vec::new(),
         };
 
         let err = backend.create_vm(config).await.unwrap_err();
@@ -1204,6 +1206,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            host_shares: Vec::new(),
         };
 
         let err = backend.create_vm(config).await.unwrap_err();

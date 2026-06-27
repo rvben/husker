@@ -52,6 +52,7 @@ async fn qemu_boots_and_vsock() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        host_shares: Vec::new(),
     };
     let info = backend.create_vm(config).await.expect("create_vm");
 
@@ -121,6 +122,7 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        host_shares: Vec::new(),
     };
     let err = backend.create(config).await.expect_err("create must fail");
     let msg = err.to_string();
@@ -177,6 +179,7 @@ async fn qemu_uefi_boots_cloud_image() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        host_shares: Vec::new(),
     };
     let info = backend.create(config).await.expect("UEFI VM should boot");
     // Give OVMF + GRUB time, then assert the serial log shows firmware/boot progress.

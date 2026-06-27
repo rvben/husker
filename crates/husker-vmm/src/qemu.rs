@@ -571,6 +571,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            host_shares: Vec::new(),
         }
     }
 

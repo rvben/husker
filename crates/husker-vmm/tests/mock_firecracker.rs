@@ -201,6 +201,7 @@ async fn create_vm_missing_binary() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        host_shares: Vec::new(),
     };
 
     let err = backend.create_vm(config).await.unwrap_err();
@@ -236,6 +237,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        host_shares: Vec::new(),
     };
 
     let _ = backend.create_vm(config).await.unwrap_err();
@@ -329,6 +331,7 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        host_shares: Vec::new(),
     };
 
     let err = backend.create_vm(config).await.unwrap_err();

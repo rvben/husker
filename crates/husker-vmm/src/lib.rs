@@ -26,6 +26,16 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+/// A host directory shared into the guest over virtiofs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostShare {
+    pub host: PathBuf,
+    pub guest: String,
+    pub read_only: bool,
+    /// Stable virtiofs device tag (e.g. "fs0"); the guest mounts by tag.
+    pub tag: String,
+}
+
 /// Configuration for creating a new VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
@@ -60,6 +70,10 @@ pub struct VmConfig {
     /// `None` omits the drive; core sets this when a volume is attached.
     #[serde(default)]
     pub volume_path: Option<PathBuf>,
+    /// Host directories to share into the guest over virtiofs. Empty by default;
+    /// each entry becomes a virtiofs device with the entry's `tag`.
+    #[serde(default)]
+    pub host_shares: Vec<HostShare>,
 }
 
 /// Runtime information about a VM.
@@ -531,6 +545,43 @@ mod tests {
             variable_store: "/tmp/nvram.bin".into(),
         };
         assert_eq!(efi.as_str(), "efi");
+    }
+
+    #[test]
+    fn vmconfig_default_has_no_host_shares() {
+        use super::{BootMode, VmConfig};
+        let c = VmConfig {
+            name: "test".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_path: "/k".into(),
+            rootfs_path: "/r".into(),
+            kernel_args: None,
+            initrd_path: None,
+            vsock_cid: 3,
+            tap_device: None,
+            guest_mac: None,
+            vmm: None,
+            boot: BootMode::DirectKernel,
+            seed_path: None,
+            balloon: false,
+            volume_path: None,
+            host_shares: Vec::new(),
+        };
+        assert!(c.host_shares.is_empty());
+    }
+
+    #[test]
+    fn host_share_holds_tag_and_ro() {
+        use super::HostShare;
+        let s = HostShare {
+            host: "/srv/work".into(),
+            guest: "/work".into(),
+            read_only: true,
+            tag: "fs0".into(),
+        };
+        assert_eq!(s.tag, "fs0");
+        assert!(s.read_only);
     }
 
     #[test]
