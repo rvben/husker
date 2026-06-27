@@ -951,6 +951,14 @@ struct Config {
     /// (human units, e.g. "10G"). None leaves the image's own size.
     #[serde(default)]
     default_disk_size: Option<String>,
+    /// Default memory (MiB) applied when neither the CLI flag nor a profile sets it.
+    /// Falls back to the built-in 128 MiB when unset.
+    #[serde(default)]
+    default_memory: Option<u32>,
+    /// Default vCPU count applied when neither the CLI flag nor a profile sets it.
+    /// Falls back to the built-in 1 when unset.
+    #[serde(default)]
+    default_cpus: Option<u32>,
     #[serde(default = "husker::default_images_base_url")]
     images_base_url: String,
     #[serde(default)]
@@ -2064,6 +2072,8 @@ impl Default for Config {
             default_rootfs: default_rootfs_path(),
             default_initrd: Some(default_initrd_path()),
             default_disk_size: None,
+            default_memory: None,
+            default_cpus: None,
             images_base_url: default_images_base_url(),
             api_token: None,
             api_max_request_bytes: default_api_max_request_bytes(),
@@ -2147,8 +2157,8 @@ fn build_vm_request_body(
 
     let mut body = serde_json::json!({
         "name": name,
-        "vcpu_count": args.cpus.unwrap_or(1),
-        "mem_size_mib": args.memory.unwrap_or(128),
+        "vcpu_count": args.cpus,
+        "mem_size_mib": args.memory,
         "env": env_pairs,
     });
 
@@ -5994,6 +6004,16 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(val) = std::env::var("HUSKER_DEFAULT_DISK_SIZE") {
         config.default_disk_size = Some(val);
     }
+    if let Ok(val) = std::env::var("HUSKER_DEFAULT_MEMORY")
+        && let Ok(parsed) = val.parse::<u32>()
+    {
+        config.default_memory = Some(parsed);
+    }
+    if let Ok(val) = std::env::var("HUSKER_DEFAULT_CPUS")
+        && let Ok(parsed) = val.parse::<u32>()
+    {
+        config.default_cpus = Some(parsed);
+    }
     if let Ok(val) = std::env::var("HUSKER_IMAGES_BASE_URL") {
         config.images_base_url = val;
     }
@@ -6897,7 +6917,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
-                ),
+                )
+                .with_default_resources(config.default_memory, config.default_cpus),
             )
         };
         #[cfg(not(target_os = "linux"))]
@@ -6922,7 +6943,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
-                ),
+                )
+                .with_default_resources(config.default_memory, config.default_cpus),
             )
         };
         run_linux_daemon(
@@ -6953,7 +6975,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
-                ),
+                )
+                .with_default_resources(config.default_memory, config.default_cpus),
         );
 
         run_initial_service_reconcile(&core).await;
@@ -6985,7 +7008,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
                     config.default_initrd.clone(),
-                ),
+                )
+                .with_default_resources(config.default_memory, config.default_cpus),
         );
 
         run_initial_service_reconcile(&core).await;
@@ -9744,5 +9768,92 @@ mod tests {
         let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
             .unwrap();
         assert!(body.get("mounts").is_none());
+    }
+
+    // --- Feature: configurable daemon-level default resources ---
+
+    #[test]
+    fn request_body_sends_null_cpus_and_memory_when_unset() {
+        // With no profile and no explicit CLI flags the client sends null so the
+        // daemon can apply its own configured defaults.
+        let args = VmRequestArgs::default();
+        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
+            .unwrap();
+        assert_eq!(
+            body["vcpu_count"],
+            serde_json::Value::Null,
+            "vcpu_count must be null when not set by CLI or profile"
+        );
+        assert_eq!(
+            body["mem_size_mib"],
+            serde_json::Value::Null,
+            "mem_size_mib must be null when not set by CLI or profile"
+        );
+    }
+
+    #[test]
+    fn request_body_sends_explicit_cli_cpus_and_memory() {
+        // Explicit CLI flags are forwarded verbatim; the daemon must honour them
+        // over any daemon-level defaults.
+        let args = VmRequestArgs {
+            cpus: Some(4),
+            memory: Some(2048),
+            ..VmRequestArgs::default()
+        };
+        let body = build_vm_request_body("vm", args, None, &Config::default(), OutputFormat::Json)
+            .unwrap();
+        assert_eq!(body["vcpu_count"], serde_json::json!(4));
+        assert_eq!(body["mem_size_mib"], serde_json::json!(2048));
+    }
+
+    #[test]
+    fn profile_fills_cpus_and_memory_when_cli_omits_them() {
+        // A profile that specifies cpus/memory should propagate into the request
+        // when no explicit CLI flags were passed.
+        let mut config = Config::default();
+        config.profiles.insert(
+            "heavy".to_string(),
+            Profile {
+                cpus: Some(8),
+                memory: Some(8192),
+                ..Profile::default()
+            },
+        );
+        let args = VmRequestArgs::default();
+        let body =
+            build_vm_request_body("vm", args, Some("heavy"), &config, OutputFormat::Json).unwrap();
+        assert_eq!(body["vcpu_count"], serde_json::json!(8));
+        assert_eq!(body["mem_size_mib"], serde_json::json!(8192));
+    }
+
+    #[test]
+    fn explicit_cli_cpus_and_memory_win_over_profile() {
+        // Explicit CLI values must not be overwritten by profile values.
+        let mut config = Config::default();
+        config.profiles.insert(
+            "heavy".to_string(),
+            Profile {
+                cpus: Some(8),
+                memory: Some(8192),
+                ..Profile::default()
+            },
+        );
+        let args = VmRequestArgs {
+            cpus: Some(2),
+            memory: Some(512),
+            ..VmRequestArgs::default()
+        };
+        let body =
+            build_vm_request_body("vm", args, Some("heavy"), &config, OutputFormat::Json).unwrap();
+        assert_eq!(
+            body["vcpu_count"],
+            serde_json::json!(2),
+            "explicit --cpus must win over profile cpus"
+        );
+        assert_eq!(
+            body["mem_size_mib"],
+            serde_json::json!(512),
+            "explicit --memory must win over profile memory"
+        );
     }
 }

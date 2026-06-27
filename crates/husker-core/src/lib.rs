@@ -651,6 +651,12 @@ pub struct HuskerCore<B: VmmBackend> {
     default_rootfs: Option<PathBuf>,
     /// Default initrd the daemon uses when a create request omits initrd_path.
     default_initrd: Option<PathBuf>,
+    /// Default memory (MiB) applied when a create request omits mem_size_mib.
+    /// Falls back to the built-in 128 MiB when unset.
+    default_memory: Option<u32>,
+    /// Default vCPU count applied when a create request omits vcpu_count.
+    /// Falls back to the built-in 1 when unset.
+    default_cpus: Option<u32>,
     runtime_dir: PathBuf,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -831,6 +837,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_kernel: None,
             default_rootfs: None,
             default_initrd: None,
+            default_memory: None,
+            default_cpus: None,
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -857,6 +865,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_kernel: None,
             default_rootfs: None,
             default_initrd: None,
+            default_memory: None,
+            default_cpus: None,
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -887,6 +897,21 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.default_rootfs = rootfs;
         self.default_initrd = initrd;
         self
+    }
+
+    /// Set the daemon-level default memory and vCPU count applied when a create
+    /// request omits those values. Resolution order: explicit CLI flag > profile >
+    /// these daemon defaults > built-in 128 MiB / 1 vCPU.
+    pub fn with_default_resources(mut self, memory: Option<u32>, cpus: Option<u32>) -> Self {
+        self.default_memory = memory;
+        self.default_cpus = cpus;
+        self
+    }
+
+    /// Return the daemon-configured default memory (MiB) and vCPU count.
+    /// Both are `None` when not configured (the built-in 128 / 1 fallback applies).
+    pub fn default_resources(&self) -> (Option<u32>, Option<u32>) {
+        (self.default_memory, self.default_cpus)
     }
 
     /// Set the default backend kind used when a create request omits `--vmm`.
@@ -1373,8 +1398,12 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
-            vcpu_count: req.vcpu_count.unwrap_or(1),
-            mem_size_mib: req.mem_size_mib.unwrap_or(128),
+            vcpu_count: req
+                .vcpu_count
+                .unwrap_or_else(|| self.default_cpus.unwrap_or(1)),
+            mem_size_mib: req
+                .mem_size_mib
+                .unwrap_or_else(|| self.default_memory.unwrap_or(128)),
             kernel_path: config_kernel_path,
             rootfs_path: disk_path,
             kernel_args,
@@ -1594,8 +1623,12 @@ impl<B: VmmBackend> HuskerCore<B> {
 
             let vm_config = husker_vmm::VmConfig {
                 name: req.name.clone(),
-                vcpu_count: req.vcpu_count.unwrap_or(1),
-                mem_size_mib: req.mem_size_mib.unwrap_or(128),
+                vcpu_count: req
+                    .vcpu_count
+                    .unwrap_or_else(|| self.default_cpus.unwrap_or(1)),
+                mem_size_mib: req
+                    .mem_size_mib
+                    .unwrap_or_else(|| self.default_memory.unwrap_or(128)),
                 kernel_path: PathBuf::new(),
                 rootfs_path: disk,
                 kernel_args: None,
