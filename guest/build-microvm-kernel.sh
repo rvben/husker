@@ -21,7 +21,10 @@ if [ -z "${WORK_DIR:-}" ]; then
   WORK_DIR="$(mktemp -d /tmp/husker-kernel-build.XXXXXX)"
   _OWN_WORK_DIR=1
 fi
-cleanup() { [ "$_OWN_WORK_DIR" = 1 ] && rm -rf "$WORK_DIR"; }
+# Use an `if`, not `[ ... ] && ...`: as the EXIT trap's last command a `&&` whose
+# test is false returns 1, which would make the script exit 1 on SUCCESS whenever
+# WORK_DIR was provided externally (e.g. to keep the tree for a second `make`).
+cleanup() { if [ "$_OWN_WORK_DIR" = 1 ]; then rm -rf "$WORK_DIR"; fi; }
 trap cleanup EXIT
 
 case "$ARCH" in
@@ -120,6 +123,12 @@ if [ "$KARCH" = "x86_64" ]; then
   cfg --enable KVM_GUEST
   cfg --enable SERIAL_8250
   cfg --enable SERIAL_8250_CONSOLE
+  # PVH boot entry: emits the XEN_ELFNOTE_PHYS32_ENTRY note so QEMU can
+  # direct-boot this uncompressed vmlinux (`-kernel vmlinux`). Without it QEMU
+  # rejects the flat ELF ("loading uncompressed kernel without PVH ELF Note").
+  # Firecracker ignores the extra note and boots the same image, so one kernel
+  # serves both backends. aarch64 has no PVH; QEMU boots its `Image` directly.
+  cfg --enable PVH
 else
   # QEMU aarch64 console (ttyAMA0); Apple VZ uses hvc0 via VIRTIO_CONSOLE
   cfg --enable SERIAL_AMBA_PL011
@@ -139,7 +148,7 @@ grep -q "^# CONFIG_MODULES is not set" .config \
   || { echo "FATAL: CONFIG_MODULES is still enabled" >&2; exit 1; }
 
 if [ "$KARCH" = "x86_64" ]; then
-  for opt in KVM_GUEST SERIAL_8250 SERIAL_8250_CONSOLE; do
+  for opt in KVM_GUEST SERIAL_8250 SERIAL_8250_CONSOLE PVH; do
     grep -q "^CONFIG_${opt}=y" .config || { echo "FATAL: CONFIG_${opt} is not =y" >&2; exit 1; }
   done
 else
