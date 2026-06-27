@@ -1112,10 +1112,14 @@ fn daemon_to_profile(d: husker_core::DaemonProfile) -> Profile {
 
 /// Fetch the daemon's configured profiles from `GET /v1/profiles`.
 ///
-/// Returns `Ok(empty map)` on recoverable non-errors: connection failures
-/// (daemon offline, DNS, timeout) and HTTP 404 (older daemon without the
-/// endpoint). Callers treat these as "no daemon profiles available" and fall
-/// back to local profiles only.
+/// Returns `Ok(None)` on recoverable non-errors where the caller should fall
+/// back to local profiles only: connection failures (daemon offline, DNS,
+/// timeout) and HTTP 404 (older daemon without the endpoint). This is distinct
+/// from `Ok(Some(empty map))`, which means the daemon IS reachable and simply
+/// has no profiles configured.
+///
+/// Returns `Ok(Some(map))` when the daemon responds successfully, even if the
+/// map is empty.
 ///
 /// Returns `Err` for conditions where the daemon IS reachable but actively
 /// rejected or failed the request: HTTP 401/403 (auth failure) and 5xx (server
@@ -1125,19 +1129,19 @@ async fn fetch_daemon_profiles(
     client: &reqwest::Client,
     api_url: &str,
     api_token: Option<&str>,
-) -> anyhow::Result<std::collections::HashMap<String, Profile>> {
+) -> anyhow::Result<Option<std::collections::HashMap<String, Profile>>> {
     let req = with_api_auth(client.get(format!("{api_url}/v1/profiles")), api_token);
     let resp = match req.send().await {
         Ok(r) => r,
         // Connection-level failures (refused, DNS, timeout): daemon is offline
         // or unreachable. Fall back to local profiles silently.
-        Err(_) => return Ok(Default::default()),
+        Err(_) => return Ok(None),
     };
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         // HTTP 404: daemon is reachable but does not expose /v1/profiles
         // (older version). Fall back to local profiles silently.
-        return Ok(Default::default());
+        return Ok(None);
     }
     if status == reqwest::StatusCode::UNAUTHORIZED
         || status == reqwest::StatusCode::FORBIDDEN
@@ -1153,20 +1157,22 @@ async fn fetch_daemon_profiles(
         ));
     }
     let Ok(body) = resp.json::<serde_json::Value>().await else {
-        return Ok(Default::default());
+        return Ok(None);
     };
     let Some(profiles_val) = body.get("profiles") else {
-        return Ok(Default::default());
+        return Ok(None);
     };
     let Ok(daemon_map) = serde_json::from_value::<
         std::collections::HashMap<String, husker_core::DaemonProfile>,
     >(profiles_val.clone()) else {
-        return Ok(Default::default());
+        return Ok(None);
     };
-    Ok(daemon_map
-        .into_iter()
-        .map(|(k, v)| (k, daemon_to_profile(v)))
-        .collect())
+    Ok(Some(
+        daemon_map
+            .into_iter()
+            .map(|(k, v)| (k, daemon_to_profile(v)))
+            .collect(),
+    ))
 }
 
 /// Whether the winning profile entry came from the local config or the daemon.
@@ -2651,7 +2657,7 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let daemon_profiles =
                     match fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await {
-                        Ok(p) => p,
+                        Ok(opt) => opt.unwrap_or_default(),
                         Err(e) => exit_with_error(output, e.to_string()),
                     };
                 let (merged_profiles, profile_origins) =
@@ -3299,7 +3305,7 @@ async fn run(cli: Cli) -> Result<()> {
                     match fetch_daemon_profiles(&profile_client, &api_url, api_token.as_deref())
                         .await
                     {
-                        Ok(p) => p,
+                        Ok(opt) => opt.unwrap_or_default(),
                         Err(e) => exit_with_error(output, e.to_string()),
                     };
                 let (merged_profiles, profile_origins) =
@@ -4008,12 +4014,13 @@ async fn run(cli: Cli) -> Result<()> {
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(3))
                     .build()?;
-                let daemon_profiles =
+                let daemon_result =
                     match fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await {
-                        Ok(p) => p,
+                        Ok(o) => o,
                         Err(e) => exit_with_error(output, e.to_string()),
                     };
-                let daemon_offline = daemon_profiles.is_empty();
+                let daemon_offline = daemon_result.is_none();
+                let daemon_profiles = daemon_result.unwrap_or_default();
                 let (merged, profile_origins) = merge_profiles(daemon_profiles, &config.profiles);
 
                 if output == OutputFormat::Json {
@@ -10559,8 +10566,8 @@ mod tests {
             "404 (old daemon without /v1/profiles) must fall back silently, not error"
         );
         assert!(
-            result.unwrap().is_empty(),
-            "404 fallback must yield an empty profile map"
+            result.unwrap().is_none(),
+            "404 fallback must return None to distinguish from a reachable daemon with zero profiles"
         );
     }
 
@@ -10579,8 +10586,28 @@ mod tests {
             "connection-level failure must fall back silently, not error"
         );
         assert!(
-            result.unwrap().is_empty(),
-            "connection-failure fallback must yield an empty profile map"
+            result.unwrap().is_none(),
+            "connection-failure fallback must return None to distinguish from a reachable daemon with zero profiles"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_profiles_returns_some_for_reachable_empty_daemon() {
+        // A daemon that is reachable and returns 200 with an empty profiles map
+        // must produce Ok(Some(empty map)), not Ok(None). This distinguishes
+        // "daemon online, zero profiles" from "daemon offline / fell back".
+        let base_url = profiles_server("200 OK", r#"{"profiles":{}}"#).await;
+        let client = reqwest::Client::new();
+        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        assert!(result.is_ok(), "200 with empty profiles map must not error");
+        let opt = result.unwrap();
+        assert!(
+            opt.is_some(),
+            "reachable daemon returning empty profiles must yield Some(map), not None"
+        );
+        assert!(
+            opt.unwrap().is_empty(),
+            "the returned map should be empty when the daemon has no profiles"
         );
     }
 
