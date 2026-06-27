@@ -22,8 +22,8 @@ isolation and controlled write-back.
 ## Syntax
 
 ```
-husker job --vmm qemu --mount <host>:<guest>[:ro] -- <cmd>
-husker run  --vmm qemu --mount <host>:<guest>[:ro] --name <vm>
+husker job --mount <host>:<guest>[:ro] -- <cmd>
+husker run --mount <host>:<guest>[:ro] --name <vm>
 ```
 
 - `<host>` - absolute path on the host that the daemon is allowed to share
@@ -31,6 +31,8 @@ husker run  --vmm qemu --mount <host>:<guest>[:ro] --name <vm>
 - `:ro` - optional suffix to mount the share read-only in the guest
 - The flag is repeatable; each use adds one share.
 - Default guest path when `<guest>` is omitted: `/mnt/<host-basename>`.
+- `--mount` runs on the QEMU backend; husker selects QEMU automatically when
+  `--vmm` is unset (Firecracker cannot do virtiofs), so no `--vmm qemu` is needed.
 
 ## Example: Rust iterative build
 
@@ -40,7 +42,6 @@ from the host and a persistent cargo cache volume:
 ```bash
 husker job \
   --profile rust \
-  --vmm qemu \
   --mount "$(pwd):/work" \
   --volume cargo-cache \
   -- sh -c 'cd /work && cargo build --release'
@@ -72,9 +73,11 @@ not add broad directories like `/home` or `/` to the allowlist.
 
 ## Known limitations
 
-**QEMU only.** Firecracker does not support virtiofs; `--mount` requires
-`--vmm qemu`. Auto-selecting QEMU when `--mount` is present is not yet
-implemented, so you must pass `--vmm qemu` explicitly today.
+**QEMU only.** Firecracker does not support virtiofs, so `--mount` runs on the
+QEMU backend. When `--vmm` is unset, husker selects QEMU automatically as soon
+as a `--mount` is present, so you do not need to pass `--vmm qemu`. Passing
+`--vmm firecracker` together with `--mount` is rejected rather than silently
+producing a VM without the share.
 
 **Cloud-image (UEFI) VMs.** When booting with `--cloud-image`, the virtiofs
 device is attached to the VM but the guest does not receive the
