@@ -2236,4 +2236,65 @@ mod kernel_args_composition {
             "initrd_path must be propagated to VmConfig"
         );
     }
+
+    /// Regression: the non-linux-net direct-kernel branch previously hardcoded
+    /// `req.vcpu_count.unwrap_or(1)` / `req.mem_size_mib.unwrap_or(128)` instead
+    /// of consulting the daemon's configured defaults. A request that omits both
+    /// fields must use the daemon defaults, not the built-in 1/128 fallback.
+    #[tokio::test]
+    async fn direct_kernel_applies_daemon_default_resources_when_request_omits_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("vmlinux");
+        std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
+        let rootfs = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+
+        let runtime_dir = tmp.path().join("run");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mock = MockVmm::new();
+        let core = Arc::new(
+            HuskerCore::new(
+                mock.clone(),
+                StateStore::open_memory().unwrap(),
+                StorageConfig {
+                    data_dir: data_dir.to_path_buf(),
+                },
+                runtime_dir,
+            )
+            .with_default_resources(Some(512), Some(4)),
+        );
+
+        core.create_vm(CreateVmRequest {
+            name: "defaults-test".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            vcpu_count: None,
+            mem_size_mib: None,
+            initrd_path: None,
+            userdata: None,
+            env: Vec::new(),
+            vmm: None,
+            cloud_image: None,
+            disk_size: None,
+            ssh_authorized_keys: Vec::new(),
+            balloon: false,
+            volume: None,
+            network: None,
+            mounts: Vec::new(),
+        })
+        .await
+        .expect("create_vm should succeed with daemon defaults");
+
+        let cfg = mock.last_config().await.expect("VmConfig was captured");
+        assert_eq!(
+            cfg.vcpu_count, 4,
+            "daemon default_cpus=4 must be used when vcpu_count is omitted"
+        );
+        assert_eq!(
+            cfg.mem_size_mib, 512,
+            "daemon default_memory=512 must be used when mem_size_mib is omitted"
+        );
+    }
 }

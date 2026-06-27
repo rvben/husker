@@ -1778,8 +1778,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         let volume_path = volume_attachment.as_ref().map(|(_, p)| p.clone());
         let vm_config = husker_vmm::VmConfig {
             name: req.name.clone(),
-            vcpu_count: req.vcpu_count.unwrap_or(1),
-            mem_size_mib: req.mem_size_mib.unwrap_or(128),
+            vcpu_count: req
+                .vcpu_count
+                .unwrap_or_else(|| self.default_cpus.unwrap_or(1)),
+            mem_size_mib: req
+                .mem_size_mib
+                .unwrap_or_else(|| self.default_memory.unwrap_or(128)),
             kernel_path: kernel.to_path_buf(),
             rootfs_path: vm_rootfs,
             kernel_args: Some("console=hvc0 root=/dev/vda rw init=/sbin/init".into()),
