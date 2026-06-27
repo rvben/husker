@@ -86,6 +86,9 @@ line). The guest-agent auto-mount path therefore does not trigger. Use the
 direct-kernel OCI rootfs path (`husker images pull`) for host shares; cloud
 images do not benefit from `--mount` in the current release.
 
-**QEMU direct-kernel boot requires a PVH/bzImage kernel.** The husker default
-images work. Firecracker-format `vmlinux` flat binaries will not boot under
-QEMU - use `husker images pull` to fetch the correct kernel for your arch.
+**QEMU direct-kernel boot needs a PVH kernel.** The husker default x86_64 kernel
+(`husker images pull`) is built with `CONFIG_PVH`, so QEMU direct-boots it and
+`--mount` works out of the box; the same image still boots under Firecracker.
+Only a custom kernel built without the PVH ELF note (a plain `vmlinux`) fails
+under QEMU with "loading uncompressed kernel without PVH ELF Note"; pass a PVH or
+bzImage kernel via `--kernel` in that case.
