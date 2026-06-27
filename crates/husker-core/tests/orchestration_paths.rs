@@ -564,6 +564,7 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             balloon: false,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -601,6 +602,7 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             balloon: false,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
         .unwrap_err()
@@ -663,6 +665,7 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             balloon: false,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
         .unwrap_err()
@@ -1612,6 +1615,7 @@ async fn create_vm_rejects_unsafe_names() {
                 balloon: false,
                 volume: None,
                 network: None,
+                mounts: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -1945,6 +1949,7 @@ async fn create_vm_accepts_safe_names() {
                 balloon: false,
                 volume: None,
                 network: None,
+                mounts: Vec::new(),
             })
             .await
             .unwrap_err();

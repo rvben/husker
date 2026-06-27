@@ -149,6 +149,11 @@ pub struct CreateVmRequest {
     /// host LAN bridge and DHCP assigns its address.
     #[serde(default)]
     pub network: Option<String>,
+    /// Host directories to share into the guest over virtiofs.
+    /// Each entry is a `host:guest[:ro]` spec (e.g. `/srv/work:/build:ro`).
+    /// Supported on Linux with the direct-kernel boot path only.
+    #[serde(default)]
+    pub mounts: Vec<String>,
 }
 
 /// Parameters for creating a host group.
@@ -446,6 +451,93 @@ fn validate_host_path(kind: &str, path: &Path) -> Result<(), CoreError> {
         _ => {}
     }
     Ok(())
+}
+
+/// Parse a `host:guest[:ro]` mount spec into a [`husker_vmm::HostShare`].
+///
+/// Rules:
+/// - `host` (part 0) must be a non-empty absolute path.
+/// - `guest` defaults to `/mnt/<basename of host>` when omitted.
+/// - A 2-part spec whose second part is exactly `ro` is treated as `host + read-only`
+///   with the default guest path. A caller who wants both a custom guest path and
+///   read-only access must supply all three parts: `host:guest:ro`.
+/// - `tag` is derived as `format!("fs{index}")`.
+pub fn parse_mount_spec(spec: &str, index: usize) -> Result<husker_vmm::HostShare, String> {
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    let host_str = parts[0];
+    if host_str.is_empty() {
+        return Err(format!("mount spec '{spec}': host path is empty"));
+    }
+    if !host_str.starts_with('/') {
+        return Err(format!(
+            "mount spec '{spec}': host path must be absolute, got '{host_str}'"
+        ));
+    }
+    if host_str.split('/').any(|seg| seg == "..") {
+        return Err(format!(
+            "mount spec '{spec}': host path must not contain '..' components"
+        ));
+    }
+    let tag = format!("fs{index}");
+    let default_guest = || {
+        let basename = std::path::Path::new(host_str)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("share");
+        format!("/mnt/{basename}")
+    };
+    match parts.as_slice() {
+        [_host] => Ok(husker_vmm::HostShare {
+            host: host_str.into(),
+            guest: default_guest(),
+            read_only: false,
+            tag,
+        }),
+        [_host, second] if *second == "ro" => Ok(husker_vmm::HostShare {
+            host: host_str.into(),
+            guest: default_guest(),
+            read_only: true,
+            tag,
+        }),
+        [_host, guest] => {
+            if guest.is_empty() {
+                return Err(format!("mount spec '{spec}': guest path is empty"));
+            }
+            if !guest.starts_with('/') {
+                return Err(format!(
+                    "mount spec '{spec}': guest path must be absolute, got '{guest}'"
+                ));
+            }
+            Ok(husker_vmm::HostShare {
+                host: host_str.into(),
+                guest: guest.to_string(),
+                read_only: false,
+                tag,
+            })
+        }
+        [_host, guest, trailing] => {
+            if guest.is_empty() {
+                return Err(format!("mount spec '{spec}': guest path is empty"));
+            }
+            if !guest.starts_with('/') {
+                return Err(format!(
+                    "mount spec '{spec}': guest path must be absolute, got '{guest}'"
+                ));
+            }
+            if *trailing != "ro" {
+                return Err(format!(
+                    "mount spec '{spec}': trailing option must be 'ro', got '{trailing}'"
+                ));
+            }
+            Ok(husker_vmm::HostShare {
+                host: host_str.into(),
+                guest: guest.to_string(),
+                read_only: true,
+                tag,
+            })
+        }
+        _ => Err(format!("mount spec '{spec}': invalid format")),
+    }
 }
 
 /// Tracks resources allocated during VM creation for rollback on failure.
@@ -1231,6 +1323,15 @@ impl<B: VmmBackend> HuskerCore<B> {
                 conventional.exists().then_some(conventional)
             });
 
+        // Parse and validate host-mount specs. Each spec is validated for path
+        // safety here; the API layer enforces the allowlist before forwarding.
+        let mut host_shares: Vec<husker_vmm::HostShare> = Vec::new();
+        for (i, spec) in req.mounts.iter().enumerate() {
+            let share = parse_mount_spec(spec, i).map_err(CoreError::InvalidArgument)?;
+            validate_host_path("mount", &share.host)?;
+            host_shares.push(share);
+        }
+
         // NAT direct-kernel VMs pass the static IP as a kernel boot parameter.
         // Cloud VMs (NAT and bridged) use cloud-init for network; kernel_args is None.
         let kernel_args = if is_cloud {
@@ -1248,7 +1349,17 @@ impl<B: VmmBackend> HuskerCore<B> {
                  ip={ip}::{gateway}:{netmask}::eth0:off",
                 ip = guest_ip.expect("direct-kernel boot is always NAT")
             );
-            Some(apply_boot_init(&base, boot_init.as_deref()))
+            let mut args = apply_boot_init(&base, boot_init.as_deref());
+            // Append one token per virtiofs share; the guest init reads these to
+            // determine which tags to mount and where.
+            for share in &host_shares {
+                let ro_suffix = if share.read_only { ":ro" } else { "" };
+                args.push_str(&format!(
+                    " husker.share={}={}{}",
+                    share.tag, share.guest, ro_suffix
+                ));
+            }
+            Some(args)
         };
 
         let vm_config = husker_vmm::VmConfig {
@@ -1267,6 +1378,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             seed_path,
             balloon: req.balloon,
             volume_path,
+            host_shares,
         };
 
         let info = self.vmm.create_vm(vm_config).await?;
@@ -2760,6 +2872,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 balloon: false,
                 volume: None,
                 network: None,
+                mounts: Vec::new(),
             })
             .await
             .map_err(|e| match e {
@@ -2966,6 +3079,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: false,
             volume: None,
             network: None,
+            mounts: Vec::new(),
         })
         .await
     }
@@ -4237,6 +4351,7 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             volume: svc.volume.clone(),
             // Services always use NAT; bridged networking is not supported for services.
             network: None,
+            mounts: Vec::new(),
         }
     } else {
         CreateVmRequest {
@@ -4256,6 +4371,7 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             volume: svc.volume.clone(),
             // Services always use NAT; bridged networking is not supported for services.
             network: None,
+            mounts: Vec::new(),
         }
     }
 }
@@ -6213,6 +6329,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             ssh_authorized_keys: vec![],
             balloon: false,
             volume: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -6262,6 +6379,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             ssh_authorized_keys: vec![],
             balloon: false,
             volume: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -6372,6 +6490,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             ssh_authorized_keys: vec![],
             balloon: false,
             volume: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -6610,6 +6729,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             ssh_authorized_keys: vec![],
             balloon: false,
             network: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -6649,6 +6769,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             ssh_authorized_keys: vec![],
             balloon: false,
             network: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -6688,6 +6809,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             ssh_authorized_keys: vec![],
             balloon: false,
             network: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -6752,6 +6874,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             ssh_authorized_keys: vec![],
             balloon: false,
             network: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm(req).await;
@@ -6866,6 +6989,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             network: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm_record(req, None, true).await.unwrap_err();
@@ -6906,6 +7030,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             network: None,
+            mounts: vec![],
         };
 
         let err = core.create_vm_record(req, None, true).await.unwrap_err();
@@ -6971,5 +7096,52 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
                 "daemon defaults should have filled the service kernel/rootfs; got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn parse_mount_spec_defaults_and_ro() {
+        let s = parse_mount_spec("/srv/work", 0).unwrap();
+        assert_eq!(
+            (s.host.as_path(), s.guest.as_str(), s.read_only, s.tag.as_str()),
+            (std::path::Path::new("/srv/work"), "/mnt/work", false, "fs0")
+        );
+        let s = parse_mount_spec("/srv/work:/build:ro", 2).unwrap();
+        assert_eq!(
+            (s.host.as_path(), s.guest.as_str(), s.read_only, s.tag.as_str()),
+            (std::path::Path::new("/srv/work"), "/build", true, "fs2")
+        );
+    }
+
+    #[test]
+    fn parse_mount_spec_two_part_ro_shorthand() {
+        // Two-part spec with second part exactly "ro" means host + read-only + default guest.
+        let s = parse_mount_spec("/data:ro", 1).unwrap();
+        assert_eq!(s.host.as_path(), std::path::Path::new("/data"));
+        assert_eq!(s.guest, "/mnt/data");
+        assert!(s.read_only);
+        assert_eq!(s.tag, "fs1");
+    }
+
+    #[test]
+    fn parse_mount_spec_two_part_custom_guest_rw() {
+        let s = parse_mount_spec("/host/src:/workspace", 3).unwrap();
+        assert_eq!(s.host.as_path(), std::path::Path::new("/host/src"));
+        assert_eq!(s.guest, "/workspace");
+        assert!(!s.read_only);
+        assert_eq!(s.tag, "fs3");
+    }
+
+    #[test]
+    fn parse_mount_spec_errors() {
+        // Relative host path.
+        assert!(parse_mount_spec("relative/path:/guest", 0).is_err());
+        // Empty host path.
+        assert!(parse_mount_spec(":/guest", 0).is_err());
+        // Non-absolute guest path.
+        assert!(parse_mount_spec("/host:relative/guest", 0).is_err());
+        // Unknown trailing option.
+        assert!(parse_mount_spec("/host:/guest:rw", 0).is_err());
+        // Host path with ".." component.
+        assert!(parse_mount_spec("/host/../etc:/guest", 0).is_err());
     }
 }

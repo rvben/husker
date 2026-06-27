@@ -279,6 +279,9 @@ pub struct ApiPolicy {
     pub exec_allowlist: Vec<String>,
     pub exec_denylist: Vec<String>,
     pub exec_env_allowlist: Vec<String>,
+    /// Host paths allowed as virtiofs mount sources. Empty means deny all mounts.
+    #[serde(default)]
+    pub allowed_mount_host_paths: Vec<String>,
 }
 
 impl Default for ApiPolicy {
@@ -295,6 +298,7 @@ impl Default for ApiPolicy {
             exec_allowlist: Vec::new(),
             exec_denylist: Vec::new(),
             exec_env_allowlist: Vec::new(),
+            allowed_mount_host_paths: Vec::new(),
         }
     }
 }
@@ -755,6 +759,28 @@ fn is_allowed_guest_path(path: &str, allowlist: &[String]) -> bool {
     if allowlist.is_empty() {
         return true;
     }
+    allowlist.iter().any(|prefix| {
+        let Some(p) = normalize_guest_path(prefix) else {
+            return false;
+        };
+        normalized == p || normalized.starts_with(&(p + "/"))
+    })
+}
+
+/// Check whether a host path is permitted by the mount allowlist.
+///
+/// Unlike guest-path gating, an empty allowlist DENIES all mounts. This is the
+/// safe default: operators must explicitly opt in to which host directories may
+/// be shared with guests.
+fn is_allowed_host_path(path: &str, allowlist: &[String]) -> bool {
+    if allowlist.is_empty() {
+        return false;
+    }
+    // Reuse normalize_guest_path: host paths are also absolute Unix paths and
+    // the same normalisation (strip CurDir, reject ParentDir) applies.
+    let Some(normalized) = normalize_guest_path(path) else {
+        return false;
+    };
     allowlist.iter().any(|prefix| {
         let Some(p) = normalize_guest_path(prefix) else {
             return false;
@@ -1946,6 +1972,31 @@ async fn create_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Json(req): Json<CreateVmRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let policy = current_policy();
+    for (i, spec) in req.mounts.iter().enumerate() {
+        let share = husker_core::parse_mount_spec(spec, i).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                error_response_with_hint(
+                    "invalid_mount_spec",
+                    e,
+                    "use the form host:guest[:ro] with absolute paths",
+                ),
+            )
+        })?;
+        let host_str = share.host.to_string_lossy();
+        if !is_allowed_host_path(&host_str, &policy.allowed_mount_host_paths) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                error_response_with_hint(
+                    "policy_mount_path_denied",
+                    format!("host path '{}' is not allowed for mount", share.host.display()),
+                    "set allowed_mount_host_paths in daemon config",
+                ),
+            ));
+        }
+    }
+
     let record = core.create_vm(req).await.map_err(map_error)?;
 
     core.spawn_userdata(&record);
@@ -5226,5 +5277,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let json = response_json(response).await;
         assert_eq!(json["code"], "volume_attached");
+    }
+
+    #[test]
+    fn mount_host_path_allowlist_enforcement() {
+        let allow = vec!["/srv".to_string(), "/data/shared".to_string()];
+
+        // Exact match on an allowlist prefix.
+        assert!(is_allowed_host_path("/srv", &allow));
+        // Path under an allowlist prefix.
+        assert!(is_allowed_host_path("/srv/work", &allow));
+        assert!(is_allowed_host_path("/data/shared/project", &allow));
+        // Not in the allowlist.
+        assert!(!is_allowed_host_path("/etc/passwd", &allow));
+        assert!(!is_allowed_host_path("/data", &allow));
+
+        // Empty allowlist must deny all paths.
+        let empty: Vec<String> = Vec::new();
+        assert!(!is_allowed_host_path("/srv/work", &empty));
+        assert!(!is_allowed_host_path("/", &empty));
+
+        // Relative and parent-traversal paths are rejected regardless of allowlist.
+        assert!(!is_allowed_host_path("relative/path", &allow));
+        assert!(!is_allowed_host_path("/srv/../etc", &allow));
     }
 }
