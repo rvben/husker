@@ -70,6 +70,9 @@
 # Empty lists allow all absolute guest paths.
 # allowed_read_paths = ["/tmp", "/var/log"]
 # allowed_write_paths = ["/tmp", "/var/tmp"]
+# Host directories that may be bind-mounted into guests via --mount.
+# Empty list denies all bind mounts (secure default).
+# allowed_mount_host_paths = ["/srv/husker-work", "/data/shared"]
 
 # Exec policy controls.
 # Empty allowlist permits all commands not explicitly denied.

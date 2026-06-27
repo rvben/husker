@@ -965,6 +965,8 @@ struct Config {
     allowed_read_paths: Vec<String>,
     #[serde(default)]
     allowed_write_paths: Vec<String>,
+    #[serde(default)]
+    allowed_mount_host_paths: Vec<String>,
     #[serde(default = "default_exec_timeout_secs")]
     exec_timeout_secs: u64,
     #[serde(default = "default_exec_timeout_max_secs")]
@@ -2068,6 +2070,7 @@ impl Default for Config {
             api_sensitive_rate_limit_per_minute: default_api_sensitive_rate_limit_per_minute(),
             allowed_read_paths: Vec::new(),
             allowed_write_paths: Vec::new(),
+            allowed_mount_host_paths: Vec::new(),
             exec_timeout_secs: default_exec_timeout_secs(),
             exec_timeout_max_secs: default_exec_timeout_max_secs(),
             exec_allowlist: Vec::new(),
@@ -6029,6 +6032,13 @@ fn apply_env_overrides(config: &mut Config) {
             .filter(|s| !s.is_empty())
             .collect();
     }
+    if let Ok(val) = std::env::var("HUSKER_ALLOWED_MOUNT_HOST_PATHS") {
+        config.allowed_mount_host_paths = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
     if let Ok(val) = std::env::var("HUSKER_EXEC_TIMEOUT_SECS")
         && let Ok(parsed) = val.parse::<u64>()
     {
@@ -6749,6 +6759,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         sensitive_rate_limit_per_minute: config.api_sensitive_rate_limit_per_minute,
         allowed_read_paths: config.allowed_read_paths.clone(),
         allowed_write_paths: config.allowed_write_paths.clone(),
+        allowed_mount_host_paths: config.allowed_mount_host_paths.clone(),
         exec_timeout_secs: config.exec_timeout_secs,
         exec_timeout_max_secs: config.exec_timeout_max_secs,
         exec_allowlist: config.exec_allowlist.clone(),
