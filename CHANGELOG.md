@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 
 
 
+
+## [0.4.23](https://github.com/rvben/husker/compare/v0.4.22...v0.4.23) - 2026-06-28
+
+### Added
+
+- **husker**: expose daemon profiles via GET /v1/profiles and husker profile list ([42d20af](https://github.com/rvben/husker/commit/42d20afd82dc6655ac83c80f2a106a522713304c))
+- **husker**: add configurable daemon-level default memory and vCPU count ([e629283](https://github.com/rvben/husker/commit/e62928372d36f4da05953e317eb75f24b5dfcd59))
+
+### Fixed
+
+- **profiles**: distinguish daemon offline from daemon with zero profiles ([56e94e7](https://github.com/rvben/husker/commit/56e94e70c06a24059fe314501f9d4079317401c5))
+- **husker**: surface auth/server errors from profiles fetch; annotate profile list in schema ([85ff808](https://github.com/rvben/husker/commit/85ff8082b8b277844eaa5212bec2bc8f90e80384))
+- **husker-core**: apply daemon default resources on all non-linux-net create paths ([21b2260](https://github.com/rvben/husker/commit/21b226000117797b79a2f71217832620e491bc32))
+- **profiles**: track merged-winner origin to fix daemon vs local path resolution ([8d5407c](https://github.com/rvben/husker/commit/8d5407cb0e9e917210973cc1304b7a515903ef5b))
+- **husker**: two P2 correctness fixes for daemon profiles and snapshot restore ([b420ebb](https://github.com/rvben/husker/commit/b420ebb413c31e0e8183ee9cb9e41a2eab0e422f))
+
 ## [0.4.22](https://github.com/rvben/husker/compare/v0.4.21...v0.4.22) - 2026-06-27
 
 ### Fixed
