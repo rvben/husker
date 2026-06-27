@@ -3,6 +3,26 @@
 All notable changes to this project are documented in this file.
 
 
+
+## [0.4.21](https://github.com/rvben/husker/compare/v0.4.20...v0.4.21) - 2026-06-27
+
+### Added
+
+- **husker-vmm**: auto-select qemu when host shares present and vmm unset ([9f578c4](https://github.com/rvben/husker/commit/9f578c4ca346b14dcb0bb94912d5f570edb7be8d))
+- **husker-api**: mounts request field + host-path allowlist + cmdline injection ([77cf44c](https://github.com/rvben/husker/commit/77cf44c8a5ef06c877622b0f1e99c7bb2dc01e87))
+- **husker-agent**: mount virtiofs host shares from cmdline ([4b35149](https://github.com/rvben/husker/commit/4b35149d8ee3f5553c9bfe1d18b7bc6103ad3df0))
+- **husker-vmm**: virtiofsd + vhost-user-fs device per host share ([403f186](https://github.com/rvben/husker/commit/403f1869fdd463de908e74ba1ec97295969b1d44))
+- **husker-vmm**: qemu shared memory-backend when host shares present ([464a2fe](https://github.com/rvben/husker/commit/464a2fe02a19af4c9b590f771d14ddd337cfdb91))
+- **husker-vmm**: firecracker rejects --mount host shares ([e2c4ce3](https://github.com/rvben/husker/commit/e2c4ce3bb1fa456c89dd8a62db6567b35fb0f2ed))
+- **husker**: --mount flag + profile mounts ([af7f8c0](https://github.com/rvben/husker/commit/af7f8c060a8d3043f9af34f466c8662107431e01))
+- **husker-vmm**: add HostShare + VmConfig.host_shares ([af847e6](https://github.com/rvben/husker/commit/af847e6f2bece5518bb1cb4018647d13ea5cba6e))
+
+### Fixed
+
+- **guest**: build a PVH-enabled microVM kernel so QEMU can direct-boot it ([7888b3a](https://github.com/rvben/husker/commit/7888b3a9765edc793bc1b5e1c612c6d5313b6663))
+- **husker-core**: set mounts on CreateVmRequest literals in tests ([6439605](https://github.com/rvben/husker/commit/6439605f865f29df68ab4004fd20e929d9af382a))
+- **husker**: propagate allowed_mount_host_paths to Config and ApiPolicy ([27b0441](https://github.com/rvben/husker/commit/27b044162f6de769b037f6c6dcd905cd5b90af91))
+
 ## [0.4.20](https://github.com/rvben/husker/compare/v0.4.19...v0.4.20) - 2026-06-25
 
 ### Fixed
