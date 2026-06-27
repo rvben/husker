@@ -74,12 +74,17 @@ jobs:
           mkdir -p stage
           KERNEL_SRC=$( [ "${{ matrix.arch }}" = "aarch64" ] && echo Image-virt || echo vmlinux )
           cp "$HOME/.local/share/husker/kernels/$KERNEL_SRC" "stage/kernel-${{ matrix.arch }}"
-          # The x86_64 kernel must carry the PVH ELF note (CONFIG_PVH) or QEMU
-          # cannot direct-boot it, and host bind-mounts (--mount) auto-select QEMU.
-          # Fail the publish loudly if a kernel bump ever drops the note.
+          # The x86_64 kernel must carry the PVH entry note or QEMU cannot
+          # direct-boot it, and host bind-mounts (--mount) auto-select QEMU. Match
+          # XEN_ELFNOTE_PHYS32_ENTRY (note type 0x12) SPECIFICALLY: QEMU's PVH
+          # loader keys off that note, and other Xen notes do not make the kernel
+          # QEMU-bootable, so a broad "any Xen note" check could pass a kernel that
+          # dropped CONFIG_PVH. readelf shows it as the decoded name or as
+          # "Unknown note type: (0x00000012)". Fail the publish loudly if it is gone.
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            readelf -n "stage/kernel-${{ matrix.arch }}" | grep -qiE 'Xen|phys32' \
-              || { echo "FATAL: kernel-${{ matrix.arch }} has no PVH ELF note (CONFIG_PVH lost)" >&2; exit 1; }
+            readelf -n "stage/kernel-${{ matrix.arch }}" \
+              | grep -qiE 'PHYS32_ENTRY|note type: \(0x0*12\)' \
+              || { echo "FATAL: kernel-${{ matrix.arch }} lacks the PVH PHYS32_ENTRY note (CONFIG_PVH lost)" >&2; exit 1; }
           fi
           INITRAMFS_SRC=$( [ "${{ matrix.arch }}" = "aarch64" ] && echo initramfs-virt.gz || echo initramfs-x86_64-virt.gz )
           cp "$HOME/.local/share/husker/kernels/$INITRAMFS_SRC" "stage/initramfs-${{ matrix.arch }}.gz"
