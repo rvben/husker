@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file.
 
 
 
+
+## [0.4.24](https://github.com/rvben/husker/compare/v0.4.23...v0.4.24) - 2026-06-28
+
+### Added
+
+- **husker-vmm**: send graceful flush before destroy_vm ([d941604](https://github.com/rvben/husker/commit/d94160412afc3f8fab43d7ef17d376de991ea057))
+- **husker-agent**: auto-mount /dev/vdb at /data in the supervisor ([f33fb45](https://github.com/rvben/husker/commit/f33fb45d02d07e22cdeff4d4984931b750000af9))
+- **husker-agent**: handle Shutdown request with sync and volume unmount ([4c80118](https://github.com/rvben/husker/commit/4c801183da93d604b0af47a4951b8d67794b6d0d))
+- **husker-agent-proto**: add Shutdown request and ShuttingDown response ([1095580](https://github.com/rvben/husker/commit/10955801762469ae88087219040882e489ed24fb))
+
+### Fixed
+
+- **husker-vmm**: bound the whole shutdown-ack read so a guest hung in sync cannot block destroy (codex review) ([4474611](https://github.com/rvben/husker/commit/4474611fc0510c8ab7350e3dbc5d12c8e434002a))
+- **husker-vmm**: wait for the sync ack (bounded) so large volume flushes complete before kill (codex review) ([7b7c30b](https://github.com/rvben/husker/commit/7b7c30b5e74b75163fc5bba7d91e2fab719be88a))
+- **husker-vmm**: bound the whole graceful-flush attempt so a wedged VM cannot delay destroy (codex review) ([dc944c5](https://github.com/rvben/husker/commit/dc944c5bc2bc4e25d17591a84b454fc1949b4209))
+
 ## [0.4.23](https://github.com/rvben/husker/compare/v0.4.22...v0.4.23) - 2026-06-28
 
 ### Added
