@@ -147,8 +147,15 @@ impl LinuxDispatchBackend {
         // GENEROUSLY (a large dirty cache on a slow disk takes seconds to flush)
         // but still bounded, so a guest stuck inside sync() can never block the
         // destroy indefinitely. A timeout here just falls through to the kill.
-        let _ = read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(30))
-            .await;
+        // `tokio::time::timeout` bounds the WHOLE read, including the common
+        // "guest accepted the request but has not sent any bytes yet" case (a
+        // hang inside sync() before the length prefix), which the message-level
+        // timeout alone does not cover.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(30)),
+        )
+        .await;
     }
 }
 
