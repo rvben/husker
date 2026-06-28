@@ -695,12 +695,55 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
             }),
         },
 
+        AgentRequest::Shutdown => {
+            // Flush all dirty pages and best-effort-unmount the data volume
+            // so writes to a `--volume` disk are durable before the host
+            // kills the VM process.
+            #[cfg(target_os = "linux")]
+            flush_and_unmount();
+            AgentResponse::ShuttingDown
+        }
+
         // ShellStart is handled in handle_connection before reaching here.
         // ShellData and ShellResize are only valid during an active shell session.
         AgentRequest::ShellStart(_) | AgentRequest::ShellData(_) | AgentRequest::ShellResize(_) => {
             AgentResponse::Error(ErrorResponse {
                 message: "shell messages are not valid outside a shell session".into(),
             })
+        }
+    }
+}
+
+/// Flush all dirty pages to disk, then best-effort-unmount `/data` (the
+/// auto-mounted volume) and any virtiofs shares mounted by the supervisor.
+///
+/// Called on receiving a `Shutdown` request so that writes to named volumes
+/// are durable before the host force-kills the VM. All unmount errors are
+/// ignored: a `sync()` before any `umount2()` is the durability guarantee,
+/// and a lazy detach (`MNT_DETACH`) is sufficient even when the umount
+/// itself fails.
+#[cfg(target_os = "linux")]
+fn flush_and_unmount() {
+    // SAFETY: sync() takes no pointers and has no preconditions; it queues
+    // all dirty page-cache and buffer-cache writes to their respective block
+    // devices and waits for completion.
+    unsafe { libc::sync() };
+
+    // Best-effort lazy unmount of the auto-mounted data volume.
+    let data = std::ffi::CString::new("/data").expect("no NUL in /data");
+    // SAFETY: data is a valid CString held for the call; MNT_DETACH detaches
+    // the mount from the name-space immediately and waits for all in-flight
+    // I/O (already flushed by sync) to drain before freeing the superblock.
+    unsafe { libc::umount2(data.as_ptr(), libc::MNT_DETACH) };
+
+    // Best-effort lazy unmount of virtiofs shares the supervisor mounted.
+    // Errors are ignored: the sync above is the durability guarantee.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        for (_tag, path, _ro) in supervisor::parse_shares(&cmdline) {
+            if let Ok(cpath) = std::ffi::CString::new(path.as_str()) {
+                // SAFETY: cpath is a valid CString held for the call.
+                unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) };
+            }
         }
     }
 }
@@ -989,6 +1032,18 @@ mod tests {
         assert_eq!(
             resolv_conf_contents(&["192.0.2.1".into(), "1.1.1.1".into()]),
             Some("nameserver 192.0.2.1\nnameserver 1.1.1.1\n".to_string())
+        );
+    }
+
+    // The sync/umount syscalls are Linux-gated; the response variant is asserted
+    // on all platforms because handle_request is cross-platform and always returns
+    // ShuttingDown (the no-op non-Linux path omits the syscalls only).
+    #[tokio::test]
+    async fn shutdown_returns_shutting_down() {
+        let response = handle_request(AgentRequest::Shutdown).await;
+        assert!(
+            matches!(response, AgentResponse::ShuttingDown),
+            "expected ShuttingDown, got {response:?}"
         );
     }
 }
