@@ -122,22 +122,21 @@ impl LinuxDispatchBackend {
     /// silently discarded. This is intentional: the flush is a best-effort
     /// durability improvement and must never prevent a VM from being destroyed.
     async fn graceful_flush(&self, id: Uuid) {
-        let Ok(mut stream) = self.vsock_connect(id, AGENT_VSOCK_PORT).await else {
-            return;
-        };
-        if write_message(&mut stream, &AgentRequest::Shutdown)
-            .await
-            .is_err()
-        {
-            return;
-        }
-        // 3 s is generous for a sync + umount on a microVM with a volume
-        // that was written by the workload. A timeout or protocol error is
-        // silently ignored: the sync() inside the agent already ran.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(3)),
-        )
+        // Bound the WHOLE best-effort attempt (connect + write + ack) in one
+        // timeout: a wedged guest or a vsock connect that never completes must
+        // never delay the hard destroy that follows. 3 s is generous for a sync
+        // + umount on a microVM. Every failure mode (no agent, connection
+        // refused, timeout, protocol error, dead VM) is silently discarded.
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stream = self.vsock_connect(id, AGENT_VSOCK_PORT).await.ok()?;
+            write_message(&mut stream, &AgentRequest::Shutdown)
+                .await
+                .ok()?;
+            let _ =
+                read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(3))
+                    .await;
+            Some(())
+        })
         .await;
     }
 }
