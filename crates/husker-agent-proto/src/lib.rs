@@ -38,6 +38,12 @@ pub enum AgentRequest {
     /// host-side identity (TAP/IP), so the live guest picks up the new address,
     /// gateway, and DNS.
     ReconfigureNetwork(ReconfigureNetworkRequest),
+
+    /// Flush all dirty pages to disk and unmount the data volume, then signal
+    /// readiness to be destroyed. Sent by the host as the first step of
+    /// `destroy_vm` so that writes to a named volume (`--volume`) are durable
+    /// even when the guest process is killed immediately after.
+    Shutdown,
 }
 
 /// Messages sent from the guest agent back to the host.
@@ -73,6 +79,10 @@ pub enum AgentResponse {
 
     /// Acknowledgement that the guest network was reconfigured.
     ReconfigureNetwork(ReconfigureNetworkResponse),
+
+    /// Acknowledgement that the guest has synced dirty pages and unmounted the
+    /// data volume; the host may now kill the VM process.
+    ShuttingDown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -590,6 +600,22 @@ mod tests {
         let encoded = encode_message(&pong).unwrap();
         let (decoded, _): (AgentResponse, usize) = decode_message(&encoded).unwrap().unwrap();
         assert!(matches!(decoded, AgentResponse::Pong));
+    }
+
+    #[test]
+    fn roundtrip_shutdown() {
+        let req = AgentRequest::Shutdown;
+        let encoded = encode_message(&req).unwrap();
+        let (decoded, consumed): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert!(matches!(decoded, AgentRequest::Shutdown));
+
+        let resp = AgentResponse::ShuttingDown;
+        let encoded = encode_message(&resp).unwrap();
+        let (decoded, consumed): (AgentResponse, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert!(matches!(decoded, AgentResponse::ShuttingDown));
     }
 
     #[test]
