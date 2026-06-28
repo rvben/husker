@@ -114,9 +114,10 @@ impl LinuxDispatchBackend {
             .ok_or(VmmError::VmNotFound(id))
     }
 
-    /// Send a `Shutdown` message to the in-guest agent and wait briefly for
-    /// the acknowledgement, causing the agent to call `sync()` and unmount the
-    /// data volume so writes are durable before the host kills the VM process.
+    /// Send a `Shutdown` message to the in-guest agent and wait for the
+    /// acknowledgement, causing the agent to call `sync()` and unmount the data
+    /// volume so writes are durable before the host kills the VM process. The
+    /// ack arrives only after `sync()` returns, so the wait tracks the flush.
     ///
     /// Every failure mode (no agent, connection refused, timeout, dead VM) is
     /// silently discarded. This is intentional: the flush is a best-effort
@@ -127,17 +128,27 @@ impl LinuxDispatchBackend {
         // never delay the hard destroy that follows. 3 s is generous for a sync
         // + umount on a microVM. Every failure mode (no agent, connection
         // refused, timeout, protocol error, dead VM) is silently discarded.
-        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        // Phase 1 - connect + deliver the Shutdown with a SHORT bound: a dead,
+        // old, or wedged VM that does not accept the connection promptly is not
+        // worth waiting on, so fall through to the hard kill.
+        let connected = tokio::time::timeout(Duration::from_secs(3), async {
             let mut stream = self.vsock_connect(id, AGENT_VSOCK_PORT).await.ok()?;
             write_message(&mut stream, &AgentRequest::Shutdown)
                 .await
                 .ok()?;
-            let _ =
-                read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(3))
-                    .await;
-            Some(())
+            Some(stream)
         })
         .await;
+        let Ok(Some(mut stream)) = connected else {
+            return;
+        };
+        // Phase 2 - the agent acks `ShuttingDown` only AFTER `sync()` returns, so
+        // waiting for the ack IS waiting for the volume to reach disk. Wait
+        // GENEROUSLY (a large dirty cache on a slow disk takes seconds to flush)
+        // but still bounded, so a guest stuck inside sync() can never block the
+        // destroy indefinitely. A timeout here just falls through to the kill.
+        let _ = read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(30))
+            .await;
     }
 }
 
