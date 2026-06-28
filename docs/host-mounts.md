@@ -44,13 +44,18 @@ husker job \
   --profile rust \
   --mount "$(pwd):/work" \
   --volume cargo-cache \
-  -- sh -c 'cd /work && cargo build --release'
+  -- sh -c 'cd /work && CARGO_HOME=/data cargo build --release'
 ```
 
 - `--profile rust` selects a pre-configured VM preset (CPUs, memory, image).
 - `--mount "$(pwd):/work"` shares the current directory into `/work` in the guest.
-- `--volume cargo-cache` attaches a named persistent disk so Cargo's registry and
-  compiled deps survive across jobs.
+- `--volume cargo-cache` attaches a named persistent disk. The guest agent
+  auto-mounts it at `/data` - no manual `mount /dev/vdb` step required.
+- `CARGO_HOME=/data` points Cargo at the auto-mounted volume so the registry
+  and compiled deps survive across jobs.
+- On teardown the daemon sends a graceful flush signal to the guest agent,
+  which calls `sync()` and unmounts `/data` before the VM process is killed,
+  so all writes to the volume are durable. No manual `sync; umount` is needed.
 - The build artifacts land in `$(pwd)/target/` on the host in real time.
 
 ## Security
@@ -71,6 +76,23 @@ daemon before the VM starts.
 For untrusted or agentic jobs, mount only the paths the job strictly needs. Do
 not add broad directories like `/home` or `/` to the allowlist.
 
+## Volume auto-mount and durable teardown
+
+When a volume is attached with `--volume <name>`, the guest supervisor
+auto-mounts it at `/data` before the workload starts. This applies to
+direct-kernel VMs (the default microVM path using a husker OCI image).
+Cloud-image VMs already mount `/dev/vdb` at `/data` via cloud-init and
+are handled by the same convention.
+
+On `destroy` (or when a `husker job` completes), the daemon sends a
+`Shutdown` message to the in-guest agent before killing the VM process.
+The agent calls `sync()` to flush all dirty pages to disk and unmounts
+`/data` with a lazy detach, then replies. The daemon waits up to 3 s for
+the reply before proceeding with the hard kill. This guarantees that writes
+to the volume are durable on the host even when the VM is force-killed.
+
+No manual `mount /dev/vdb ...`, `sync`, or `umount` step is needed.
+
 ## Known limitations
 
 **QEMU only.** Firecracker does not support virtiofs, so `--mount` runs on the
@@ -82,9 +104,10 @@ producing a VM without the share.
 **Cloud-image (UEFI) VMs.** When booting with `--cloud-image`, the virtiofs
 device is attached to the VM but the guest does not receive the
 `husker.share=` kernel command-line token (UEFI boot has no kernel command
-line). The guest-agent auto-mount path therefore does not trigger. Use the
-direct-kernel OCI rootfs path (`husker images pull`) for host shares; cloud
-images do not benefit from `--mount` in the current release.
+line). The guest-agent host-share auto-mount path therefore does not trigger
+for `--mount`. Use the direct-kernel OCI rootfs path (`husker images pull`)
+for host shares; cloud images do not benefit from `--mount` in the current
+release. Volume auto-mount (`--volume`) is unaffected: cloud-init handles it.
 
 **QEMU direct-kernel boot needs a PVH kernel.** The husker default x86_64 kernel
 (`husker images pull`) is built with `CONFIG_PVH`, so QEMU direct-boots it and

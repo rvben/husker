@@ -5,7 +5,11 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use husker_agent_proto::{
+    AGENT_VSOCK_PORT, AgentRequest, AgentResponse, read_message_with_timeout, write_message,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -109,6 +113,33 @@ impl LinuxDispatchBackend {
             .copied()
             .ok_or(VmmError::VmNotFound(id))
     }
+
+    /// Send a `Shutdown` message to the in-guest agent and wait briefly for
+    /// the acknowledgement, causing the agent to call `sync()` and unmount the
+    /// data volume so writes are durable before the host kills the VM process.
+    ///
+    /// Every failure mode (no agent, connection refused, timeout, dead VM) is
+    /// silently discarded. This is intentional: the flush is a best-effort
+    /// durability improvement and must never prevent a VM from being destroyed.
+    async fn graceful_flush(&self, id: Uuid) {
+        let Ok(mut stream) = self.vsock_connect(id, AGENT_VSOCK_PORT).await else {
+            return;
+        };
+        if write_message(&mut stream, &AgentRequest::Shutdown)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        // 3 s is generous for a sync + umount on a microVM with a volume
+        // that was written by the workload. A timeout or protocol error is
+        // silently ignored: the sync() inside the agent already ran.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(3)),
+        )
+        .await;
+    }
 }
 
 /// Selects the VMM backend kind for a new VM.
@@ -157,6 +188,10 @@ impl VmmBackend for LinuxDispatchBackend {
 
     async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
         let kind = self.kind_of(id).await?;
+        // Best-effort graceful flush before the hard kill. All errors are
+        // intentionally swallowed so a dead or agentless VM is destroyed
+        // just as before (no behavior change on failure paths).
+        self.graceful_flush(id).await;
         let result = match kind {
             VmmKind::Firecracker => self.firecracker.destroy_vm(id).await,
             VmmKind::Qemu => self.qemu.destroy_vm(id).await,
