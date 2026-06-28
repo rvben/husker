@@ -406,6 +406,44 @@ fn mount_virtiofs(tag: &str, path: &str, ro: bool) -> io::Result<()> {
     }
 }
 
+/// Mount `/dev/vdb` as ext4 at `/data` if the device is present. Called after
+/// virtiofs shares so the volume is available before any workload starts.
+///
+/// Cloud-image VMs already auto-mount via cloud-init. This brings direct-kernel
+/// VMs (the common microVM sandbox case) to parity: a job using `--volume`
+/// always finds its cache at `/data` without a manual `mount` call.
+///
+/// Best-effort: logs and returns on any failure. A missing `/dev/vdb` (no
+/// volume attached) is silently skipped.
+fn mount_volume_if_present() {
+    if !Path::new("/dev/vdb").exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all("/data");
+    let source = CString::new("/dev/vdb").expect("no NUL in /dev/vdb");
+    let target = CString::new("/data").expect("no NUL in /data");
+    let fstype = CString::new("ext4").expect("no NUL in ext4");
+    // SAFETY: all three pointers are valid CStrings held for the call; flags
+    // are 0 (default mount options); data pointer is null.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        info!("mounted /dev/vdb (ext4) on /data");
+    } else {
+        warn!(
+            "could not mount /dev/vdb on /data: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
 /// Reboot the guest immediately. Used when a critical init step fails: the host
 /// observes the VM exit and reports it, rather than the guest half-booting and
 /// accepting vsock while workloads mysteriously fail. Never returns.
@@ -463,6 +501,11 @@ pub fn run(cmdline: &str) -> ! {
             Err(e) => warn!("could not mount virtiofs share {tag} on {path}: {e}"),
         }
     }
+
+    // Auto-mount the persistent volume if one was attached. Cloud images
+    // already auto-mount /dev/vdb via cloud-init; this brings direct-kernel
+    // VMs to parity so jobs always find their volume cache at /data.
+    mount_volume_if_present();
 
     supervise()
 }
