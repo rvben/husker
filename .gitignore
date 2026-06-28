@@ -6,3 +6,4 @@
 .env
 *.ext4
 vmlinux
+.worktrees/
