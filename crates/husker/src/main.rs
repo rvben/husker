@@ -571,6 +571,11 @@ enum Commands {
     /// Emit a machine-readable contract of the CLI (commands, args, output
     /// fields, exit codes) for agent introspection
     Schema,
+
+    /// Diagnose host readiness (reflink, free space, backend) and print findings.
+    /// Tries the daemon first; falls back to a local probe when the target is local
+    /// and the daemon is unreachable.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -1182,6 +1187,52 @@ async fn fetch_daemon_profiles(
             .map(|(k, v)| (k, daemon_to_profile(v)))
             .collect(),
     ))
+}
+
+/// Fetch a diagnostics report from the daemon's `GET /v1/diagnostics` endpoint.
+async fn fetch_diagnostics(
+    api_url: &str,
+    client: &reqwest::Client,
+) -> anyhow::Result<husker_core::DiagnosticsReport> {
+    let resp = client
+        .get(format!("{api_url}/v1/diagnostics"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp.json().await?)
+}
+
+/// True when the API URL targets the local daemon, so a local probe is valid
+/// as a fallback when the daemon is not running.
+fn is_local_api(api_url: &str) -> bool {
+    api_url.contains("127.0.0.1") || api_url.contains("localhost")
+}
+
+/// Map a diagnostics report to a process exit code: 1 on any hard failure,
+/// 0 otherwise (warnings are reported but do not fail).
+fn doctor_exit_code(report: &husker_core::DiagnosticsReport) -> i32 {
+    if report.has_failure() {
+        exit_code::GENERAL
+    } else {
+        0
+    }
+}
+
+/// Render a diagnostics report as `[ok/warn/FAIL] name: message` lines (text)
+/// or a JSON array (JSON format).
+fn render_diagnostics(report: &husker_core::DiagnosticsReport, format: OutputFormat) {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(report).unwrap());
+        return;
+    }
+    for c in &report.checks {
+        let tag = match c.status {
+            husker_core::CheckStatus::Ok => "ok  ",
+            husker_core::CheckStatus::Warn => "warn",
+            husker_core::CheckStatus::Fail => "FAIL",
+        };
+        println!("[{tag}] {}: {}", c.name, c.message);
+    }
 }
 
 /// Whether the winning profile entry came from the local config or the daemon.
@@ -2153,6 +2204,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "context list"
             | "context show"
             | "profile list"
+            | "doctor"
     );
     let output_fields: Vec<&'static str> = match path {
         "balloon" => vec!["status", "action", "vm", "amount_mib"],
@@ -2203,6 +2255,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "context add" => vec!["status", "action", "name", "api_url"],
         "context use" | "context remove" => vec!["status", "action", "name"],
         "profile list" => vec!["status", "action", "profiles"],
+        "doctor" => vec!["name", "status", "message"],
         _ => vec![],
     };
     (!read_only, output_fields)
@@ -4114,6 +4167,45 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Doctor => {
+            let config = load_config(config_path.as_deref());
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()?;
+            let report = match fetch_diagnostics(&api_url, &client).await {
+                Ok(r) => r,
+                Err(_) if is_local_api(&api_url) => {
+                    // Daemon is not running locally: run the probe directly on the host.
+                    let storage = husker_storage::StorageConfig {
+                        data_dir: config.data_dir.clone(),
+                        state_dir: config.effective_state_dir(),
+                    };
+                    let storage_volume = config.storage_volume;
+                    tokio::task::spawn_blocking(move || {
+                        husker_core::build_diagnostics(&storage, storage_volume)
+                    })
+                    .await
+                    .unwrap_or(husker_core::DiagnosticsReport { checks: Vec::new() })
+                }
+                Err(e) => {
+                    exit_with_error(
+                        output,
+                        ApiFailure {
+                            message: format!("daemon unreachable: {e}"),
+                            code: None,
+                            exit_code: exit_code::DAEMON_UNREACHABLE,
+                            hint: None,
+                        },
+                    );
+                }
+            };
+            render_diagnostics(&report, output);
+            let code = doctor_exit_code(&report);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Commands::Context { .. } => {
             unreachable!("Context is handled before daemon-target resolution in run()")
         }
@@ -10740,5 +10832,26 @@ mod tests {
         assert!(storage_mount_satisfied(false, false)); // flag off -> always ok
         assert!(storage_mount_satisfied(true, true)); // mounted -> ok
         assert!(!storage_mount_satisfied(true, false)); // flag on, not mounted -> refuse
+    }
+
+    #[test]
+    fn doctor_exit_code_from_report() {
+        use husker_core::{CheckResult, CheckStatus, DiagnosticsReport};
+        let ok = DiagnosticsReport {
+            checks: vec![CheckResult {
+                name: "x".into(),
+                status: CheckStatus::Warn,
+                message: "m".into(),
+            }],
+        };
+        assert_eq!(doctor_exit_code(&ok), 0); // warnings do not fail
+        let bad = DiagnosticsReport {
+            checks: vec![CheckResult {
+                name: "x".into(),
+                status: CheckStatus::Fail,
+                message: "m".into(),
+            }],
+        };
+        assert_eq!(doctor_exit_code(&bad), exit_code::GENERAL);
     }
 }
