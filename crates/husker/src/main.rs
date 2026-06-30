@@ -4342,7 +4342,9 @@ async fn run(cli: Cli) -> Result<()> {
                         let script = ss::render_migration_script(&plan);
                         let unit = ss::render_systemd_mount_unit(&plan);
                         if let Some(dir) = out {
-                            std::fs::create_dir_all(&dir).ok();
+                            if let Err(e) = std::fs::create_dir_all(&dir) {
+                                exit_with_error(output, format!("cannot create {}: {e}", dir.display()));
+                            }
                             let script_path = dir.join("husker-setup-storage.sh");
                             let unit_path = dir.join("husker-storage.mount");
                             if !yes && (script_path.exists() || unit_path.exists()) {
@@ -4352,8 +4354,12 @@ async fn run(cli: Cli) -> Result<()> {
                                     output,
                                 );
                             }
-                            std::fs::write(&script_path, &script).expect("write script");
-                            std::fs::write(&unit_path, &unit).expect("write unit");
+                            std::fs::write(&script_path, &script).unwrap_or_else(|e| {
+                                exit_with_error(output, format!("cannot write {}: {e}", script_path.display()))
+                            });
+                            std::fs::write(&unit_path, &unit).unwrap_or_else(|e| {
+                                exit_with_error(output, format!("cannot write {}: {e}", unit_path.display()))
+                            });
                             println!(
                                 "wrote {} and {}",
                                 script_path.display(),
