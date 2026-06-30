@@ -5903,7 +5903,7 @@ async fn run_shell(
     let vm_id = vm["id"].as_str().context("missing VM id")?;
 
     let config = load_config(config_path.as_deref());
-    let runtime_dir = config.data_dir.join("run");
+    let runtime_dir = config.effective_state_dir().join("run");
     let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
 
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -7137,8 +7137,29 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         config
     };
 
-    let runtime_dir = config.data_dir.join("run");
-    let db_path = config.data_dir.join("husker.db");
+    let storage = husker_storage::StorageConfig {
+        data_dir: config.data_dir.clone(),
+        state_dir: config.effective_state_dir(),
+    };
+
+    // Mount guard: when data_dir is a dedicated storage mount, refuse to start
+    // (and create nothing under it) until the loopback is actually mounted.
+    if !storage_mount_satisfied(config.storage_volume, storage.sentinel_path().exists()) {
+        anyhow::bail!(
+            "storage_volume is enabled but the storage loopback is not mounted \
+             (sentinel {} missing). Mount it before starting husker \
+             (systemctl start the .mount unit, or mount -o loop the image).",
+            storage.sentinel_path().display()
+        );
+    }
+
+    // Daemon lock: refuse to start a second daemon against the same state dir.
+    std::fs::create_dir_all(storage.state_dir.clone()).context("creating state directory")?;
+    let _daemon_lock = acquire_daemon_lock(&storage.lock_path())
+        .context("another husker daemon is already running (state dir is locked)")?;
+
+    let runtime_dir = storage.runtime_dir();
+    let db_path = storage.db_path();
     let api_token = config.api_token.clone();
     let service_reconcile_enabled = config.service_reconcile_enabled;
     let service_reconcile_interval = config.service_reconcile_interval_secs;
@@ -7159,7 +7180,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     husker_api::set_policy(api_policy);
 
     std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
-    std::fs::create_dir_all(config.data_dir.join("vms")).context("creating vms directory")?;
+    std::fs::create_dir_all(storage.vms_dir()).context("creating vms directory")?;
 
     let state = husker_state::StateStore::open(&db_path).context("opening state database")?;
 
@@ -7189,11 +7210,6 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     state
         .ensure_cid_base(config.cid_base)
         .context("applying cid_base")?;
-
-    let storage = husker_storage::StorageConfig {
-        data_dir: config.data_dir.clone(),
-        state_dir: config.data_dir.clone(),
-    };
 
     #[cfg(feature = "linux-net")]
     {
