@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 pub mod firecracker;
 pub mod images;
+pub mod storage_setup;
 
 /// The guest agent binary embedded by `build.rs` (from the musl build output or
 /// `HUSKER_EMBED_AGENT_BIN`). Empty when no agent was embedded at build time, in
