@@ -4890,15 +4890,21 @@ fn available_bytes(path: &std::path::Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
 /// Whether an executable is on `PATH`.
 fn binary_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+    std::env::split_paths(&paths).any(|dir| {
+        let p = dir.join(name);
+        std::fs::metadata(&p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
 }
 
 /// Build the host diagnostics report. Pure host inspection (no backend state),
@@ -7502,8 +7508,11 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         // Always includes the reflink and free-space checks by name.
         assert!(report.checks.iter().any(|c| c.name == "data-dir reflink"));
         assert!(report.checks.iter().any(|c| c.name == "data-dir free space"));
-        // storage_volume=false => the mount check must not be a failure.
-        assert!(!report.has_failure() || report.checks.iter().all(|c| c.name != "storage volume mount"));
+        // storage_volume=false => the mount check must be absent entirely.
+        assert!(
+            !report.checks.iter().any(|c| c.name == "storage volume mount"),
+            "mount check must not appear when storage_volume=false"
+        );
     }
 
     #[test]
