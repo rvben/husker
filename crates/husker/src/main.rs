@@ -572,10 +572,59 @@ enum Commands {
     /// fields, exit codes) for agent introspection
     Schema,
 
+    /// Generate a one-time migration to a reflink-capable storage volume
+    Setup {
+        #[command(subcommand)]
+        action: SetupAction,
+    },
+
     /// Diagnose host readiness (reflink, free space, backend) and print findings.
     /// Tries the daemon first; falls back to a local probe when the target is local
     /// and the daemon is unreachable.
     Doctor,
+}
+
+#[derive(clap::Subcommand)]
+enum SetupAction {
+    /// Generate the script + unit to migrate the data dir onto a reflink volume
+    Storage {
+        /// Where the DB + runtime relocate (default: <data_dir>-state)
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Loopback image path (default: <data_dir>.img)
+        #[arg(long)]
+        image_path: Option<PathBuf>,
+        /// Loopback size, e.g. 50G (default: bulk usage + margin, capped at 80% free)
+        #[arg(long)]
+        size: Option<String>,
+        /// Filesystem for the loopback
+        #[arg(long, value_enum, default_value = "xfs")]
+        fs: SetupFsArg,
+        /// Reboot persistence mechanism
+        #[arg(long, value_enum, default_value = "systemd")]
+        persist: SetupPersistArg,
+        /// Thin-provision the loopback (sparse; documents the ENOSPC risk)
+        #[arg(long)]
+        thin: bool,
+        /// Write the script + unit into this directory instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Skip the overwrite confirmation when --out targets existing files
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SetupFsArg {
+    Xfs,
+    Btrfs,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SetupPersistArg {
+    Systemd,
+    Fstab,
 }
 
 #[derive(Subcommand)]
@@ -2171,6 +2220,69 @@ fn schema_global_args(root: &clap::Command) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Bytes available to a non-privileged writer on the fs backing `path`.
+fn available_bytes_for(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// Total apparent size of `path` (best-effort recursive sum; 0 if unreadable).
+fn dir_usage_bytes(path: &Path) -> u64 {
+    fn walk(p: &Path, acc: &mut u64) {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let Ok(ft) = e.file_type() else { continue };
+                if ft.is_dir() {
+                    walk(&e.path(), acc);
+                } else if let Ok(m) = e.metadata() {
+                    *acc += m.len();
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(path, &mut acc);
+    acc
+}
+
+/// Whether an executable is on PATH (with an execute bit).
+fn which_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|d| {
+                let p = d.join(name);
+                std::fs::metadata(&p)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The managed config file the migration script edits: the first existing of
+/// the discovery order, else the system default.
+fn config_path_or_default() -> PathBuf {
+    let user = dirs_config_husker();
+    if user.exists() {
+        return user;
+    }
+    PathBuf::from("/etc/husker/config.toml")
+}
+
+/// `~/.config/husker/config.toml`.
+fn dirs_config_husker() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".config/husker/config.toml")
+}
+
 /// Manual annotations clap cannot derive: whether a command mutates state, and
 /// the fields its JSON output emits. Read-only commands are listed explicitly;
 /// everything else is treated as mutating. `output_fields` are provided for the
@@ -2205,6 +2317,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
             | "context show"
             | "profile list"
             | "doctor"
+            | "setup storage"
     );
     let output_fields: Vec<&'static str> = match path {
         "balloon" => vec!["status", "action", "vm", "amount_mib"],
@@ -2256,6 +2369,7 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "context use" | "context remove" => vec!["status", "action", "name"],
         "profile list" => vec!["status", "action", "profiles"],
         "doctor" => vec!["name", "status", "message"],
+        "setup storage" => vec!["status", "script_path", "unit_path"],
         _ => vec![],
     };
     (!read_only, output_fields)
@@ -4162,6 +4276,99 @@ async fn run(cli: Cli) -> Result<()> {
                         println!(
                             "\n(daemon profiles unavailable - offline or daemon does not support GET /v1/profiles)"
                         );
+                    }
+                }
+                Ok(())
+            }
+        },
+        Commands::Setup { action } => match action {
+            SetupAction::Storage {
+                state_dir,
+                image_path,
+                size,
+                fs,
+                persist,
+                thin,
+                out,
+                yes,
+            } => {
+                use husker::storage_setup as ss;
+                let config = load_config(config_path.as_deref());
+                let data_dir = config.data_dir.clone();
+                let images_dir = data_dir.join("images");
+                let vms_dir = data_dir.join("vms");
+                let reflink = husker_storage::probe_reflink(&images_dir, &vms_dir)
+                    .unwrap_or(husker_storage::ReflinkStatus::FullCopy);
+                let fs_enum = match fs {
+                    SetupFsArg::Xfs => ss::SetupFs::Xfs,
+                    SetupFsArg::Btrfs => ss::SetupFs::Btrfs,
+                };
+                let facts = ss::StorageSetupHostFacts {
+                    reflink,
+                    free_bytes: available_bytes_for(&data_dir).unwrap_or(0),
+                    bulk_usage_bytes: dir_usage_bytes(&data_dir),
+                    mkfs_available: which_on_path(match fs {
+                        SetupFsArg::Xfs => "mkfs.xfs",
+                        SetupFsArg::Btrfs => "mkfs.btrfs",
+                    }),
+                    rsync_available: which_on_path("rsync"),
+                    is_local_context: is_local_api(&api_url),
+                };
+                let opts = ss::StorageSetupOptions {
+                    state_dir,
+                    image_path,
+                    size,
+                    fs: fs_enum,
+                    persist: match persist {
+                        SetupPersistArg::Systemd => ss::SetupPersist::Systemd,
+                        SetupPersistArg::Fstab => ss::SetupPersist::Fstab,
+                    },
+                    thin,
+                };
+                let config_file = config_path_or_default();
+                match ss::build_storage_setup_plan(
+                    &data_dir,
+                    &config_file,
+                    "127.0.0.1:7777",
+                    opts,
+                    &facts,
+                ) {
+                    Ok(ss::SetupOutcome::AlreadyReflink) => {
+                        println!(
+                            "data dir already supports reflink (copy-on-write); no migration needed."
+                        );
+                    }
+                    Ok(ss::SetupOutcome::Plan(plan)) => {
+                        let script = ss::render_migration_script(&plan);
+                        let unit = ss::render_systemd_mount_unit(&plan);
+                        if let Some(dir) = out {
+                            std::fs::create_dir_all(&dir).ok();
+                            let script_path = dir.join("husker-setup-storage.sh");
+                            let unit_path = dir.join("husker-storage.mount");
+                            if !yes && (script_path.exists() || unit_path.exists()) {
+                                require_confirmation(
+                                    &format!("overwrite files in {}?", dir.display()),
+                                    yes,
+                                    output,
+                                );
+                            }
+                            std::fs::write(&script_path, &script).expect("write script");
+                            std::fs::write(&unit_path, &unit).expect("write unit");
+                            println!(
+                                "wrote {} and {}",
+                                script_path.display(),
+                                unit_path.display()
+                            );
+                            println!(
+                                "review, then run as root on the daemon host: sudo bash {}",
+                                script_path.display()
+                            );
+                        } else {
+                            print!("{script}");
+                        }
+                    }
+                    Err(e) => {
+                        exit_with_error(output, e.to_string());
                     }
                 }
                 Ok(())
@@ -10860,5 +11067,12 @@ mod tests {
             }],
         };
         assert_eq!(doctor_exit_code(&bad), exit_code::GENERAL);
+    }
+
+    #[test]
+    fn setup_storage_in_schema_is_read_only() {
+        // build_cli_schema derives from clap; the annotation marks setup storage read-only.
+        let (mutating, _fields) = schema_command_annotations("setup storage");
+        assert!(!mutating, "setup storage only prints/writes files; must be read-only");
     }
 }
