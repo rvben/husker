@@ -7088,6 +7088,35 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
     }
 }
 
+/// Acquire an exclusive, non-blocking advisory lock on the daemon lock file.
+/// The returned `File` must be kept alive for the daemon's lifetime; the lock
+/// releases when it is dropped or the process exits. An error means another
+/// process already holds it (a daemon is running).
+fn acquire_daemon_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    // SAFETY: file owns a valid fd for the duration of this call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Whether the daemon may proceed under the storage-volume policy. When the
+/// data dir is a dedicated mount (`storage_volume`), the loopback must be
+/// mounted, proven by the sentinel file existing under the data dir.
+fn storage_mount_satisfied(storage_volume: bool, sentinel_exists: bool) -> bool {
+    !storage_volume || sentinel_exists
+}
+
 async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     tracing::info!("starting husker daemon");
 
@@ -10679,5 +10708,21 @@ mod tests {
             cfg.effective_state_dir(),
             PathBuf::from("/var/lib/husker-state")
         );
+    }
+
+    #[test]
+    fn second_daemon_lock_acquisition_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("husker.lock");
+        let _held = acquire_daemon_lock(&lock).expect("first lock acquires");
+        // A second exclusive non-blocking lock on the same path must fail.
+        assert!(acquire_daemon_lock(&lock).is_err());
+    }
+
+    #[test]
+    fn mount_guard_logic() {
+        assert!(storage_mount_satisfied(false, false)); // flag off -> always ok
+        assert!(storage_mount_satisfied(true, true)); // mounted -> ok
+        assert!(!storage_mount_satisfied(true, false)); // flag on, not mounted -> refuse
     }
 }
