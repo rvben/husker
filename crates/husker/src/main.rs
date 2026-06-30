@@ -1205,7 +1205,7 @@ async fn fetch_diagnostics(
 /// True when the API URL targets the local daemon, so a local probe is valid
 /// as a fallback when the daemon is not running.
 fn is_local_api(api_url: &str) -> bool {
-    api_url.contains("127.0.0.1") || api_url.contains("localhost")
+    api_url.contains("127.0.0.1") || api_url.contains("localhost") || api_url.contains("[::1]")
 }
 
 /// Map a diagnostics report to a process exit code: 1 on any hard failure,
@@ -4176,16 +4176,23 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(r) => r,
                 Err(_) if is_local_api(&api_url) => {
                     // Daemon is not running locally: run the probe directly on the host.
+                    eprintln!("(daemon not reachable; running local host probe)");
                     let storage = husker_storage::StorageConfig {
                         data_dir: config.data_dir.clone(),
                         state_dir: config.effective_state_dir(),
                     };
                     let storage_volume = config.storage_volume;
-                    tokio::task::spawn_blocking(move || {
+                    match tokio::task::spawn_blocking(move || {
                         husker_core::build_diagnostics(&storage, storage_volume)
                     })
                     .await
-                    .unwrap_or(husker_core::DiagnosticsReport { checks: Vec::new() })
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("diagnostics probe failed: {e}");
+                            husker_core::DiagnosticsReport { checks: Vec::new() }
+                        }
+                    }
                 }
                 Err(e) => {
                     exit_with_error(

@@ -104,6 +104,7 @@ async fn openapi_contains_critical_paths() {
         "/v1/vms/{name}/logs",
         "/v1/vms/{name}/ready",
         "/v1/vms/{name}/shell",
+        "/v1/diagnostics",
     ] {
         assert!(
             paths.contains_key(required),

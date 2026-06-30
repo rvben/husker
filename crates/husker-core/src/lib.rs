@@ -4850,6 +4850,7 @@ async fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::
 
 /// Severity of a single diagnostic check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Ok,
@@ -4859,6 +4860,7 @@ pub enum CheckStatus {
 
 /// One diagnostic check result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct CheckResult {
     pub name: String,
     pub status: CheckStatus,
@@ -4868,6 +4870,7 @@ pub struct CheckResult {
 /// Full host diagnostics report. Computed daemon-side (for remote contexts) or
 /// locally by the CLI when the daemon is down.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct DiagnosticsReport {
     pub checks: Vec<CheckResult>,
 }

@@ -23,11 +23,12 @@ use utoipa::OpenApi;
 use utoipa::ToSchema;
 
 use husker_core::{
-    CoreError, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest,
-    CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest,
-    DaemonProfile, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
-    ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
-    ServiceRecord, ShellEvent, SnapshotRecord, VmRecord, VolumeRecord,
+    CheckResult, CheckStatus, CoreError, CreateHostGroupRequest, CreatePoolRequest,
+    CreateSecretRequest, CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest,
+    CreateVolumeRequest, DaemonProfile, DiagnosticsReport, ExportImageRequest, ExportImageResult,
+    HostGroupRecord, HuskerCore, ImageRecord, ImportImageRequest, PoolRecord,
+    RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata, ServiceRecord, ShellEvent,
+    SnapshotRecord, VmRecord, VolumeRecord,
 };
 use husker_vmm::VmmBackend;
 
@@ -614,6 +615,7 @@ pub enum WsShellOutput {
         get_logs,
         get_ready,
         metrics_handler,
+        diagnostics,
     ),
     components(schemas(
         VmResponse,
@@ -664,6 +666,9 @@ pub enum WsShellOutput {
         ScaleServiceRequest,
         BalloonRequest,
         CreateVmRequest,
+        DiagnosticsReport,
+        CheckResult,
+        CheckStatus,
     )),
     tags(
         (name = "vms", description = "VM lifecycle management"),
@@ -1248,17 +1253,31 @@ async fn list_profiles<B: VmmBackend + 'static>(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/diagnostics",
+    tag = "health",
+    responses(
+        (status = 200, description = "Host diagnostic checks (reflink, free space, backend)", body = DiagnosticsReport)
+    )
+)]
 /// GET /v1/diagnostics - host-side health checks (reflink, free space, backend).
 async fn diagnostics<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
-) -> Json<husker_core::DiagnosticsReport> {
+) -> Json<DiagnosticsReport> {
     let storage = core.storage_config().clone();
     // probe_reflink does blocking fs IO; run it off the async executor.
-    let report = tokio::task::spawn_blocking(move || {
+    let report = match tokio::task::spawn_blocking(move || {
         husker_core::build_diagnostics(&storage, false)
     })
     .await
-    .unwrap_or(husker_core::DiagnosticsReport { checks: Vec::new() });
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "diagnostics probe task panicked");
+            DiagnosticsReport { checks: Vec::new() }
+        }
+    };
     Json(report)
 }
 
