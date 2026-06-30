@@ -1,6 +1,6 @@
 //! Generator for the one-time `husker setup storage` migration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Filesystem for the reflink-capable loopback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +110,134 @@ pub fn render_fstab_line(plan: &StorageSetupPlan) -> String {
     )
 }
 
+/// Caller-supplied options (from the CLI flags).
+#[derive(Debug, Clone)]
+pub struct StorageSetupOptions {
+    pub state_dir: Option<PathBuf>,
+    pub image_path: Option<PathBuf>,
+    pub size: Option<String>,
+    pub fs: SetupFs,
+    pub persist: SetupPersist,
+    pub thin: bool,
+}
+
+/// Host facts gathered by the caller (injected so the builder stays pure).
+#[derive(Debug, Clone)]
+pub struct StorageSetupHostFacts {
+    pub reflink: husker_storage::ReflinkStatus,
+    pub free_bytes: u64,
+    pub bulk_usage_bytes: u64,
+    pub mkfs_available: bool,
+    pub rsync_available: bool,
+    pub is_local_context: bool,
+}
+
+/// Result of planning: a no-op (already reflink) or a validated plan.
+#[derive(Debug)]
+pub enum SetupOutcome {
+    AlreadyReflink,
+    Plan(StorageSetupPlan),
+}
+
+/// Why a plan could not be built. Maps to a process exit code.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error("setup storage runs on the daemon host; ssh to it and run there")]
+    RemoteContext,
+    #[error("required tool not found on PATH: {0}")]
+    MissingTool(String),
+    #[error("insufficient space: need >= {needed} bytes free, have {have}")]
+    InsufficientSpace { needed: u64, have: u64 },
+    #[error("{0} must not live under the data dir (the mount would hide it)")]
+    PathUnderDataDir(PathBuf),
+}
+
+impl SetupError {
+    pub fn exit_code(&self) -> i32 {
+        // All generate-time refusals are GENERAL(1); the daemon-running CONFLICT
+        // is enforced by the generated script at run time, not here.
+        1
+    }
+}
+
+/// Margin (bytes) required on top of the current bulk usage, since the
+/// migration transiently holds the original bulk plus the loopback copy.
+const SPACE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn human_size(bytes: u64) -> String {
+    let gib = bytes.div_ceil(1024 * 1024 * 1024).max(1);
+    format!("{gib}G")
+}
+
+/// Build a validated migration plan from config + flags + injected host facts.
+pub fn build_storage_setup_plan(
+    data_dir: &Path,
+    config_file: &Path,
+    api_addr: &str,
+    opts: StorageSetupOptions,
+    facts: &StorageSetupHostFacts,
+) -> Result<SetupOutcome, SetupError> {
+    if !facts.is_local_context {
+        return Err(SetupError::RemoteContext);
+    }
+    if matches!(facts.reflink, husker_storage::ReflinkStatus::Supported) {
+        return Ok(SetupOutcome::AlreadyReflink);
+    }
+    if !facts.mkfs_available {
+        return Err(SetupError::MissingTool(match opts.fs {
+            SetupFs::Xfs => "mkfs.xfs".into(),
+            SetupFs::Btrfs => "mkfs.btrfs".into(),
+        }));
+    }
+    if !facts.rsync_available {
+        return Err(SetupError::MissingTool("rsync".into()));
+    }
+
+    let state_dir = opts
+        .state_dir
+        .unwrap_or_else(|| sibling(data_dir, "-state"));
+    let image_path = opts
+        .image_path
+        .unwrap_or_else(|| sibling(data_dir, ".img"));
+    if state_dir.starts_with(data_dir) {
+        return Err(SetupError::PathUnderDataDir(state_dir));
+    }
+    if image_path.starts_with(data_dir) {
+        return Err(SetupError::PathUnderDataDir(image_path));
+    }
+
+    let needed = facts.bulk_usage_bytes + SPACE_MARGIN_BYTES;
+    if facts.free_bytes < needed {
+        return Err(SetupError::InsufficientSpace {
+            needed,
+            have: facts.free_bytes,
+        });
+    }
+    // Default loopback size: the current bulk plus a fixed headroom margin
+    // (preallocated, so we keep it conservative; the operator sizes up with
+    // --size if they expect growth). The precondition guarantees free >= needed.
+    let size = opts.size.unwrap_or_else(|| human_size(needed));
+
+    Ok(SetupOutcome::Plan(StorageSetupPlan {
+        data_dir: data_dir.to_path_buf(),
+        state_dir,
+        image_path,
+        size,
+        fs: opts.fs,
+        persist: opts.persist,
+        thin: opts.thin,
+        config_file: config_file.to_path_buf(),
+        api_addr: api_addr.to_string(),
+    }))
+}
+
+/// `<dir><suffix>` as a sibling path (e.g. `/var/lib/husker` + `-state`).
+fn sibling(dir: &Path, suffix: &str) -> PathBuf {
+    let mut s = dir.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +328,88 @@ mod tests {
         let s = render_migration_script(&plan);
         assert!(s.contains("mkfs.btrfs"));
         assert!(!s.contains("mkfs.xfs"));
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+    use husker_storage::ReflinkStatus;
+
+    fn facts() -> StorageSetupHostFacts {
+        StorageSetupHostFacts {
+            reflink: ReflinkStatus::FullCopy,
+            free_bytes: 100 * 1024 * 1024 * 1024,
+            bulk_usage_bytes: 5 * 1024 * 1024 * 1024,
+            mkfs_available: true,
+            rsync_available: true,
+            is_local_context: true,
+        }
+    }
+    fn opts() -> StorageSetupOptions {
+        StorageSetupOptions {
+            state_dir: None,
+            image_path: None,
+            size: None,
+            fs: SetupFs::Xfs,
+            persist: SetupPersist::Systemd,
+            thin: false,
+        }
+    }
+    fn build(o: StorageSetupOptions, f: StorageSetupHostFacts) -> Result<SetupOutcome, SetupError> {
+        build_storage_setup_plan(
+            std::path::Path::new("/var/lib/husker"),
+            std::path::Path::new("/etc/husker/config.toml"),
+            "127.0.0.1:7777",
+            o,
+            &f,
+        )
+    }
+
+    #[test]
+    fn default_plan_uses_sibling_state_and_image() {
+        let SetupOutcome::Plan(p) = build(opts(), facts()).unwrap() else {
+            panic!("expected a plan");
+        };
+        assert_eq!(p.state_dir, std::path::PathBuf::from("/var/lib/husker-state"));
+        assert_eq!(p.image_path, std::path::PathBuf::from("/var/lib/husker.img"));
+        assert!(!p.thin);
+    }
+
+    #[test]
+    fn already_reflink_is_a_noop() {
+        let mut f = facts();
+        f.reflink = ReflinkStatus::Supported;
+        assert!(matches!(build(opts(), f).unwrap(), SetupOutcome::AlreadyReflink));
+    }
+
+    #[test]
+    fn non_local_context_refused() {
+        let mut f = facts();
+        f.is_local_context = false;
+        let e = build(opts(), f).unwrap_err();
+        assert!(matches!(e, SetupError::RemoteContext));
+        assert_eq!(e.exit_code(), 1);
+    }
+
+    #[test]
+    fn missing_tools_refused() {
+        let mut f = facts();
+        f.mkfs_available = false;
+        assert!(matches!(build(opts(), f).unwrap_err(), SetupError::MissingTool(_)));
+    }
+
+    #[test]
+    fn insufficient_space_refused() {
+        let mut f = facts();
+        f.free_bytes = 1024 * 1024 * 1024; // 1 GiB, less than bulk + margin
+        assert!(matches!(build(opts(), f).unwrap_err(), SetupError::InsufficientSpace { .. }));
+    }
+
+    #[test]
+    fn state_dir_under_data_dir_refused() {
+        let mut o = opts();
+        o.state_dir = Some(std::path::PathBuf::from("/var/lib/husker/state"));
+        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::PathUnderDataDir(_)));
     }
 }
