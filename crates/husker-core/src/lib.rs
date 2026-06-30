@@ -4413,6 +4413,11 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         Ok(())
     }
+
+    /// The storage configuration this core was built with.
+    pub fn storage_config(&self) -> &husker_storage::StorageConfig {
+        &self.storage
+    }
 }
 
 /// Build the create request for one service instance.
@@ -4841,6 +4846,167 @@ async fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// Severity of a single diagnostic check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// One diagnostic check result.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CheckResult {
+    pub name: String,
+    pub status: CheckStatus,
+    pub message: String,
+}
+
+/// Full host diagnostics report. Computed daemon-side (for remote contexts) or
+/// locally by the CLI when the daemon is down.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DiagnosticsReport {
+    pub checks: Vec<CheckResult>,
+}
+
+impl DiagnosticsReport {
+    /// True if any check is a hard failure (warnings do not count).
+    pub fn has_failure(&self) -> bool {
+        self.checks.iter().any(|c| c.status == CheckStatus::Fail)
+    }
+}
+
+/// Bytes available to a non-privileged writer on the filesystem backing `path`.
+/// Returns `None` if the path cannot be stat'd.
+fn available_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: c_path is a valid NUL-terminated string; statvfs writes into stat.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// Whether an executable is on `PATH`.
+fn binary_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+}
+
+/// Build the host diagnostics report. Pure host inspection (no backend state),
+/// so the CLI can call it directly for a local target.
+pub fn build_diagnostics(
+    storage: &husker_storage::StorageConfig,
+    storage_volume: bool,
+) -> DiagnosticsReport {
+    let mut checks = Vec::new();
+
+    // data-dir reflink (the real images -> vms path).
+    match husker_storage::probe_reflink(&storage.images_dir(), &storage.vms_dir()) {
+        Ok(husker_storage::ReflinkStatus::Supported) => checks.push(CheckResult {
+            name: "data-dir reflink".into(),
+            status: CheckStatus::Ok,
+            message: "copy-on-write clones supported".into(),
+        }),
+        Ok(husker_storage::ReflinkStatus::FullCopy) => checks.push(CheckResult {
+            name: "data-dir reflink".into(),
+            status: CheckStatus::Warn,
+            message: "no reflink: every VM pays a full rootfs copy. Run `husker setup storage`."
+                .into(),
+        }),
+        Err(e) => checks.push(CheckResult {
+            name: "data-dir reflink".into(),
+            status: CheckStatus::Fail,
+            message: format!("data dir not writable: {e}"),
+        }),
+    }
+
+    // data-dir free space.
+    match available_bytes(&storage.data_dir) {
+        Some(bytes) => {
+            let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let status = if bytes < 1024 * 1024 * 1024 {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Ok
+            };
+            checks.push(CheckResult {
+                name: "data-dir free space".into(),
+                status,
+                message: format!("{gib:.1} GiB free"),
+            });
+        }
+        None => checks.push(CheckResult {
+            name: "data-dir free space".into(),
+            status: CheckStatus::Fail,
+            message: "cannot stat data dir".into(),
+        }),
+    }
+
+    // backend availability (Linux: firecracker + /dev/kvm).
+    #[cfg(target_os = "linux")]
+    {
+        let fc = binary_on_path("firecracker");
+        let kvm = std::path::Path::new("/dev/kvm").exists();
+        let (status, message) = match (fc, kvm) {
+            (true, true) => (CheckStatus::Ok, "firecracker + /dev/kvm present".to_string()),
+            (false, _) => (CheckStatus::Fail, "firecracker not on PATH".to_string()),
+            (_, false) => (CheckStatus::Fail, "/dev/kvm missing".to_string()),
+        };
+        checks.push(CheckResult {
+            name: "backend".into(),
+            status,
+            message,
+        });
+    }
+
+    // migration helpers (advisory; needed by `setup storage`).
+    let mkfs = binary_on_path("mkfs.xfs");
+    let rsync = binary_on_path("rsync");
+    checks.push(CheckResult {
+        name: "migration helpers".into(),
+        status: if mkfs && rsync {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        message: format!(
+            "mkfs.xfs: {}, rsync: {}",
+            if mkfs { "present" } else { "missing" },
+            if rsync { "present" } else { "missing" }
+        ),
+    });
+
+    // storage volume mount (only when the flag is set).
+    if storage_volume {
+        let mounted = storage.sentinel_path().exists();
+        checks.push(CheckResult {
+            name: "storage volume mount".into(),
+            status: if mounted {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Fail
+            },
+            message: if mounted {
+                "storage loopback mounted".into()
+            } else {
+                format!(
+                    "storage_volume set but loopback not mounted (sentinel {} missing)",
+                    storage.sentinel_path().display()
+                )
+            },
+        });
+    }
+
+    DiagnosticsReport { checks }
 }
 
 #[cfg(test)]
@@ -7323,5 +7489,38 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             v.get("ssh_keys").is_none(),
             "DaemonProfile must not include ssh_keys in the serialized API response"
         );
+    }
+
+    #[test]
+    fn build_diagnostics_reports_reflink_and_free_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let report = build_diagnostics(&storage, false);
+        // Always includes the reflink and free-space checks by name.
+        assert!(report.checks.iter().any(|c| c.name == "data-dir reflink"));
+        assert!(report.checks.iter().any(|c| c.name == "data-dir free space"));
+        // storage_volume=false => the mount check must not be a failure.
+        assert!(!report.has_failure() || report.checks.iter().all(|c| c.name != "storage volume mount"));
+    }
+
+    #[test]
+    fn build_diagnostics_fails_when_volume_flag_set_but_unmounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().to_path_buf(),
+        };
+        // No sentinel file present => the mount check must fail.
+        let report = build_diagnostics(&storage, true);
+        let mount = report
+            .checks
+            .iter()
+            .find(|c| c.name == "storage volume mount")
+            .expect("mount check present when storage_volume=true");
+        assert_eq!(mount.status, CheckStatus::Fail);
+        assert!(report.has_failure());
     }
 }
