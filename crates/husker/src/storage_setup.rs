@@ -374,6 +374,7 @@ mod build_tests {
         assert_eq!(p.state_dir, std::path::PathBuf::from("/var/lib/husker-state"));
         assert_eq!(p.image_path, std::path::PathBuf::from("/var/lib/husker.img"));
         assert!(!p.thin);
+        assert_eq!(p.size, "7G");
     }
 
     #[test]
@@ -411,5 +412,19 @@ mod build_tests {
         let mut o = opts();
         o.state_dir = Some(std::path::PathBuf::from("/var/lib/husker/state"));
         assert!(matches!(build(o, facts()).unwrap_err(), SetupError::PathUnderDataDir(_)));
+    }
+
+    #[test]
+    fn image_path_under_data_dir_refused() {
+        let mut o = opts();
+        o.image_path = Some(std::path::PathBuf::from("/var/lib/husker/vol.img"));
+        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::PathUnderDataDir(_)));
+    }
+
+    #[test]
+    fn rsync_missing_refused() {
+        let mut f = facts();
+        f.rsync_available = false;
+        assert!(matches!(build(opts(), f).unwrap_err(), SetupError::MissingTool(t) if t == "rsync"));
     }
 }
