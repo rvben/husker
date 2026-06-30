@@ -124,5 +124,5 @@ fi
 
 # STEP 9: done.
 log "DONE. $DATA_DIR is now a reflink-capable $FS volume; new VM clones are copy-on-write."
-log "ROLLBACK: systemctl stop husker; umount $DATA_DIR; rmdir $DATA_DIR; mv $BACKUP $DATA_DIR; remove the mount unit/fstab line + the config edits; start husker."
+log "ROLLBACK: systemctl stop husker; umount $DATA_DIR; rmdir $DATA_DIR; mv $BACKUP $DATA_DIR; mv ${STATE_DIR}/husker.db ${DATA_DIR}/husker.db; mv ${STATE_DIR}/husker.db-wal ${DATA_DIR}/husker.db-wal 2>/dev/null; mv ${STATE_DIR}/husker.db-shm ${DATA_DIR}/husker.db-shm 2>/dev/null; remove the mount unit/fstab line + the config edits; start husker."
 log "When satisfied: rm -rf $BACKUP"

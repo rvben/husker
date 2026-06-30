@@ -338,6 +338,14 @@ mod tests {
         assert!(s.contains("mkfs.btrfs"));
         assert!(!s.contains("mkfs.xfs"));
     }
+
+    #[test]
+    fn migration_script_rollback_restores_the_db() {
+        let s = render_migration_script(&sample_plan());
+        let rollback = s.lines().find(|l| l.contains("ROLLBACK")).expect("rollback line present");
+        // STEP 3 moves the DB to state_dir, so the rollback MUST move it back.
+        assert!(rollback.contains("husker.db"), "rollback must restore the DB from state_dir");
+    }
 }
 
 #[cfg(test)]

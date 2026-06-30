@@ -594,7 +594,7 @@ enum SetupAction {
         /// Loopback image path (default: <data_dir>.img)
         #[arg(long)]
         image_path: Option<PathBuf>,
-        /// Loopback size, e.g. 50G (default: bulk usage + margin, capped at 80% free)
+        /// Loopback size, e.g. 50G (default: current bulk usage + 2G margin)
         #[arg(long)]
         size: Option<String>,
         /// Filesystem for the loopback
@@ -4326,10 +4326,15 @@ async fn run(cli: Cli) -> Result<()> {
                     thin,
                 };
                 let config_file = config_path_or_default();
+                let api_addr = api_url
+                    .strip_prefix("http://")
+                    .or_else(|| api_url.strip_prefix("https://"))
+                    .unwrap_or(api_url.as_str())
+                    .trim_end_matches('/');
                 match ss::build_storage_setup_plan(
                     &data_dir,
                     &config_file,
-                    "127.0.0.1:7777",
+                    api_addr,
                     opts,
                     &facts,
                 ) {
