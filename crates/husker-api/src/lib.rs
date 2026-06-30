@@ -922,7 +922,8 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/logs", get(get_logs::<B>))
         .route("/v1/vms/{name}/ready", get(get_ready::<B>))
         .route("/v1/metrics", get(metrics_handler::<B>))
-        .route("/v1/profiles", get(list_profiles::<B>));
+        .route("/v1/profiles", get(list_profiles::<B>))
+        .route("/v1/diagnostics", get(diagnostics::<B>));
 
     let router = router
         .route(
@@ -1245,6 +1246,20 @@ async fn list_profiles<B: VmmBackend + 'static>(
     Json(ProfilesResponse {
         profiles: core.profiles().clone(),
     })
+}
+
+/// GET /v1/diagnostics - host-side health checks (reflink, free space, backend).
+async fn diagnostics<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+) -> Json<husker_core::DiagnosticsReport> {
+    let storage = core.storage_config().clone();
+    // probe_reflink does blocking fs IO; run it off the async executor.
+    let report = tokio::task::spawn_blocking(move || {
+        husker_core::build_diagnostics(&storage, false)
+    })
+    .await
+    .unwrap_or(husker_core::DiagnosticsReport { checks: Vec::new() });
+    Json(report)
 }
 
 #[utoipa::path(
@@ -3603,6 +3618,19 @@ mod tests {
         assert_eq!(caps["port_forward"], serde_json::json!(true));
         assert_eq!(caps["bridged_net"], cfg!(feature = "linux-net"));
         assert_eq!(caps["oci_import"], cfg!(target_os = "linux"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_returns_checks() {
+        let app = router(test_core());
+        let response = app
+            .oneshot(Request::get("/v1/diagnostics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let report: husker_core::DiagnosticsReport = serde_json::from_slice(&bytes).unwrap();
+        assert!(report.checks.iter().any(|c| c.name == "data-dir reflink"));
     }
 
     #[tokio::test]
