@@ -4,7 +4,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -174,6 +174,43 @@ fn should_warn_reflink_fallback(copied: Option<u64>, warned: &AtomicBool) -> boo
     warned
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
+}
+
+/// Result of probing whether a data directory supports copy-on-write clones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReflinkStatus {
+    /// The filesystem performed a copy-on-write reflink clone.
+    Supported,
+    /// The clone fell back to a full byte copy (e.g. ext4).
+    FullCopy,
+}
+
+/// Counter for unique probe file names within a process.
+static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Probe whether cloning from `images_dir` to `vms_dir` reflinks or falls back
+/// to a full copy, by performing a real `reflink_or_copy` between the two dirs.
+///
+/// Creates the dirs if missing and removes both temp files before returning.
+/// This exercises the exact production clone mechanism, so the verdict cannot
+/// diverge from real `clone_rootfs` behavior.
+pub fn probe_reflink(images_dir: &Path, vms_dir: &Path) -> std::io::Result<ReflinkStatus> {
+    std::fs::create_dir_all(images_dir)?;
+    std::fs::create_dir_all(vms_dir)?;
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let src = images_dir.join(format!(".husker-reflink-probe-{pid}-{seq}.src"));
+    let dst = vms_dir.join(format!(".husker-reflink-probe-{pid}-{seq}.dst"));
+    std::fs::write(&src, b"husker reflink probe")?;
+    let result = reflink_copy::reflink_or_copy(&src, &dst);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    match result {
+        // None => reflink succeeded; Some(bytes) => fell back to a full copy.
+        Ok(None) => Ok(ReflinkStatus::Supported),
+        Ok(Some(_)) => Ok(ReflinkStatus::FullCopy),
+        Err(e) => Err(e),
+    }
 }
 
 /// Grow a disk image to `new_size_bytes` using `qemu-img resize`.
@@ -778,5 +815,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = convert_qcow2_to_raw(&dir.path().join("absent.qcow2"), &dir.path().join("d.raw"));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn probe_reflink_returns_a_definite_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let vms = dir.path().join("vms");
+        // Must classify (Supported on CoW fs, FullCopy on ext4/tmpfs); never error.
+        let status = probe_reflink(&images, &vms).expect("probe must not error");
+        assert!(matches!(
+            status,
+            ReflinkStatus::Supported | ReflinkStatus::FullCopy
+        ));
+        // Probe must leave no temp files behind.
+        let leftover_images: Vec<_> = std::fs::read_dir(&images).unwrap().collect();
+        let leftover_vms: Vec<_> = std::fs::read_dir(&vms).unwrap().collect();
+        assert!(leftover_images.is_empty(), "probe left files in images dir");
+        assert!(leftover_vms.is_empty(), "probe left files in vms dir");
     }
 }
