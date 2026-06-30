@@ -98,8 +98,9 @@ flush "$DATA_DIR"
 
 # STEP 8: persist the mount across reboot.
 if [ "$PERSIST" = "fstab" ]; then
-  grep -qF "$IMAGE_PATH $DATA_DIR" /etc/fstab || printf '%s\n' "{{FSTAB_LINE}}" >> /etc/fstab
-  log "added /etc/fstab entry"
+  FSTAB_TARGET="${HUSKER_FSTAB_FILE:-/etc/fstab}"
+  grep -qF "$IMAGE_PATH $DATA_DIR" "$FSTAB_TARGET" 2>/dev/null || printf '%s\n' "{{FSTAB_LINE}}" >> "$FSTAB_TARGET"
+  log "added fstab entry to $FSTAB_TARGET"
 else
   UNIT="$(systemd-escape -p --suffix=mount "$DATA_DIR")"
   cat > "/etc/systemd/system/${UNIT}" <<'UNITEOF'

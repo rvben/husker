@@ -322,6 +322,15 @@ mod tests {
     }
 
     #[test]
+    fn migration_script_fstab_target_is_overridable() {
+        let s = render_migration_script(&sample_plan());
+        assert!(
+            s.contains("HUSKER_FSTAB_FILE"),
+            "fstab target must honor HUSKER_FSTAB_FILE so tests do not touch the real /etc/fstab"
+        );
+    }
+
+    #[test]
     fn migration_script_btrfs_uses_mkfs_btrfs() {
         let mut plan = sample_plan();
         plan.fs = SetupFs::Btrfs;

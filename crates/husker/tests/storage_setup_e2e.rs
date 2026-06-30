@@ -39,10 +39,11 @@ fn generated_script_migrates_and_data_survives() {
     let script_path = root.path().join("migrate.sh");
     std::fs::write(&script_path, &script).unwrap();
 
-    // The fstab branch appends to /etc/fstab; run with a redirected fstab by
-    // bind-mounting a temp file is complex - instead assert the migration up to
-    // the mount succeeds and the data survived. Run under sudo.
+    // Point the fstab branch at a temp file so the real /etc/fstab is never
+    // touched. sudo strips env by default; pass the var as a VAR=value arg.
+    let fstab_path = root.path().join("test-fstab");
     let out = Command::new("sudo")
+        .arg(format!("HUSKER_FSTAB_FILE={}", fstab_path.display()))
         .arg("bash")
         .arg(&script_path)
         .output()
@@ -64,8 +65,14 @@ fn generated_script_migrates_and_data_survives() {
     let backup = format!("{}.pre-reflink.bak", data_dir.display());
     assert!(Path::new(&backup).exists(), "original backup missing");
 
-    // Cleanup: unmount + remove (best-effort).
-    let _ = Command::new("sudo").args(["umount", data_dir.to_str().unwrap()]).status();
+    // Cleanup: unmount + remove (best-effort; warn on failure so loop mounts do
+    // not silently linger on the test host).
+    let umount = Command::new("sudo")
+        .args(["umount", data_dir.to_str().unwrap()])
+        .status();
+    if !matches!(umount, Ok(s) if s.success()) {
+        eprintln!("warning: cleanup umount of {} failed; loop mount may linger", data_dir.display());
+    }
 }
 
 fn is_reflink_capable(images: &Path, vms: &Path) -> bool {
