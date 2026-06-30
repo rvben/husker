@@ -60,6 +60,45 @@ pub fn render_systemd_mount_unit(plan: &StorageSetupPlan) -> String {
     )
 }
 
+const SCRIPT_TEMPLATE: &str = include_str!("templates/setup-storage.sh.tmpl");
+
+/// Render the operator-run migration bash script from the plan.
+pub fn render_migration_script(plan: &StorageSetupPlan) -> String {
+    let alloc_line = if plan.thin {
+        // Thin: sparse image. ENOSPC inside the volume becomes an XFS I/O error
+        // on the backing fs, not a clean guest ENOSPC - hence the warning.
+        "log \"WARNING: --thin loopback is sparse; if the backing fs fills, \
+             the volume can hit I/O errors, not clean ENOSPC\"; truncate -s \"$SIZE\" \"$IMAGE_PATH\""
+            .to_string()
+    } else {
+        "fallocate -l \"$SIZE\" \"$IMAGE_PATH\"".to_string()
+    };
+    // Render only the chosen mkfs so a btrfs script never mentions mkfs.xfs.
+    let mkfs_line = match plan.fs {
+        SetupFs::Xfs => "mkfs.xfs -q -m reflink=1 \"$IMAGE_PATH\"",
+        SetupFs::Btrfs => "mkfs.btrfs -q \"$IMAGE_PATH\"",
+    };
+    SCRIPT_TEMPLATE
+        .replace("{{DATA_DIR}}", &plan.data_dir.display().to_string())
+        .replace("{{STATE_DIR}}", &plan.state_dir.display().to_string())
+        .replace("{{IMAGE_PATH}}", &plan.image_path.display().to_string())
+        .replace("{{SIZE}}", &plan.size)
+        .replace("{{FS}}", plan.fs.name())
+        .replace("{{CONFIG_FILE}}", &plan.config_file.display().to_string())
+        .replace("{{API_ADDR}}", &plan.api_addr)
+        .replace(
+            "{{PERSIST}}",
+            match plan.persist {
+                SetupPersist::Systemd => "systemd",
+                SetupPersist::Fstab => "fstab",
+            },
+        )
+        .replace("{{ALLOC_LINE}}", &alloc_line)
+        .replace("{{MKFS_LINE}}", mkfs_line)
+        .replace("{{FSTAB_LINE}}", &render_fstab_line(plan))
+        .replace("{{SYSTEMD_UNIT}}", render_systemd_mount_unit(plan).trim_end())
+}
+
 /// `/etc/fstab` line equivalent. `nofail` so a missing image never blocks boot
 /// (the daemon mount guard catches an unmounted volume instead).
 pub fn render_fstab_line(plan: &StorageSetupPlan) -> String {
@@ -106,5 +145,48 @@ mod tests {
             line,
             "/var/lib/husker.img /var/lib/husker xfs loop,nofail 0 0"
         );
+    }
+
+    #[test]
+    fn migration_script_substitutes_and_orders_correctly() {
+        let s = render_migration_script(&sample_plan());
+        // tokens substituted
+        assert!(s.contains("DATA_DIR=\"/var/lib/husker\""));
+        assert!(s.contains("STATE_DIR=\"/var/lib/husker-state\""));
+        assert!(s.contains("IMAGE_PATH=\"/var/lib/husker.img\""));
+        assert!(!s.contains("{{"), "unsubstituted token remains");
+        // safety-critical content
+        assert!(s.contains("set -euo pipefail"));
+        assert!(s.contains("rsync -aHAXS --numeric-ids"));
+        assert!(s.contains("mkfs.xfs"));
+        assert!(s.contains("systemd-escape -p --suffix=mount"));
+        assert!(s.contains(".pre-reflink.bak"));
+        assert!(s.contains(".husker-storage-volume")); // sentinel
+        // ORDER: config write must precede the state relocate, which must precede
+        // the destructive `mv` of the data dir.
+        let cfg = s.find("STEP 2: write config").expect("step 2 present");
+        let reloc = s.find("STEP 3: relocate state").expect("step 3 present");
+        let swap = s.find("STEP 7: swap").expect("step 7 present");
+        assert!(cfg < reloc && reloc < swap, "destructive steps out of order");
+        // preallocated by default (not thin)
+        assert!(s.contains("fallocate -l"));
+    }
+
+    #[test]
+    fn migration_script_thin_uses_truncate_and_warns() {
+        let mut plan = sample_plan();
+        plan.thin = true;
+        let s = render_migration_script(&plan);
+        assert!(s.contains("truncate -s"));
+        assert!(s.to_lowercase().contains("thin"));
+    }
+
+    #[test]
+    fn migration_script_btrfs_uses_mkfs_btrfs() {
+        let mut plan = sample_plan();
+        plan.fs = SetupFs::Btrfs;
+        let s = render_migration_script(&plan);
+        assert!(s.contains("mkfs.btrfs"));
+        assert!(!s.contains("mkfs.xfs"));
     }
 }
