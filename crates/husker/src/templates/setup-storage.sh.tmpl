@@ -23,7 +23,7 @@ LOCK="${STATE_DIR}/husker.lock"
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-flush() { sync; command -v syncfs >/dev/null 2>&1 && syncfs "$1" >/dev/null 2>&1 || true; }
+flush() { sync; }  # full sync: flush all filesystems to disk before the next step
 
 [ "$(id -u)" -eq 0 ] || die "must run as root"
 [ -d "$DATA_DIR" ] || die "data dir $DATA_DIR does not exist"
@@ -80,7 +80,10 @@ mountpoint -q "$STAGING" || mount -o loop "$IMAGE_PATH" "$STAGING"
 log "copying data dir -> loopback (rsync -aHAXS)"
 rsync -aHAXS --numeric-ids "${DATA_DIR}/" "${STAGING}/"
 log "verifying copy (checksum)"
-if rsync -aHAXSn --numeric-ids --checksum "${DATA_DIR}/" "${STAGING}/" | grep -q .; then
+VERIFY_OUT="$(rsync -aHAXSn --numeric-ids --checksum "${DATA_DIR}/" "${STAGING}/")" || {
+  umount "$STAGING"; die "verify rsync failed; aborting (data dir untouched)"
+}
+if [ -n "$VERIFY_OUT" ]; then
   umount "$STAGING"; die "copy verification found differences; aborting (data dir untouched)"
 fi
 flush "$STAGING"; umount "$STAGING"

@@ -182,6 +182,18 @@ mod tests {
     }
 
     #[test]
+    fn migration_script_verify_is_failure_safe() {
+        let s = render_migration_script(&sample_plan());
+        // The verify must capture output (so a failing rsync is caught), not pipe
+        // into grep (which conflates "rsync failed" with "no differences").
+        assert!(s.contains("VERIFY_OUT="), "verify must capture rsync output");
+        assert!(
+            !s.contains("--checksum \"${DATA_DIR}/\" \"${STAGING}/\" | grep"),
+            "verify must not pipe rsync into grep"
+        );
+    }
+
+    #[test]
     fn migration_script_btrfs_uses_mkfs_btrfs() {
         let mut plan = sample_plan();
         plan.fs = SetupFs::Btrfs;
