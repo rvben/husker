@@ -955,6 +955,15 @@ struct Config {
     ovmf_vars: PathBuf,
     #[serde(default = "default_data_dir")]
     data_dir: PathBuf,
+    /// Directory for the live state DB, runtime sockets, and the daemon lock.
+    /// Unset means "same as data_dir" (current behavior). Set by `setup storage`
+    /// when the data dir becomes a dedicated reflink-capable mount.
+    #[serde(default)]
+    state_dir: Option<PathBuf>,
+    /// True when `data_dir` is a dedicated storage mount that must be present
+    /// before the daemon starts. Set by `setup storage`.
+    #[serde(default)]
+    storage_volume: bool,
     #[serde(default = "husker::default_kernel_path")]
     default_kernel: PathBuf,
     #[serde(default = "husker::default_rootfs_path")]
@@ -2239,6 +2248,8 @@ impl Default for Config {
             #[cfg(all(feature = "linux-net", target_os = "linux"))]
             ovmf_vars: default_ovmf_vars(),
             data_dir: default_data_dir(),
+            state_dir: None,
+            storage_volume: false,
             default_kernel: default_kernel_path(),
             default_rootfs: default_rootfs_path(),
             default_initrd: Some(default_initrd_path()),
@@ -2275,6 +2286,15 @@ impl Default for Config {
             lan_bridge: None,
             profiles: Default::default(),
         }
+    }
+}
+
+impl Config {
+    /// The effective state directory: explicit `state_dir`, else `data_dir`.
+    fn effective_state_dir(&self) -> PathBuf {
+        self.state_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.clone())
     }
 }
 
@@ -6304,6 +6324,12 @@ fn apply_env_overrides(config: &mut Config) {
             config.default_initrd = Some(husker::default_initrd_path_for(&new_data_dir));
         }
         config.data_dir = new_data_dir;
+    }
+    if let Ok(val) = std::env::var("HUSKER_STATE_DIR") {
+        config.state_dir = Some(PathBuf::from(val));
+    }
+    if let Ok(val) = std::env::var("HUSKER_STORAGE_VOLUME") {
+        config.storage_volume = matches!(val.as_str(), "1" | "true" | "yes" | "on");
     }
     if let Ok(val) = std::env::var("HUSKER_DEFAULT_KERNEL") {
         config.default_kernel = PathBuf::from(val);
@@ -10637,6 +10663,21 @@ mod tests {
         assert!(
             fields.contains(&"profiles"),
             "profile list output must include 'profiles'"
+        );
+    }
+
+    #[test]
+    fn effective_state_dir_defaults_to_data_dir() {
+        let mut cfg = Config {
+            data_dir: PathBuf::from("/var/lib/husker"),
+            state_dir: None,
+            ..Config::default()
+        };
+        assert_eq!(cfg.effective_state_dir(), PathBuf::from("/var/lib/husker"));
+        cfg.state_dir = Some(PathBuf::from("/var/lib/husker-state"));
+        assert_eq!(
+            cfg.effective_state_dir(),
+            PathBuf::from("/var/lib/husker-state")
         );
     }
 }
