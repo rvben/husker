@@ -142,6 +142,7 @@ fn build_core(
 ) -> Arc<HuskerCore<MockVmm>> {
     let storage = StorageConfig {
         data_dir: data_dir.to_path_buf(),
+        state_dir: data_dir.to_path_buf(),
     };
     Arc::new(HuskerCore::new(
         mock,
@@ -770,6 +771,7 @@ async fn service_with_one_running_instance() -> (
     let state = StateStore::open_memory().unwrap();
     let storage = StorageConfig {
         data_dir: data_dir.to_path_buf(),
+        state_dir: data_dir.to_path_buf(),
     };
     let core = Arc::new(HuskerCore::new(
         mock.clone(),
@@ -949,6 +951,7 @@ async fn set_balloon_happy_path_forwards_to_vmm() {
     let mock = MockVmm::new();
     let storage = StorageConfig {
         data_dir: data_dir.to_path_buf(),
+        state_dir: data_dir.to_path_buf(),
     };
     let core = Arc::new(HuskerCore::new(
         mock.clone(),

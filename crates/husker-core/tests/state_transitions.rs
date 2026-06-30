@@ -123,6 +123,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
     let state_store = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-mock-test"),
+        state_dir: PathBuf::from("/tmp/husker-mock-test"),
     };
 
     let now = chrono::Utc::now();

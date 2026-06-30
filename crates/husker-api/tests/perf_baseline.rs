@@ -19,6 +19,7 @@ fn test_core() -> Arc<HuskerCore<husker_vmm::firecracker::FirecrackerBackend>> {
     let state = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-perf-test"),
+        state_dir: PathBuf::from("/tmp/husker-perf-test"),
     };
     let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
         std::path::Path::new("/nonexistent"),

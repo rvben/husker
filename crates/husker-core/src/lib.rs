@@ -5115,6 +5115,7 @@ mod tests {
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         let core = HuskerCore::new(
@@ -5149,6 +5150,7 @@ mod tests {
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
             husker_storage::StorageConfig {
                 data_dir: tmp.path().to_path_buf(),
+                state_dir: tmp.path().to_path_buf(),
             },
             "husker0".into(),
             vec![],
@@ -5304,6 +5306,7 @@ mod tests {
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         let core = HuskerCore::new(
@@ -6077,6 +6080,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         #[cfg(not(feature = "linux-net"))]
@@ -6168,6 +6172,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         #[cfg(not(feature = "linux-net"))]
@@ -6234,6 +6239,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         #[cfg(not(feature = "linux-net"))]
@@ -6307,6 +6313,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             .unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         #[cfg(not(feature = "linux-net"))]
@@ -6408,6 +6415,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         // Provide a lan_bridge so that precondition doesn't fire first.
@@ -6459,6 +6467,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         // No with_lan_bridge call -> lan_bridge stays None.
@@ -6539,6 +6548,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         let core = HuskerCore::new(
@@ -6575,6 +6585,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
         let core = HuskerCore::new(
@@ -6632,6 +6643,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     ) -> HuskerCore<husker_vmm::apple_vz::AppleVzBackend> {
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.to_path_buf(),
+            state_dir: tmp.to_path_buf(),
         };
         let runtime_dir = tmp.join("run");
         HuskerCore::new(
@@ -7062,6 +7074,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let runtime_dir = tmp.path().join("run");
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
 
         // Create minimal real files so validate_kernel / validate_rootfs pass.
@@ -7163,6 +7176,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let runtime_dir = tmp.path().join("run");
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
         };
 
         let kernel_path = tmp.path().join("vmlinux");

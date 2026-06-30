@@ -53,6 +53,7 @@ fn test_core() -> Arc<HuskerCore<husker_vmm::firecracker::FirecrackerBackend>> {
     let state = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     make_core(state, storage, PathBuf::from("/tmp/husker-test/run"))
 }
@@ -126,6 +127,7 @@ async fn health_counts_vms_correctly() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
 
@@ -340,6 +342,7 @@ async fn snapshot_endpoints_roundtrip() {
         state,
         husker_storage::StorageConfig {
             data_dir: data_dir.clone(),
+            state_dir: data_dir.clone(),
         },
         runtime_dir,
     );
@@ -406,6 +409,7 @@ async fn image_endpoints_roundtrip() {
         husker_state::StateStore::open_memory().unwrap(),
         husker_storage::StorageConfig {
             data_dir: data_dir.clone(),
+            state_dir: data_dir.clone(),
         },
         runtime_dir,
     );
@@ -495,6 +499,7 @@ async fn secret_endpoints_roundtrip() {
         husker_state::StateStore::open_memory().unwrap(),
         husker_storage::StorageConfig {
             data_dir: data_dir.clone(),
+            state_dir: data_dir.clone(),
         },
         runtime_dir,
     );
@@ -857,6 +862,7 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
     let app = router(core);
@@ -1013,6 +1019,7 @@ async fn vm_response_json_structure() {
     // Build a core with this pre-populated state
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let populated_core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
 
@@ -1100,6 +1107,7 @@ async fn list_vms_returns_all_records() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
 
@@ -1333,6 +1341,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
 
@@ -1388,6 +1397,7 @@ async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
     state.insert_vm(&record).unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
     let app = router(core);
@@ -1445,6 +1455,7 @@ async fn vm_response_with_null_optional_fields() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
 
@@ -1524,6 +1535,7 @@ async fn logs_returns_serial_output() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 
@@ -1582,6 +1594,7 @@ async fn logs_tail_returns_last_n_lines() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 
@@ -1639,6 +1652,7 @@ async fn logs_no_serial_file_returns_404() {
     // Do NOT create the serial log file
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 
@@ -1704,6 +1718,7 @@ fn logs_test_core(
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, runtime_dir.path().to_path_buf());
     (core, runtime_dir)
@@ -1948,6 +1963,7 @@ async fn logs_large_file_is_truncated() {
 
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
     };
     let core = make_core(state, storage, runtime_dir.path().to_path_buf());
 

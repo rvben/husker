@@ -183,6 +183,7 @@ fn core_with_running_vm_backend(
     let state_store = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: tmp.path().to_path_buf(),
+        state_dir: tmp.path().to_path_buf(),
     };
 
     let now = chrono::Utc::now();
@@ -260,6 +261,7 @@ fn core_store_with_vm(
     let state_store = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: tmp.path().to_path_buf(),
+        state_dir: tmp.path().to_path_buf(),
     };
     let now = chrono::Utc::now();
     let id = Uuid::new_v4();
@@ -592,6 +594,7 @@ fn core_with_pool(
     let state_store = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: tmp.path().to_path_buf(),
+        state_dir: tmp.path().to_path_buf(),
     };
     let now = chrono::Utc::now();
     let template_id = Uuid::new_v4();

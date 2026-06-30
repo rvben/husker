@@ -67,14 +67,20 @@ pub fn default_storage_driver() -> Arc<dyn StorageDriver> {
 /// Manages rootfs images and kernel files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Base directory for storing images and kernels.
+    /// Base directory for bulk, reflink-participating data (images, vms, volumes,
+    /// suspend, kernels). Becomes a dedicated mount after `setup storage`.
     pub data_dir: PathBuf,
+    /// Directory for the live state DB, runtime sockets, and the daemon lock.
+    /// Defaults equal to `data_dir`; relocated by `setup storage`.
+    pub state_dir: PathBuf,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
+        let data_dir = PathBuf::from("/var/lib/husker");
         Self {
-            data_dir: PathBuf::from("/var/lib/husker"),
+            state_dir: data_dir.clone(),
+            data_dir,
         }
     }
 }
@@ -94,6 +100,26 @@ impl StorageConfig {
 
     pub fn volumes_dir(&self) -> PathBuf {
         self.data_dir.join("volumes")
+    }
+
+    pub fn vms_dir(&self) -> PathBuf {
+        self.data_dir.join("vms")
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.state_dir.join("husker.db")
+    }
+
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.state_dir.join("run")
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.state_dir.join("husker.lock")
+    }
+
+    pub fn sentinel_path(&self) -> PathBuf {
+        self.data_dir.join(".husker-storage-volume")
     }
 }
 
@@ -815,6 +841,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = convert_qcow2_to_raw(&dir.path().join("absent.qcow2"), &dir.path().join("d.raw"));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn state_dir_derives_db_and_runtime_paths() {
+        let cfg = StorageConfig {
+            data_dir: PathBuf::from("/data"),
+            state_dir: PathBuf::from("/state"),
+        };
+        assert_eq!(cfg.db_path(), PathBuf::from("/state/husker.db"));
+        assert_eq!(cfg.runtime_dir(), PathBuf::from("/state/run"));
+        assert_eq!(cfg.lock_path(), PathBuf::from("/state/husker.lock"));
+        assert_eq!(cfg.vms_dir(), PathBuf::from("/data/vms"));
+        assert_eq!(
+            cfg.sentinel_path(),
+            PathBuf::from("/data/.husker-storage-volume")
+        );
+        // Default keeps state_dir equal to data_dir (no behavior change).
+        let def = StorageConfig::default();
+        assert_eq!(def.state_dir, def.data_dir);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use tempfile::tempdir;
 fn images_dir_returns_expected_path() {
     let config = StorageConfig {
         data_dir: PathBuf::from("/var/lib/husker"),
+        state_dir: PathBuf::from("/var/lib/husker"),
     };
     assert_eq!(config.images_dir(), PathBuf::from("/var/lib/husker/images"));
 }
@@ -20,6 +21,7 @@ fn images_dir_returns_expected_path() {
 fn kernels_dir_returns_expected_path() {
     let config = StorageConfig {
         data_dir: PathBuf::from("/var/lib/husker"),
+        state_dir: PathBuf::from("/var/lib/husker"),
     };
     assert_eq!(
         config.kernels_dir(),
@@ -31,6 +33,7 @@ fn kernels_dir_returns_expected_path() {
 fn vm_dir_returns_expected_path() {
     let config = StorageConfig {
         data_dir: PathBuf::from("/data"),
+        state_dir: PathBuf::from("/data"),
     };
     assert_eq!(config.vm_dir("my-vm"), PathBuf::from("/data/vms/my-vm"));
 }

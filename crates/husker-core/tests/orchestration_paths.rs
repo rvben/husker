@@ -239,6 +239,7 @@ fn build_core(
 ) -> Arc<HuskerCore<MockVmm>> {
     let storage = StorageConfig {
         data_dir: data_dir.to_path_buf(),
+        state_dir: data_dir.to_path_buf(),
     };
 
     #[cfg(feature = "linux-net")]
@@ -1152,6 +1153,7 @@ async fn port_forward_applies_for_qemu_backed_vm() {
         husker_net::IpAllocator::new(std::net::Ipv4Addr::new(192, 0, 2, 0), 24),
         StorageConfig {
             data_dir: data_dir.clone(),
+            state_dir: data_dir.clone(),
         },
         BRIDGE.to_string(),
         vec!["8.8.8.8".into()],
@@ -2136,6 +2138,7 @@ mod kernel_args_composition {
             StateStore::open_memory().unwrap(),
             StorageConfig {
                 data_dir: data_dir.to_path_buf(),
+                state_dir: data_dir.to_path_buf(),
             },
             runtime_dir,
         ));
@@ -2260,6 +2263,7 @@ mod kernel_args_composition {
                 StateStore::open_memory().unwrap(),
                 StorageConfig {
                     data_dir: data_dir.to_path_buf(),
+                    state_dir: data_dir.to_path_buf(),
                 },
                 runtime_dir,
             )

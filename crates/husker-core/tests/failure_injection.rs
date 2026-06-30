@@ -133,6 +133,7 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
     let state_store = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-failure-test"),
+        state_dir: PathBuf::from("/tmp/husker-failure-test"),
     };
 
     let id = Uuid::new_v4();

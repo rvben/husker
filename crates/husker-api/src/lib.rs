@@ -3451,6 +3451,7 @@ mod tests {
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
             data_dir: PathBuf::from("/tmp/husker-test"),
+            state_dir: PathBuf::from("/tmp/husker-test"),
         };
         make_core(state, storage, PathBuf::from("/tmp/husker-test/run"))
     }
@@ -3558,6 +3559,7 @@ mod tests {
             state,
             husker_storage::StorageConfig {
                 data_dir: std::path::PathBuf::from("/tmp/husker-test"),
+                state_dir: std::path::PathBuf::from("/tmp/husker-test"),
             },
             std::path::PathBuf::from("/tmp/husker-test/run"),
         )
@@ -3877,6 +3879,7 @@ mod tests {
             state,
             husker_storage::StorageConfig {
                 data_dir: data_dir.clone(),
+                state_dir: data_dir.clone(),
             },
             runtime_dir,
         );
@@ -3943,6 +3946,7 @@ mod tests {
             husker_state::StateStore::open_memory().unwrap(),
             husker_storage::StorageConfig {
                 data_dir: data_dir.clone(),
+                state_dir: data_dir.clone(),
             },
             runtime_dir,
         );
@@ -4029,6 +4033,7 @@ mod tests {
             husker_state::StateStore::open_memory().unwrap(),
             husker_storage::StorageConfig {
                 data_dir: data_dir.clone(),
+                state_dir: data_dir.clone(),
             },
             runtime_dir,
         );
@@ -4259,7 +4264,10 @@ mod tests {
 
         let core = make_core(
             state,
-            husker_storage::StorageConfig { data_dir },
+            husker_storage::StorageConfig {
+                data_dir: data_dir.clone(),
+                state_dir: data_dir,
+            },
             runtime_dir,
         );
         let app = router(core);
@@ -4384,6 +4392,7 @@ mod tests {
             state,
             husker_storage::StorageConfig {
                 data_dir: std::path::PathBuf::from("/tmp/husker-test"),
+                state_dir: std::path::PathBuf::from("/tmp/husker-test"),
             },
             std::path::PathBuf::from("/tmp/husker-test/run"),
         );
@@ -5290,6 +5299,7 @@ mod tests {
             state,
             husker_storage::StorageConfig {
                 data_dir: std::path::PathBuf::from("/tmp/husker-test"),
+                state_dir: std::path::PathBuf::from("/tmp/husker-test"),
             },
             std::path::PathBuf::from("/tmp/husker-test/run"),
         );

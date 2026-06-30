@@ -149,6 +149,7 @@ fn build_core(
 ) -> Arc<HuskerCore<UnreachableVsockVmm>> {
     let storage = StorageConfig {
         data_dir: PathBuf::from("/tmp/husker-discovery-test"),
+        state_dir: PathBuf::from("/tmp/husker-discovery-test"),
     };
     let runtime_dir = PathBuf::from("/tmp/husker-discovery-test/run");
 

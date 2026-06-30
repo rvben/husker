@@ -7136,7 +7136,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         .context("applying cid_base")?;
 
     let storage = husker_storage::StorageConfig {
-        data_dir: config.data_dir,
+        data_dir: config.data_dir.clone(),
+        state_dir: config.data_dir.clone(),
     };
 
     #[cfg(feature = "linux-net")]
