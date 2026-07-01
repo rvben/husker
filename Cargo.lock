@@ -889,7 +889,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "husker"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -913,6 +913,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "toml",
@@ -923,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "husker-agent"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "husker-agent-proto",
@@ -939,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "husker-agent-proto"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "proptest",
  "serde",
@@ -951,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "husker-api"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "async-stream",
  "axum",
@@ -977,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "husker-cloudinit"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "fatfs",
  "husker-agent-proto",
@@ -986,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "husker-core"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "chrono",
  "husker-agent",
@@ -1011,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "husker-net"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "proptest",
  "serde_json",
@@ -1022,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "husker-oci"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "axum",
  "flate2",
@@ -1041,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "husker-state"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1054,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "husker-storage"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "reflink-copy",
  "serde",
@@ -1067,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "husker-vmm"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "block2",
  "dispatch2",

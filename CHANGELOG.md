@@ -7,6 +7,33 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.25](https://github.com/rvben/husker/compare/v0.4.24...v0.4.25) - 2026-07-01
+
+### Added
+
+- **husker**: add setup storage command to generate the migration script ([d0ccb97](https://github.com/rvben/husker/commit/d0ccb97ef233f477fdb09510e69748c6d4a65fe7))
+- **husker**: validate and build the setup-storage plan from host facts ([9f869f3](https://github.com/rvben/husker/commit/9f869f3c46ac0e44ca989163cbfcdb9827de11e2))
+- **husker**: render the setup-storage migration script from a template ([f2b35f2](https://github.com/rvben/husker/commit/f2b35f2010876ffe5263e4598c4642595ca72ef1))
+- **husker**: add storage-setup plan types and systemd/fstab renderers ([602cd4e](https://github.com/rvben/husker/commit/602cd4e35223e8f20b26af8b73ea06c1ba4b892a))
+- **husker**: add doctor command for host diagnostics ([b49fb9c](https://github.com/rvben/husker/commit/b49fb9c206026ee1e0a812831bd1b8381c8aa4af))
+- **api**: add GET /v1/diagnostics host health endpoint ([947a074](https://github.com/rvben/husker/commit/947a074ac5222eb1f7ff234e2bdd70f761cd33ef))
+- **husker**: guard daemon startup with flock and storage mount sentinel ([d4ed055](https://github.com/rvben/husker/commit/d4ed055c15212a567bea1d30bbed6ef7ea4d1bf4))
+- **husker**: add daemon flock and storage mount-guard helpers ([35c027c](https://github.com/rvben/husker/commit/35c027ce567a64320c8fc05ff798a387a7dc0848))
+- **husker**: add state_dir and storage_volume config with env overrides ([0f8b69f](https://github.com/rvben/husker/commit/0f8b69fc91fe8bb389c8d16808dc2235bb696b36))
+- **core**: add host diagnostics model and build_diagnostics ([26c37ae](https://github.com/rvben/husker/commit/26c37ae33eb42c6978d6b92775fbc7c8a5042727))
+- **storage**: add state_dir to StorageConfig with db/runtime/lock paths ([b5efaf9](https://github.com/rvben/husker/commit/b5efaf9f35ea3cc57bbfc7ec0bd50eb9113f4be4))
+- **storage**: add empirical reflink probe for diagnostics ([6305155](https://github.com/rvben/husker/commit/630515553a6e87198c43ed500287266a747795d1))
+
+### Fixed
+
+- **husker**: treat ssh-tunneled contexts as remote in doctor and setup storage ([c7d36ad](https://github.com/rvben/husker/commit/c7d36ad113cf1e196155b8cceccc234abd04691f))
+- **husker**: reject sub-minimum loopback size at generate time; e2e uses 1G ([9e0573e](https://github.com/rvben/husker/commit/9e0573e689d2d4e3cfc96a225d9a8a5c2b7022cf))
+- **husker**: restore the DB in setup-storage rollback and derive api_addr from api_url ([1837c59](https://github.com/rvben/husker/commit/1837c59ed00d636c55e5600d8cc3000a35b4805a))
+- **husker**: make setup-storage fstab target overridable so the e2e never touches real /etc/fstab ([b522dba](https://github.com/rvben/husker/commit/b522dba82aea7bf14caaa270c84a2c1f572b0fea))
+- **husker**: exit gracefully on setup-storage --out write errors ([72f2b25](https://github.com/rvben/husker/commit/72f2b252596a700adf08604e21850ca296a4e409))
+- **husker**: make the setup-storage verify failure-safe and simplify flush ([bb19bba](https://github.com/rvben/husker/commit/bb19bba8cf171dfac7d81fb548607e0096f35ad5))
+- **api**: document /v1/diagnostics in OpenAPI and surface diagnostics probe panics ([28bd200](https://github.com/rvben/husker/commit/28bd200167786061025475b4198716c17936e108))
+
 ## [0.4.24](https://github.com/rvben/husker/compare/v0.4.23...v0.4.24) - 2026-06-28
 
 ### Added
