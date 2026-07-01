@@ -150,6 +150,10 @@ pub enum SetupError {
     InsufficientSpace { needed: u64, have: u64 },
     #[error("{0} must not live under the data dir (the mount would hide it)")]
     PathUnderDataDir(PathBuf),
+    #[error("invalid --size value: {0}")]
+    InvalidSize(String),
+    #[error("--size {have} bytes is below the {fs} minimum of {min} bytes")]
+    SizeTooSmall { fs: &'static str, have: u64, min: u64 },
 }
 
 impl SetupError {
@@ -167,6 +171,29 @@ const SPACE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 fn human_size(bytes: u64) -> String {
     let gib = bytes.div_ceil(1024 * 1024 * 1024).max(1);
     format!("{gib}G")
+}
+
+/// Parse a size like "512M", "2G", "300m", or a plain byte count into bytes.
+/// Binary suffixes (K/M/G/T = *1024^n). Returns None on malformed input.
+fn parse_size_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last()? {
+        'k' | 'K' => (&s[..s.len() - 1], 1024u64),
+        'm' | 'M' => (&s[..s.len() - 1], 1024u64 * 1024),
+        'g' | 'G' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
+        't' | 'T' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        '0'..='9' => (s, 1u64),
+        _ => return None,
+    };
+    num.trim().parse::<u64>().ok()?.checked_mul(mult)
+}
+
+/// Minimum loopback size the filesystem can be created on.
+fn fs_min_bytes(fs: SetupFs) -> u64 {
+    match fs {
+        SetupFs::Xfs => 300 * 1024 * 1024,   // mkfs.xfs: "must be larger than 300MB"
+        SetupFs::Btrfs => 128 * 1024 * 1024, // btrfs minimum is ~109 MiB; round up
+    }
 }
 
 /// Build a validated migration plan from config + flags + injected host facts.
@@ -213,10 +240,22 @@ pub fn build_storage_setup_plan(
             have: facts.free_bytes,
         });
     }
-    // Default loopback size: the current bulk plus a fixed headroom margin
-    // (preallocated, so we keep it conservative; the operator sizes up with
-    // --size if they expect growth). The precondition guarantees free >= needed.
-    let size = opts.size.unwrap_or_else(|| human_size(needed));
+    // Resolve the loopback size in bytes: explicit --size (parsed) or the
+    // default (current bulk + margin). Reject anything below the fs minimum so
+    // the operator gets a clear error instead of a cryptic mkfs failure.
+    let size_bytes = match &opts.size {
+        Some(s) => parse_size_bytes(s).ok_or_else(|| SetupError::InvalidSize(s.clone()))?,
+        None => needed,
+    };
+    let min = fs_min_bytes(opts.fs);
+    if size_bytes < min {
+        return Err(SetupError::SizeTooSmall {
+            fs: opts.fs.name(),
+            have: size_bytes,
+            min,
+        });
+    }
+    let size = opts.size.clone().unwrap_or_else(|| human_size(needed));
 
     Ok(SetupOutcome::Plan(StorageSetupPlan {
         data_dir: data_dir.to_path_buf(),
@@ -443,5 +482,27 @@ mod build_tests {
         let mut f = facts();
         f.rsync_available = false;
         assert!(matches!(build(opts(), f).unwrap_err(), SetupError::MissingTool(t) if t == "rsync"));
+    }
+
+    #[test]
+    fn explicit_size_below_xfs_min_refused() {
+        let mut o = opts();
+        o.size = Some("100M".into());
+        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::SizeTooSmall { .. }));
+    }
+
+    #[test]
+    fn invalid_size_refused() {
+        let mut o = opts();
+        o.size = Some("banana".into());
+        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::InvalidSize(_)));
+    }
+
+    #[test]
+    fn valid_explicit_size_accepted() {
+        let mut o = opts();
+        o.size = Some("2G".into());
+        let SetupOutcome::Plan(p) = build(o, facts()).unwrap() else { panic!("expected plan") };
+        assert_eq!(p.size, "2G");
     }
 }

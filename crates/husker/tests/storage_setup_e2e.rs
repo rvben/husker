@@ -28,7 +28,7 @@ fn generated_script_migrates_and_data_survives() {
         data_dir: data_dir.clone(),
         state_dir: root.path().join("state"),
         image_path: root.path().join("vol.img"),
-        size: "256M".into(),
+        size: "1G".into(),
         fs: husker::storage_setup::SetupFs::Xfs,
         persist: husker::storage_setup::SetupPersist::Fstab, // avoid touching real systemd
         thin: false,
