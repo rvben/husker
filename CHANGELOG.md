@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.31](https://github.com/rvben/husker/compare/v0.4.30...v0.4.31) - 2026-07-01
+
+### Added
+
+- **vmm**: opt-in per-VM cgroup v2 resource limits on Linux (Firecracker and QEMU). Set `resource_limits = true` (default off, `HUSKER_RESOURCE_LIMITS`) to cap each VM's memory at `mem_size_mib + memory_overhead_mib` (default 256 MiB margin) with `memory.swap.max=0` and `memory.oom.group=1`, so a runaway guest OOMs in its own cgroup instead of the host; enable `cpu_limit` to also cap CPU at the VM's vCPU count. The daemon builds a delegated cgroup topology at startup (requires `Delegate=yes` on the unit) and fails closed if limits are requested but unavailable; each VMM process is placed in its own `vm-<id>` cgroup and reaped on exit, destroy, or create-time failure. `husker doctor` reports a `cgroup limits` readiness check ([b27a4a7](https://github.com/rvben/husker/commit/b27a4a7))
+
+
 ## [0.4.30](https://github.com/rvben/husker/compare/v0.4.29...v0.4.30) - 2026-07-01
 
 ### Added
