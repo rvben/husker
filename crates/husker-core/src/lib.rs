@@ -7803,9 +7803,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             .iter()
             .find(|c| c.name == "embedded agent")
             .expect("embedded agent check present");
+        // A missing agent is advisory (Warn), never a hard failure. Assert the
+        // agent check's own status, not report.has_failure(): other checks
+        // (backend/NAT) legitimately Fail on a host without firecracker/kvm (a
+        // bare CI runner), which is unrelated to the embedded-agent check.
         assert_eq!(agent.status, CheckStatus::Warn);
-        // A missing agent is advisory, not a hard failure.
-        assert!(!report.has_failure());
+        assert_ne!(agent.status, CheckStatus::Fail);
     }
 
     #[test]
