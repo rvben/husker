@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.29](https://github.com/rvben/husker/compare/v0.4.28...v0.4.29) - 2026-07-01
+
+### Added
+
+- **api**: add an optional unauthenticated metrics listener (`metrics_listen` / `HUSKER_METRICS_LISTEN`) that serves ONLY GET /v1/metrics on a separate bind, so Prometheus can scrape without the API token while the main API stays authenticated/loopback ([6b99f7f](https://github.com/rvben/husker/commit/6b99f7f))
+
+
 ## [0.4.28](https://github.com/rvben/husker/compare/v0.4.27...v0.4.28) - 2026-07-01
 
 ### Added
