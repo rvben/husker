@@ -108,6 +108,20 @@ pub struct VmRecord {
     pub volume: Option<String>,
     /// Network mode: "nat" (husker-managed NAT) or "bridged" (LAN bridge via DHCP).
     pub network: String,
+    /// Last control-plane interaction, debounced observability mirror of the
+    /// in-memory activity signal used by the idle policy.
+    pub last_activity_at: DateTime<Utc>,
+    /// When the VM entered `suspended` (drives the reap timer). None = never
+    /// suspended or suspended without stamping; treated as not-reapable.
+    pub suspended_at: Option<DateTime<Utc>>,
+    /// Idle policy: seconds of idle before suspend. None = policy disabled.
+    pub idle_timeout_secs: Option<u64>,
+    /// Idle policy: seconds suspended before reap. None/0 = never reap.
+    pub suspend_ttl_secs: Option<u64>,
+    /// Idle policy: whether the VM auto-resumes on activity/connect (default true).
+    pub auto_resume: bool,
+    /// Source VM this VM was forked from, or None. Fences reap of fork sources.
+    pub forked_from: Option<Uuid>,
 }
 
 /// Persistent port forward record.
@@ -440,10 +454,21 @@ impl StateStore {
             "ALTER TABLE vms ADD COLUMN network TEXT NOT NULL DEFAULT 'nat'",
             // userspace-proxy bind address for port forwards
             "ALTER TABLE port_forwards ADD COLUMN bind_addr TEXT",
+            // idle policy columns (all nullable; auto_resume back-fills to 1 = enabled)
+            "ALTER TABLE vms ADD COLUMN last_activity_at TEXT",
+            "ALTER TABLE vms ADD COLUMN suspended_at TEXT",
+            "ALTER TABLE vms ADD COLUMN idle_timeout_secs INTEGER",
+            "ALTER TABLE vms ADD COLUMN suspend_ttl_secs INTEGER",
+            "ALTER TABLE vms ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE vms ADD COLUMN forked_from TEXT",
         ];
         for sql in ADD_COLUMNS {
             add_column(&conn, sql)?;
         }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vms_forked_from ON vms(forked_from)",
+            [],
+        )?;
 
         Ok(())
     }
@@ -458,8 +483,9 @@ impl StateStore {
                               tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                               created_at, updated_at, userdata, userdata_status, userdata_env,
                               service_id, service_ordinal, vmm, boot_mode, balloon, volume,
-                              network)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                              network, last_activity_at, suspended_at, idle_timeout_secs,
+                              suspend_ttl_secs, auto_resume, forked_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -485,6 +511,12 @@ impl StateStore {
                 record.balloon as i64,
                 record.volume,
                 record.network,
+                record.last_activity_at.to_rfc3339(),
+                record.suspended_at.map(|d| d.to_rfc3339()),
+                record.idle_timeout_secs.map(|v| v as i64),
+                record.suspend_ttl_secs.map(|v| v as i64),
+                record.auto_resume as i64,
+                record.forked_from.map(|u| u.to_string()),
             ],
         )
         .map_err(|e| match &e {
@@ -507,7 +539,8 @@ impl StateStore {
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
-                    network
+                    network, last_activity_at, suspended_at, idle_timeout_secs,
+                    suspend_ttl_secs, auto_resume, forked_from
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -526,7 +559,8 @@ impl StateStore {
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
-                    network
+                    network, last_activity_at, suspended_at, idle_timeout_secs,
+                    suspend_ttl_secs, auto_resume, forked_from
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -545,7 +579,8 @@ impl StateStore {
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
-                    network
+                    network, last_activity_at, suspended_at, idle_timeout_secs,
+                    suspend_ttl_secs, auto_resume, forked_from
              FROM vms ORDER BY created_at",
         )?;
 
@@ -564,7 +599,8 @@ impl StateStore {
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
-                    network
+                    network, last_activity_at, suspended_at, idle_timeout_secs,
+                    suspend_ttl_secs, auto_resume, forked_from
              FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
         )?;
         let records = stmt
@@ -584,6 +620,68 @@ impl StateStore {
             return Err(StateError::VmNotFound(id));
         }
         Ok(())
+    }
+
+    /// Update the debounced last-activity mirror.
+    pub fn touch_last_activity(&self, id: Uuid, at: DateTime<Utc>) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE vms SET last_activity_at = ?1 WHERE id = ?2",
+            params![at.to_rfc3339(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Set or clear the reap timer anchor.
+    pub fn set_suspended_at(&self, id: Uuid, at: Option<DateTime<Utc>>) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE vms SET suspended_at = ?1 WHERE id = ?2",
+            params![at.map(|d| d.to_rfc3339()), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Set the idle policy fields.
+    pub fn set_idle_policy(
+        &self,
+        id: Uuid,
+        idle_timeout_secs: Option<u64>,
+        suspend_ttl_secs: Option<u64>,
+        auto_resume: bool,
+    ) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE vms SET idle_timeout_secs = ?1, suspend_ttl_secs = ?2, auto_resume = ?3 WHERE id = ?4",
+            params![
+                idle_timeout_secs.map(|v| v as i64),
+                suspend_ttl_secs.map(|v| v as i64),
+                auto_resume as i64,
+                id.to_string()
+            ],
+        )?;
+        if n == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Count children forked from `source_id` that are in a non-terminal state.
+    pub fn count_live_forks_of(&self, source_id: Uuid) -> Result<usize, StateError> {
+        let conn = self.lock()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vms WHERE forked_from = ?1 \
+             AND state IN ('creating','running','paused','suspending','suspended')",
+            params![source_id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Persist the DHCP-assigned guest IP for a VM.
@@ -1473,7 +1571,8 @@ impl StateStore {
                     tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
-                    network
+                    network, last_activity_at, suspended_at, idle_timeout_secs,
+                    suspend_ttl_secs, auto_resume, forked_from
              FROM vms WHERE volume = ?1 LIMIT 1",
             params![volume_name],
             row_to_vm_record,
@@ -1502,6 +1601,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
     let id_str: String = row.get(0)?;
     let created_str: String = row.get(12)?;
     let updated_str: String = row.get(13)?;
+    let created = parse_datetime(&created_str)?;
 
     Ok(VmRecord {
         id: parse_uuid(&id_str)?,
@@ -1516,7 +1616,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
         guest_ip: row.get(9)?,
         kernel_path: row.get(10)?,
         rootfs_path: row.get(11)?,
-        created_at: parse_datetime(&created_str)?,
+        created_at: created,
         updated_at: parse_datetime(&updated_str)?,
         userdata: row.get(14)?,
         userdata_status: row.get(15)?,
@@ -1546,6 +1646,24 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
         },
         volume: row.get(22)?,
         network: row.get(23)?,
+        last_activity_at: {
+            let s: Option<String> = row.get(24)?;
+            match s {
+                Some(s) => parse_datetime(&s)?,
+                None => created, // legacy rows: fall back to created_at
+            }
+        },
+        suspended_at: {
+            let s: Option<String> = row.get(25)?;
+            s.map(|s| parse_datetime(&s)).transpose()?
+        },
+        idle_timeout_secs: row.get::<_, Option<i64>>(26)?.map(|v| v as u64),
+        suspend_ttl_secs: row.get::<_, Option<i64>>(27)?.map(|v| v as u64),
+        auto_resume: row.get::<_, i64>(28)? != 0,
+        forked_from: {
+            let s: Option<String> = row.get(29)?;
+            s.as_deref().map(parse_uuid).transpose()?
+        },
     })
 }
 
@@ -1730,6 +1848,12 @@ mod tests {
             balloon: false,
             volume: None,
             network: "nat".into(),
+            last_activity_at: Utc::now(),
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         }
     }
 
@@ -1916,6 +2040,58 @@ mod tests {
         store.insert_vm(&rec).unwrap();
         store.delete_vm(rec.id).unwrap();
         assert!(store.get_vm(rec.id).is_err());
+    }
+
+    #[test]
+    fn vm_record_roundtrips_idle_policy_fields() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("idle-vm");
+        rec.idle_timeout_secs = Some(1800);
+        rec.suspend_ttl_secs = Some(3600);
+        rec.auto_resume = false;
+        rec.forked_from = None;
+        store.insert_vm(&rec).unwrap();
+
+        let got = store.get_vm_by_name("idle-vm").unwrap();
+        assert_eq!(got.idle_timeout_secs, Some(1800));
+        assert_eq!(got.suspend_ttl_secs, Some(3600));
+        assert!(!got.auto_resume);
+        assert_eq!(got.last_activity_at, rec.last_activity_at);
+        assert_eq!(got.suspended_at, None);
+    }
+
+    #[test]
+    fn setters_update_activity_suspend_and_policy() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("s1");
+        store.insert_vm(&rec).unwrap();
+        let t = Utc::now();
+        store.touch_last_activity(rec.id, t).unwrap();
+        store.set_suspended_at(rec.id, Some(t)).unwrap();
+        store
+            .set_idle_policy(rec.id, Some(60), Some(120), true)
+            .unwrap();
+        let got = store.get_vm(rec.id).unwrap();
+        assert_eq!(got.suspended_at.map(|d| d.timestamp()), Some(t.timestamp()));
+        assert_eq!(got.idle_timeout_secs, Some(60));
+        store.set_suspended_at(rec.id, None).unwrap();
+        assert_eq!(store.get_vm(rec.id).unwrap().suspended_at, None);
+    }
+
+    #[test]
+    fn count_live_forks_counts_only_non_terminal_children() {
+        let store = StateStore::open_memory().unwrap();
+        let src = make_record("src");
+        store.insert_vm(&src).unwrap();
+        let mut child = make_record("child");
+        child.forked_from = Some(src.id);
+        child.state = "running".into();
+        store.insert_vm(&child).unwrap();
+        let mut dead = make_record("dead");
+        dead.forked_from = Some(src.id);
+        dead.state = "stopped".into();
+        store.insert_vm(&dead).unwrap();
+        assert_eq!(store.count_live_forks_of(src.id).unwrap(), 1);
     }
 
     #[test]

@@ -29,6 +29,12 @@ fn make_record(name: &str) -> VmRecord {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: Utc::now(),
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     }
 }
 
