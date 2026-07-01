@@ -7,6 +7,12 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.26](https://github.com/rvben/husker/compare/v0.4.25...v0.4.26) - 2026-07-01
+
+### Fixed
+
+- **husker**: insert setup-storage config keys before the first TOML table ([093e5b0](https://github.com/rvben/husker/commit/093e5b0fc42b5ede4600b1b5882656da3934b8e3))
+
 ## [0.4.25](https://github.com/rvben/husker/compare/v0.4.24...v0.4.25) - 2026-07-01
 
 ### Added
