@@ -213,6 +213,12 @@ fn core_with_running_vm_backend(
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state_store.insert_vm(&record).unwrap();
 
@@ -290,6 +296,12 @@ fn core_store_with_vm(
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state_store.insert_vm(&record).unwrap();
 
@@ -623,6 +635,12 @@ fn core_with_pool(
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state_store.insert_vm(&template).unwrap();
     state_store

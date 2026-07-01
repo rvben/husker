@@ -122,6 +122,12 @@ async fn health_counts_vms_correctly() {
             balloon: false,
             volume: None,
             network: "nat".into(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -413,6 +419,12 @@ async fn snapshot_endpoints_roundtrip() {
             balloon: false,
             volume: None,
             network: "nat".into(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         })
         .unwrap();
 
@@ -935,6 +947,12 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1091,6 +1109,12 @@ async fn vm_response_json_structure() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1179,6 +1203,12 @@ async fn list_vms_returns_all_records() {
             balloon: false,
             volume: None,
             network: "nat".into(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -1414,6 +1444,12 @@ async fn list_port_forwards_empty_for_existing_vm() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1471,6 +1507,12 @@ async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
     let storage = husker_storage::StorageConfig {
@@ -1528,6 +1570,12 @@ async fn vm_response_with_null_optional_fields() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1604,6 +1652,12 @@ async fn logs_returns_serial_output() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1664,6 +1718,12 @@ async fn logs_tail_returns_last_n_lines() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1724,6 +1784,12 @@ async fn logs_no_serial_file_returns_404() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1786,6 +1852,12 @@ fn logs_test_core(
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -2029,6 +2101,12 @@ async fn logs_large_file_is_truncated() {
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state.insert_vm(&record).unwrap();
 

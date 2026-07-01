@@ -163,6 +163,12 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
         balloon: false,
         volume: None,
         network: "nat".into(),
+        last_activity_at: now,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
     };
     state_store.insert_vm(&record).unwrap();
 

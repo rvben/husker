@@ -1633,6 +1633,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
             network: network_mode.to_string(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -1846,6 +1852,12 @@ impl<B: VmmBackend> HuskerCore<B> {
                 balloon: req.balloon,
                 volume: None,
                 network: network_mode.to_string(),
+                last_activity_at: now,
+                suspended_at: None,
+                idle_timeout_secs: None,
+                suspend_ttl_secs: None,
+                auto_resume: true,
+                forked_from: None,
             };
 
             self.state.insert_vm(&record).map_err(|e| match e {
@@ -1953,6 +1965,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
             network: network_mode.to_string(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         };
 
         self.state.insert_vm(&record).map_err(|e| match e {
@@ -2495,6 +2513,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: false,
             volume: None,
             network: "nat".into(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         };
         self.state.insert_vm(&record).map_err(|e| match e {
             husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
@@ -6205,6 +6229,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             network: "nat".into(),
+            last_activity_at: chrono::Utc::now(),
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         }
     }
 
@@ -6490,6 +6520,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: Some("mydata".into()),
             network: "nat".into(),
+            last_activity_at: chrono::Utc::now(),
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         };
         state.insert_vm(&vm).unwrap();
 
@@ -7085,6 +7121,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             network: "bridged".into(),
+            last_activity_at: chrono::Utc::now(),
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         };
         state.insert_vm(&vm).unwrap();
 
@@ -7226,6 +7268,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             network: "nat".into(),
+            last_activity_at: chrono::Utc::now(),
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
         }
     }
 
