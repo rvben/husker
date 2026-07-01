@@ -709,6 +709,24 @@ pub struct HuskerCore<B: VmmBackend> {
     vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-service reconcile locks; serialize concurrent reconciles of the same service.
     reconcile_locks: std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    /// Last control-plane activity (exec/shell/API touch) per VM, feeding the
+    /// idle policy's `idle_for` calculation. In-memory only; a daemon restart
+    /// loses history, but `seed_activity` reseeds a VM's clock on next sighting.
+    control_plane_last_active: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
+    /// Last network activity (port-forward byte delta) per VM, feeding the idle
+    /// policy's `idle_for` calculation alongside `control_plane_last_active`.
+    network_last_active: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
+    /// Last-seen cumulative (packets, bytes) per forward comment, for delta
+    /// detection: a growing counter between polls means the forward is active.
+    network_counters: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
+    /// Open-session refcount per VM (attached exec/shell streams). A non-zero
+    /// count shields a VM from idle suspension regardless of its last-activity
+    /// timestamps; see [`HuskerCore::begin_session`] and [`ActiveSessionGuard`].
+    active_sessions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+    /// Idle-policy defaults applied to opted-in VMs.
+    idle_policy: IdlePolicyConfig,
+    /// Idle-policy action counters, exposed via `/v1/metrics`.
+    idle_metrics: Arc<IdleMetrics>,
     /// Userspace TCP port-forward proxies, keyed by VM (macOS, no host nftables).
     #[cfg(not(feature = "linux-net"))]
     port_proxy: Arc<crate::port_proxy::PortProxy<crate::port_proxy::ActiveDialer>>,
@@ -899,6 +917,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            control_plane_last_active: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            network_last_active: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            network_counters: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            idle_policy: IdlePolicyConfig::default(),
+            idle_metrics: Arc::new(IdleMetrics::default()),
         }
     }
 
@@ -931,6 +957,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             runtime_dir,
             vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            control_plane_last_active: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            network_last_active: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            network_counters: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            idle_policy: IdlePolicyConfig::default(),
+            idle_metrics: Arc::new(IdleMetrics::default()),
             port_proxy: Arc::new(crate::port_proxy::PortProxy::new(
                 crate::port_proxy::ActiveDialer::default(),
             )),
@@ -1111,6 +1145,87 @@ impl<B: VmmBackend> HuskerCore<B> {
         self
     }
 
+    /// Set the idle-policy configuration applied to opted-in VMs.
+    pub fn with_idle_policy(mut self, cfg: IdlePolicyConfig) -> Self {
+        self.idle_policy = cfg;
+        self
+    }
+
+    /// The idle-policy configuration applied to opted-in VMs.
+    pub fn idle_policy(&self) -> &IdlePolicyConfig {
+        &self.idle_policy
+    }
+
+    /// Idle-policy action counters, exposed via `/v1/metrics`.
+    pub fn idle_metrics(&self) -> &IdleMetrics {
+        &self.idle_metrics
+    }
+
+    /// Last-seen cumulative (packets, bytes) per forward comment. The idle
+    /// policy's network-activity poll compares a fresh nftables read against
+    /// this map to detect a growing counter (traffic since the last poll) and
+    /// calls [`HuskerCore::mark_network_active`] when it finds one.
+    pub fn network_counters(
+        &self,
+    ) -> &Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>> {
+        &self.network_counters
+    }
+
+    /// Record control-plane activity (an exec/shell/API touch) against a VM's
+    /// idle clock.
+    pub fn note_activity(&self, id: Uuid) {
+        self.control_plane_last_active
+            .lock()
+            .expect("control_plane_last_active poisoned")
+            .insert(id, std::time::Instant::now());
+    }
+
+    /// Record network activity (a port-forward byte delta) against a VM's idle
+    /// clock.
+    pub fn mark_network_active(&self, id: Uuid) {
+        self.network_last_active
+            .lock()
+            .expect("network_last_active poisoned")
+            .insert(id, std::time::Instant::now());
+    }
+
+    /// Number of open sessions (exec/shell streams) currently pinning `id` active.
+    pub fn active_session_count(&self, id: Uuid) -> u64 {
+        *self
+            .active_sessions
+            .lock()
+            .expect("active_sessions poisoned")
+            .get(&id)
+            .unwrap_or(&0)
+    }
+
+    /// Increment the active-session refcount for `id` and return an RAII guard
+    /// that decrements it on drop, including on cancellation or a panic, so a
+    /// session can never leak the count and strand a VM pinned-active.
+    pub fn begin_session(&self, id: Uuid) -> ActiveSessionGuard {
+        *self
+            .active_sessions
+            .lock()
+            .expect("active_sessions poisoned")
+            .entry(id)
+            .or_insert(0) += 1;
+        ActiveSessionGuard::from_parts(Arc::clone(&self.active_sessions), id)
+    }
+
+    /// Seed both activity timers to now. Call on create/fork/first-sight so a
+    /// never-touched VM has a real idle clock instead of a missing entry.
+    pub fn seed_activity(&self, id: Uuid) {
+        let now = std::time::Instant::now();
+        self.control_plane_last_active
+            .lock()
+            .expect("control_plane_last_active poisoned")
+            .insert(id, now);
+        self.network_last_active
+            .lock()
+            .expect("network_last_active poisoned")
+            .insert(id, now);
+    }
+
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.vm_name_locks.lock().expect("vm_name_locks poisoned");
         map.entry(name.to_string())
@@ -1247,6 +1362,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         match self.try_create_vm(req, tags, &mut resources).await {
             Ok(record) => {
                 info!(name = %record.name, id = %record.id, "VM created");
+                self.seed_activity(record.id);
                 Ok(record)
             }
             Err(e) => {
@@ -2400,6 +2516,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         match self.try_fork_vm(&source, fork_name, &mut resources).await {
             Ok(rec) => {
                 info!(%source_name, %fork_name, "VM forked");
+                self.seed_activity(rec.id);
                 Ok(rec)
             }
             Err(e) => {
@@ -5482,6 +5599,51 @@ pub fn evaluate_policy(
     }
 }
 
+/// RAII guard that keeps a VM pinned "active" for the idle policy. Decrements
+/// the per-VM session refcount on drop, so a cancelled or panicking stream can
+/// never leak the count and strand a VM pinned-active.
+pub struct ActiveSessionGuard {
+    sessions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+    id: Uuid,
+}
+
+impl ActiveSessionGuard {
+    /// Build a guard directly from its parts. Used by callers in other modules
+    /// within this crate (e.g. the macOS userspace port-forward proxy) that
+    /// hold a VM id and the shared session map but not a `HuskerCore` reference.
+    pub(crate) fn from_parts(
+        sessions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+        id: Uuid,
+    ) -> Self {
+        Self { sessions, id }
+    }
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        let mut map = self.sessions.lock().expect("active_sessions poisoned");
+        if let Some(n) = map.get_mut(&self.id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// Idle-policy action counters, exposed via `/v1/metrics`.
+#[derive(Debug, Default)]
+pub struct IdleMetrics {
+    /// VMs auto-suspended for exceeding `idle_timeout_secs`.
+    pub suspended_total: std::sync::atomic::AtomicU64,
+    /// Suspended VMs auto-resumed by a control-plane touch (exec/shell/API).
+    pub auto_resumed_control_plane_total: std::sync::atomic::AtomicU64,
+    /// Suspended VMs auto-resumed by an inbound port-forward connection.
+    pub auto_resumed_connect_total: std::sync::atomic::AtomicU64,
+    /// Suspended VMs reaped for exceeding `suspend_ttl_secs`.
+    pub reaped_total: std::sync::atomic::AtomicU64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5507,6 +5669,58 @@ mod tests {
         tokio::fs::write(&path, b"old-and-longer").await.unwrap();
         write_file_atomic(&path, b"new").await.unwrap();
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
+    }
+
+    /// Build a `HuskerCore` for tests that only exercise in-memory bookkeeping
+    /// (activity timers, session refcounts) and never touch the VMM or disk.
+    /// The data/runtime paths are placeholders: `HuskerCore::new` and
+    /// `FirecrackerBackend::new` do no I/O, so nothing needs to exist on disk.
+    #[cfg(feature = "linux-net")]
+    async fn test_core() -> HuskerCore<husker_vmm::firecracker::FirecrackerBackend> {
+        let dir = std::env::temp_dir().join(format!("husker-core-test-{}", Uuid::new_v4()));
+        let runtime_dir = dir.join("run");
+        HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
+            ),
+            husker_state::StateStore::open_memory().unwrap(),
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            husker_storage::StorageConfig {
+                data_dir: dir.clone(),
+                state_dir: dir,
+            },
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        )
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn active_session_guard_increments_and_decrements() {
+        let core = test_core().await;
+        let id = Uuid::new_v4();
+        assert_eq!(core.active_session_count(id), 0);
+        {
+            let _g = core.begin_session(id);
+            assert_eq!(core.active_session_count(id), 1);
+            let _g2 = core.begin_session(id);
+            assert_eq!(core.active_session_count(id), 2);
+        }
+        assert_eq!(core.active_session_count(id), 0);
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn guard_decrements_even_when_dropped_early() {
+        let core = test_core().await;
+        let id = Uuid::new_v4();
+        let g = core.begin_session(id);
+        assert_eq!(core.active_session_count(id), 1);
+        drop(g);
+        assert_eq!(core.active_session_count(id), 0);
     }
 
     /// Block until `/proc/<pid>/cmdline` is observable, so the test never reads a
