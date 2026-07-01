@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use husker_api::{VmResponse, router};
+use husker_api::{VmResponse, metrics_router, router};
 use husker_core::HuskerCore;
 
 fn make_core(
@@ -185,6 +185,36 @@ async fn metrics_endpoint_returns_prometheus_text() {
     // individual statuses are host-dependent, so assert the family, not a value.
     assert!(body.contains("husker_diagnostic_check_status"));
     assert!(body.contains("# TYPE husker_diagnostic_check_status gauge"));
+}
+
+#[tokio::test]
+async fn metrics_router_serves_only_metrics_not_the_api() {
+    // The standalone metrics listener (for unauthenticated Prometheus scraping)
+    // must expose ONLY /v1/metrics - never the VM-control API.
+    let app = metrics_router(test_core());
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("husker_vms_total"));
+
+    // No other route is mounted on the metrics listener.
+    for path in ["/v1/vms", "/v1/health", "/v1/diagnostics", "/v1/secrets"] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must not be reachable on the metrics-only listener"
+        );
+    }
 }
 
 // ── List Endpoint ────────────────────────────────────────────────────
