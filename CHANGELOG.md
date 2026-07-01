@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.30](https://github.com/rvben/husker/compare/v0.4.29...v0.4.30) - 2026-07-01
+
+### Added
+
+- **api**: add an optional bearer token for the metrics listener (`metrics_token` / `HUSKER_METRICS_TOKEN`); when set, `/v1/metrics` requires `Authorization: Bearer` - defense in depth alongside a host firewall, independent of `api_token`. Unset keeps it unauthenticated ([ee96382](https://github.com/rvben/husker/commit/ee96382))
+
+
 ## [0.4.29](https://github.com/rvben/husker/compare/v0.4.28...v0.4.29) - 2026-07-01
 
 ### Added
