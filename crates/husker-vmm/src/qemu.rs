@@ -502,13 +502,16 @@ impl QemuKvmBackend {
         if inst.info.state == VmState::Running || inst.info.state == VmState::Paused {
             match inst.process.try_wait() {
                 Ok(Some(_)) => {
+                    // Process exited — mark as stopped and reap the now-empty cgroup.
                     inst.info.state = VmState::Stopped;
                     inst.info.pid = None;
+                    inst.cgroup.remove();
                 }
                 Ok(None) => {}
                 Err(_) => {
                     inst.info.state = VmState::Failed;
                     inst.info.pid = None;
+                    inst.cgroup.remove();
                 }
             }
         }

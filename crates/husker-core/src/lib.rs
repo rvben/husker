@@ -5333,12 +5333,12 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
                         .join("cgroup.subtree_control")
                 })
                 .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.contains("memory"))
+                .map(|s| s.contains("memory") && s.contains("cpu"))
                 .unwrap_or(false);
             let (status, message) = match (v2, delegated) {
                 (true, true) => (
                     CheckStatus::Ok,
-                    "cgroup v2 + memory controller delegated".into(),
+                    "cgroup v2 + memory/cpu controllers delegated".into(),
                 ),
                 (false, _) => (
                     CheckStatus::Fail,
@@ -5346,7 +5346,8 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
                 ),
                 (_, false) => (
                     CheckStatus::Fail,
-                    "memory controller not delegated (add Delegate=yes to husker.service)".into(),
+                    "memory/cpu controllers not delegated (add Delegate=yes to husker.service)"
+                        .into(),
                 ),
             };
             checks.push(CheckResult {

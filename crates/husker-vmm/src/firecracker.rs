@@ -640,14 +640,16 @@ impl VmmBackend for FirecrackerBackend {
         if instance.info.state == VmState::Running || instance.info.state == VmState::Paused {
             match instance.process.try_wait() {
                 Ok(Some(_)) => {
-                    // Process exited — mark as stopped
+                    // Process exited — mark as stopped and reap the now-empty cgroup.
                     instance.info.state = VmState::Stopped;
                     instance.info.pid = None;
+                    instance.cgroup.remove();
                 }
                 Ok(None) => {} // Still running
                 Err(_) => {
                     instance.info.state = VmState::Failed;
                     instance.info.pid = None;
+                    instance.cgroup.remove();
                 }
             }
         }

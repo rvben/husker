@@ -26,7 +26,11 @@ fn memory_max_bytes(mem_size_mib: u32, overhead_mib: u32) -> u64 {
 
 /// `cpu.max` line ("<quota> <period>") capping the VM to `vcpu_count` cores.
 fn cpu_max_line(vcpu_count: u32) -> String {
-    format!("{} {}", vcpu_count.max(1) * CPU_PERIOD_US, CPU_PERIOD_US)
+    format!(
+        "{} {}",
+        vcpu_count.max(1) as u64 * CPU_PERIOD_US as u64,
+        CPU_PERIOD_US
+    )
 }
 
 /// Extract the cgroup v2 path from `/proc/self/cgroup` (the `0::<path>` line).
@@ -178,6 +182,7 @@ impl CgroupSupervisor {
 
     /// SIGKILL any pids in a cgroup, then rmdir it. Best-effort.
     fn kill_and_rmdir(dir: &Path) {
+        let mut killed_any = false;
         if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
             for pid in procs
                 .split_whitespace()
@@ -185,12 +190,16 @@ impl CgroupSupervisor {
             {
                 // SAFETY: kill(2) with a pid + SIGKILL; harmless if the pid is gone.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
+                killed_any = true;
             }
         }
-        // Real cgroup pseudo-files cannot be unlinked; rmdir works once all
-        // tasks have exited. In tests we use a tempdir with regular files, so
-        // we remove_dir_all to simulate the same "dir is gone" postcondition.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Best-effort: real cgroup pseudo-files cannot be unlinked; rmdir works
+        // once all tasks have exited. Only wait when we actually signalled a
+        // process (an already-empty cgroup can be removed immediately). If rmdir
+        // still fails, the next daemon-start orphan sweep reaps it.
+        if killed_any {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         #[cfg(not(test))]
         let _ = std::fs::remove_dir(dir);
         #[cfg(test)]

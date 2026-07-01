@@ -149,6 +149,9 @@
 # resource_limits = true
 # Host-memory margin (MiB) over guest RAM for memory.max. 256 is safe for
 # Firecracker; QEMU with large VMs may need 512-1024.
+# Note: virtiofsd helper processes for host_shares/--volume run OUTSIDE the
+# VM's cgroup, so workloads using host shares should raise memory_overhead_mib
+# to leave headroom (their memory is not counted against the VM's memory.max).
 # memory_overhead_mib = 256
 # Also cap host CPU to <vcpus> cores per VM (cpu.max). Off by default.
 # cpu_limit = false
