@@ -96,7 +96,10 @@ pub fn render_migration_script(plan: &StorageSetupPlan) -> String {
         .replace("{{ALLOC_LINE}}", &alloc_line)
         .replace("{{MKFS_LINE}}", mkfs_line)
         .replace("{{FSTAB_LINE}}", &render_fstab_line(plan))
-        .replace("{{SYSTEMD_UNIT}}", render_systemd_mount_unit(plan).trim_end())
+        .replace(
+            "{{SYSTEMD_UNIT}}",
+            render_systemd_mount_unit(plan).trim_end(),
+        )
 }
 
 /// `/etc/fstab` line equivalent. `nofail` so a missing image never blocks boot
@@ -153,7 +156,11 @@ pub enum SetupError {
     #[error("invalid --size value: {0}")]
     InvalidSize(String),
     #[error("--size {have} bytes is below the {fs} minimum of {min} bytes")]
-    SizeTooSmall { fs: &'static str, have: u64, min: u64 },
+    SizeTooSmall {
+        fs: &'static str,
+        have: u64,
+        min: u64,
+    },
 }
 
 impl SetupError {
@@ -191,7 +198,7 @@ fn parse_size_bytes(s: &str) -> Option<u64> {
 /// Minimum loopback size the filesystem can be created on.
 fn fs_min_bytes(fs: SetupFs) -> u64 {
     match fs {
-        SetupFs::Xfs => 300 * 1024 * 1024,   // mkfs.xfs: "must be larger than 300MB"
+        SetupFs::Xfs => 300 * 1024 * 1024, // mkfs.xfs: "must be larger than 300MB"
         SetupFs::Btrfs => 128 * 1024 * 1024, // btrfs minimum is ~109 MiB; round up
     }
 }
@@ -223,9 +230,7 @@ pub fn build_storage_setup_plan(
     let state_dir = opts
         .state_dir
         .unwrap_or_else(|| sibling(data_dir, "-state"));
-    let image_path = opts
-        .image_path
-        .unwrap_or_else(|| sibling(data_dir, ".img"));
+    let image_path = opts.image_path.unwrap_or_else(|| sibling(data_dir, ".img"));
     if state_dir.starts_with(data_dir) {
         return Err(SetupError::PathUnderDataDir(state_dir));
     }
@@ -364,7 +369,10 @@ mod tests {
         let cfg = s.find("STEP 2: write config").expect("step 2 present");
         let reloc = s.find("STEP 3: relocate state").expect("step 3 present");
         let swap = s.find("STEP 7: swap").expect("step 7 present");
-        assert!(cfg < reloc && reloc < swap, "destructive steps out of order");
+        assert!(
+            cfg < reloc && reloc < swap,
+            "destructive steps out of order"
+        );
         // preallocated by default (not thin)
         assert!(s.contains("fallocate -l"));
     }
@@ -383,7 +391,10 @@ mod tests {
         let s = render_migration_script(&sample_plan());
         // The verify must capture output (so a failing rsync is caught), not pipe
         // into grep (which conflates "rsync failed" with "no differences").
-        assert!(s.contains("VERIFY_OUT="), "verify must capture rsync output");
+        assert!(
+            s.contains("VERIFY_OUT="),
+            "verify must capture rsync output"
+        );
         assert!(
             !s.contains("--checksum \"${DATA_DIR}/\" \"${STAGING}/\" | grep"),
             "verify must not pipe rsync into grep"
@@ -411,9 +422,15 @@ mod tests {
     #[test]
     fn migration_script_rollback_restores_the_db() {
         let s = render_migration_script(&sample_plan());
-        let rollback = s.lines().find(|l| l.contains("ROLLBACK")).expect("rollback line present");
+        let rollback = s
+            .lines()
+            .find(|l| l.contains("ROLLBACK"))
+            .expect("rollback line present");
         // STEP 3 moves the DB to state_dir, so the rollback MUST move it back.
-        assert!(rollback.contains("husker.db"), "rollback must restore the DB from state_dir");
+        assert!(
+            rollback.contains("husker.db"),
+            "rollback must restore the DB from state_dir"
+        );
     }
 }
 
@@ -457,8 +474,14 @@ mod build_tests {
         let SetupOutcome::Plan(p) = build(opts(), facts()).unwrap() else {
             panic!("expected a plan");
         };
-        assert_eq!(p.state_dir, std::path::PathBuf::from("/var/lib/husker-state"));
-        assert_eq!(p.image_path, std::path::PathBuf::from("/var/lib/husker.img"));
+        assert_eq!(
+            p.state_dir,
+            std::path::PathBuf::from("/var/lib/husker-state")
+        );
+        assert_eq!(
+            p.image_path,
+            std::path::PathBuf::from("/var/lib/husker.img")
+        );
         assert!(!p.thin);
         assert_eq!(p.size, "7G");
     }
@@ -467,7 +490,10 @@ mod build_tests {
     fn already_reflink_is_a_noop() {
         let mut f = facts();
         f.reflink = ReflinkStatus::Supported;
-        assert!(matches!(build(opts(), f).unwrap(), SetupOutcome::AlreadyReflink));
+        assert!(matches!(
+            build(opts(), f).unwrap(),
+            SetupOutcome::AlreadyReflink
+        ));
     }
 
     #[test]
@@ -483,56 +509,78 @@ mod build_tests {
     fn missing_tools_refused() {
         let mut f = facts();
         f.mkfs_available = false;
-        assert!(matches!(build(opts(), f).unwrap_err(), SetupError::MissingTool(_)));
+        assert!(matches!(
+            build(opts(), f).unwrap_err(),
+            SetupError::MissingTool(_)
+        ));
     }
 
     #[test]
     fn insufficient_space_refused() {
         let mut f = facts();
         f.free_bytes = 1024 * 1024 * 1024; // 1 GiB, less than bulk + margin
-        assert!(matches!(build(opts(), f).unwrap_err(), SetupError::InsufficientSpace { .. }));
+        assert!(matches!(
+            build(opts(), f).unwrap_err(),
+            SetupError::InsufficientSpace { .. }
+        ));
     }
 
     #[test]
     fn state_dir_under_data_dir_refused() {
         let mut o = opts();
         o.state_dir = Some(std::path::PathBuf::from("/var/lib/husker/state"));
-        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::PathUnderDataDir(_)));
+        assert!(matches!(
+            build(o, facts()).unwrap_err(),
+            SetupError::PathUnderDataDir(_)
+        ));
     }
 
     #[test]
     fn image_path_under_data_dir_refused() {
         let mut o = opts();
         o.image_path = Some(std::path::PathBuf::from("/var/lib/husker/vol.img"));
-        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::PathUnderDataDir(_)));
+        assert!(matches!(
+            build(o, facts()).unwrap_err(),
+            SetupError::PathUnderDataDir(_)
+        ));
     }
 
     #[test]
     fn rsync_missing_refused() {
         let mut f = facts();
         f.rsync_available = false;
-        assert!(matches!(build(opts(), f).unwrap_err(), SetupError::MissingTool(t) if t == "rsync"));
+        assert!(
+            matches!(build(opts(), f).unwrap_err(), SetupError::MissingTool(t) if t == "rsync")
+        );
     }
 
     #[test]
     fn explicit_size_below_xfs_min_refused() {
         let mut o = opts();
         o.size = Some("100M".into());
-        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::SizeTooSmall { .. }));
+        assert!(matches!(
+            build(o, facts()).unwrap_err(),
+            SetupError::SizeTooSmall { .. }
+        ));
     }
 
     #[test]
     fn invalid_size_refused() {
         let mut o = opts();
         o.size = Some("banana".into());
-        assert!(matches!(build(o, facts()).unwrap_err(), SetupError::InvalidSize(_)));
+        assert!(matches!(
+            build(o, facts()).unwrap_err(),
+            SetupError::InvalidSize(_)
+        ));
     }
 
     #[test]
     fn valid_explicit_size_accepted() {
         let mut o = opts();
         o.size = Some("2G".into());
-        let SetupOutcome::Plan(p) = build(o, facts()).unwrap() else { panic!("expected plan") };
+        let SetupOutcome::Plan(p) = build(o, facts()).unwrap() else {
+            panic!("expected plan")
+        };
         assert_eq!(p.size, "2G");
     }
 }

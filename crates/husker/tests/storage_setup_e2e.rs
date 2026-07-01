@@ -66,7 +66,10 @@ fn generated_script_migrates_and_data_survives() {
     );
 
     // The data dir is now a mounted reflink volume; the base image survived.
-    assert!(data_dir.join("images/base.ext4").exists(), "migrated data missing");
+    assert!(
+        data_dir.join("images/base.ext4").exists(),
+        "migrated data missing"
+    );
     assert!(
         is_reflink_capable(&data_dir.join("images"), &data_dir.join("vms")),
         "migrated data dir is not reflink-capable"
@@ -78,11 +81,20 @@ fn generated_script_migrates_and_data_survives() {
     // Config-write must have inserted the top-level keys BEFORE the [table],
     // leaving the file valid TOML with the existing section intact.
     let cfg = std::fs::read_to_string(&config_file).expect("config readable");
-    assert!(cfg.contains("storage_volume = true"), "storage_volume not written");
-    assert!(cfg.contains("[profiles.demo]"), "existing section not preserved");
+    assert!(
+        cfg.contains("storage_volume = true"),
+        "storage_volume not written"
+    );
+    assert!(
+        cfg.contains("[profiles.demo]"),
+        "existing section not preserved"
+    );
     let sd = cfg.find("state_dir").expect("state_dir written to config");
     let sec = cfg.find("[profiles.demo]").expect("section present");
-    assert!(sd < sec, "state_dir must be a top-level key before the [table]");
+    assert!(
+        sd < sec,
+        "state_dir must be a top-level key before the [table]"
+    );
 
     // Cleanup: unmount + remove (best-effort; warn on failure so loop mounts do
     // not silently linger on the test host).
@@ -90,7 +102,10 @@ fn generated_script_migrates_and_data_survives() {
         .args(["umount", data_dir.to_str().unwrap()])
         .status();
     if !matches!(umount, Ok(s) if s.success()) {
-        eprintln!("warning: cleanup umount of {} failed; loop mount may linger", data_dir.display());
+        eprintln!(
+            "warning: cleanup umount of {} failed; loop mount may linger",
+            data_dir.display()
+        );
     }
 }
 
