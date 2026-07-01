@@ -180,6 +180,11 @@ async fn metrics_endpoint_returns_prometheus_text() {
     assert!(body.contains("husker_api_requests_total"));
     assert!(body.contains("husker_vms_total"));
     assert!(body.contains("husker_api_uptime_seconds"));
+    // Host diagnostics are surfaced as severity gauges. The metric family is
+    // always present (reflink/free-space/backend checks always emit a result);
+    // individual statuses are host-dependent, so assert the family, not a value.
+    assert!(body.contains("husker_diagnostic_check_status"));
+    assert!(body.contains("# TYPE husker_diagnostic_check_status gauge"));
 }
 
 // ── List Endpoint ────────────────────────────────────────────────────

@@ -660,6 +660,11 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Whether the data dir is a mounted reflink storage volume (config flag);
     /// surfaced by diagnostics so `/v1/diagnostics` can report the mount guard.
     storage_volume: bool,
+    /// TTL cache for the host diagnostics report. `build_diagnostics` does real
+    /// filesystem IO (the reflink probe writes a temp file), so the cache bounds
+    /// that work to once per `DIAGNOSTICS_CACHE_TTL` even under frequent metrics
+    /// scrapes. Shared by `/v1/metrics` and `/v1/diagnostics`.
+    diagnostics_cache: std::sync::Mutex<Option<(std::time::Instant, DiagnosticsReport)>>,
     #[cfg(feature = "linux-net")]
     ovmf_code_path: PathBuf,
     #[cfg(feature = "linux-net")]
@@ -708,6 +713,11 @@ pub struct HuskerCore<B: VmmBackend> {
 
 /// Per-attempt timeout for agent connect+ping in readiness loops.
 const AGENT_PING_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// TTL for the cached host diagnostics report (see `HuskerCore::diagnostics`).
+/// Bounds the reflink-probe filesystem IO to at most once per interval under
+/// frequent `/v1/metrics` scrapes.
+const DIAGNOSTICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Lines of guest serial console appended to a boot/agent-readiness failure.
 const BOOT_FAILURE_SERIAL_TAIL_LINES: usize = 20;
@@ -867,6 +877,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             storage_volume: false,
+            diagnostics_cache: std::sync::Mutex::new(None),
             ovmf_code_path: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
             ovmf_vars_template_path: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
             embedded_agent: &[],
@@ -904,6 +915,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             storage_volume: false,
+            diagnostics_cache: std::sync::Mutex::new(None),
             embedded_agent: &[],
             default_kernel: None,
             default_rootfs: None,
@@ -969,6 +981,42 @@ impl<B: VmmBackend> HuskerCore<B> {
         {
             None
         }
+    }
+
+    /// Host diagnostics report, served from a short-TTL cache. `build_diagnostics`
+    /// does real filesystem IO (the reflink probe writes a temp file), so the
+    /// cache bounds that to once per `DIAGNOSTICS_CACHE_TTL` even when `/v1/metrics`
+    /// is scraped every few seconds. Callers should invoke this from a blocking
+    /// context (it may probe the filesystem) and under a timeout (a wedged
+    /// filesystem must not strand the scrape).
+    ///
+    /// On a cache miss the lock is deliberately held across the probe: concurrent
+    /// callers serialize on it and reuse the single fresh result instead of each
+    /// launching a redundant probe (no thundering herd). The probe is short, and
+    /// the common case (a hit) acquires and releases the lock immediately.
+    /// Poisoned-lock safe: a poisoned mutex falls back to a fresh, uncached
+    /// computation.
+    pub fn diagnostics(&self) -> DiagnosticsReport {
+        let build = || {
+            let input = DiagnosticsInput {
+                storage: &self.storage,
+                storage_volume: self.storage_volume,
+                embedded_agent_present: !self.embedded_agent.is_empty(),
+                host_interface: self.host_interface(),
+            };
+            build_diagnostics(&input)
+        };
+        let Ok(mut cache) = self.diagnostics_cache.lock() else {
+            return build();
+        };
+        if let Some((computed_at, report)) = cache.as_ref()
+            && computed_at.elapsed() < DIAGNOSTICS_CACHE_TTL
+        {
+            return report.clone();
+        }
+        let report = build();
+        *cache = Some((std::time::Instant::now(), report.clone()));
+        report
     }
 
     /// Set the default kernel/rootfs/initrd the daemon uses when a create request
@@ -4912,6 +4960,19 @@ pub enum CheckStatus {
     Fail,
 }
 
+impl CheckStatus {
+    /// Numeric severity for metrics/alerting: 0 = ok, 1 = warn, 2 = fail.
+    /// Ordered so `>= 2` selects hard failures and `>= 1` selects anything
+    /// not-ok.
+    pub fn severity(self) -> u8 {
+        match self {
+            CheckStatus::Ok => 0,
+            CheckStatus::Warn => 1,
+            CheckStatus::Fail => 2,
+        }
+    }
+}
+
 /// One diagnostic check result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -7862,5 +7923,16 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
                 .any(|c| c.name == "state-dir free space"),
             "state-dir check must appear when state_dir != data_dir"
         );
+    }
+
+    #[test]
+    fn check_status_severity_orders_ok_warn_fail() {
+        assert_eq!(CheckStatus::Ok.severity(), 0);
+        assert_eq!(CheckStatus::Warn.severity(), 1);
+        assert_eq!(CheckStatus::Fail.severity(), 2);
+        // Ordering is the metrics/alerting contract: `>= 2` selects failures,
+        // `>= 1` selects anything not-ok.
+        assert!(CheckStatus::Fail.severity() > CheckStatus::Warn.severity());
+        assert!(CheckStatus::Warn.severity() > CheckStatus::Ok.severity());
     }
 }

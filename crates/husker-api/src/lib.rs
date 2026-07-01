@@ -1253,6 +1253,11 @@ async fn list_profiles<B: VmmBackend + 'static>(
     })
 }
 
+/// Bound on the diagnostics probe so a wedged filesystem never strands a
+/// `/v1/metrics` scrape or a `/v1/diagnostics` request. Well above the normal
+/// probe cost (milliseconds), below Prometheus's default scrape timeout.
+const DIAGNOSTICS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[utoipa::path(
     get,
     path = "/v1/diagnostics",
@@ -1265,25 +1270,23 @@ async fn list_profiles<B: VmmBackend + 'static>(
 async fn diagnostics<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
 ) -> Json<DiagnosticsReport> {
-    let storage = core.storage_config().clone();
-    let storage_volume = core.storage_volume();
-    let embedded_agent_present = core.embedded_agent_present();
-    let host_interface = core.host_interface().map(|s| s.to_owned());
-    // probe_reflink does blocking fs IO; run it off the async executor.
-    let report = match tokio::task::spawn_blocking(move || {
-        let input = husker_core::DiagnosticsInput {
-            storage: &storage,
-            storage_volume,
-            embedded_agent_present,
-            host_interface: host_interface.as_deref(),
-        };
-        husker_core::build_diagnostics(&input)
-    })
+    // build_diagnostics does blocking fs IO (the reflink probe); run it off the
+    // async executor under a timeout. Served from a short-TTL cache shared with
+    // /v1/metrics.
+    let probe = core.clone();
+    let report = match tokio::time::timeout(
+        DIAGNOSTICS_PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(move || probe.diagnostics()),
+    )
     .await
     {
-        Ok(r) => r,
-        Err(e) => {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "diagnostics probe task panicked");
+            DiagnosticsReport { checks: Vec::new() }
+        }
+        Err(_) => {
+            tracing::error!("diagnostics probe timed out");
             DiagnosticsReport { checks: Vec::new() }
         }
     };
@@ -1381,7 +1384,41 @@ husker_vms_failed {}\n",
         }
     }
 
+    // Host diagnostics as severity gauges (0=ok, 1=warn, 2=fail), served from the
+    // TTL cache shared with /v1/diagnostics so frequent scrapes never re-probe the
+    // filesystem. Run off the async executor under a timeout: a wedged filesystem
+    // drops the diagnostic gauges from this scrape rather than hanging it.
+    let probe = core.clone();
+    if let Ok(Ok(report)) = tokio::time::timeout(
+        DIAGNOSTICS_PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(move || probe.diagnostics()),
+    )
+    .await
+    {
+        out.push_str(
+            "# HELP husker_diagnostic_check_status Host diagnostic check severity (0=ok, 1=warn, 2=fail).\n\
+# TYPE husker_diagnostic_check_status gauge\n",
+        );
+        for check in &report.checks {
+            out.push_str(&format!(
+                "husker_diagnostic_check_status{{check=\"{}\"}} {}\n",
+                escape_prometheus_label(&check.name),
+                check.status.severity(),
+            ));
+        }
+    }
+
     out
+}
+
+/// Escape a string for use as a Prometheus label value (backslash, double-quote,
+/// newline), per the text exposition format. Diagnostic check names are static
+/// today, but escaping keeps the endpoint well-formed if one ever gains a special
+/// character.
+fn escape_prometheus_label(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[utoipa::path(
