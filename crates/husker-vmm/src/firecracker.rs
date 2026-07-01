@@ -640,16 +640,19 @@ impl VmmBackend for FirecrackerBackend {
         if instance.info.state == VmState::Running || instance.info.state == VmState::Paused {
             match instance.process.try_wait() {
                 Ok(Some(_)) => {
-                    // Process exited — mark as stopped and reap the now-empty cgroup.
+                    // Process exited: mark as stopped and reap the now-empty cgroup.
                     instance.info.state = VmState::Stopped;
                     instance.info.pid = None;
                     instance.cgroup.remove();
                 }
                 Ok(None) => {} // Still running
                 Err(_) => {
+                    // try_wait() failed: the process state is ambiguous (it may
+                    // still be alive), so do NOT reap the cgroup here. remove()
+                    // SIGKILLs any pids in the cgroup, which could kill a live
+                    // VMM. destroy_vm and the startup orphan sweep reclaim it.
                     instance.info.state = VmState::Failed;
                     instance.info.pid = None;
-                    instance.cgroup.remove();
                 }
             }
         }

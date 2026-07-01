@@ -502,16 +502,19 @@ impl QemuKvmBackend {
         if inst.info.state == VmState::Running || inst.info.state == VmState::Paused {
             match inst.process.try_wait() {
                 Ok(Some(_)) => {
-                    // Process exited — mark as stopped and reap the now-empty cgroup.
+                    // Process exited: mark as stopped and reap the now-empty cgroup.
                     inst.info.state = VmState::Stopped;
                     inst.info.pid = None;
                     inst.cgroup.remove();
                 }
                 Ok(None) => {}
                 Err(_) => {
+                    // try_wait() failed: the process state is ambiguous (it may
+                    // still be alive), so do NOT reap the cgroup here. remove()
+                    // SIGKILLs any pids in the cgroup, which could kill a live
+                    // VMM. destroy_vm and the startup orphan sweep reclaim it.
                     inst.info.state = VmState::Failed;
                     inst.info.pid = None;
-                    inst.cgroup.remove();
                 }
             }
         }
