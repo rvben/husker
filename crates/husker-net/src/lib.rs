@@ -1,6 +1,6 @@
 //! Linux networking helpers for bridge/TAP lifecycle, NAT, and port forwarding.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
@@ -547,6 +547,7 @@ pub async fn add_port_forward(
             "tcp",
             "dport",
             &host_port.to_string(),
+            "counter",
             "dnat",
             "to",
             &dnat_target,
@@ -762,6 +763,101 @@ fn find_rules_by_comment_prefix(nft_json: &str, prefix: &str) -> Vec<(String, u6
     }
 
     results
+}
+
+/// Walk `nft -j list table` JSON for the rule with the given comment and return
+/// its inline (packets, bytes) counter, if present.
+///
+/// The counter is an anonymous per-rule counter statement embedded in the DNAT
+/// rule (see `add_port_forward`), so it serializes as `{"counter":{"packets":N,
+/// "bytes":M}}` (an object) rather than a named-counter reference (a string).
+fn parse_counter_from_table_json(json: &str, comment_tag: &str) -> Option<(u64, u64)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    for item in v.get("nftables")?.as_array()? {
+        let rule = match item.get("rule") {
+            Some(r) => r,
+            None => continue,
+        };
+        if rule.get("comment").and_then(|c| c.as_str()) != Some(comment_tag) {
+            continue;
+        }
+        for expr in rule.get("expr")?.as_array()? {
+            if let Some(counter) = expr.get("counter") {
+                let p = counter.get("packets")?.as_u64()?;
+                let b = counter.get("bytes")?.as_u64()?;
+                return Some((p, b));
+            }
+        }
+    }
+    None
+}
+
+/// Collect every husker-managed port-forward rule's (packets, bytes) counter,
+/// keyed by its own `husker-pf:<tap>:<port>` comment.
+fn parse_all_counters_from_table_json(json: &str) -> HashMap<String, (u64, u64)> {
+    let mut out = HashMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return out;
+    };
+    let Some(items) = v.get("nftables").and_then(|n| n.as_array()) else {
+        return out;
+    };
+    for item in items {
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
+        let Some(comment) = rule.get("comment").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if !comment.starts_with("husker-pf:") {
+            continue;
+        }
+        let Some(expr) = rule.get("expr").and_then(|e| e.as_array()) else {
+            continue;
+        };
+        for e in expr {
+            if let Some(c) = e.get("counter")
+                && let (Some(p), Some(b)) = (
+                    c.get("packets").and_then(|x| x.as_u64()),
+                    c.get("bytes").and_then(|x| x.as_u64()),
+                )
+            {
+                out.insert(comment.to_string(), (p, b));
+            }
+        }
+    }
+    out
+}
+
+/// Read the DNAT rule's traffic counter for a single port forward.
+///
+/// Runs a single `nft -j list table` call and picks out the rule tagged
+/// `husker-pf:<tap_name>:<host_port>`.
+pub async fn read_port_forward_counter(
+    host_port: u16,
+    tap_name: &str,
+    bridge_name: &str,
+) -> Result<(u64, u64), NetError> {
+    let table = nft_table_for_bridge(bridge_name);
+    let output = run_cmd("nft", &["-j", "list", "table", "ip", &table]).await?;
+    let tag = format!("husker-pf:{tap_name}:{host_port}");
+    parse_counter_from_table_json(&output, &tag).ok_or_else(|| NetError::CommandFailed {
+        cmd: "nft -j list table".into(),
+        message: format!("no counter found for rule tagged {tag}"),
+    })
+}
+
+/// Read every husker-managed port-forward counter in one `nft list table` call.
+///
+/// Used by the idle-policy loop's per-tick snapshot so it does not shell out to
+/// `nft` once per forward; results are keyed by each rule's own `husker-pf:`
+/// comment (see `parse_all_counters_from_table_json`).
+pub async fn read_all_port_forward_counters(
+    bridge_name: &str,
+) -> Result<HashMap<String, (u64, u64)>, NetError> {
+    let table = nft_table_for_bridge(bridge_name);
+    let output = run_cmd("nft", &["-j", "list", "table", "ip", &table]).await?;
+    Ok(parse_all_counters_from_table_json(&output))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1454,5 +1550,70 @@ default via 192.168.1.1 dev eth0 proto dhcp metric 100
 
         let prefix = format!("husker-pf:{tap_name}:");
         assert!(comment.starts_with(&prefix));
+    }
+
+    // ── Port Forward Counter Parsing ────────────────────────────────────
+
+    #[test]
+    fn parses_counter_for_matching_comment() {
+        let json = r#"{"nftables":[{"rule":{"chain":"prerouting","handle":7,
+          "comment":"husker-pf:tap0:8080",
+          "expr":[{"match":{}},{"counter":{"packets":12,"bytes":3456}},{"dnat":{}}]}}]}"#;
+        assert_eq!(
+            parse_counter_from_table_json(json, "husker-pf:tap0:8080"),
+            Some((12, 3456))
+        );
+        assert_eq!(
+            parse_counter_from_table_json(json, "husker-pf:tap0:9999"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_counter_missing_expr_returns_none() {
+        let json = r#"{"nftables":[{"rule":{"chain":"prerouting","handle":7,
+          "comment":"husker-pf:tap0:8080"}}]}"#;
+        assert_eq!(
+            parse_counter_from_table_json(json, "husker-pf:tap0:8080"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_counter_invalid_json_returns_none() {
+        assert_eq!(
+            parse_counter_from_table_json("not json", "husker-pf:tap0:8080"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_all_counters_collects_by_comment() {
+        let json = r#"{"nftables":[
+            {"rule":{"chain":"prerouting","handle":7,
+              "comment":"husker-pf:tap0:8080",
+              "expr":[{"counter":{"packets":12,"bytes":3456}},{"dnat":{}}]}},
+            {"rule":{"chain":"prerouting","handle":8,
+              "comment":"husker-pf:tap1:9090",
+              "expr":[{"counter":{"packets":1,"bytes":64}},{"dnat":{}}]}},
+            {"rule":{"chain":"forward","handle":9,
+              "comment":"other-rule"}}
+        ]}"#;
+
+        let counters = parse_all_counters_from_table_json(json);
+        assert_eq!(counters.len(), 2);
+        assert_eq!(counters.get("husker-pf:tap0:8080"), Some(&(12, 3456)));
+        assert_eq!(counters.get("husker-pf:tap1:9090"), Some(&(1, 64)));
+        assert!(!counters.contains_key("other-rule"));
+    }
+
+    #[test]
+    fn parse_all_counters_empty_json() {
+        assert!(parse_all_counters_from_table_json("{}").is_empty());
+    }
+
+    #[test]
+    fn parse_all_counters_invalid_json() {
+        assert!(parse_all_counters_from_table_json("not json").is_empty());
     }
 }
