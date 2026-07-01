@@ -21,11 +21,7 @@ fn test_backend(
     bin: impl Into<std::path::PathBuf>,
     dir: impl Into<std::path::PathBuf>,
 ) -> FirecrackerBackend {
-    FirecrackerBackend::new(
-        bin,
-        dir,
-        std::sync::Arc::new(CgroupSupervisor::disabled()),
-    )
+    FirecrackerBackend::new(bin, dir, std::sync::Arc::new(CgroupSupervisor::disabled()))
 }
 
 /// State tracked by the mock Firecracker API server.

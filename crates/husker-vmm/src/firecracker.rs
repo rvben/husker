@@ -332,7 +332,9 @@ impl FirecrackerBackend {
     ) -> Result<VmInfo, VmmError> {
         // Create the per-VM cgroup before spawning so we can place the process
         // immediately after obtaining its pid, before InstanceStart.
-        let vm_cgroup = self.cgroup.create_vm_cgroup(id, config.vcpu_count, config.mem_size_mib)
+        let vm_cgroup = self
+            .cgroup
+            .create_vm_cgroup(id, config.vcpu_count, config.mem_size_mib)
             .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
 
         // Spawn the Firecracker process
@@ -803,7 +805,9 @@ impl VmmBackend for FirecrackerBackend {
             .open(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
 
-        let mut vm_cgroup = self.cgroup.create_vm_cgroup(id, vcpu_count, mem_size_mib)
+        let mut vm_cgroup = self
+            .cgroup
+            .create_vm_cgroup(id, vcpu_count, mem_size_mib)
             .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
 
         let process = match tokio::process::Command::new(&self.firecracker_bin)
@@ -1258,8 +1262,7 @@ mod tests {
     async fn create_vm_cleans_up_runtime_files_on_spawn_failure() {
         let dir = tempfile::tempdir().unwrap();
         // Point at a binary that does not exist so spawn() fails immediately.
-        let backend =
-            test_backend(dir.path().join("does-not-exist-firecracker"), dir.path());
+        let backend = test_backend(dir.path().join("does-not-exist-firecracker"), dir.path());
 
         let config = VmConfig {
             name: "cleanup-on-fail".into(),

@@ -21,14 +21,13 @@ async fn cgroup_enforces_memory_max_and_removes_on_drop() {
     // Read the base cgroup path before init so we can find the vm dir later.
     // init() moves the current process to a `supervisor` leaf, which changes
     // /proc/self/cgroup; snapshot it now to get the parent's path.
-    let self_cg = std::fs::read_to_string("/proc/self/cgroup")
-        .expect("/proc/self/cgroup must be readable");
+    let self_cg =
+        std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup must be readable");
     let rel = self_cg
         .lines()
         .find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string()))
         .expect("must run on a cgroup v2 unified hierarchy (0:: line missing)");
-    let cgroup_base = std::path::PathBuf::from("/sys/fs/cgroup")
-        .join(rel.trim_start_matches('/'));
+    let cgroup_base = std::path::PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
 
     let sup = husker_vmm::cgroup::CgroupSupervisor::init(husker_vmm::cgroup::CgroupConfig {
         enabled: true,
@@ -47,7 +46,11 @@ async fn cgroup_enforces_memory_max_and_removes_on_drop() {
     let mut vc = sup.create_vm_cgroup(vm_id, 2, 128).unwrap();
 
     let vm_dir = cgroup_base.join(format!("vm-{vm_id}"));
-    assert!(vm_dir.exists(), "vm cgroup dir must exist: {}", vm_dir.display());
+    assert!(
+        vm_dir.exists(),
+        "vm cgroup dir must exist: {}",
+        vm_dir.display()
+    );
 
     // memory.max = (128 + 256) * 1024 * 1024 = 402653184
     let expected_mem: u64 = (128 + 256) * 1024 * 1024;

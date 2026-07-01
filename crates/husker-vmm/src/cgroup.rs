@@ -84,7 +84,10 @@ impl CgroupSupervisor {
 
     #[cfg(test)]
     pub fn with_base_for_test(base: PathBuf, config: CgroupConfig) -> Self {
-        Self { base: Some(base), config }
+        Self {
+            base: Some(base),
+            config,
+        }
     }
 
     /// Set up the delegated topology and return a live supervisor. Errors if the
@@ -96,21 +99,29 @@ impl CgroupSupervisor {
         // 1. Our own v2 cgroup path.
         let self_cg = std::fs::read_to_string("/proc/self/cgroup")
             .map_err(|e| CgroupError::Unavailable(format!("read /proc/self/cgroup: {e}")))?;
-        let rel = parse_self_cgroup_path(&self_cg)
-            .ok_or_else(|| CgroupError::Unavailable("not on a cgroup v2 unified hierarchy".into()))?;
+        let rel = parse_self_cgroup_path(&self_cg).ok_or_else(|| {
+            CgroupError::Unavailable("not on a cgroup v2 unified hierarchy".into())
+        })?;
         let svc = PathBuf::from(CGROUP_ROOT).join(rel.trim_start_matches('/'));
 
         // 2. Move ourselves to a leaf so the parent can hold child cgroups.
         let supervisor = svc.join("supervisor");
-        std::fs::create_dir_all(&supervisor)
-            .map_err(|e| CgroupError::Io { path: supervisor.clone(), source: e })?;
-        write_file(&supervisor.join("cgroup.procs"), &format!("{}\n", std::process::id()))?;
+        std::fs::create_dir_all(&supervisor).map_err(|e| CgroupError::Io {
+            path: supervisor.clone(),
+            source: e,
+        })?;
+        write_file(
+            &supervisor.join("cgroup.procs"),
+            &format!("{}\n", std::process::id()),
+        )?;
 
         // 3. Enable controllers in the parent, then verify by read-back.
         write_file(&svc.join("cgroup.subtree_control"), "+memory +cpu\n")?;
         let probe = svc.join("vm-probe");
-        std::fs::create_dir_all(&probe)
-            .map_err(|e| CgroupError::Io { path: probe.clone(), source: e })?;
+        std::fs::create_dir_all(&probe).map_err(|e| CgroupError::Io {
+            path: probe.clone(),
+            source: e,
+        })?;
         let controllers =
             std::fs::read_to_string(probe.join("cgroup.controllers")).unwrap_or_default();
         let _ = std::fs::remove_dir(&probe);
@@ -133,7 +144,10 @@ impl CgroupSupervisor {
                 }
             }
         }
-        Ok(Self { base: Some(svc), config })
+        Ok(Self {
+            base: Some(svc),
+            config,
+        })
     }
 
     pub fn create_vm_cgroup(
@@ -142,10 +156,14 @@ impl CgroupSupervisor {
         vcpu_count: u32,
         mem_size_mib: u32,
     ) -> Result<VmCgroup, CgroupError> {
-        let Some(base) = &self.base else { return Ok(VmCgroup { dir: None }) };
+        let Some(base) = &self.base else {
+            return Ok(VmCgroup { dir: None });
+        };
         let dir = base.join(vm_cgroup_dir_name(id));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| CgroupError::Io { path: dir.clone(), source: e })?;
+        std::fs::create_dir_all(&dir).map_err(|e| CgroupError::Io {
+            path: dir.clone(),
+            source: e,
+        })?;
         write_file(
             &dir.join("memory.max"),
             &memory_max_bytes(mem_size_mib, self.config.memory_overhead_mib).to_string(),
@@ -161,7 +179,10 @@ impl CgroupSupervisor {
     /// SIGKILL any pids in a cgroup, then rmdir it. Best-effort.
     fn kill_and_rmdir(dir: &Path) {
         if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-            for pid in procs.split_whitespace().filter_map(|p| p.parse::<i32>().ok()) {
+            for pid in procs
+                .split_whitespace()
+                .filter_map(|p| p.parse::<i32>().ok())
+            {
                 // SAFETY: kill(2) with a pid + SIGKILL; harmless if the pid is gone.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
@@ -213,7 +234,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sup = CgroupSupervisor::with_base_for_test(
             dir.path().to_path_buf(),
-            CgroupConfig { enabled: true, memory_overhead_mib: 256, cpu_limit: cpu },
+            CgroupConfig {
+                enabled: true,
+                memory_overhead_mib: 256,
+                cpu_limit: cpu,
+            },
         );
         (dir, sup)
     }
@@ -224,11 +249,26 @@ mod tests {
         let id = uuid::Uuid::from_u128(1);
         let mut vc = sup.create_vm_cgroup(id, 2, 512).unwrap();
         let d = dir.path().join(format!("vm-{id}"));
-        assert_eq!(fs::read_to_string(d.join("memory.max")).unwrap().trim(),
-                   (768u64 * 1024 * 1024).to_string());
-        assert_eq!(fs::read_to_string(d.join("memory.swap.max")).unwrap().trim(), "0");
-        assert_eq!(fs::read_to_string(d.join("memory.oom.group")).unwrap().trim(), "1");
-        assert!(!d.join("cpu.max").exists(), "cpu.max only when cpu_limit=true");
+        assert_eq!(
+            fs::read_to_string(d.join("memory.max")).unwrap().trim(),
+            (768u64 * 1024 * 1024).to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(d.join("memory.swap.max"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        assert_eq!(
+            fs::read_to_string(d.join("memory.oom.group"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        assert!(
+            !d.join("cpu.max").exists(),
+            "cpu.max only when cpu_limit=true"
+        );
         vc.remove();
         assert!(!d.exists(), "remove() rmdirs the cgroup");
     }
@@ -239,7 +279,10 @@ mod tests {
         let id = uuid::Uuid::from_u128(2);
         let _vc = sup.create_vm_cgroup(id, 4, 1024).unwrap();
         let d = dir.path().join(format!("vm-{id}"));
-        assert_eq!(fs::read_to_string(d.join("cpu.max")).unwrap().trim(), "400000 100000");
+        assert_eq!(
+            fs::read_to_string(d.join("cpu.max")).unwrap().trim(),
+            "400000 100000"
+        );
     }
 
     #[tokio::test]
@@ -257,7 +300,7 @@ mod tests {
         let sup = CgroupSupervisor::disabled();
         let mut vc = sup.create_vm_cgroup(uuid::Uuid::nil(), 1, 128).unwrap();
         vc.place(1).unwrap(); // no-op, no error
-        vc.remove();          // no-op
+        vc.remove(); // no-op
     }
 
     #[test]
@@ -300,6 +343,9 @@ mod tests {
     #[test]
     fn vm_cgroup_dir_name_is_prefixed() {
         let id = uuid::Uuid::nil();
-        assert_eq!(vm_cgroup_dir_name(id), "vm-00000000-0000-0000-0000-000000000000");
+        assert_eq!(
+            vm_cgroup_dir_name(id),
+            "vm-00000000-0000-0000-0000-000000000000"
+        );
     }
 }

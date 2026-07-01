@@ -5323,7 +5323,10 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
             let v2 = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
             let delegated = std::fs::read_to_string("/proc/self/cgroup")
                 .ok()
-                .and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::").map(String::from)))
+                .and_then(|c| {
+                    c.lines()
+                        .find_map(|l| l.strip_prefix("0::").map(String::from))
+                })
                 .map(|rel| {
                     std::path::Path::new("/sys/fs/cgroup")
                         .join(rel.trim_start_matches('/'))
@@ -5333,11 +5336,24 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
                 .map(|s| s.contains("memory"))
                 .unwrap_or(false);
             let (status, message) = match (v2, delegated) {
-                (true, true) => (CheckStatus::Ok, "cgroup v2 + memory controller delegated".into()),
-                (false, _) => (CheckStatus::Fail, "cgroup v2 unified hierarchy not mounted".into()),
-                (_, false) => (CheckStatus::Fail, "memory controller not delegated (add Delegate=yes to husker.service)".into()),
+                (true, true) => (
+                    CheckStatus::Ok,
+                    "cgroup v2 + memory controller delegated".into(),
+                ),
+                (false, _) => (
+                    CheckStatus::Fail,
+                    "cgroup v2 unified hierarchy not mounted".into(),
+                ),
+                (_, false) => (
+                    CheckStatus::Fail,
+                    "memory controller not delegated (add Delegate=yes to husker.service)".into(),
+                ),
             };
-            checks.push(CheckResult { name: "cgroup limits".into(), status, message });
+            checks.push(CheckResult {
+                name: "cgroup limits".into(),
+                status,
+                message,
+            });
         }
         #[cfg(not(target_os = "linux"))]
         {
