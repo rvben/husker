@@ -657,6 +657,9 @@ pub struct HuskerCore<B: VmmBackend> {
     ip_allocator: husker_net::IpAllocator,
     storage: husker_storage::StorageConfig,
     storage_driver: Arc<dyn husker_storage::StorageDriver>,
+    /// Whether the data dir is a mounted reflink storage volume (config flag);
+    /// surfaced by diagnostics so `/v1/diagnostics` can report the mount guard.
+    storage_volume: bool,
     #[cfg(feature = "linux-net")]
     ovmf_code_path: PathBuf,
     #[cfg(feature = "linux-net")]
@@ -668,6 +671,10 @@ pub struct HuskerCore<B: VmmBackend> {
     lan_bridge: Option<String>,
     #[cfg(feature = "linux-net")]
     dns_servers: Vec<String>,
+    /// Host uplink interface for guest NAT egress; surfaced by diagnostics so a
+    /// misconfigured uplink (guests with no WAN/DNS) is caught by `husker doctor`.
+    #[cfg(feature = "linux-net")]
+    host_interface: String,
     /// Backend kind to persist when a create request omits `--vmm`. Mirrors the
     /// dispatcher's configured default so the record reflects the backend that
     /// actually runs the VM. Defaults to Firecracker.
@@ -859,12 +866,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             ip_allocator,
             storage,
             storage_driver: husker_storage::default_storage_driver(),
+            storage_volume: false,
             ovmf_code_path: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
             ovmf_vars_template_path: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
             embedded_agent: &[],
             bridge_name,
             lan_bridge: None,
             dns_servers,
+            host_interface: String::new(),
             default_vmm_kind: husker_vmm::VmmKind::Firecracker,
             default_kernel: None,
             default_rootfs: None,
@@ -894,6 +903,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             state,
             storage,
             storage_driver: husker_storage::default_storage_driver(),
+            storage_volume: false,
             embedded_agent: &[],
             default_kernel: None,
             default_rootfs: None,
@@ -915,6 +925,50 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub fn with_embedded_agent(mut self, agent: &'static [u8]) -> Self {
         self.embedded_agent = agent;
         self
+    }
+
+    /// Set whether the data dir is a mounted reflink storage volume (config flag).
+    /// Surfaced by diagnostics; does not change create/destroy behavior.
+    pub fn with_storage_volume(mut self, storage_volume: bool) -> Self {
+        self.storage_volume = storage_volume;
+        self
+    }
+
+    /// Set the host uplink interface used for guest NAT egress. Surfaced by
+    /// diagnostics so a misconfigured uplink (guests with no WAN/DNS) is caught by
+    /// `husker doctor`.
+    #[cfg(feature = "linux-net")]
+    pub fn with_host_interface(mut self, host_interface: String) -> Self {
+        self.host_interface = host_interface;
+        self
+    }
+
+    /// Whether the data dir is a mounted reflink storage volume (config flag).
+    pub fn storage_volume(&self) -> bool {
+        self.storage_volume
+    }
+
+    /// Whether this binary carries an embedded guest agent (needed by cloud-image
+    /// VMs at create time).
+    pub fn embedded_agent_present(&self) -> bool {
+        !self.embedded_agent.is_empty()
+    }
+
+    /// Configured host uplink interface for guest NAT egress, if set. `None` on
+    /// the macOS backend (which NATs internally) or when unconfigured.
+    pub fn host_interface(&self) -> Option<&str> {
+        #[cfg(feature = "linux-net")]
+        {
+            if self.host_interface.is_empty() {
+                None
+            } else {
+                Some(self.host_interface.as_str())
+            }
+        }
+        #[cfg(not(feature = "linux-net"))]
+        {
+            None
+        }
     }
 
     /// Set the default kernel/rootfs/initrd the daemon uses when a create request
@@ -4910,12 +4964,26 @@ fn binary_on_path(name: &str) -> bool {
     })
 }
 
+/// Inputs to [`build_diagnostics`]: the storage layout plus the daemon-config
+/// facts the host checks need. The CLI local probe fills these from its loaded
+/// config; the `/v1/diagnostics` handler fills them from the running manager.
+pub struct DiagnosticsInput<'a> {
+    /// Storage layout (data dir, state dir, derived image/vm dirs).
+    pub storage: &'a husker_storage::StorageConfig,
+    /// Whether the data dir is a mounted reflink storage volume (config flag).
+    pub storage_volume: bool,
+    /// Whether this binary carries an embedded guest agent. Cloud-image VMs need
+    /// it at create time; a missing agent is a silent footgun until then.
+    pub embedded_agent_present: bool,
+    /// Configured host uplink interface for guest NAT egress (Linux). `None` when
+    /// unknown, e.g. the macOS backend, which NATs internally via VZ.
+    pub host_interface: Option<&'a str>,
+}
+
 /// Build the host diagnostics report. Pure host inspection (no backend state),
 /// so the CLI can call it directly for a local target.
-pub fn build_diagnostics(
-    storage: &husker_storage::StorageConfig,
-    storage_volume: bool,
-) -> DiagnosticsReport {
+pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
+    let storage = input.storage;
     let mut checks = Vec::new();
 
     // data-dir reflink (the real images -> vms path).
@@ -4960,18 +5028,170 @@ pub fn build_diagnostics(
         }),
     }
 
+    // state-dir free space (only when it is a separate filesystem from the data
+    // dir; the reflink split puts the DB + runtime here, off the loopback).
+    if storage.state_dir != storage.data_dir {
+        match available_bytes(&storage.state_dir) {
+            Some(bytes) => {
+                let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                // Holds only the SQLite DB + runtime, so warn only when truly tight.
+                let status = if bytes < 256 * 1024 * 1024 {
+                    CheckStatus::Warn
+                } else {
+                    CheckStatus::Ok
+                };
+                checks.push(CheckResult {
+                    name: "state-dir free space".into(),
+                    status,
+                    message: format!("{gib:.1} GiB free"),
+                });
+            }
+            None => checks.push(CheckResult {
+                name: "state-dir free space".into(),
+                status: CheckStatus::Fail,
+                message: "cannot stat state dir".into(),
+            }),
+        }
+    }
+
     // backend availability (Linux: firecracker + /dev/kvm).
     #[cfg(target_os = "linux")]
     {
         let fc = binary_on_path("firecracker");
         let kvm = std::path::Path::new("/dev/kvm").exists();
         let (status, message) = match (fc, kvm) {
-            (true, true) => (CheckStatus::Ok, "firecracker + /dev/kvm present".to_string()),
+            (true, true) => (
+                CheckStatus::Ok,
+                "firecracker + /dev/kvm present".to_string(),
+            ),
             (false, _) => (CheckStatus::Fail, "firecracker not on PATH".to_string()),
             (_, false) => (CheckStatus::Fail, "/dev/kvm missing".to_string()),
         };
         checks.push(CheckResult {
             name: "backend".into(),
+            status,
+            message,
+        });
+    }
+
+    // backend availability (macOS: Apple VZ is always present via the framework;
+    // cloud-image VMs additionally need qemu-img for the qcow2 -> raw conversion).
+    #[cfg(target_os = "macos")]
+    {
+        let qemu_img = binary_on_path("qemu-img");
+        checks.push(CheckResult {
+            name: "backend".into(),
+            status: if qemu_img {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warn
+            },
+            message: if qemu_img {
+                "Apple Virtualization.framework + qemu-img present".into()
+            } else {
+                "Apple Virtualization.framework present; qemu-img missing (cloud images need it)"
+                    .into()
+            },
+        });
+    }
+
+    // embedded guest agent (cloud-image VMs fail at create without it).
+    checks.push(CheckResult {
+        name: "embedded agent".into(),
+        status: if input.embedded_agent_present {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        message: if input.embedded_agent_present {
+            "guest agent embedded in this binary".into()
+        } else {
+            "no embedded agent: cloud-image VMs will fail at create (rebuild with HUSKER_EMBED_AGENT_BIN)"
+                .into()
+        },
+    });
+
+    // default boot kernel (the `husker image pull` target; VMs fall back to it).
+    let kernel = storage.kernels_dir().join("vmlinux");
+    let kernel_present = kernel.exists();
+    checks.push(CheckResult {
+        name: "default boot images".into(),
+        status: if kernel_present {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        message: if kernel_present {
+            format!("default kernel present at {}", kernel.display())
+        } else {
+            "no default kernel (run `husker image pull`)".into()
+        },
+    });
+
+    // vhost_vsock (Linux): the QEMU backend + host-bind-mount (--mount) jobs reach
+    // the guest agent over /dev/vhost-vsock; without the module they fail to start.
+    #[cfg(target_os = "linux")]
+    {
+        let present = std::path::Path::new("/dev/vhost-vsock").exists();
+        checks.push(CheckResult {
+            name: "vhost_vsock".into(),
+            status: if present {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warn
+            },
+            message: if present {
+                "/dev/vhost-vsock present".into()
+            } else {
+                "/dev/vhost-vsock missing (QEMU backend + --mount jobs need it: modprobe vhost_vsock)"
+                    .into()
+            },
+        });
+    }
+
+    // guest NAT egress (Linux): guests reach the WAN/DNS through an nftables
+    // masquerade off the configured uplink with IP forwarding on. A wrong or
+    // absent uplink is the classic "guests have no internet" failure.
+    #[cfg(target_os = "linux")]
+    {
+        let ip_forward = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        let nft = binary_on_path("nft");
+        let iface_ok = match input.host_interface {
+            Some(iface) => std::path::Path::new(&format!("/sys/class/net/{iface}")).exists(),
+            // Unknown uplink (daemon did not report one): skip the interface probe.
+            None => true,
+        };
+        let (status, message) = if !iface_ok {
+            (
+                CheckStatus::Fail,
+                format!(
+                    "host_interface {} not found (guests get no WAN/DNS)",
+                    input.host_interface.unwrap_or("?")
+                ),
+            )
+        } else if !ip_forward {
+            (
+                CheckStatus::Fail,
+                "IP forwarding disabled (sysctl net.ipv4.ip_forward=1 for guest egress)".into(),
+            )
+        } else if !nft {
+            (
+                CheckStatus::Warn,
+                "nft not on PATH (husker programs guest NAT via nftables)".into(),
+            )
+        } else {
+            (
+                CheckStatus::Ok,
+                match input.host_interface {
+                    Some(iface) => format!("uplink {iface}, IP forwarding on, nftables present"),
+                    None => "IP forwarding on, nftables present".into(),
+                },
+            )
+        };
+        checks.push(CheckResult {
+            name: "guest NAT egress".into(),
             status,
             message,
         });
@@ -4995,7 +5215,7 @@ pub fn build_diagnostics(
     });
 
     // storage volume mount (only when the flag is set).
-    if storage_volume {
+    if input.storage_volume {
         let mounted = storage.sentinel_path().exists();
         checks.push(CheckResult {
             name: "storage volume mount".into(),
@@ -7507,14 +7727,36 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             data_dir: dir.path().to_path_buf(),
             state_dir: dir.path().to_path_buf(),
         };
-        let report = build_diagnostics(&storage, false);
+        let input = DiagnosticsInput {
+            storage: &storage,
+            storage_volume: false,
+            embedded_agent_present: true,
+            host_interface: None,
+        };
+        let report = build_diagnostics(&input);
         // Always includes the reflink and free-space checks by name.
         assert!(report.checks.iter().any(|c| c.name == "data-dir reflink"));
-        assert!(report.checks.iter().any(|c| c.name == "data-dir free space"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "data-dir free space")
+        );
         // storage_volume=false => the mount check must be absent entirely.
         assert!(
-            !report.checks.iter().any(|c| c.name == "storage volume mount"),
+            !report
+                .checks
+                .iter()
+                .any(|c| c.name == "storage volume mount"),
             "mount check must not appear when storage_volume=false"
+        );
+        // state_dir == data_dir => no separate state-dir free-space check.
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.name == "state-dir free space"),
+            "state-dir check must not appear when state_dir == data_dir"
         );
     }
 
@@ -7526,7 +7768,13 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             state_dir: dir.path().to_path_buf(),
         };
         // No sentinel file present => the mount check must fail.
-        let report = build_diagnostics(&storage, true);
+        let input = DiagnosticsInput {
+            storage: &storage,
+            storage_volume: true,
+            embedded_agent_present: true,
+            host_interface: None,
+        };
+        let report = build_diagnostics(&input);
         let mount = report
             .checks
             .iter()
@@ -7534,5 +7782,82 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             .expect("mount check present when storage_volume=true");
         assert_eq!(mount.status, CheckStatus::Fail);
         assert!(report.has_failure());
+    }
+
+    #[test]
+    fn build_diagnostics_warns_on_missing_embedded_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let input = DiagnosticsInput {
+            storage: &storage,
+            storage_volume: false,
+            embedded_agent_present: false,
+            host_interface: None,
+        };
+        let report = build_diagnostics(&input);
+        let agent = report
+            .checks
+            .iter()
+            .find(|c| c.name == "embedded agent")
+            .expect("embedded agent check present");
+        assert_eq!(agent.status, CheckStatus::Warn);
+        // A missing agent is advisory, not a hard failure.
+        assert!(!report.has_failure());
+    }
+
+    #[test]
+    fn build_diagnostics_reports_embedded_agent_ok_and_missing_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let input = DiagnosticsInput {
+            storage: &storage,
+            storage_volume: false,
+            embedded_agent_present: true,
+            host_interface: None,
+        };
+        let report = build_diagnostics(&input);
+        let agent = report
+            .checks
+            .iter()
+            .find(|c| c.name == "embedded agent")
+            .expect("embedded agent check present");
+        assert_eq!(agent.status, CheckStatus::Ok);
+        // No kernel file in a fresh temp dir => the default-images check warns.
+        let images = report
+            .checks
+            .iter()
+            .find(|c| c.name == "default boot images")
+            .expect("default boot images check present");
+        assert_eq!(images.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn build_diagnostics_checks_state_dir_when_split_from_data_dir() {
+        let data = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: data.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+        };
+        let input = DiagnosticsInput {
+            storage: &storage,
+            storage_volume: false,
+            embedded_agent_present: true,
+            host_interface: None,
+        };
+        let report = build_diagnostics(&input);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "state-dir free space"),
+            "state-dir check must appear when state_dir != data_dir"
+        );
     }
 }

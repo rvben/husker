@@ -1266,9 +1266,18 @@ async fn diagnostics<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
 ) -> Json<DiagnosticsReport> {
     let storage = core.storage_config().clone();
+    let storage_volume = core.storage_volume();
+    let embedded_agent_present = core.embedded_agent_present();
+    let host_interface = core.host_interface().map(|s| s.to_owned());
     // probe_reflink does blocking fs IO; run it off the async executor.
     let report = match tokio::task::spawn_blocking(move || {
-        husker_core::build_diagnostics(&storage, false)
+        let input = husker_core::DiagnosticsInput {
+            storage: &storage,
+            storage_volume,
+            embedded_agent_present,
+            host_interface: host_interface.as_deref(),
+        };
+        husker_core::build_diagnostics(&input)
     })
     .await
     {

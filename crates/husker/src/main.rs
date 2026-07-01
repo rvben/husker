@@ -2748,8 +2748,12 @@ async fn run(cli: Cli) -> Result<()> {
     // THIS machine's data dir). Refuse a remote/ssh context up front, before we
     // open a tunnel or probe the local host, so the error is clean and no local
     // dirs are touched.
-    if matches!(&command, Commands::Setup { action: SetupAction::Storage { .. } })
-        && (api_url.starts_with("ssh://") || !is_local_api(&api_url))
+    if matches!(
+        &command,
+        Commands::Setup {
+            action: SetupAction::Storage { .. }
+        }
+    ) && (api_url.starts_with("ssh://") || !is_local_api(&api_url))
     {
         exit_with_error(
             output,
@@ -4355,13 +4359,8 @@ async fn run(cli: Cli) -> Result<()> {
                     .or_else(|| api_url.strip_prefix("https://"))
                     .unwrap_or(api_url.as_str())
                     .trim_end_matches('/');
-                match ss::build_storage_setup_plan(
-                    &data_dir,
-                    &config_file,
-                    api_addr,
-                    opts,
-                    &facts,
-                ) {
+                match ss::build_storage_setup_plan(&data_dir, &config_file, api_addr, opts, &facts)
+                {
                     Ok(ss::SetupOutcome::AlreadyReflink) => {
                         println!(
                             "data dir already supports reflink (copy-on-write); no migration needed."
@@ -4372,7 +4371,10 @@ async fn run(cli: Cli) -> Result<()> {
                         let unit = ss::render_systemd_mount_unit(&plan);
                         if let Some(dir) = out {
                             if let Err(e) = std::fs::create_dir_all(&dir) {
-                                exit_with_error(output, format!("cannot create {}: {e}", dir.display()));
+                                exit_with_error(
+                                    output,
+                                    format!("cannot create {}: {e}", dir.display()),
+                                );
                             }
                             let script_path = dir.join("husker-setup-storage.sh");
                             let unit_path = dir.join("husker-storage.mount");
@@ -4384,10 +4386,16 @@ async fn run(cli: Cli) -> Result<()> {
                                 );
                             }
                             std::fs::write(&script_path, &script).unwrap_or_else(|e| {
-                                exit_with_error(output, format!("cannot write {}: {e}", script_path.display()))
+                                exit_with_error(
+                                    output,
+                                    format!("cannot write {}: {e}", script_path.display()),
+                                )
                             });
                             std::fs::write(&unit_path, &unit).unwrap_or_else(|e| {
-                                exit_with_error(output, format!("cannot write {}: {e}", unit_path.display()))
+                                exit_with_error(
+                                    output,
+                                    format!("cannot write {}: {e}", unit_path.display()),
+                                )
                             });
                             println!(
                                 "wrote {} and {}",
@@ -4424,8 +4432,19 @@ async fn run(cli: Cli) -> Result<()> {
                         state_dir: config.effective_state_dir(),
                     };
                     let storage_volume = config.storage_volume;
+                    let embedded_agent_present = husker::agent_embedded();
+                    #[cfg(feature = "linux-net")]
+                    let host_interface = Some(config.host_interface.clone());
+                    #[cfg(not(feature = "linux-net"))]
+                    let host_interface: Option<String> = None;
                     match tokio::task::spawn_blocking(move || {
-                        husker_core::build_diagnostics(&storage, storage_volume)
+                        let input = husker_core::DiagnosticsInput {
+                            storage: &storage,
+                            storage_volume,
+                            embedded_agent_present,
+                            host_interface: host_interface.as_deref(),
+                        };
+                        husker_core::build_diagnostics(&input)
                     })
                     .await
                     {
@@ -7636,6 +7655,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     runtime_dir.clone(),
                 )
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
+                .with_storage_volume(config.storage_volume)
+                .with_host_interface(config.host_interface.clone())
                 .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
                 .with_lan_bridge(config.lan_bridge.clone())
                 .with_default_vmm_kind(default_kind)
@@ -7672,6 +7693,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     config.dns_servers,
                     runtime_dir.clone(),
                 )
+                .with_storage_volume(config.storage_volume)
+                .with_host_interface(config.host_interface.clone())
                 .with_default_images(
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
@@ -7711,6 +7734,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         let core = Arc::new(
             husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
+                .with_storage_volume(config.storage_volume)
                 .with_default_images(
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
@@ -7751,6 +7775,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         let core = Arc::new(
             husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
+                .with_storage_volume(config.storage_volume)
                 .with_default_images(
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
@@ -11119,6 +11144,9 @@ mod tests {
     fn setup_storage_in_schema_is_read_only() {
         // build_cli_schema derives from clap; the annotation marks setup storage read-only.
         let (mutating, _fields) = schema_command_annotations("setup storage");
-        assert!(!mutating, "setup storage only prints/writes files; must be read-only");
+        assert!(
+            !mutating,
+            "setup storage only prints/writes files; must be read-only"
+        );
     }
 }
