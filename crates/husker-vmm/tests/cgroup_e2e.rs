@@ -44,7 +44,7 @@ async fn cgroup_enforces_memory_max_and_removes_on_drop() {
     });
 
     let vm_id = uuid::Uuid::from_u128(0xE2E);
-    let vc = sup.create_vm_cgroup(vm_id, 2, 128).unwrap();
+    let mut vc = sup.create_vm_cgroup(vm_id, 2, 128).unwrap();
 
     let vm_dir = cgroup_base.join(format!("vm-{vm_id}"));
     assert!(vm_dir.exists(), "vm cgroup dir must exist: {}", vm_dir.display());

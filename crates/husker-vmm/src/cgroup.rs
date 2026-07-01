@@ -187,9 +187,17 @@ impl VmCgroup {
         write_file(&dir.join("cgroup.procs"), &format!("{pid}\n"))
     }
 
-    pub fn remove(&self) {
-        if let Some(dir) = &self.dir {
-            CgroupSupervisor::kill_and_rmdir(dir);
+    pub fn remove(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            CgroupSupervisor::kill_and_rmdir(&dir);
+        }
+    }
+}
+
+impl Drop for VmCgroup {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            CgroupSupervisor::kill_and_rmdir(&dir);
         }
     }
 }
@@ -214,7 +222,7 @@ mod tests {
     async fn create_vm_cgroup_writes_memory_swap_and_oom_group() {
         let (dir, sup) = temp_supervisor(false);
         let id = uuid::Uuid::from_u128(1);
-        let vc = sup.create_vm_cgroup(id, 2, 512).unwrap();
+        let mut vc = sup.create_vm_cgroup(id, 2, 512).unwrap();
         let d = dir.path().join(format!("vm-{id}"));
         assert_eq!(fs::read_to_string(d.join("memory.max")).unwrap().trim(),
                    (768u64 * 1024 * 1024).to_string());
@@ -247,9 +255,21 @@ mod tests {
     #[test]
     fn disabled_supervisor_produces_noop_cgroups() {
         let sup = CgroupSupervisor::disabled();
-        let vc = sup.create_vm_cgroup(uuid::Uuid::nil(), 1, 128).unwrap();
+        let mut vc = sup.create_vm_cgroup(uuid::Uuid::nil(), 1, 128).unwrap();
         vc.place(1).unwrap(); // no-op, no error
         vc.remove();          // no-op
+    }
+
+    #[test]
+    fn drop_removes_the_cgroup() {
+        let (dir, sup) = temp_supervisor(false);
+        let id = uuid::Uuid::from_u128(9);
+        let d = dir.path().join(format!("vm-{id}"));
+        {
+            let _vc = sup.create_vm_cgroup(id, 1, 128).unwrap();
+            assert!(d.exists());
+        } // _vc drops here → Drop rmdirs
+        assert!(!d.exists(), "Drop removes the cgroup dir");
     }
 
     #[test]

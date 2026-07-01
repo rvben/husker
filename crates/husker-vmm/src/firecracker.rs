@@ -350,7 +350,6 @@ impl FirecrackerBackend {
         {
             Ok(p) => p,
             Err(e) => {
-                vm_cgroup.remove();
                 return Err(VmmError::ProcessError(format!("spawn firecracker: {e}")));
             }
         };
@@ -359,7 +358,6 @@ impl FirecrackerBackend {
         if let Some(p) = pid
             && let Err(e) = vm_cgroup.place(p)
         {
-            vm_cgroup.remove();
             return Err(VmmError::ProcessError(format!("place vmm in cgroup: {e}")));
         }
 
@@ -371,7 +369,6 @@ impl FirecrackerBackend {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         if !socket_path.exists() {
-            vm_cgroup.remove();
             return Err(VmmError::ProcessError(
                 "Firecracker socket did not appear within 5s".into(),
             ));
@@ -806,7 +803,7 @@ impl VmmBackend for FirecrackerBackend {
             .open(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
 
-        let vm_cgroup = self.cgroup.create_vm_cgroup(id, vcpu_count, mem_size_mib)
+        let mut vm_cgroup = self.cgroup.create_vm_cgroup(id, vcpu_count, mem_size_mib)
             .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
 
         let process = match tokio::process::Command::new(&self.firecracker_bin)
