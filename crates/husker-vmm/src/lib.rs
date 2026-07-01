@@ -12,6 +12,8 @@ pub mod qmp;
 #[cfg(unix)]
 pub mod qemu;
 
+pub mod cgroup;
+
 #[cfg(target_os = "linux")]
 pub mod dispatch;
 #[cfg(target_os = "linux")]
