@@ -5321,6 +5321,14 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
         #[cfg(target_os = "linux")]
         {
             let v2 = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+            // Read the daemon cgroup's `cgroup.controllers` (the controllers
+            // available to enable on children), NOT `cgroup.subtree_control`.
+            // Once resource limits are on, `init()` has moved the daemon into a
+            // `supervisor` leaf whose subtree_control is empty (no children),
+            // which would read as "not delegated" even though limits work.
+            // `cgroup.controllers` correctly reflects cpu+memory availability in
+            // both the pre-init (daemon in the service cgroup) and post-init
+            // (daemon in the leaf) states.
             let delegated = std::fs::read_to_string("/proc/self/cgroup")
                 .ok()
                 .and_then(|c| {
@@ -5330,7 +5338,7 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
                 .map(|rel| {
                     std::path::Path::new("/sys/fs/cgroup")
                         .join(rel.trim_start_matches('/'))
-                        .join("cgroup.subtree_control")
+                        .join("cgroup.controllers")
                 })
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|s| s.contains("memory") && s.contains("cpu"))
