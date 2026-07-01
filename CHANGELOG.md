@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.32](https://github.com/rvben/husker/compare/v0.4.31...v0.4.32) - 2026-07-01
+
+### Fixed
+
+- **core**: `husker doctor`'s `cgroup limits` readiness check now reads the daemon cgroup's `cgroup.controllers` instead of `cgroup.subtree_control`. Once `resource_limits` is enabled, `init()` moves the daemon into a `supervisor` leaf whose `subtree_control` is empty, which made the check falsely report the memory/cpu controllers as not delegated even while limits were being enforced ([18d0e60](https://github.com/rvben/husker/commit/18d0e60))
+
+
 ## [0.4.31](https://github.com/rvben/husker/compare/v0.4.30...v0.4.31) - 2026-07-01
 
 ### Added
