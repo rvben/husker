@@ -335,8 +335,13 @@ mod tests {
     async fn unknown_id_routes_to_not_found() {
         use crate::VmmBackend;
         let dir = tempfile::tempdir().unwrap();
-        let fc = crate::firecracker::FirecrackerBackend::new("firecracker", dir.path());
-        let qemu = crate::qemu::QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let cgroup = std::sync::Arc::new(crate::cgroup::CgroupSupervisor::disabled());
+        let fc = crate::firecracker::FirecrackerBackend::new(
+            "firecracker",
+            dir.path(),
+            std::sync::Arc::clone(&cgroup),
+        );
+        let qemu = crate::qemu::QemuKvmBackend::new("qemu-system-x86_64", dir.path(), cgroup);
         let be = LinuxDispatchBackend::new(fc, qemu, crate::VmmKind::Firecracker);
         let id = uuid::Uuid::new_v4();
         assert!(matches!(

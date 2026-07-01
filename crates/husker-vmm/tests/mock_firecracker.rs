@@ -13,8 +13,20 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::sync::Mutex;
 
+use husker_vmm::cgroup::CgroupSupervisor;
 use husker_vmm::firecracker::FirecrackerBackend;
 use husker_vmm::{VmConfig, VmmBackend, VmmError};
+
+fn test_backend(
+    bin: impl Into<std::path::PathBuf>,
+    dir: impl Into<std::path::PathBuf>,
+) -> FirecrackerBackend {
+    FirecrackerBackend::new(
+        bin,
+        dir,
+        std::sync::Arc::new(CgroupSupervisor::disabled()),
+    )
+}
 
 /// State tracked by the mock Firecracker API server.
 #[derive(Default)]
@@ -183,7 +195,7 @@ async fn mock_fc_error_response_includes_body() {
 #[tokio::test]
 async fn create_vm_missing_binary() {
     let dir = tempfile::tempdir().unwrap();
-    let backend = FirecrackerBackend::new("/nonexistent/firecracker", dir.path());
+    let backend = test_backend("/nonexistent/firecracker", dir.path());
 
     let config = VmConfig {
         name: "test".into(),
@@ -219,7 +231,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
     let runtime_dir = dir.path().join("run");
     std::fs::create_dir_all(&runtime_dir).unwrap();
 
-    let backend = FirecrackerBackend::new("/nonexistent/firecracker", &runtime_dir);
+    let backend = test_backend("/nonexistent/firecracker", &runtime_dir);
 
     let config = VmConfig {
         name: "orphan-test".into(),
@@ -313,7 +325,7 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         std::fs::set_permissions(&wrapper_script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let backend = FirecrackerBackend::new(&wrapper_script, &runtime_dir);
+    let backend = test_backend(&wrapper_script, &runtime_dir);
 
     let config = VmConfig {
         name: "api-fail-test".into(),

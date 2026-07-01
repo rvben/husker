@@ -64,14 +64,20 @@ pub struct QemuKvmBackend {
     pub(crate) binary: PathBuf,
     pub(crate) runtime_dir: PathBuf,
     pub(crate) instances: Arc<Mutex<HashMap<Uuid, QemuInstance>>>,
+    cgroup: std::sync::Arc<crate::cgroup::CgroupSupervisor>,
 }
 
 impl QemuKvmBackend {
-    pub fn new(binary: impl Into<PathBuf>, runtime_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        binary: impl Into<PathBuf>,
+        runtime_dir: impl Into<PathBuf>,
+        cgroup: std::sync::Arc<crate::cgroup::CgroupSupervisor>,
+    ) -> Self {
         Self {
             binary: binary.into(),
             runtime_dir: runtime_dir.into(),
             instances: Arc::new(Mutex::new(HashMap::new())),
+            cgroup,
         }
     }
 
@@ -652,6 +658,17 @@ impl crate::VmmBackend for QemuKvmBackend {
 mod tests {
     use super::*;
 
+    fn test_backend(
+        bin: impl Into<std::path::PathBuf>,
+        dir: impl Into<std::path::PathBuf>,
+    ) -> QemuKvmBackend {
+        QemuKvmBackend::new(
+            bin,
+            dir,
+            std::sync::Arc::new(crate::cgroup::CgroupSupervisor::disabled()),
+        )
+    }
+
     fn sample_config() -> VmConfig {
         VmConfig {
             name: "qvm".into(),
@@ -677,7 +694,7 @@ mod tests {
 
     #[test]
     fn build_args_has_core_flags() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         for flag in [
             "-machine",
@@ -697,7 +714,7 @@ mod tests {
 
     #[test]
     fn build_args_wires_vsock_cid() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter().any(|a| a == "vhost-vsock-pci,guest-cid=7"),
@@ -707,7 +724,7 @@ mod tests {
 
     #[test]
     fn build_args_attaches_raw_rootfs_and_root_device() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter()
@@ -726,7 +743,7 @@ mod tests {
 
     #[test]
     fn build_args_includes_tap_when_present() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter().any(|a| a.contains("ifname=husker7")),
@@ -741,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_name_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let be = test_backend("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
         be.instances.lock().await.insert(
             id,
@@ -774,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn destroy_removes_runtime_files() {
         let dir = tempfile::tempdir().unwrap();
-        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let be = test_backend("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
         let qmp = dir.path().join("a.qmp");
         let pid = dir.path().join("a.pid");
@@ -811,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn info_detects_dead_process() {
         let dir = tempfile::tempdir().unwrap();
-        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let be = test_backend("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
         let process = tokio::process::Command::new("true").spawn().unwrap();
         be.instances.lock().await.insert(
@@ -845,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn not_found_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let be = test_backend("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
         assert!(matches!(be.info(id).await, Err(VmmError::VmNotFound(_))));
         assert!(matches!(be.destroy(id).await, Err(VmmError::VmNotFound(_))));
@@ -856,7 +873,7 @@ mod tests {
 
     #[test]
     fn build_args_strips_pci_off_for_qemu() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.kernel_args = Some("console=ttyS0 reboot=k panic=1 pci=off ip=192.0.2.2::192.0.2.1:255.255.255.252::eth0:off".into());
         let args = be.build_args(Uuid::nil(), &cfg).unwrap();
@@ -887,7 +904,7 @@ mod tests {
 
     #[test]
     fn build_args_uefi_uses_pflash_and_qcow2_no_kernel() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let be = test_backend("qemu-system-x86_64", "/run/husker");
         let id = Uuid::nil();
         let args = be.build_args(id, &uefi_config()).unwrap();
 
@@ -925,7 +942,7 @@ mod tests {
 
     #[test]
     fn build_args_direct_kernel_still_has_kernel_and_raw_rootfs() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             args.iter().any(|a| a == "-kernel"),
@@ -943,7 +960,7 @@ mod tests {
 
     #[test]
     fn build_args_uefi_attaches_seed_when_present() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let be = test_backend("qemu-system-x86_64", "/run/husker");
         let mut cfg = uefi_config();
         cfg.seed_path = Some("/var/lib/husker/vms/qvm/seed.img".into());
         let args = be.build_args(Uuid::nil(), &cfg).unwrap();
@@ -957,7 +974,7 @@ mod tests {
 
     #[test]
     fn build_args_uefi_omits_seed_when_absent() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let be = test_backend("qemu-system-x86_64", "/run/husker");
         let args = be.build_args(Uuid::nil(), &uefi_config()).unwrap(); // seed_path None
         assert!(
             !args.iter().any(|a| a.contains("seed.img")),
@@ -968,7 +985,7 @@ mod tests {
     #[tokio::test]
     async fn destroy_removes_ovmf_vars_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let be = test_backend("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
         // Simulate a booted UEFI VM: a VARS copy exists in the runtime dir.
         let vars = be.ovmf_vars_copy(id);
@@ -1041,7 +1058,7 @@ mod tests {
 
     #[test]
     fn build_args_includes_balloon_device_when_enabled() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.balloon = true;
         let args = be.build_args(Uuid::nil(), &cfg).unwrap();
@@ -1053,7 +1070,7 @@ mod tests {
 
     #[test]
     fn build_args_omits_balloon_device_by_default() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let args = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
             !args.iter().any(|a| a == "virtio-balloon-pci"),
@@ -1063,7 +1080,7 @@ mod tests {
 
     #[test]
     fn build_args_uefi_includes_balloon_device_when_enabled() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let be = test_backend("qemu-system-x86_64", "/run/husker");
         let mut cfg = uefi_config();
         cfg.balloon = true;
         let args = be.build_args(Uuid::nil(), &cfg).unwrap();
@@ -1078,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn set_balloon_without_device_is_invalid_config() {
         let dir = tempfile::tempdir().unwrap();
-        let be = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+        let be = test_backend("qemu-system-x86_64", dir.path());
         let id = Uuid::new_v4();
         be.instances.lock().await.insert(
             id,
@@ -1117,7 +1134,7 @@ mod tests {
     /// vdc=seed (NoCloud reads the seed by filesystem label so position is free).
     #[test]
     fn build_args_uefi_volume_ordering_disk_then_volume_then_seed() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let be = test_backend("qemu-system-x86_64", "/run/husker");
         let mut cfg = uefi_config();
         cfg.volume_path = Some("/var/lib/husker/volumes/data.img".into());
         cfg.seed_path = Some("/var/lib/husker/vms/qvm/seed.img".into());
@@ -1166,7 +1183,7 @@ mod tests {
     /// the volume -drive so the guest sees vda=rootfs, vdb=volume.
     #[test]
     fn build_args_direct_volume_ordering_rootfs_then_volume() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.volume_path = Some("/var/lib/husker/volumes/data.img".into());
         let args = be.build_args(Uuid::nil(), &cfg).unwrap();
@@ -1202,7 +1219,7 @@ mod tests {
     /// When no volume is set, the volume -drive is absent in both boot modes.
     #[test]
     fn build_args_no_volume_drive_when_absent() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/run/husker");
+        let be = test_backend("qemu-system-x86_64", "/run/husker");
         // Direct-kernel, no volume
         let args_direct = be.build_args(Uuid::nil(), &sample_config()).unwrap();
         assert!(
@@ -1219,7 +1236,7 @@ mod tests {
 
     #[test]
     fn build_args_efi_returns_invalid_config_error() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.boot = crate::BootMode::Efi {
             variable_store: "/tmp/nvram.bin".into(),
@@ -1235,7 +1252,7 @@ mod tests {
 
     #[test]
     fn qemu_uses_shared_memory_backend_when_shares_present() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.mem_size_mib = 2048;
         cfg.host_shares = vec![crate::HostShare {
@@ -1263,7 +1280,7 @@ mod tests {
 
     #[test]
     fn qemu_uses_plain_memory_without_shares() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.mem_size_mib = 512;
         let args = be.build_args(Uuid::nil(), &cfg).unwrap();
@@ -1276,7 +1293,7 @@ mod tests {
 
     #[test]
     fn qemu_emits_vhost_user_fs_device_per_share() {
-        let be = QemuKvmBackend::new("qemu-system-x86_64", "/tmp");
+        let be = test_backend("qemu-system-x86_64", "/tmp");
         let mut cfg = sample_config();
         cfg.host_shares = vec![
             crate::HostShare {

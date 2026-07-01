@@ -5578,6 +5578,7 @@ mod tests {
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -5601,6 +5602,7 @@ mod tests {
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -6551,6 +6553,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -6643,6 +6646,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -6710,6 +6714,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -6784,6 +6789,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -6879,6 +6885,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -6931,6 +6938,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -7011,6 +7019,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             ),
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),

@@ -112,6 +112,7 @@ pub struct FirecrackerBackend {
     firecracker_bin: PathBuf,
     runtime_dir: PathBuf,
     instances: Arc<Mutex<HashMap<Uuid, FcInstance>>>,
+    cgroup: std::sync::Arc<crate::cgroup::CgroupSupervisor>,
 }
 
 /// Minimum Firecracker version `husker fork` needs: `network_overrides` (1.12.0,
@@ -145,11 +146,16 @@ fn parse_firecracker_version(output: &str) -> Option<(u32, u32, u32)> {
 }
 
 impl FirecrackerBackend {
-    pub fn new(firecracker_bin: impl Into<PathBuf>, runtime_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        firecracker_bin: impl Into<PathBuf>,
+        runtime_dir: impl Into<PathBuf>,
+        cgroup: std::sync::Arc<crate::cgroup::CgroupSupervisor>,
+    ) -> Self {
         Self {
             firecracker_bin: firecracker_bin.into(),
             runtime_dir: runtime_dir.into(),
             instances: Arc::new(Mutex::new(HashMap::new())),
+            cgroup,
         }
     }
 
@@ -919,6 +925,17 @@ impl VmmBackend for FirecrackerBackend {
 mod tests {
     use super::*;
 
+    fn test_backend(
+        bin: impl Into<std::path::PathBuf>,
+        dir: impl Into<std::path::PathBuf>,
+    ) -> FirecrackerBackend {
+        FirecrackerBackend::new(
+            bin,
+            dir,
+            std::sync::Arc::new(crate::cgroup::CgroupSupervisor::disabled()),
+        )
+    }
+
     #[test]
     fn recover_aliased_rootfs_restores_real_disk_over_stale_symlink() {
         // Simulate a fork that crashed mid-load: source is a stale symlink to a
@@ -1140,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_name_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let backend = test_backend("firecracker", dir.path());
 
         // Manually insert a fake instance
         let id = Uuid::new_v4();
@@ -1194,7 +1211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Point at a binary that does not exist so spawn() fails immediately.
         let backend =
-            FirecrackerBackend::new(dir.path().join("does-not-exist-firecracker"), dir.path());
+            test_backend(dir.path().join("does-not-exist-firecracker"), dir.path());
 
         let config = VmConfig {
             name: "cleanup-on-fail".into(),
@@ -1237,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn vm_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let backend = test_backend("firecracker", dir.path());
         let id = Uuid::new_v4();
 
         assert!(matches!(
@@ -1265,7 +1282,7 @@ mod tests {
     #[tokio::test]
     async fn destroy_cleans_up_files() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let backend = test_backend("firecracker", dir.path());
 
         let id = Uuid::new_v4();
         let socket_path = dir.path().join("test.sock");
@@ -1309,7 +1326,7 @@ mod tests {
     #[tokio::test]
     async fn vm_info_detects_dead_process() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let backend = test_backend("firecracker", dir.path());
 
         let id = Uuid::new_v4();
         // Spawn a process that exits immediately
@@ -1346,7 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn set_balloon_unknown_id_is_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let backend = test_backend("firecracker", dir.path());
         let id = Uuid::new_v4();
         assert!(matches!(
             backend.set_balloon(id, 64).await,
@@ -1359,7 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn set_balloon_without_device_is_invalid_config() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let backend = test_backend("firecracker", dir.path());
         let id = Uuid::new_v4();
         let instance = FcInstance {
             info: VmInfo {
@@ -1387,10 +1404,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn backend_accepts_a_disabled_supervisor() {
+        use std::sync::Arc;
+        let _be = FirecrackerBackend::new(
+            "firecracker",
+            "/tmp",
+            Arc::new(crate::cgroup::CgroupSupervisor::disabled()),
+        );
+    }
+
     #[tokio::test]
     async fn firecracker_rejects_host_shares() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FirecrackerBackend::new("firecracker", dir.path());
+        let backend = test_backend("firecracker", dir.path());
 
         let mut config = VmConfig {
             name: "test-shares".into(),

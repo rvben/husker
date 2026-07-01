@@ -7676,11 +7676,27 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
         #[cfg(target_os = "linux")]
         let core = {
+            let cgroup = std::sync::Arc::new(
+                husker_vmm::cgroup::CgroupSupervisor::init(husker_vmm::cgroup::CgroupConfig {
+                    enabled: config.resource_limits,
+                    memory_overhead_mib: config.memory_overhead_mib,
+                    cpu_limit: config.cpu_limit,
+                })
+                .unwrap_or_else(|e| {
+                    if config.resource_limits {
+                        eprintln!("husker: resource_limits enabled but cgroup setup failed: {e}");
+                        std::process::exit(1);
+                    }
+                    husker_vmm::cgroup::CgroupSupervisor::disabled()
+                }),
+            );
             let firecracker = husker_vmm::firecracker::FirecrackerBackend::new(
                 &config.firecracker_bin,
                 &runtime_dir,
+                std::sync::Arc::clone(&cgroup),
             );
-            let qemu = husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir);
+            let qemu =
+                husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir, cgroup);
             let default_kind = match config.vmm {
                 VmmSelection::Qemu => husker_vmm::VmmKind::Qemu,
                 VmmSelection::Firecracker => husker_vmm::VmmKind::Firecracker,
@@ -7731,6 +7747,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
                 &config.firecracker_bin,
                 &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
             );
             Arc::new(
                 husker_core::HuskerCore::new(
@@ -7826,6 +7843,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
         let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
             PathBuf::from("firecracker"),
             &runtime_dir,
+            std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
         );
 
         let core = Arc::new(

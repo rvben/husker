@@ -27,6 +27,7 @@ fn make_core(
     let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
         std::path::Path::new("/nonexistent"),
         std::path::Path::new("/tmp"),
+        std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
     );
 
     #[cfg(feature = "linux-net")]
