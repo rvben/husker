@@ -9,13 +9,15 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+use crate::ActiveSessionGuard;
 
 /// Connects a host-side accept loop to a service inside the guest.
 pub trait GuestDialer: Clone + Send + Sync + 'static {
@@ -42,12 +44,65 @@ impl GuestDialer for DirectIpDialer {
 /// dialer is the only change needed to move to Approach B.
 pub type ActiveDialer = DirectIpDialer;
 
+/// Wraps an inner dialer with an async "resume the VM first" hook. Implements
+/// `GuestDialer` so `PortProxy` calls it transparently: the resume hook is not
+/// a `PortProxy` concern (`PortProxy` is generic over `GuestDialer` and cannot
+/// see a hook that lives on a concrete dialer). `resume` runs inside `dial()`,
+/// before delegating to the inner dialer, so every accepted connection wakes
+/// the captured VM (idempotently) before its bytes are relayed.
+#[derive(Clone)]
+pub struct ResumeDialer<D, F> {
+    inner: D,
+    vm_name: String,
+    resume: F,
+}
+
+impl<D, F, Fut> ResumeDialer<D, F>
+where
+    D: GuestDialer,
+    F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = io::Result<()>> + Send,
+{
+    pub fn new(inner: D, vm_name: String, resume: F) -> Self {
+        Self {
+            inner,
+            vm_name,
+            resume,
+        }
+    }
+}
+
+impl<D, F, Fut> GuestDialer for ResumeDialer<D, F>
+where
+    D: GuestDialer,
+    F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = io::Result<()>> + Send,
+{
+    type Stream = D::Stream;
+
+    async fn dial(&self, guest_ip: Ipv4Addr, guest_port: u16) -> io::Result<Self::Stream> {
+        (self.resume)(self.vm_name.clone()).await?; // idempotent wake
+        self.inner.dial(guest_ip, guest_port).await
+    }
+}
+
+/// Spawns a guarded relay for one connection drained synchronously from the
+/// OS backlog (see `PortProxy::drain_and_close`). Boxed because `Forward`
+/// itself is not generic over `GuestDialer`; the closure captures a concrete
+/// dialer, the guest target, and the shared session map.
+type DrainRelay = Box<dyn Fn(TcpStream, SocketAddr) + Send + Sync>;
+
 /// One active forward's accept loop. Aborting on drop frees the bound host port
-/// (the listener lives in this task). Already-accepted relay connections run in
-/// their own detached tasks and drain naturally when either side closes - which,
-/// for a destroyed VM whose guest is gone, happens immediately.
+/// once every clone of `listener` (this one, and the accept loop's) is gone.
+/// Already-accepted relay connections run in their own detached tasks and
+/// drain naturally when either side closes - which, for a destroyed VM whose
+/// guest is gone, happens immediately.
 struct Forward {
     handle: JoinHandle<()>,
+    listener: Arc<TcpListener>,
+    /// `None` for forwards created via `add`, which have no session map to
+    /// guard and are torn down by `stop`/`stop_all` without draining.
+    drain_relay: Option<DrainRelay>,
 }
 
 impl Drop for Forward {
@@ -82,15 +137,116 @@ impl<D: GuestDialer> PortProxy<D> {
     ) -> io::Result<u16> {
         let listener = TcpListener::bind(SocketAddr::new(bind_addr, host_port)).await?;
         let bound = listener.local_addr()?.port();
+        let listener = Arc::new(listener);
         let dialer = self.dialer.clone();
-        let handle = tokio::spawn(accept_loop(listener, dialer, guest_ip, guest_port));
+        let handle = tokio::spawn(accept_loop(
+            Arc::clone(&listener),
+            dialer,
+            guest_ip,
+            guest_port,
+        ));
         self.forwards
             .lock()
             .expect("port proxy mutex poisoned")
             .entry(vm_id)
             .or_default()
-            .insert(bound, Forward { handle });
+            .insert(
+                bound,
+                Forward {
+                    handle,
+                    listener,
+                    drain_relay: None,
+                },
+            );
         Ok(bound)
+    }
+
+    /// Like `add`, but each accepted connection first mints an
+    /// `ActiveSessionGuard` (kept for the connection's lifetime) before
+    /// awaiting the dialer - which, for a `ResumeDialer`, transparently
+    /// resumes the VM. The accept loop spawns a task per connection
+    /// immediately so a slow resume never blocks accepting the next one.
+    pub async fn add_guarded(
+        &self,
+        vm_id: Uuid,
+        bind_addr: IpAddr,
+        host_port: u16,
+        guest_ip: Ipv4Addr,
+        guest_port: u16,
+        sessions: Arc<Mutex<HashMap<Uuid, u64>>>,
+    ) -> io::Result<u16> {
+        let listener = TcpListener::bind(SocketAddr::new(bind_addr, host_port)).await?;
+        let bound = listener.local_addr()?.port();
+        let listener = Arc::new(listener);
+        let dialer = self.dialer.clone();
+        let handle = tokio::spawn(guarded_accept_loop(
+            Arc::clone(&listener),
+            dialer.clone(),
+            guest_ip,
+            guest_port,
+            vm_id,
+            Arc::clone(&sessions),
+        ));
+        let drain_relay: DrainRelay = Box::new(move |inbound, peer| {
+            spawn_guarded_relay(
+                inbound,
+                peer,
+                dialer.clone(),
+                guest_ip,
+                guest_port,
+                vm_id,
+                Arc::clone(&sessions),
+            );
+        });
+        self.forwards
+            .lock()
+            .expect("port proxy mutex poisoned")
+            .entry(vm_id)
+            .or_default()
+            .insert(
+                bound,
+                Forward {
+                    handle,
+                    listener,
+                    drain_relay: Some(drain_relay),
+                },
+            );
+        Ok(bound)
+    }
+
+    /// Drain up to 128 already-queued connections from `vm_id`'s forwards'
+    /// OS backlog into guarded relays, then close their listeners. Used when
+    /// suspending a VM: a connection that raced the accept loop right before
+    /// teardown still gets serviced instead of being reset. Non-blocking:
+    /// polling the listener never awaits, so in-flight relay tasks are never
+    /// waited on.
+    pub fn drain_and_close(&self, vm_id: Uuid) {
+        const DRAIN_CAP: usize = 128;
+        let Some(map) = self
+            .forwards
+            .lock()
+            .expect("port proxy mutex poisoned")
+            .remove(&vm_id)
+        else {
+            return;
+        };
+        for forward in map.into_values() {
+            if let Some(relay) = &forward.drain_relay {
+                for _ in 0..DRAIN_CAP {
+                    match try_accept_now(&forward.listener) {
+                        Ok(Some((inbound, peer))) => relay(inbound, peer),
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!(error = %e, "drain accept failed; stopping drain");
+                            break;
+                        }
+                    }
+                }
+            }
+            // `forward` drops here: `Forward::drop` aborts the accept-loop
+            // task, and the listener closes once every `Arc<TcpListener>`
+            // clone (ours here, and the aborted task's) is gone.
+        }
     }
 
     /// Stop and remove one forward. No-op if absent.
@@ -114,8 +270,21 @@ impl<D: GuestDialer> PortProxy<D> {
     }
 }
 
+/// Poll `listener` once with a no-op waker: `Ok(Some(_))` if a connection was
+/// already queued, `Ok(None)` if the backlog is empty right now. Used by
+/// `PortProxy::drain_and_close` to drain synchronously without an executor
+/// (tokio's `TcpListener` has no `try_accept`, only `poll_accept`).
+fn try_accept_now(listener: &TcpListener) -> io::Result<Option<(TcpStream, SocketAddr)>> {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match listener.poll_accept(&mut cx) {
+        std::task::Poll::Ready(Ok(pair)) => Ok(Some(pair)),
+        std::task::Poll::Ready(Err(e)) => Err(e),
+        std::task::Poll::Pending => Ok(None),
+    }
+}
+
 async fn accept_loop<D: GuestDialer>(
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
     dialer: D,
     guest_ip: Ipv4Addr,
     guest_port: u16,
@@ -146,6 +315,72 @@ async fn accept_loop<D: GuestDialer>(
             }
         });
     }
+}
+
+/// Like `accept_loop`, but each accepted connection is relayed through
+/// `spawn_guarded_relay` so it holds an `ActiveSessionGuard` for `vm_id` and
+/// goes through `dialer.dial()` (a `ResumeDialer` resumes the VM there)
+/// rather than being dialed directly in the loop.
+async fn guarded_accept_loop<D: GuestDialer>(
+    listener: Arc<TcpListener>,
+    dialer: D,
+    guest_ip: Ipv4Addr,
+    guest_port: u16,
+    vm_id: Uuid,
+    sessions: Arc<Mutex<HashMap<Uuid, u64>>>,
+) {
+    loop {
+        let (inbound, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(error = %e, "guarded port-forward accept failed; stopping listener");
+                return;
+            }
+        };
+        spawn_guarded_relay(
+            inbound,
+            peer,
+            dialer.clone(),
+            guest_ip,
+            guest_port,
+            vm_id,
+            Arc::clone(&sessions),
+        );
+    }
+}
+
+/// Mint an `ActiveSessionGuard` for `vm_id`, then dial and relay one
+/// connection in its own task. The guard is held for the connection's full
+/// lifetime - including the dialer's resume hook - and drops when the
+/// connection closes, releasing the VM's active-session pin.
+fn spawn_guarded_relay<D: GuestDialer>(
+    mut inbound: TcpStream,
+    peer: SocketAddr,
+    dialer: D,
+    guest_ip: Ipv4Addr,
+    guest_port: u16,
+    vm_id: Uuid,
+    sessions: Arc<Mutex<HashMap<Uuid, u64>>>,
+) {
+    tokio::spawn(async move {
+        *sessions
+            .lock()
+            .expect("active_sessions poisoned")
+            .entry(vm_id)
+            .or_insert(0) += 1;
+        let _guard = ActiveSessionGuard::from_parts(Arc::clone(&sessions), vm_id);
+        match dialer.dial(guest_ip, guest_port).await {
+            Ok(mut upstream) => {
+                debug!(%peer, %guest_ip, guest_port, "guarded port-forward connection open");
+                if let Err(e) = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await {
+                    debug!(%peer, error = %e, "guarded port-forward connection closed with error");
+                }
+            }
+            Err(e) => {
+                warn!(%peer, %guest_ip, guest_port, error = %e, "guarded port-forward dial failed");
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -244,5 +479,88 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(freed, "port should be free after stop_all");
+    }
+
+    #[tokio::test]
+    async fn resume_hook_fires_before_dial_and_guard_is_held() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let guest_port = spawn_echo().await;
+        let resumed = Arc::new(AtomicUsize::new(0));
+        let sessions = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::<Uuid, u64>::new(),
+        ));
+        let vm = Uuid::new_v4();
+
+        let r = Arc::clone(&resumed);
+        let dialer = ResumeDialer::new(DirectIpDialer, "vm".to_string(), move |_name| {
+            let r = Arc::clone(&r);
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let proxy = PortProxy::new(dialer);
+        let host_port = proxy
+            .add_guarded(
+                vm,
+                "127.0.0.1".parse().unwrap(),
+                0,
+                Ipv4Addr::LOCALHOST,
+                guest_port,
+                Arc::clone(&sessions),
+            )
+            .await
+            .unwrap();
+
+        let mut c = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        assert_eq!(resumed.load(Ordering::SeqCst), 1);
+        // The relay holds a guard for the VM while the connection is open.
+        assert!(*sessions.lock().unwrap().get(&vm).unwrap_or(&0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn drain_and_close_relays_pending_connection_then_frees_port() {
+        let guest_port = spawn_echo().await;
+        let sessions = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::<Uuid, u64>::new(),
+        ));
+        let vm = Uuid::new_v4();
+        let proxy = PortProxy::new(DirectIpDialer);
+        let host_port = proxy
+            .add_guarded(
+                vm,
+                "127.0.0.1".parse().unwrap(),
+                0,
+                Ipv4Addr::LOCALHOST,
+                guest_port,
+                Arc::clone(&sessions),
+            )
+            .await
+            .unwrap();
+
+        // Connect, then close the forward immediately: whichever of the
+        // background accept loop or drain_and_close's own try_accept picks
+        // this connection up, it must still be relayed correctly.
+        let mut client = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+        proxy.drain_and_close(vm);
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        let mut freed = false;
+        for _ in 0..50 {
+            if TcpListener::bind(("127.0.0.1", host_port)).await.is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(freed, "port should be free after drain_and_close");
     }
 }

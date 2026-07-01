@@ -2,8 +2,9 @@
 
 pub mod agent_client;
 
-/// Userspace TCP port-forward proxy, used on backends without host nftables (macOS/VZ).
-#[cfg(not(feature = "linux-net"))]
+/// Userspace TCP port-forward proxy. Used on backends without host nftables
+/// (macOS/VZ) for regular forwards, and on Linux for the resume-listener
+/// forwards that wake a suspended VM on first connection.
 mod port_proxy;
 
 #[cfg(feature = "linux-net")]
