@@ -315,6 +315,36 @@ mod tests {
     }
 
     #[test]
+    fn migration_script_config_write_is_toml_section_safe() {
+        let s = render_migration_script(&sample_plan());
+        // Config keys must be inserted BEFORE the first [table] (TOML requires
+        // top-level keys to precede any table); a bare append would land them
+        // inside the last [section] (e.g. [profiles.*]) and break config parse.
+        assert!(
+            s.contains("husker_set_toplevel"),
+            "config-write must use the section-safe insert helper"
+        );
+        assert!(
+            s.contains("/^[[:space:]]*\\[/"),
+            "config-write must insert before the first TOML table header (incl. indented)"
+        );
+        assert!(
+            !s.contains("printf 'state_dir = \"%s\"\\n' \"$STATE_DIR\" >> \"$CONFIG_FILE\""),
+            "config-write must not naively append state_dir to the end of the file"
+        );
+        // Rewrite in place (cat > file), not `mv tmp file`, so a root-run
+        // migration preserves the config's original owner/mode.
+        assert!(
+            s.contains("cat \"$CONFIG_FILE.husker-tmp\" > \"$CONFIG_FILE\""),
+            "config rewrite must preserve ownership by writing content in place"
+        );
+        assert!(
+            !s.contains("mv \"$CONFIG_FILE.husker-tmp\" \"$CONFIG_FILE\""),
+            "config rewrite must not mv-replace the file (changes owner/mode)"
+        );
+    }
+
+    #[test]
     fn migration_script_substitutes_and_orders_correctly() {
         let s = render_migration_script(&sample_plan());
         // tokens substituted

@@ -53,8 +53,26 @@ if mountpoint -q "$STAGING"; then umount "$STAGING"; fi
 # fresh DB under the (about-to-move) data dir.
 [ -n "$CONFIG_FILE" ] || die "no managed config target; pass --state-dir and ensure $CONFIG_FILE exists"
 mkdir -p "$(dirname "$CONFIG_FILE")"; touch "$CONFIG_FILE"
-grep -q '^state_dir' "$CONFIG_FILE" || printf 'state_dir = "%s"\n' "$STATE_DIR" >> "$CONFIG_FILE"
-grep -q '^storage_volume' "$CONFIG_FILE" || printf 'storage_volume = true\n' >> "$CONFIG_FILE"
+# Insert a top-level TOML key BEFORE the first [table] header (TOML requires
+# top-level keys to precede any table), or append when the file has no tables.
+# A naive `>> file` lands the key inside the last [section] and breaks the
+# daemon's config parse (e.g. under [profiles.*]).
+husker_set_toplevel() {
+  grep -qE "^$1[[:space:]]*=" "$CONFIG_FILE" && return 0
+  if grep -qE '^[[:space:]]*\[' "$CONFIG_FILE"; then
+    # Rewrite the file's CONTENT in place (cat > file), not `mv tmp file`, so
+    # the original owner/mode survive - a root-run migration must not leave a
+    # user- or service-owned config root-owned (breaking 0600 access). Match
+    # optional leading whitespace: TOML permits indented table headers.
+    awk -v ins="$2" 'BEGIN{d=0} /^[[:space:]]*\[/ && !d {print ins; d=1} {print}' "$CONFIG_FILE" > "$CONFIG_FILE.husker-tmp" \
+      && cat "$CONFIG_FILE.husker-tmp" > "$CONFIG_FILE" \
+      && rm -f "$CONFIG_FILE.husker-tmp"
+  else
+    printf '%s\n' "$2" >> "$CONFIG_FILE"
+  fi
+}
+husker_set_toplevel state_dir "state_dir = \"$STATE_DIR\""
+husker_set_toplevel storage_volume "storage_volume = true"
 log "wrote state_dir + storage_volume to $CONFIG_FILE"
 
 # STEP 3: relocate state DB (+ WAL/SHM) and runtime to state_dir.

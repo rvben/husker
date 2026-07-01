@@ -23,6 +23,16 @@ fn generated_script_migrates_and_data_survives() {
     std::fs::write(data_dir.join("husker.db"), b"fake-sqlite").unwrap();
     std::fs::write(data_dir.join("images/base.ext4"), vec![7u8; 1024 * 1024]).unwrap();
 
+    // A config WITH a [table] section: proves the config-write inserts the
+    // top-level keys BEFORE the section (a naive append would land them inside
+    // [profiles.demo] and break the daemon's config parse).
+    let config_file = root.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        "dns_servers = [\"10.0.0.1\"]\n\n[profiles.demo]\nrootfs = \"x\"\n",
+    )
+    .unwrap();
+
     // Build a plan pointed at the temp layout and render the script.
     let plan = husker::storage_setup::StorageSetupPlan {
         data_dir: data_dir.clone(),
@@ -32,7 +42,7 @@ fn generated_script_migrates_and_data_survives() {
         fs: husker::storage_setup::SetupFs::Xfs,
         persist: husker::storage_setup::SetupPersist::Fstab, // avoid touching real systemd
         thin: false,
-        config_file: root.path().join("config.toml"),
+        config_file: config_file.clone(),
         api_addr: "127.0.0.1:59999".into(), // nothing listening
     };
     let script = husker::storage_setup::render_migration_script(&plan);
@@ -64,6 +74,15 @@ fn generated_script_migrates_and_data_survives() {
     // Original kept as backup.
     let backup = format!("{}.pre-reflink.bak", data_dir.display());
     assert!(Path::new(&backup).exists(), "original backup missing");
+
+    // Config-write must have inserted the top-level keys BEFORE the [table],
+    // leaving the file valid TOML with the existing section intact.
+    let cfg = std::fs::read_to_string(&config_file).expect("config readable");
+    assert!(cfg.contains("storage_volume = true"), "storage_volume not written");
+    assert!(cfg.contains("[profiles.demo]"), "existing section not preserved");
+    let sd = cfg.find("state_dir").expect("state_dir written to config");
+    let sec = cfg.find("[profiles.demo]").expect("section present");
+    assert!(sd < sec, "state_dir must be a top-level key before the [table]");
 
     // Cleanup: unmount + remove (best-effort; warn on failure so loop mounts do
     // not silently linger on the test host).
