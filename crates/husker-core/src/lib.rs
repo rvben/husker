@@ -5401,6 +5401,87 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
     DiagnosticsReport { checks }
 }
 
+/// Idle-policy defaults from daemon config, applied to opted-in VMs.
+#[derive(Debug, Clone)]
+pub struct IdlePolicyConfig {
+    pub poll_interval_secs: u64,
+    pub default_idle_timeout_secs: u64,
+    pub default_suspend_ttl_secs: u64,
+    pub default_auto_resume: bool,
+}
+
+impl Default for IdlePolicyConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: 30,
+            default_idle_timeout_secs: 1800,
+            default_suspend_ttl_secs: 0,
+            default_auto_resume: true,
+        }
+    }
+}
+
+/// Decision produced by [`evaluate_policy`] for the idle-policy poll loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyAction {
+    /// No action: policy disabled, ineligible VM, or thresholds not met.
+    None,
+    /// The VM has been idle past `idle_timeout_secs`; suspend it.
+    Suspend,
+    /// The VM has been suspended past `suspend_ttl_secs` and is safe to reap.
+    Reap,
+}
+
+/// Pure idle-policy decision. All time and refcount inputs are resolved by the
+/// caller so this function reads no clock and touches no I/O.
+pub fn evaluate_policy(
+    record: &VmRecord,
+    now: chrono::DateTime<chrono::Utc>,
+    idle_for: Option<std::time::Duration>,
+    has_active_session: bool,
+    has_live_fork: bool,
+) -> PolicyAction {
+    // Not opted in, wrong backend, or managed by another lifecycle: never act.
+    let Some(idle_timeout) = record.idle_timeout_secs else {
+        return PolicyAction::None;
+    };
+    if record.vmm != "firecracker" {
+        return PolicyAction::None;
+    }
+    if record.service_id.is_some() || record.forked_from.is_some() {
+        return PolicyAction::None;
+    }
+    // An open session/relay (or a mid-wake connection) shields both branches.
+    if has_active_session {
+        return PolicyAction::None;
+    }
+
+    match record.state.as_str() {
+        "running" => match idle_for {
+            Some(d) if d.as_secs() >= idle_timeout => PolicyAction::Suspend,
+            _ => PolicyAction::None,
+        },
+        "suspended" => {
+            let ttl = record.suspend_ttl_secs.unwrap_or(0);
+            if ttl == 0 {
+                return PolicyAction::None;
+            }
+            if record.volume.is_some() || has_live_fork {
+                return PolicyAction::None;
+            }
+            let Some(since) = record.suspended_at else {
+                return PolicyAction::None;
+            };
+            if (now - since).num_seconds() >= ttl as i64 {
+                PolicyAction::Reap
+            } else {
+                PolicyAction::None
+            }
+        }
+        _ => PolicyAction::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8095,5 +8176,166 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         // `>= 1` selects anything not-ok.
         assert!(CheckStatus::Fail.severity() > CheckStatus::Warn.severity());
         assert!(CheckStatus::Warn.severity() > CheckStatus::Ok.severity());
+    }
+}
+
+#[cfg(test)]
+mod idle_policy_tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::time::Duration;
+
+    /// A minimal, policy-eligible `VmRecord`: `running`, `firecracker`, no
+    /// service/fork/volume attachments, no idle policy set by default.
+    fn sample_vm_record(name: &str) -> VmRecord {
+        let now = Utc::now();
+        VmRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            state: "running".into(),
+            pid: None,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 3,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            created_at: now,
+            updated_at: now,
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: "firecracker".into(),
+            boot_mode: "direct".into(),
+            balloon: false,
+            volume: None,
+            network: "nat".into(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
+        }
+    }
+
+    fn running(idle_timeout: Option<u64>) -> VmRecord {
+        let mut r = sample_vm_record("v");
+        r.state = "running".into();
+        r.vmm = "firecracker".into();
+        r.idle_timeout_secs = idle_timeout;
+        r
+    }
+
+    #[test]
+    fn running_idle_past_threshold_suspends() {
+        let r = running(Some(60));
+        let a = evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(61)), false, false);
+        assert!(matches!(a, PolicyAction::Suspend));
+    }
+
+    #[test]
+    fn running_below_threshold_does_nothing() {
+        let r = running(Some(60));
+        assert!(matches!(
+            evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(10)), false, false),
+            PolicyAction::None
+        ));
+    }
+
+    #[test]
+    fn active_session_shields_from_suspend() {
+        let r = running(Some(60));
+        assert!(matches!(
+            evaluate_policy(&r, Utc::now(), None, true, false),
+            PolicyAction::None
+        ));
+    }
+
+    #[test]
+    fn no_policy_never_acts() {
+        let r = running(None);
+        assert!(matches!(
+            evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(999)), false, false),
+            PolicyAction::None
+        ));
+    }
+
+    #[test]
+    fn non_firecracker_never_acts() {
+        let mut r = running(Some(1));
+        r.vmm = "qemu".into();
+        assert!(matches!(
+            evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(99)), false, false),
+            PolicyAction::None
+        ));
+    }
+
+    #[test]
+    fn service_or_fork_vm_never_acts() {
+        let mut svc = running(Some(1));
+        svc.service_id = Some(Uuid::new_v4());
+        assert!(matches!(
+            evaluate_policy(&svc, Utc::now(), Some(Duration::from_secs(99)), false, false),
+            PolicyAction::None
+        ));
+        let mut fork = running(Some(1));
+        fork.forked_from = Some(Uuid::new_v4());
+        assert!(matches!(
+            evaluate_policy(&fork, Utc::now(), Some(Duration::from_secs(99)), false, false),
+            PolicyAction::None
+        ));
+    }
+
+    #[test]
+    fn suspended_past_ttl_reaps_when_eligible() {
+        let mut r = running(Some(60));
+        r.state = "suspended".into();
+        r.suspend_ttl_secs = Some(100);
+        r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(101));
+        assert!(matches!(
+            evaluate_policy(&r, Utc::now(), None, false, false),
+            PolicyAction::Reap
+        ));
+    }
+
+    #[test]
+    fn suspended_with_live_fork_or_volume_or_null_ts_not_reaped() {
+        let base = || {
+            let mut r = running(Some(60));
+            r.state = "suspended".into();
+            r.suspend_ttl_secs = Some(100);
+            r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(101));
+            r
+        };
+        // live fork
+        assert!(matches!(
+            evaluate_policy(&base(), Utc::now(), None, false, true),
+            PolicyAction::None
+        ));
+        // volume
+        let mut vol = base();
+        vol.volume = Some("data".into());
+        assert!(matches!(
+            evaluate_policy(&vol, Utc::now(), None, false, false),
+            PolicyAction::None
+        ));
+        // null timestamp
+        let mut nots = base();
+        nots.suspended_at = None;
+        assert!(matches!(
+            evaluate_policy(&nots, Utc::now(), None, false, false),
+            PolicyAction::None
+        ));
+        // active session
+        let active = base();
+        assert!(matches!(
+            evaluate_policy(&active, Utc::now(), None, true, false),
+            PolicyAction::None
+        ));
     }
 }
