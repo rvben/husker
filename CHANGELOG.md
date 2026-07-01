@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.28](https://github.com/rvben/husker/compare/v0.4.27...v0.4.28) - 2026-07-01
+
+### Added
+
+- **core**: surface each `husker doctor` check in GET /v1/metrics as a `husker_diagnostic_check_status{check="..."}` gauge (0=ok, 1=warn, 2=fail), served from a 60s TTL cache shared with /v1/diagnostics ([ed78900](https://github.com/rvben/husker/commit/ed78900))
+
+
 ## [0.4.27](https://github.com/rvben/husker/compare/v0.4.26...v0.4.27) - 2026-07-01
 
 ### Added
