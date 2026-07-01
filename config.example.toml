@@ -53,11 +53,17 @@
 # Set this in production or whenever daemon binds beyond localhost.
 # api_token = "replace-with-a-long-random-token"
 
-# Optional separate bind for an UNAUTHENTICATED /v1/metrics endpoint, so Prometheus
-# can scrape without the API token while the main API (listen) stays authenticated
-# and/or on localhost. Only metrics are served here (no exec/shell/VM control).
-# Restrict network exposure at the host firewall. Env: HUSKER_METRICS_LISTEN.
+# Optional separate bind for a /v1/metrics endpoint, so Prometheus can scrape while
+# the main API (listen) stays on localhost. Only metrics are served here (no
+# exec/shell/VM control). Restrict network exposure at the host firewall. Env:
+# HUSKER_METRICS_LISTEN.
 # metrics_listen = "0.0.0.0:9758"
+
+# Optional bearer token for the metrics endpoint (env: HUSKER_METRICS_TOKEN). When
+# set, scrapers must send `Authorization: Bearer <token>` - defense in depth on top
+# of the firewall. Independent of api_token. Unset = unauthenticated (the standard
+# exporter pattern).
+# metrics_token = "replace-with-a-long-random-token"
 
 # Global max HTTP request body size accepted by the API (bytes).
 # api_max_request_bytes = 2097152

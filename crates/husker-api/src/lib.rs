@@ -993,24 +993,38 @@ pub async fn serve_with_auth<B: VmmBackend + 'static>(
     .await
 }
 
-/// Minimal router exposing ONLY `GET /v1/metrics`, unauthenticated. Served on a
-/// separate bind (`metrics_listen`) so Prometheus can scrape without a token while
-/// the full API - exec, shell, VM control - stays on its own listener. No other
-/// route is mounted, so this port never exposes anything but read-only metrics.
-pub fn metrics_router<B: VmmBackend + 'static>(core: Arc<HuskerCore<B>>) -> Router {
-    Router::new()
-        .route("/v1/metrics", get(metrics_handler::<B>))
-        .with_state(core)
+/// Minimal router exposing ONLY `GET /v1/metrics`. Served on a separate bind
+/// (`metrics_listen`) so Prometheus can scrape while the full API - exec, shell,
+/// VM control - stays on its own listener. No other route is mounted, so this port
+/// never exposes anything but read-only metrics. When `token` is set the endpoint
+/// requires `Authorization: Bearer <token>` (defense in depth on top of any host
+/// firewall); when `None` it is unauthenticated (the standard exporter pattern).
+pub fn metrics_router<B: VmmBackend + 'static>(
+    core: Arc<HuskerCore<B>>,
+    token: Option<String>,
+) -> Router {
+    let router = Router::new().route("/v1/metrics", get(metrics_handler::<B>));
+    let router = if let Some(token) = token {
+        let expected = Arc::new(format!("Bearer {token}"));
+        router.layer(axum::middleware::from_fn_with_state(
+            expected,
+            auth_middleware,
+        ))
+    } else {
+        router
+    };
+    router.with_state(core)
 }
 
 /// Serve the metrics-only router on `addr`. The payload is non-sensitive (VM
-/// counts, request counters, diagnostic severities); restrict network exposure at
-/// the host firewall.
+/// counts, request counters, diagnostic severities); pass `token` for bearer auth
+/// and/or restrict network exposure at the host firewall.
 pub async fn serve_metrics<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
     addr: SocketAddr,
+    token: Option<String>,
 ) -> std::io::Result<()> {
-    let app = metrics_router(core);
+    let app = metrics_router(core, token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "husker metrics endpoint listening");
     axum::serve(listener, app)

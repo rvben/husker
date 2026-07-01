@@ -1040,12 +1040,18 @@ struct Config {
     images_base_url: String,
     #[serde(default)]
     api_token: Option<String>,
-    /// Optional separate bind for an unauthenticated `GET /v1/metrics` endpoint, so
-    /// Prometheus can scrape without the API token while the main API (listen) stays
-    /// authenticated/loopback. Only metrics are served there. Restrict exposure at
-    /// the host firewall. Env override: HUSKER_METRICS_LISTEN.
+    /// Optional separate bind for a `GET /v1/metrics` endpoint, so Prometheus can
+    /// scrape while the main API (listen) stays on localhost. Only metrics are
+    /// served there. Env override: HUSKER_METRICS_LISTEN.
     #[serde(default)]
     metrics_listen: Option<SocketAddr>,
+    /// Optional bearer token for the metrics listener (env: HUSKER_METRICS_TOKEN).
+    /// When set, the metrics endpoint requires `Authorization: Bearer <token>` -
+    /// defense in depth alongside a host firewall. Independent of `api_token`, so
+    /// the main API can stay token-less on localhost. When unset the metrics
+    /// endpoint is unauthenticated (the standard exporter pattern).
+    #[serde(default)]
+    metrics_token: Option<String>,
     #[serde(default = "default_api_max_request_bytes")]
     api_max_request_bytes: usize,
     #[serde(default = "default_api_max_file_read_bytes")]
@@ -2440,6 +2446,7 @@ impl Default for Config {
             images_base_url: default_images_base_url(),
             api_token: None,
             metrics_listen: None,
+            metrics_token: None,
             api_max_request_bytes: default_api_max_request_bytes(),
             api_max_file_read_bytes: default_api_max_file_read_bytes(),
             api_max_file_write_bytes: default_api_max_file_write_bytes(),
@@ -6731,6 +6738,9 @@ fn apply_env_overrides(config: &mut Config) {
     {
         config.metrics_listen = Some(parsed);
     }
+    if let Ok(val) = std::env::var("HUSKER_METRICS_TOKEN") {
+        config.metrics_token = Some(val);
+    }
     if let Ok(val) = std::env::var("HUSKER_API_MAX_REQUEST_BYTES")
         && let Ok(parsed) = val.parse::<usize>()
     {
@@ -7727,6 +7737,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             listen,
             api_token.clone(),
             config.metrics_listen,
+            config.metrics_token.clone(),
             service_reconcile_enabled,
             service_reconcile_interval,
         )
@@ -7770,7 +7781,11 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             service_reconcile_interval,
         );
         spawn_log_rotation(Arc::clone(&core));
-        spawn_metrics_endpoint(Arc::clone(&core), config.metrics_listen);
+        spawn_metrics_endpoint(
+            Arc::clone(&core),
+            config.metrics_listen,
+            config.metrics_token.clone(),
+        );
         husker_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
         drain_vms_on_shutdown(&core).await;
         Ok(())
@@ -7812,7 +7827,11 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             service_reconcile_interval,
         );
         spawn_log_rotation(Arc::clone(&core));
-        spawn_metrics_endpoint(Arc::clone(&core), config.metrics_listen);
+        spawn_metrics_endpoint(
+            Arc::clone(&core),
+            config.metrics_listen,
+            config.metrics_token.clone(),
+        );
         husker_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
         drain_vms_on_shutdown(&core).await;
         Ok(())
@@ -7870,10 +7889,11 @@ async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
 fn spawn_metrics_endpoint<B: husker_vmm::VmmBackend + 'static>(
     core: std::sync::Arc<husker_core::HuskerCore<B>>,
     metrics_listen: Option<std::net::SocketAddr>,
+    metrics_token: Option<String>,
 ) {
     if let Some(addr) = metrics_listen {
         tokio::spawn(async move {
-            if let Err(e) = husker_api::serve_metrics(core, addr).await {
+            if let Err(e) = husker_api::serve_metrics(core, addr, metrics_token).await {
                 tracing::error!(%addr, error = %e, "metrics endpoint failed to serve");
             }
         });
@@ -7890,6 +7910,7 @@ async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
     listen: std::net::SocketAddr,
     api_token: Option<String>,
     metrics_listen: Option<std::net::SocketAddr>,
+    metrics_token: Option<String>,
     service_reconcile_enabled: bool,
     service_reconcile_interval: u64,
 ) -> Result<()> {
@@ -7904,7 +7925,7 @@ async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
         service_reconcile_interval,
     );
     spawn_log_rotation(std::sync::Arc::clone(&core));
-    spawn_metrics_endpoint(std::sync::Arc::clone(&core), metrics_listen);
+    spawn_metrics_endpoint(std::sync::Arc::clone(&core), metrics_listen, metrics_token);
     husker_api::serve_with_auth(std::sync::Arc::clone(&core), listen, api_token).await?;
     drain_vms_on_shutdown(&core).await;
     Ok(())

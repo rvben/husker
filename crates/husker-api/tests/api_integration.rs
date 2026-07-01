@@ -189,9 +189,9 @@ async fn metrics_endpoint_returns_prometheus_text() {
 
 #[tokio::test]
 async fn metrics_router_serves_only_metrics_not_the_api() {
-    // The standalone metrics listener (for unauthenticated Prometheus scraping)
-    // must expose ONLY /v1/metrics - never the VM-control API.
-    let app = metrics_router(test_core());
+    // The standalone metrics listener (unauthenticated here) must expose ONLY
+    // /v1/metrics - never the VM-control API.
+    let app = metrics_router(test_core(), None);
 
     let response = app
         .clone()
@@ -215,6 +215,48 @@ async fn metrics_router_serves_only_metrics_not_the_api() {
             "{path} must not be reachable on the metrics-only listener"
         );
     }
+}
+
+#[tokio::test]
+async fn metrics_router_requires_bearer_when_token_set() {
+    // With a token configured, the metrics endpoint rejects unauthenticated and
+    // wrong-token scrapes and accepts the correct bearer.
+    let app = metrics_router(test_core(), Some("s3cret-metrics-token".into()));
+
+    // No Authorization header -> 401.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Wrong token -> 401.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics")
+                .header("Authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Correct bearer -> 200 with metrics.
+    let response = app
+        .oneshot(
+            Request::get("/v1/metrics")
+                .header("Authorization", "Bearer s3cret-metrics-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("husker_vms_total"));
 }
 
 // ── List Endpoint ────────────────────────────────────────────────────
