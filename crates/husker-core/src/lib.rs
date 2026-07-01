@@ -660,6 +660,9 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Whether the data dir is a mounted reflink storage volume (config flag);
     /// surfaced by diagnostics so `/v1/diagnostics` can report the mount guard.
     storage_volume: bool,
+    /// Whether cgroup v2 resource limits are requested (config flag); gates the
+    /// cgroup readiness check in diagnostics.
+    resource_limits: bool,
     /// TTL cache for the host diagnostics report. `build_diagnostics` does real
     /// filesystem IO (the reflink probe writes a temp file), so the cache bounds
     /// that work to once per `DIAGNOSTICS_CACHE_TTL` even under frequent metrics
@@ -877,6 +880,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             storage_volume: false,
+            resource_limits: false,
             diagnostics_cache: std::sync::Mutex::new(None),
             ovmf_code_path: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
             ovmf_vars_template_path: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
@@ -915,6 +919,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             storage_volume: false,
+            resource_limits: false,
             diagnostics_cache: std::sync::Mutex::new(None),
             embedded_agent: &[],
             default_kernel: None,
@@ -946,6 +951,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         self
     }
 
+    /// Set whether cgroup v2 resource limits are requested (config flag). Surfaced
+    /// by diagnostics so the cgroup readiness check is shown only when relevant.
+    pub fn with_resource_limits(mut self, resource_limits: bool) -> Self {
+        self.resource_limits = resource_limits;
+        self
+    }
+
     /// Set the host uplink interface used for guest NAT egress. Surfaced by
     /// diagnostics so a misconfigured uplink (guests with no WAN/DNS) is caught by
     /// `husker doctor`.
@@ -958,6 +970,11 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Whether the data dir is a mounted reflink storage volume (config flag).
     pub fn storage_volume(&self) -> bool {
         self.storage_volume
+    }
+
+    /// Whether cgroup v2 resource limits are requested (config flag).
+    pub fn resource_limits(&self) -> bool {
+        self.resource_limits
     }
 
     /// Whether this binary carries an embedded guest agent (needed by cloud-image
@@ -1003,6 +1020,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 storage_volume: self.storage_volume,
                 embedded_agent_present: !self.embedded_agent.is_empty(),
                 host_interface: self.host_interface(),
+                resource_limits_requested: self.resource_limits(),
             };
             build_diagnostics(&input)
         };
@@ -5039,6 +5057,8 @@ pub struct DiagnosticsInput<'a> {
     /// Configured host uplink interface for guest NAT egress (Linux). `None` when
     /// unknown, e.g. the macOS backend, which NATs internally via VZ.
     pub host_interface: Option<&'a str>,
+    /// Whether the daemon is configured with resource_limits; gates the cgroup readiness check.
+    pub resource_limits_requested: bool,
 }
 
 /// Build the host diagnostics report. Pure host inspection (no backend state),
@@ -5294,6 +5314,39 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
                 )
             },
         });
+    }
+
+    // cgroup v2 resource-limit readiness (only meaningful when requested).
+    if input.resource_limits_requested {
+        #[cfg(target_os = "linux")]
+        {
+            let v2 = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+            let delegated = std::fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::").map(String::from)))
+                .map(|rel| {
+                    std::path::Path::new("/sys/fs/cgroup")
+                        .join(rel.trim_start_matches('/'))
+                        .join("cgroup.subtree_control")
+                })
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.contains("memory"))
+                .unwrap_or(false);
+            let (status, message) = match (v2, delegated) {
+                (true, true) => (CheckStatus::Ok, "cgroup v2 + memory controller delegated".into()),
+                (false, _) => (CheckStatus::Fail, "cgroup v2 unified hierarchy not mounted".into()),
+                (_, false) => (CheckStatus::Fail, "memory controller not delegated (add Delegate=yes to husker.service)".into()),
+            };
+            checks.push(CheckResult { name: "cgroup limits".into(), status, message });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            checks.push(CheckResult {
+                name: "cgroup limits".into(),
+                status: CheckStatus::Warn,
+                message: "resource limits (cgroups) are enforced only on Linux (Firecracker/QEMU); ignored on this platform".into(),
+            });
+        }
     }
 
     DiagnosticsReport { checks }
@@ -7802,6 +7855,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage_volume: false,
             embedded_agent_present: true,
             host_interface: None,
+            resource_limits_requested: false,
         };
         let report = build_diagnostics(&input);
         // Always includes the reflink and free-space checks by name.
@@ -7843,6 +7897,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage_volume: true,
             embedded_agent_present: true,
             host_interface: None,
+            resource_limits_requested: false,
         };
         let report = build_diagnostics(&input);
         let mount = report
@@ -7866,6 +7921,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage_volume: false,
             embedded_agent_present: false,
             host_interface: None,
+            resource_limits_requested: false,
         };
         let report = build_diagnostics(&input);
         let agent = report
@@ -7893,6 +7949,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage_volume: false,
             embedded_agent_present: true,
             host_interface: None,
+            resource_limits_requested: false,
         };
         let report = build_diagnostics(&input);
         let agent = report
@@ -7923,6 +7980,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage_volume: false,
             embedded_agent_present: true,
             host_interface: None,
+            resource_limits_requested: false,
         };
         let report = build_diagnostics(&input);
         assert!(
@@ -7931,6 +7989,27 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
                 .iter()
                 .any(|c| c.name == "state-dir free space"),
             "state-dir check must appear when state_dir != data_dir"
+        );
+    }
+
+    #[test]
+    fn build_diagnostics_reports_cgroup_readiness_when_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let input = DiagnosticsInput {
+            storage: &storage,
+            storage_volume: false,
+            embedded_agent_present: true,
+            host_interface: None,
+            resource_limits_requested: true,
+        };
+        let report = build_diagnostics(&input);
+        assert!(
+            report.checks.iter().any(|c| c.name == "cgroup limits"),
+            "cgroup readiness check must appear when resource_limits is requested"
         );
     }
 

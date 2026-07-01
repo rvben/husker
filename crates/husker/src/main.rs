@@ -4473,6 +4473,7 @@ async fn run(cli: Cli) -> Result<()> {
                             storage_volume,
                             embedded_agent_present,
                             host_interface: host_interface.as_deref(),
+                            resource_limits_requested: config.resource_limits,
                         };
                         husker_core::build_diagnostics(&input)
                     })
@@ -7721,6 +7722,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                 )
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
                 .with_storage_volume(config.storage_volume)
+                .with_resource_limits(config.resource_limits)
                 .with_host_interface(config.host_interface.clone())
                 .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
                 .with_lan_bridge(config.lan_bridge.clone())
@@ -7760,6 +7762,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                     runtime_dir.clone(),
                 )
                 .with_storage_volume(config.storage_volume)
+                .with_resource_limits(config.resource_limits)
                 .with_host_interface(config.host_interface.clone())
                 .with_default_images(
                     Some(config.default_kernel.clone()),
@@ -7803,6 +7806,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
                 .with_storage_volume(config.storage_volume)
+                .with_resource_limits(config.resource_limits)
                 .with_default_images(
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
@@ -7850,6 +7854,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
             husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
                 .with_storage_volume(config.storage_volume)
+                .with_resource_limits(config.resource_limits)
                 .with_default_images(
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
