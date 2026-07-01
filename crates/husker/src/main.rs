@@ -1116,6 +1116,10 @@ struct Config {
     lan_bridge: Option<String>,
     #[serde(default)]
     profiles: std::collections::HashMap<String, Profile>,
+    /// Idle-suspend policy defaults for the idle-loop reconciler. Only VMs
+    /// that opt in (via `--idle-timeout` or a profile) are affected.
+    #[serde(default)]
+    idle_policy: IdlePolicyToml,
 }
 
 /// Named VM preset, selectable with `--profile <name>` on run/job. Every key
@@ -1140,6 +1144,41 @@ struct Profile {
     #[serde(default)]
     mounts: Vec<String>,
     network: Option<String>,
+}
+
+/// Serde mirror of `husker_core::IdlePolicyConfig` (which has no serde derive)
+/// for `[idle_policy]` TOML parsing. Convert with `.into()` before handing to
+/// core APIs.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IdlePolicyToml {
+    poll_interval_secs: u64,
+    default_idle_timeout_secs: u64,
+    default_suspend_ttl_secs: u64,
+    default_auto_resume: bool,
+}
+
+impl Default for IdlePolicyToml {
+    fn default() -> Self {
+        let d = husker_core::IdlePolicyConfig::default();
+        Self {
+            poll_interval_secs: d.poll_interval_secs,
+            default_idle_timeout_secs: d.default_idle_timeout_secs,
+            default_suspend_ttl_secs: d.default_suspend_ttl_secs,
+            default_auto_resume: d.default_auto_resume,
+        }
+    }
+}
+
+impl From<IdlePolicyToml> for husker_core::IdlePolicyConfig {
+    fn from(t: IdlePolicyToml) -> Self {
+        Self {
+            poll_interval_secs: t.poll_interval_secs,
+            default_idle_timeout_secs: t.default_idle_timeout_secs,
+            default_suspend_ttl_secs: t.default_suspend_ttl_secs,
+            default_auto_resume: t.default_auto_resume,
+        }
+    }
 }
 
 /// Convert a client-side `Profile` (PathBuf fields) into a `DaemonProfile`
@@ -2490,6 +2529,7 @@ impl Default for Config {
             #[cfg(all(feature = "linux-net", target_os = "linux"))]
             lan_bridge: None,
             profiles: Default::default(),
+            idle_policy: IdlePolicyToml::default(),
         }
     }
 }
@@ -6849,6 +6889,25 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(val) = std::env::var("HUSKER_SERVICE_RECONCILE_ENABLED") {
         config.service_reconcile_enabled = matches!(val.as_str(), "1" | "true" | "TRUE" | "yes");
     }
+    if let Ok(val) = std::env::var("HUSKER_IDLE_POLL_INTERVAL_SECS")
+        && let Ok(n) = val.parse::<u64>()
+    {
+        config.idle_policy.poll_interval_secs = n;
+    }
+    if let Ok(val) = std::env::var("HUSKER_IDLE_DEFAULT_TIMEOUT_SECS")
+        && let Ok(n) = val.parse::<u64>()
+    {
+        config.idle_policy.default_idle_timeout_secs = n;
+    }
+    if let Ok(val) = std::env::var("HUSKER_IDLE_DEFAULT_SUSPEND_TTL_SECS")
+        && let Ok(n) = val.parse::<u64>()
+    {
+        config.idle_policy.default_suspend_ttl_secs = n;
+    }
+    if let Ok(val) = std::env::var("HUSKER_IDLE_DEFAULT_AUTO_RESUME") {
+        config.idle_policy.default_auto_resume =
+            matches!(val.as_str(), "1" | "true" | "yes" | "on");
+    }
     #[cfg(feature = "linux-net")]
     {
         if let Ok(val) = std::env::var("HUSKER_FIRECRACKER_BIN") {
@@ -9990,6 +10049,30 @@ mod tests {
         let mut config = Config::default();
         apply_env_overrides(&mut config);
         assert_eq!(config.service_reconcile_interval_secs, 15);
+    }
+
+    #[test]
+    fn idle_policy_config_parses_from_toml() {
+        let toml = r#"
+[idle_policy]
+poll_interval_secs = 15
+default_idle_timeout_secs = 600
+default_suspend_ttl_secs = 3600
+default_auto_resume = false
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.idle_policy.poll_interval_secs, 15);
+        assert_eq!(cfg.idle_policy.default_suspend_ttl_secs, 3600);
+        assert!(!cfg.idle_policy.default_auto_resume);
+    }
+
+    #[test]
+    fn idle_policy_env_override_applies() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSKER_IDLE_POLL_INTERVAL_SECS", "42");
+        let mut cfg = Config::default();
+        apply_env_overrides(&mut cfg);
+        assert_eq!(cfg.idle_policy.poll_interval_secs, 42);
     }
 
     #[tokio::test]

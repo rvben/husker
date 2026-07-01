@@ -162,6 +162,16 @@
 # reconcile_interval_secs = 15   # how often the self-healing loop runs
 # enabled = true                 # master switch for the periodic reconcile loop
 
+# ── Idle Policy ──────────────────────────────────────────────────────
+
+# Idle policy defaults (opt-in per VM via --idle-timeout / profile).
+# The loop runs on all daemons but only acts on VMs that opted in.
+# [idle_policy]
+# poll_interval_secs = 30            # how often the idle loop evaluates VMs
+# default_idle_timeout_secs = 1800   # idle window before suspend, for VMs that opt in without a value
+# default_suspend_ttl_secs = 0       # 0 = never reap a suspended VM
+# default_auto_resume = true         # wake on control-plane call or inbound connection
+
 # ── Environment Variable Overrides ─────────────────────────────────
 #
 # All configuration values can be overridden via environment variables.
@@ -177,6 +187,10 @@
 #   HUSKER_EXEC_TIMEOUT_MAX_SECS             →  exec_timeout_max_secs
 #   HUSKER_SERVICE_RECONCILE_INTERVAL        →  service_reconcile_interval_secs
 #   HUSKER_SERVICE_RECONCILE_ENABLED         →  service_reconcile_enabled (1/true/TRUE/yes)
+#   HUSKER_IDLE_POLL_INTERVAL_SECS           →  idle_policy.poll_interval_secs
+#   HUSKER_IDLE_DEFAULT_TIMEOUT_SECS         →  idle_policy.default_idle_timeout_secs
+#   HUSKER_IDLE_DEFAULT_SUSPEND_TTL_SECS     →  idle_policy.default_suspend_ttl_secs
+#   HUSKER_IDLE_DEFAULT_AUTO_RESUME          →  idle_policy.default_auto_resume (1/true/yes/on)
 #   HUSKER_FIRECRACKER_BIN                   →  firecracker_bin    (Linux only)
 #   HUSKER_VMM                               →  vmm                (Linux only)
 #   HUSKER_QEMU_BIN                          →  qemu_bin           (Linux only)
