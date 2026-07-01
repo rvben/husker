@@ -1257,6 +1257,14 @@ fn is_local_api(api_url: &str) -> bool {
     api_url.contains("127.0.0.1") || api_url.contains("localhost") || api_url.contains("[::1]")
 }
 
+/// Whether the resolved target is genuinely the LOCAL host, not a remote daemon
+/// reached over an SSH tunnel. An `ssh://` context is rewritten to a
+/// `127.0.0.1:<port>` tunnel URL, so `is_local_api` alone would wrongly treat a
+/// remote host as local; the tunnel flag disambiguates.
+fn is_local_target(api_url: &str, via_ssh_tunnel: bool) -> bool {
+    is_local_api(api_url) && !via_ssh_tunnel
+}
+
 /// Map a diagnostics report to a process exit code: 1 on any hard failure,
 /// 0 otherwise (warnings are reported but do not fail).
 fn doctor_exit_code(report: &husker_core::DiagnosticsReport) -> i32 {
@@ -2736,6 +2744,19 @@ async fn run(cli: Cli) -> Result<()> {
     let api_url =
         resolve_effective_api_url(api_url.as_deref(), context.as_deref(), &load_contexts())?;
 
+    // `setup storage` is a host-local operation (it inspects and would migrate
+    // THIS machine's data dir). Refuse a remote/ssh context up front, before we
+    // open a tunnel or probe the local host, so the error is clean and no local
+    // dirs are touched.
+    if matches!(&command, Commands::Setup { action: SetupAction::Storage { .. } })
+        && (api_url.starts_with("ssh://") || !is_local_api(&api_url))
+    {
+        exit_with_error(
+            output,
+            "setup storage runs on the daemon host; ssh to it and run there".to_string(),
+        );
+    }
+
     // ssh:// transport: open an SSH local-forward tunnel to a remote daemon and
     // rewrite api_url to the local end. The guard keeps the ssh process alive for
     // the whole command and tears it down on return. `husker daemon` starts a
@@ -2750,6 +2771,9 @@ async fn run(cli: Cli) -> Result<()> {
         _ssh_tunnel = None;
         api_url
     };
+    // Remote-over-ssh: the tunnel URL is localhost, so `is_local_api` would
+    // misclassify it. This flag lets `is_local_target` treat it as remote.
+    let via_ssh_tunnel = _ssh_tunnel.is_some();
     set_daemon_url(&api_url);
 
     match command {
@@ -4312,7 +4336,7 @@ async fn run(cli: Cli) -> Result<()> {
                         SetupFsArg::Btrfs => "mkfs.btrfs",
                     }),
                     rsync_available: which_on_path("rsync"),
-                    is_local_context: is_local_api(&api_url),
+                    is_local_context: is_local_target(&api_url, via_ssh_tunnel),
                 };
                 let opts = ss::StorageSetupOptions {
                     state_dir,
@@ -4392,7 +4416,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .build()?;
             let report = match fetch_diagnostics(&api_url, &client).await {
                 Ok(r) => r,
-                Err(_) if is_local_api(&api_url) => {
+                Err(_) if is_local_target(&api_url, via_ssh_tunnel) => {
                     // Daemon is not running locally: run the probe directly on the host.
                     eprintln!("(daemon not reachable; running local host probe)");
                     let storage = husker_storage::StorageConfig {
@@ -11057,6 +11081,17 @@ mod tests {
         assert!(storage_mount_satisfied(false, false)); // flag off -> always ok
         assert!(storage_mount_satisfied(true, true)); // mounted -> ok
         assert!(!storage_mount_satisfied(true, false)); // flag on, not mounted -> refuse
+    }
+
+    #[test]
+    fn is_local_target_excludes_ssh_tunnels() {
+        // Genuinely local: a direct http URL to localhost, no tunnel.
+        assert!(is_local_target("http://127.0.0.1:7777", false));
+        assert!(is_local_target("http://localhost:7777", false));
+        // Remote over ssh: the tunnel URL is localhost but the host is remote.
+        assert!(!is_local_target("http://127.0.0.1:45321", true));
+        // Remote http context (non-localhost) is never local.
+        assert!(!is_local_target("http://192.0.2.5:7777", false));
     }
 
     #[test]
