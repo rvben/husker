@@ -7,6 +7,17 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.27](https://github.com/rvben/husker/compare/v0.4.26...v0.4.27) - 2026-07-01
+
+### Added
+
+- **core**: enrich `husker doctor` / GET /v1/diagnostics with host preflight checks (embedded agent, default boot images, state-dir free space, vhost_vsock, guest NAT egress, macOS backend) ([fbaf5a4](https://github.com/rvben/husker/commit/fbaf5a4265d2b4bfbaf12de4d934869a720d4ad2))
+
+### Fixed
+
+- **api**: GET /v1/diagnostics now reports the storage-mount check (it previously ignored the storage_volume config flag) ([fbaf5a4](https://github.com/rvben/husker/commit/fbaf5a4265d2b4bfbaf12de4d934869a720d4ad2))
+
+
 ## [0.4.26](https://github.com/rvben/husker/compare/v0.4.25...v0.4.26) - 2026-07-01
 
 ### Fixed
