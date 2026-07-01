@@ -24,6 +24,8 @@ struct FcInstance {
     process: tokio::process::Child,
     /// Whether the balloon device was installed at boot.
     balloon: bool,
+    /// Per-VM cgroup resource limits (no-op when the supervisor is disabled).
+    cgroup: crate::cgroup::VmCgroup,
 }
 
 /// RAII guard that temporarily makes a snapshot's embedded source rootfs path
@@ -328,8 +330,13 @@ impl FirecrackerBackend {
         serial_file: std::fs::File,
         stderr_file: std::fs::File,
     ) -> Result<VmInfo, VmmError> {
+        // Create the per-VM cgroup before spawning so we can place the process
+        // immediately after obtaining its pid, before InstanceStart.
+        let vm_cgroup = self.cgroup.create_vm_cgroup(id, config.vcpu_count, config.mem_size_mib)
+            .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
+
         // Spawn the Firecracker process
-        let process = tokio::process::Command::new(&self.firecracker_bin)
+        let process = match tokio::process::Command::new(&self.firecracker_bin)
             .arg("--api-sock")
             .arg(socket_path)
             .arg("--log-path")
@@ -340,9 +347,21 @@ impl FirecrackerBackend {
             .stderr(stderr_file)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| VmmError::ProcessError(format!("spawn firecracker: {e}")))?;
+        {
+            Ok(p) => p,
+            Err(e) => {
+                vm_cgroup.remove();
+                return Err(VmmError::ProcessError(format!("spawn firecracker: {e}")));
+            }
+        };
 
         let pid = process.id();
+        if let Some(p) = pid
+            && let Err(e) = vm_cgroup.place(p)
+        {
+            vm_cgroup.remove();
+            return Err(VmmError::ProcessError(format!("place vmm in cgroup: {e}")));
+        }
 
         // Wait for the API socket to appear
         for _ in 0..50 {
@@ -352,6 +371,7 @@ impl FirecrackerBackend {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         if !socket_path.exists() {
+            vm_cgroup.remove();
             return Err(VmmError::ProcessError(
                 "Firecracker socket did not appear within 5s".into(),
             ));
@@ -487,6 +507,7 @@ impl FirecrackerBackend {
             serial_log_path: serial_log_path.to_owned(),
             process,
             balloon: config.balloon,
+            cgroup: vm_cgroup,
         };
 
         self.instances.lock().await.insert(id, instance);
@@ -607,6 +628,7 @@ impl VmmBackend for FirecrackerBackend {
         let _ = tokio::fs::remove_file(&instance.vsock_path).await;
         let _ = tokio::fs::remove_file(&instance.boot_log_path).await;
         let _ = tokio::fs::remove_file(&instance.serial_log_path).await;
+        instance.cgroup.remove();
 
         Ok(())
     }
@@ -784,7 +806,10 @@ impl VmmBackend for FirecrackerBackend {
             .open(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
 
-        let process = tokio::process::Command::new(&self.firecracker_bin)
+        let vm_cgroup = self.cgroup.create_vm_cgroup(id, vcpu_count, mem_size_mib)
+            .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
+
+        let process = match tokio::process::Command::new(&self.firecracker_bin)
             .arg("--api-sock")
             .arg(&socket_path)
             .arg("--log-path")
@@ -795,8 +820,23 @@ impl VmmBackend for FirecrackerBackend {
             .stderr(stderr_file)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| VmmError::ProcessError(format!("spawn firecracker: {e}")))?;
+        {
+            Ok(p) => p,
+            Err(e) => {
+                vm_cgroup.remove();
+                return Err(VmmError::ProcessError(format!("spawn firecracker: {e}")));
+            }
+        };
         let pid = process.id();
+        if let Some(p) = pid
+            && let Err(e) = vm_cgroup.place(p)
+        {
+            vm_cgroup.remove();
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            let _ = tokio::fs::remove_file(&serial_log_path).await;
+            let _ = tokio::fs::remove_file(&boot_log_path).await;
+            return Err(VmmError::ProcessError(format!("place vmm in cgroup: {e}")));
+        }
 
         for _ in 0..50 {
             if socket_path.exists() {
@@ -807,6 +847,7 @@ impl VmmBackend for FirecrackerBackend {
         if !socket_path.exists() {
             // The FC process dies via kill_on_drop; remove the runtime files it
             // left so a timed-out restore does not leak the socket and logs.
+            vm_cgroup.remove();
             let _ = tokio::fs::remove_file(&socket_path).await;
             let _ = tokio::fs::remove_file(&serial_log_path).await;
             let _ = tokio::fs::remove_file(&boot_log_path).await;
@@ -838,6 +879,7 @@ impl VmmBackend for FirecrackerBackend {
                         // The FC process was already spawned; clean up its runtime
                         // files (the process itself dies via kill_on_drop) so a
                         // failed alias does not leak the socket and logs.
+                        vm_cgroup.remove();
                         let _ = tokio::fs::remove_file(&socket_path).await;
                         let _ = tokio::fs::remove_file(&serial_log_path).await;
                         let _ = tokio::fs::remove_file(&boot_log_path).await;
@@ -853,6 +895,7 @@ impl VmmBackend for FirecrackerBackend {
             // drops here too, restoring the source's rootfs.
             let serial_tail = crate::tail_lines(&serial_log_path, 20);
             let boot_tail = crate::tail_lines(&boot_log_path, 20);
+            vm_cgroup.remove();
             let _ = tokio::fs::remove_file(&socket_path).await;
             let _ = tokio::fs::remove_file(&serial_log_path).await;
             let _ = tokio::fs::remove_file(&boot_log_path).await;
@@ -883,6 +926,7 @@ impl VmmBackend for FirecrackerBackend {
             // A restored VM is not tracked as balloon-enabled; the snapshot restores
             // whatever device set it had, and the balloon op is opt-in per VM.
             balloon: false,
+            cgroup: vm_cgroup,
         };
         self.instances.lock().await.insert(id, instance);
         Ok(info)
@@ -924,6 +968,12 @@ impl VmmBackend for FirecrackerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn noop_cgroup() -> crate::cgroup::VmCgroup {
+        crate::cgroup::CgroupSupervisor::disabled()
+            .create_vm_cgroup(uuid::Uuid::nil(), 1, 128)
+            .unwrap()
+    }
 
     fn test_backend(
         bin: impl Into<std::path::PathBuf>,
@@ -1177,6 +1227,7 @@ mod tests {
             serial_log_path: dir.path().join("fake.serial.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
             balloon: false,
+            cgroup: noop_cgroup(),
         };
         backend.instances.lock().await.insert(id, instance);
 
@@ -1312,6 +1363,7 @@ mod tests {
             serial_log_path: serial_log_path.clone(),
             process: tokio::process::Command::new("true").spawn().unwrap(),
             balloon: false,
+            cgroup: noop_cgroup(),
         };
         backend.instances.lock().await.insert(id, instance);
 
@@ -1348,6 +1400,7 @@ mod tests {
             serial_log_path: dir.path().join("test.serial.log"),
             process,
             balloon: false,
+            cgroup: noop_cgroup(),
         };
         backend.instances.lock().await.insert(id, instance);
 
@@ -1394,6 +1447,7 @@ mod tests {
             serial_log_path: dir.path().join("nb.serial.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
             balloon: false,
+            cgroup: noop_cgroup(),
         };
         backend.instances.lock().await.insert(id, instance);
 
