@@ -31,6 +31,8 @@ pub(crate) struct QemuInstance {
     pub(crate) virtiofsds: Vec<tokio::process::Child>,
     /// Unix socket paths created by each virtiofsd; removed on destroy.
     pub(crate) virtiofsd_socks: Vec<PathBuf>,
+    /// Per-VM cgroup resource limits (no-op when the supervisor is disabled).
+    pub(crate) cgroup: crate::cgroup::VmCgroup,
 }
 
 /// Locate the virtiofsd binary: try `virtiofsd` on PATH, then well-known fallbacks.
@@ -377,6 +379,13 @@ impl QemuKvmBackend {
             virtiofsds.push(child);
         }
 
+        // Create the per-VM cgroup before spawning so we can place the process
+        // immediately after obtaining its pid.
+        let vm_cgroup = self
+            .cgroup
+            .create_vm_cgroup(id, config.vcpu_count, config.mem_size_mib)
+            .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
+
         let process = tokio::process::Command::new(&self.binary)
             .args(&args)
             .stdin(std::process::Stdio::null())
@@ -386,6 +395,11 @@ impl QemuKvmBackend {
             .spawn()
             .map_err(|e| VmmError::ProcessError(format!("spawn qemu: {e}")))?;
         let pid = process.id();
+        if let Some(pid) = pid {
+            vm_cgroup
+                .place(pid)
+                .map_err(|e| VmmError::ProcessError(format!("place vmm in cgroup: {e}")))?;
+        }
 
         let qmp_path = self.qmp_socket(id);
         let mut appeared = false;
@@ -430,6 +444,7 @@ impl QemuKvmBackend {
                 balloon: config.balloon,
                 virtiofsds,
                 virtiofsd_socks,
+                cgroup: vm_cgroup,
             },
         );
         // The tracked instance now owns these files; do not delete them on drop.
@@ -477,6 +492,7 @@ impl QemuKvmBackend {
         for sock in &inst.virtiofsd_socks {
             let _ = tokio::fs::remove_file(sock).await;
         }
+        inst.cgroup.remove();
         Ok(())
     }
 
@@ -658,6 +674,12 @@ impl crate::VmmBackend for QemuKvmBackend {
 mod tests {
     use super::*;
 
+    fn noop_cgroup() -> crate::cgroup::VmCgroup {
+        crate::cgroup::CgroupSupervisor::disabled()
+            .create_vm_cgroup(uuid::Uuid::nil(), 1, 128)
+            .unwrap()
+    }
+
     fn test_backend(
         bin: impl Into<std::path::PathBuf>,
         dir: impl Into<std::path::PathBuf>,
@@ -780,6 +802,7 @@ mod tests {
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
+                cgroup: noop_cgroup(),
             },
         );
         let mut cfg = sample_config();
@@ -819,6 +842,7 @@ mod tests {
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
+                cgroup: noop_cgroup(),
             },
         );
         be.destroy(id).await.unwrap();
@@ -851,6 +875,7 @@ mod tests {
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
+                cgroup: noop_cgroup(),
             },
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1010,6 +1035,7 @@ mod tests {
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
+                cgroup: noop_cgroup(),
             },
         );
         be.destroy(id).await.unwrap();
@@ -1117,6 +1143,7 @@ mod tests {
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
+                cgroup: noop_cgroup(),
             },
         );
         let err = be.set_balloon_impl(id, 64).await.unwrap_err();
