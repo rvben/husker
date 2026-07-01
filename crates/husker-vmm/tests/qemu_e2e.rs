@@ -33,6 +33,12 @@
 use husker_vmm::VmmBackend;
 use husker_vmm::qemu::QemuKvmBackend;
 
+/// A no-op cgroup supervisor for constructing backends in these boot tests
+/// (resource limits are out of scope here).
+fn disabled_cgroup() -> std::sync::Arc<husker_vmm::cgroup::CgroupSupervisor> {
+    std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled())
+}
+
 #[tokio::test]
 #[ignore = "needs KVM + vhost-vsock + qemu + images; gated by HUSKER_RUN_IGNORED_E2E"]
 async fn qemu_boots_and_vsock() {
@@ -50,7 +56,7 @@ async fn qemu_boots_and_vsock() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(42);
     let dir = tempfile::tempdir().unwrap();
-    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path(), disabled_cgroup());
 
     let config = husker_vmm::VmConfig {
         name: "e2e".into(),
@@ -121,7 +127,7 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let backend = QemuKvmBackend::new(&fake, dir.path());
+    let backend = QemuKvmBackend::new(&fake, dir.path(), disabled_cgroup());
     let config = husker_vmm::VmConfig {
         name: "e2e-broken".into(),
         vcpu_count: 1,
@@ -175,7 +181,7 @@ async fn qemu_uefi_boots_cloud_image() {
     let disk = dir.path().join("disk.qcow2");
     tokio::fs::copy(&image, &disk).await.unwrap();
 
-    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path(), disabled_cgroup());
     let config = husker_vmm::VmConfig {
         name: "uefi-e2e".into(),
         vcpu_count: 2,
@@ -243,7 +249,7 @@ async fn qemu_host_share_visible_in_guest() {
     std::fs::write(share_dir.path().join("hello.txt"), sentinel).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path(), disabled_cgroup());
 
     // kernel_args: run the agent as PID 1 in supervisor mode (husker.init=1)
     // so it mounts virtiofs shares declared in the cmdline before accepting
@@ -375,7 +381,7 @@ async fn qemu_host_share_via_initramfs() {
     std::fs::write(share_dir.path().join("hello.txt"), sentinel).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path());
+    let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path(), disabled_cgroup());
 
     // No `husker.init=1`: the rootfs runs its own init, so the initramfs `/init`
     // is what mounts the `husker.share=` virtiofs share before switch_root.
