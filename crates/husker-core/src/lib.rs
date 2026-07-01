@@ -8338,4 +8338,38 @@ mod idle_policy_tests {
             PolicyAction::None
         ));
     }
+
+    #[test]
+    fn suspended_never_reaps_when_ttl_unset_or_zero() {
+        // Otherwise fully-eligible suspended VM: firecracker, no volume, no
+        // live fork, no active session, well past any reasonable TTL. Only
+        // `suspend_ttl_secs` varies, isolating the "never reap" guard.
+        let base = || {
+            let mut r = running(Some(60));
+            r.state = "suspended".into();
+            r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(999));
+            r
+        };
+        let mut unset = base();
+        unset.suspend_ttl_secs = None;
+        assert!(matches!(
+            evaluate_policy(&unset, Utc::now(), None, false, false),
+            PolicyAction::None
+        ));
+        let mut zero = base();
+        zero.suspend_ttl_secs = Some(0);
+        assert!(matches!(
+            evaluate_policy(&zero, Utc::now(), None, false, false),
+            PolicyAction::None
+        ));
+    }
+
+    #[test]
+    fn idle_policy_config_default_values() {
+        let cfg = IdlePolicyConfig::default();
+        assert_eq!(cfg.poll_interval_secs, 30);
+        assert_eq!(cfg.default_idle_timeout_secs, 1800);
+        assert_eq!(cfg.default_suspend_ttl_secs, 0);
+        assert!(cfg.default_auto_resume);
+    }
 }
