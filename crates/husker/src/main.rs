@@ -1052,6 +1052,15 @@ struct Config {
     /// endpoint is unauthenticated (the standard exporter pattern).
     #[serde(default)]
     metrics_token: Option<String>,
+    /// Enable per-VM cgroup v2 resource limits (Linux only). Off by default.
+    #[serde(default)]
+    resource_limits: bool,
+    /// Host-memory margin (MiB) over guest RAM for the VM's memory.max.
+    #[serde(default = "default_memory_overhead_mib")]
+    memory_overhead_mib: u32,
+    /// Also cap host CPU per VM (cpu.max). Off by default.
+    #[serde(default)]
+    cpu_limit: bool,
     #[serde(default = "default_api_max_request_bytes")]
     api_max_request_bytes: usize,
     #[serde(default = "default_api_max_file_read_bytes")]
@@ -1787,6 +1796,10 @@ fn default_cid_base() -> u32 {
     3
 }
 
+fn default_memory_overhead_mib() -> u32 {
+    256
+}
+
 /// Extract a clean error message from an API error response.
 ///
 /// Handles JSON error bodies, plain text, and empty responses gracefully
@@ -2447,6 +2460,9 @@ impl Default for Config {
             api_token: None,
             metrics_listen: None,
             metrics_token: None,
+            resource_limits: false,
+            memory_overhead_mib: default_memory_overhead_mib(),
+            cpu_limit: false,
             api_max_request_bytes: default_api_max_request_bytes(),
             api_max_file_read_bytes: default_api_max_file_read_bytes(),
             api_max_file_write_bytes: default_api_max_file_write_bytes(),
@@ -6741,6 +6757,17 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(val) = std::env::var("HUSKER_METRICS_TOKEN") {
         config.metrics_token = Some(val);
     }
+    if let Ok(val) = std::env::var("HUSKER_RESOURCE_LIMITS") {
+        config.resource_limits = matches!(val.as_str(), "1" | "true" | "yes");
+    }
+    if let Ok(val) = std::env::var("HUSKER_MEMORY_OVERHEAD_MIB")
+        && let Ok(parsed) = val.parse::<u32>()
+    {
+        config.memory_overhead_mib = parsed;
+    }
+    if let Ok(val) = std::env::var("HUSKER_CPU_LIMIT") {
+        config.cpu_limit = matches!(val.as_str(), "1" | "true" | "yes");
+    }
     if let Ok(val) = std::env::var("HUSKER_API_MAX_REQUEST_BYTES")
         && let Ok(parsed) = val.parse::<usize>()
     {
@@ -9877,6 +9904,21 @@ mod tests {
         apply_env_overrides(&mut config);
         assert_eq!(config.api_max_request_bytes, expected_req);
         assert_eq!(config.exec_timeout_secs, expected_timeout);
+    }
+
+    #[test]
+    fn env_overrides_resource_limits() {
+        let _guard = env_mutex().lock().unwrap();
+        let _vars = [
+            EnvVarGuard::set("HUSKER_RESOURCE_LIMITS", "true"),
+            EnvVarGuard::set("HUSKER_MEMORY_OVERHEAD_MIB", "512"),
+            EnvVarGuard::set("HUSKER_CPU_LIMIT", "true"),
+        ];
+        let mut cfg = Config::default();
+        apply_env_overrides(&mut cfg);
+        assert!(cfg.resource_limits);
+        assert_eq!(cfg.memory_overhead_mib, 512);
+        assert!(cfg.cpu_limit);
     }
 
     #[test]

@@ -141,6 +141,18 @@
 # MicroVM guests need virtio_balloon in the guest initramfs; run
 # 'husker images pull' to refresh the default images if ballooning fails.
 
+# ── Resource limits (Linux, opt-in) ─────────────────────────────────
+# Place each VM's VMM process in a per-VM cgroup v2 with a hard memory cap so a
+# runaway VM's OOM is contained to that VM instead of the host's global OOM
+# killer. Requires cgroup v2, systemd Delegate=yes on husker.service, and
+# kernel >= 4.19. Off by default. Env: HUSKER_RESOURCE_LIMITS.
+# resource_limits = true
+# Host-memory margin (MiB) over guest RAM for memory.max. 256 is safe for
+# Firecracker; QEMU with large VMs may need 512-1024.
+# memory_overhead_mib = 256
+# Also cap host CPU to <vcpus> cores per VM (cpu.max). Off by default.
+# cpu_limit = false
+
 # ── Service Reconciler ───────────────────────────────────────────────
 
 # Background reconciler for service workloads.
@@ -173,6 +185,9 @@
 #   HUSKER_DNS_SERVERS                       →  dns_servers        (Linux only, comma-separated)
 #   HUSKER_CID_BASE                          →  cid_base           (Linux only)
 #   HUSKER_LAN_BRIDGE                        →  lan_bridge         (Linux only)
+#   HUSKER_RESOURCE_LIMITS                   →  resource_limits    (Linux only, 1/true/yes)
+#   HUSKER_MEMORY_OVERHEAD_MIB               →  memory_overhead_mib (Linux only)
+#   HUSKER_CPU_LIMIT                         →  cpu_limit          (Linux only, 1/true/yes)
 #
 # Example:
 #   HUSKER_DATA_DIR=/tmp/husker husker daemon
