@@ -3880,10 +3880,38 @@ impl<B: VmmBackend> HuskerCore<B> {
     ///
     /// Delegates vsock connection to the VMM backend, which handles the
     /// platform-specific protocol (Firecracker UDS+CONNECT, Apple VZ socket).
+    ///
+    /// A `suspended` VM with `auto_resume` set is transparently resumed first
+    /// (idempotent: resuming an already-running VM is a no-op, so a retrying
+    /// caller like [`Self::agent_connect_ready`] never double-resumes). A
+    /// `suspended` VM without `auto_resume` is left alone and reported as an
+    /// `InvalidState`, same as any other non-`running` state.
+    ///
+    /// On success, records control-plane activity for the idle policy and
+    /// returns a connection carrying an [`ActiveSessionGuard`] for its
+    /// lifetime, so the VM stays pinned active for as long as the connection
+    /// is held.
     pub async fn agent_connect(
         &self,
         name: &str,
     ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
+        let record = self.lookup_vm(name)?;
+        if record.state == "suspended" {
+            if record.auto_resume {
+                self.resume_vm(name).await?;
+                self.idle_metrics
+                    .auto_resumed_control_plane_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                return Err(CoreError::InvalidState {
+                    name: name.into(),
+                    actual: record.state,
+                    expected: "running".into(),
+                });
+            }
+        }
+        // Re-read after a possible resume: the state (and, on Linux, the
+        // vsock CID) may have changed.
         let record = self.lookup_vm(name)?;
         if record.state != "running" {
             return Err(CoreError::InvalidState {
@@ -3892,12 +3920,26 @@ impl<B: VmmBackend> HuskerCore<B> {
                 expected: "running".into(),
             });
         }
+        // Pin the VM active and record the touch before dialing the guest,
+        // so a connection attempt in progress can never be suspended out
+        // from under itself.
+        let now = chrono::Utc::now();
+        self.note_activity(record.id);
+        // Debounce the SQLite mirror: `note_activity`'s in-memory timestamp
+        // is the authoritative signal the idle-policy poll reads, so only
+        // flush to the DB when the persisted value has drifted more than
+        // ~30s. This keeps a hot exec/shell loop from writing to the DB on
+        // every call.
+        if (now - record.last_activity_at).num_seconds() >= 30 {
+            let _ = self.state.touch_last_activity(record.id, now);
+        }
+        let guard = self.begin_session(record.id);
         debug!(%name, id = %record.id, "connecting to agent via vsock");
         let stream = self
             .vmm
             .vsock_connect(record.id, husker_agent_proto::AGENT_VSOCK_PORT)
             .await?;
-        Ok(AgentConnection::new(stream))
+        Ok(AgentConnection::new(stream).with_session_guard(guard))
     }
 
     /// Connect to the guest agent, retrying transient failures with backoff.
@@ -3915,6 +3957,19 @@ impl<B: VmmBackend> HuskerCore<B> {
         name: &str,
         timeout: std::time::Duration,
     ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
+        // Resolve the VM and mint a session guard up front, held for the
+        // entire wait. `agent_connect` only attaches its own guard once a
+        // connection actually succeeds, so without this the VM would
+        // repeatedly flicker to zero active sessions between failed attempts
+        // while the guest boots (or a suspend-resume triggered by the first
+        // attempt is still in flight) - exactly the window the idle policy
+        // must not act in. This guard and the one the returned connection
+        // carries briefly overlap (count 2) once a connect succeeds; this one
+        // drops when this function returns.
+        let record = self.lookup_vm(name)?;
+        self.note_activity(record.id);
+        let _hold_guard = self.begin_session(record.id);
+
         let mut backoff = std::time::Duration::from_millis(200);
         let max_backoff = std::time::Duration::from_secs(2);
         // Shrink the deadline by one attempt window so a final attempt that
@@ -5722,6 +5777,310 @@ mod tests {
         assert_eq!(core.active_session_count(id), 1);
         drop(g);
         assert_eq!(core.active_session_count(id), 0);
+    }
+
+    /// A minimal, policy-eligible `VmRecord`: `running`, `firecracker`, no
+    /// service/fork/volume attachments, no idle policy set by default.
+    #[cfg(feature = "linux-net")]
+    fn sample_vm_record(name: &str) -> VmRecord {
+        let now = chrono::Utc::now();
+        VmRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            state: "running".into(),
+            pid: None,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 3,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            created_at: now,
+            updated_at: now,
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: "firecracker".into(),
+            boot_mode: "direct".into(),
+            balloon: false,
+            volume: None,
+            network: "nat".into(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
+        }
+    }
+
+    /// Minimal `VmmBackend` for exercising `agent_connect`/`agent_connect_ready`
+    /// without a real Firecracker process: `restore_vm` always succeeds (so a
+    /// `suspended` VM resumes cleanly) and `vsock_connect` either hands back
+    /// one end of a live `UnixStream` pair or always fails, depending on
+    /// `fail_vsock_connect`. Every other method is unused by these tests.
+    #[cfg(feature = "linux-net")]
+    struct AutoResumeMockVmm {
+        fail_vsock_connect: bool,
+    }
+
+    #[cfg(feature = "linux-net")]
+    impl VmmBackend for AutoResumeMockVmm {
+        type VsockStream = tokio::net::UnixStream;
+
+        async fn create_vm(
+            &self,
+            _config: husker_vmm::VmConfig,
+        ) -> Result<VmInfo, husker_vmm::VmmError> {
+            Err(husker_vmm::VmmError::Unsupported(
+                "not used by this test".into(),
+            ))
+        }
+
+        async fn stop_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn destroy_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn vm_info(&self, id: Uuid) -> Result<VmInfo, husker_vmm::VmmError> {
+            Err(husker_vmm::VmmError::VmNotFound(id))
+        }
+
+        async fn pause_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn resume_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn snapshot_vm(
+            &self,
+            _id: Uuid,
+            _dst: &SnapshotPaths,
+        ) -> Result<husker_vmm::SnapshotMeta, husker_vmm::VmmError> {
+            Err(husker_vmm::VmmError::Unsupported(
+                "not used by this test".into(),
+            ))
+        }
+
+        async fn restore_vm(
+            &self,
+            _src: &SnapshotPaths,
+            target: RestoreTarget,
+        ) -> Result<VmInfo, husker_vmm::VmmError> {
+            let RestoreTarget::Resume {
+                id,
+                name,
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+            } = target
+            else {
+                return Err(husker_vmm::VmmError::Unsupported(
+                    "fork restore not used by this test".into(),
+                ));
+            };
+            Ok(VmInfo {
+                id,
+                name,
+                state: VmState::Running,
+                pid: Some(1),
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+            })
+        }
+
+        async fn vsock_connect(
+            &self,
+            id: Uuid,
+            _port: u32,
+        ) -> Result<Self::VsockStream, husker_vmm::VmmError> {
+            if self.fail_vsock_connect {
+                return Err(husker_vmm::VmmError::VmNotFound(id));
+            }
+            let (a, _b) = tokio::net::UnixStream::pair()
+                .map_err(|e| husker_vmm::VmmError::ProcessError(e.to_string()))?;
+            Ok(a)
+        }
+
+        async fn set_balloon(
+            &self,
+            _id: Uuid,
+            _amount_mib: u32,
+        ) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+    }
+
+    /// Like `test_core`, but backed by `AutoResumeMockVmm` so a full
+    /// suspend -> resume -> vsock-connect round trip can execute without a
+    /// real Firecracker process. Returns the core plus the backing `TempDir`,
+    /// which must stay alive for the test's duration since `data_dir` holds
+    /// the on-disk suspend slot `resume_vm` reads from.
+    #[cfg(feature = "linux-net")]
+    async fn resume_mock_core(
+        fail_vsock_connect: bool,
+    ) -> (HuskerCore<AutoResumeMockVmm>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let core = HuskerCore::new(
+            AutoResumeMockVmm { fail_vsock_connect },
+            husker_state::StateStore::open_memory().unwrap(),
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            husker_storage::StorageConfig {
+                data_dir: tmp.path().to_path_buf(),
+                state_dir: tmp.path().to_path_buf(),
+            },
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        );
+        (core, tmp)
+    }
+
+    /// Write a valid suspend slot (manifest + vmstate + memory) for `id` under
+    /// `data_dir`, mirroring what `HuskerCore::suspend_vm` produces, so
+    /// `resume_vm`'s restore path finds a complete slot to read.
+    #[cfg(feature = "linux-net")]
+    fn stage_suspend_slot(data_dir: &std::path::Path, id: Uuid) {
+        let slot = data_dir.join("suspend").join(id.to_string());
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("memory"), b"mem").unwrap();
+        std::fs::write(slot.join("vmstate"), b"state").unwrap();
+        std::fs::write(
+            slot.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "full",
+                "backend": "firecracker",
+                "vmm_version": "test",
+                "vcpu_count": 1,
+                "mem_size_mib": 128,
+                "vsock_cid": 3,
+                "rootfs_path": "/images/rootfs.ext4",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn agent_connect_resumes_suspended_auto_resume_vm() {
+        let (core, tmp) = resume_mock_core(false).await;
+        let mut rec = sample_vm_record("aw");
+        rec.state = "suspended".into();
+        rec.vmm = "firecracker".into();
+        rec.auto_resume = true;
+        core.state.insert_vm(&rec).unwrap();
+        stage_suspend_slot(tmp.path(), rec.id);
+
+        let _conn = core
+            .agent_connect("aw")
+            .await
+            .expect("auto-resume then connect");
+        assert_eq!(
+            core.get_vm("aw").unwrap().state,
+            "running",
+            "a successful auto-resume must persist the running state"
+        );
+        assert_eq!(
+            core.active_session_count(rec.id),
+            1,
+            "the returned connection must hold exactly one session guard"
+        );
+        assert_eq!(
+            core.idle_metrics()
+                .auto_resumed_control_plane_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "auto-resume via agent_connect must bump the control-plane counter once"
+        );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn agent_connect_on_suspended_no_auto_resume_errors() {
+        let core = test_core().await;
+        let mut rec = sample_vm_record("na");
+        rec.state = "suspended".into();
+        rec.auto_resume = false;
+        core.state.insert_vm(&rec).unwrap();
+        // `AgentConnection` does not implement `Debug` (it wraps a live
+        // stream), so match instead of `unwrap_err`.
+        let err = match core.agent_connect("na").await {
+            Err(e) => e,
+            Ok(_) => panic!("a suspended VM without auto_resume must not connect"),
+        };
+        assert!(
+            matches!(err, CoreError::InvalidState { .. }),
+            "a suspended VM without auto_resume must be reported as InvalidState, got: {err:?}"
+        );
+        assert_eq!(
+            core.idle_metrics()
+                .auto_resumed_control_plane_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no auto-resume must mean no auto-resume counter bump"
+        );
+    }
+
+    /// `agent_connect_ready` mints its own session guard before the retry
+    /// loop so a VM stays pinned active for the whole boot/resume wait, even
+    /// though every individual `agent_connect` attempt only holds its own
+    /// guard for the duration of that single attempt. Simulate a guest that
+    /// never accepts the vsock connection (a stand-in for a slow boot) and
+    /// confirm the count never drops to zero until the call itself returns.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn agent_connect_ready_holds_guard_across_retries() {
+        let (core, _tmp) = resume_mock_core(true).await;
+        let core = Arc::new(core);
+        let rec = sample_vm_record("slow");
+        let id = rec.id;
+        core.state.insert_vm(&rec).unwrap();
+
+        let waiter = {
+            let core = Arc::clone(&core);
+            tokio::spawn(async move {
+                // `agent_connect_ready` shrinks its deadline by
+                // `AGENT_PING_ATTEMPT_TIMEOUT` (2s) up front, so a `timeout`
+                // at or below that collapses the deadline to "now" and the
+                // call returns after a single failed attempt - too fast for
+                // this test's sampling below to land mid-wait. 3s leaves a
+                // ~1s window of backoff sleeps to sample during.
+                core.agent_connect_ready("slow", std::time::Duration::from_secs(3))
+                    .await
+            })
+        };
+
+        // Let the spawned task run far enough to mint its guard and enter its
+        // first backoff sleep (single-threaded test runtime: the task only
+        // progresses once this task yields via `.await`).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            core.active_session_count(id) >= 1,
+            "agent_connect_ready must hold a guard while retrying"
+        );
+
+        let result = waiter.await.unwrap();
+        assert!(
+            result.is_err(),
+            "vsock_connect never succeeds in this test, so the wait must time out"
+        );
+        assert_eq!(
+            core.active_session_count(id),
+            0,
+            "the temporary guard must release once agent_connect_ready returns"
+        );
     }
 
     /// Block until `/proc/<pid>/cmdline` is observable, so the test never reads a

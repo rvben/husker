@@ -65,7 +65,7 @@ impl AgentClient {
                     ))
                 }
             })?;
-        Ok(AgentConnection { stream })
+        Ok(AgentConnection::new(stream))
     }
 
     /// Connect to the agent via a Unix socket path directly.
@@ -75,7 +75,7 @@ impl AgentClient {
         let stream = tokio::net::UnixStream::connect(path)
             .await
             .map_err(AgentError::Connection)?;
-        Ok(AgentConnection { stream })
+        Ok(AgentConnection::new(stream))
     }
 
     /// Wait for the agent to become ready, retrying ping with backoff.
@@ -114,15 +114,31 @@ impl AgentClient {
 /// A typed connection to a guest agent.
 pub struct AgentConnection<S> {
     stream: S,
+    /// Pins the connection's VM active for the idle policy for as long as
+    /// this connection is held; released on drop. Attached via
+    /// `with_session_guard` by callers that resolve a VM id (e.g.
+    /// `HuskerCore::agent_connect`). Never read - it exists purely for its
+    /// `Drop` side effect, hence the leading underscore.
+    _session_guard: Option<crate::ActiveSessionGuard>,
 }
 
 impl<S> AgentConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Wrap an existing stream as an agent connection.
+    /// Wrap an existing stream as an agent connection, with no session guard.
     pub fn new(stream: S) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            _session_guard: None,
+        }
+    }
+
+    /// Attach a session guard so this connection keeps its VM pinned active
+    /// (per the idle policy) for as long as the connection is held.
+    pub fn with_session_guard(mut self, guard: crate::ActiveSessionGuard) -> Self {
+        self._session_guard = Some(guard);
+        self
     }
 
     /// Check if the agent is alive.
