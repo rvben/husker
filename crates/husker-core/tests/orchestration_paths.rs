@@ -1551,6 +1551,163 @@ async fn secret_key_file_is_mode_0o600_on_creation() {
     assert_eq!(mode, 0o600, "secret key must be 0o600, got {mode:o}");
 }
 
+// --- Encryption at rest -------------------------------------------------------
+//
+// These drive the production create_secret/reveal_secret path and then reopen
+// the on-disk state DB to inspect (and, for the integrity cases, corrupt) the
+// raw persisted record, proving the stored value is AES-256-GCM ciphertext with
+// a fresh nonce per encryption and that decryption fails closed under tampering
+// or a key change.
+
+/// Naive subsequence search: proves a plaintext does not appear verbatim inside
+/// a persisted ciphertext blob.
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[tokio::test]
+async fn secret_is_persisted_as_ciphertext_not_plaintext() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("state.db");
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open(&db_path).unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    let plaintext = "correct horse battery staple";
+    core.create_secret(CreateSecretRequest {
+        name: "api-key".into(),
+        value: plaintext.into(),
+    })
+    .unwrap();
+
+    // Reopen the same on-disk DB to inspect the raw stored record.
+    let raw = StateStore::open(&db_path).unwrap();
+    let record = raw.get_secret_by_name("api-key").unwrap();
+
+    assert!(
+        !bytes_contain(&record.ciphertext, plaintext.as_bytes()),
+        "persisted ciphertext must not contain the plaintext"
+    );
+    // AES-256-GCM appends a 16-byte auth tag; the nonce is 96-bit.
+    assert_eq!(record.ciphertext.len(), plaintext.len() + 16);
+    assert_eq!(record.nonce.len(), 12);
+
+    // The production reveal path still recovers the original plaintext.
+    assert_eq!(core.reveal_secret("api-key").unwrap().value, plaintext);
+}
+
+#[tokio::test]
+async fn secrets_with_identical_values_use_distinct_nonces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("state.db");
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open(&db_path).unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+
+    for name in ["first", "second"] {
+        core.create_secret(CreateSecretRequest {
+            name: name.into(),
+            value: "same-value".into(),
+        })
+        .unwrap();
+    }
+
+    let raw = StateStore::open(&db_path).unwrap();
+    let a = raw.get_secret_by_name("first").unwrap();
+    let b = raw.get_secret_by_name("second").unwrap();
+    assert_ne!(a.nonce, b.nonce, "each encryption must use a fresh nonce");
+    assert_ne!(
+        a.ciphertext, b.ciphertext,
+        "identical plaintext must not produce identical ciphertext"
+    );
+}
+
+#[tokio::test]
+async fn reveal_rejects_tampered_ciphertext() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("state.db");
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open(&db_path).unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+    core.create_secret(CreateSecretRequest {
+        name: "token".into(),
+        value: "s3cr3t".into(),
+    })
+    .unwrap();
+
+    // Flip one bit of the persisted ciphertext, leaving the nonce intact.
+    let raw = StateStore::open(&db_path).unwrap();
+    let record = raw.get_secret_by_name("token").unwrap();
+    let mut tampered = record.ciphertext.clone();
+    tampered[0] ^= 0x01;
+    raw.update_secret_payload(record.id, &tampered, &record.nonce)
+        .unwrap();
+
+    let err = core.reveal_secret("token").unwrap_err();
+    assert!(
+        matches!(err, CoreError::SecretCrypto(_)),
+        "tampered ciphertext must fail GCM authentication, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn reveal_fails_after_key_replaced_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let core = build_core(
+        MockVmm::new(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+    core.create_secret(CreateSecretRequest {
+        name: "token".into(),
+        value: "s3cr3t".into(),
+    })
+    .unwrap();
+
+    // Replace the on-disk key with a different 32-byte key.
+    let key_path = data_dir.join("keys/secrets.key");
+    std::fs::write(&key_path, [0u8; 32]).unwrap();
+
+    let err = core.reveal_secret("token").unwrap_err();
+    assert!(
+        matches!(err, CoreError::SecretCrypto(_)),
+        "reveal under a replaced key must fail closed, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn reveal_missing_secret_returns_not_found() {
     let tmp = tempfile::tempdir().unwrap();
