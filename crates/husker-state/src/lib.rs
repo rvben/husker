@@ -2,13 +2,17 @@
 //! forwards, host groups, and services.
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
+
+/// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
+/// every call site that used the old `MutexGuard<Connection>` is unchanged.
+type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -248,9 +252,13 @@ pub struct VolumeRecord {
     pub created_at: DateTime<Utc>,
 }
 
-/// SQLite-backed state store. Thread-safe via internal Mutex.
+/// SQLite-backed state store. Thread-safe via an internal connection pool: a
+/// file-backed store uses several connections so concurrent requests are not
+/// serialized through one lock (WAL gives concurrent readers + a single writer),
+/// while an in-memory store uses a single connection so its ephemeral database
+/// persists across checkouts.
 pub struct StateStore {
-    conn: Mutex<Connection>,
+    pool: r2d2::Pool<SqliteConnectionManager>,
 }
 
 /// Apply an idempotent `ALTER TABLE ... ADD COLUMN` migration.
@@ -273,29 +281,50 @@ fn add_column(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
 }
 
 impl StateStore {
-    /// Open or create the state database.
+    /// Open or create the state database (file-backed, pooled for concurrency).
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
+        // WAL enables concurrent readers alongside a single writer; busy_timeout
+        // lets a writer wait for the write lock instead of failing under
+        // contention. foreign_keys is enforced per-connection.
+        let manager = SqliteConnectionManager::file(path).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            )
+        });
+        let pool = r2d2::Pool::builder()
+            .max_size(8)
+            // SQLite connections are local and don't go stale like a network DB,
+            // so skip the per-checkout test query.
+            .test_on_check_out(false)
+            .build(manager)
+            .map_err(|_| StateError::LockPoisoned)?;
+        let store = Self { pool };
         store.migrate()?;
         Ok(store)
     }
 
     /// Open an in-memory database (for testing).
+    ///
+    /// Uses a single-connection pool: an in-memory SQLite database lives only as
+    /// long as its connection, so pooling multiple `:memory:` connections would
+    /// each be a separate empty database. One connection keeps the store's data
+    /// visible across every checkout, matching the previous single-`Connection`
+    /// behavior.
     pub fn open_memory() -> Result<Self, StateError> {
-        let conn = Connection::open_in_memory()?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
+        let manager =
+            SqliteConnectionManager::memory().with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .build(manager)
+            .map_err(|_| StateError::LockPoisoned)?;
+        let store = Self { pool };
         store.migrate()?;
         Ok(store)
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StateError> {
-        self.conn.lock().map_err(|_| StateError::LockPoisoned)
+    fn lock(&self) -> Result<PooledConn, StateError> {
+        self.pool.get().map_err(|_| StateError::LockPoisoned)
     }
 
     fn migrate(&self) -> Result<(), StateError> {
@@ -1300,7 +1329,11 @@ impl StateStore {
     /// CIDs start at 3 (0=hypervisor, 1=reserved, 2=host).
     pub fn allocate_cid(&self) -> Result<u32, StateError> {
         let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
+        // BEGIN IMMEDIATE takes the write lock up front so two concurrent
+        // allocations (now possible with the connection pool) serialize on the
+        // lock instead of both reading the same next_cid and one failing with a
+        // write conflict. busy_timeout makes the loser wait rather than error.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // Try freed CIDs first (lowest available)
         let freed: Option<u32> = tx
@@ -2113,6 +2146,31 @@ mod tests {
         assert_eq!(store.allocate_cid().unwrap(), 3);
         assert_eq!(store.allocate_cid().unwrap(), 4);
         assert_eq!(store.allocate_cid().unwrap(), 5);
+    }
+
+    #[test]
+    fn concurrent_allocate_cid_never_duplicates() {
+        // The connection pool lets allocate_cid run on multiple connections at
+        // once. Its read-then-write must stay atomic (BEGIN IMMEDIATE + busy
+        // timeout) so no two concurrent allocations hand out the same CID. Uses a
+        // file-backed store (the 8-connection pool; open_memory is single-conn).
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(&dir.path().join("cids.db")).unwrap());
+        let n = 200usize;
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let s = Arc::clone(&store);
+                std::thread::spawn(move || s.allocate_cid().unwrap())
+            })
+            .collect();
+        let cids: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let unique: std::collections::HashSet<u32> = cids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            n,
+            "concurrent allocate_cid produced duplicate CIDs (race)"
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 rusqlite = { workspace = true }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
 serde = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
