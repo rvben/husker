@@ -8030,6 +8030,7 @@ async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
     if restored > 0 {
         tracing::info!(restored, "restored persisted port-forward nftables rules");
     }
+    core.reinstall_resume_listeners().await;
     spawn_service_reconcile_loop(
         std::sync::Arc::clone(&core),
         service_reconcile_enabled,

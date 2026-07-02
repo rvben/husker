@@ -2673,6 +2673,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             .insert(record.id, Box::new(proxy));
     }
 
+    /// Test-only: whether a resume listener is currently registered for `id`.
+    #[cfg(all(test, feature = "linux-net"))]
+    fn has_resume_listener_for_test(&self, id: Uuid) -> bool {
+        self.resume_listeners
+            .lock()
+            .expect("resume_listeners poisoned")
+            .contains_key(&id)
+    }
+
     /// Recover VMs interrupted mid-suspend on a previous daemon run.
     ///
     /// A VM in the transient `"suspending"` state was past its snapshot + manifest
@@ -4904,6 +4913,12 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let mut restored = 0usize;
         for vm in vms {
+            if vm.state == "suspended" {
+                // A suspended VM has no live guest; DNAT would blackhole traffic to a
+                // dead IP and bypass the resume listener. Skip; listeners are
+                // re-installed separately by `reinstall_resume_listeners`.
+                continue;
+            }
             let Some(guest_ip_str) = vm.guest_ip.as_deref() else {
                 continue;
             };
@@ -4954,6 +4969,48 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         restored
     }
+
+    /// Re-bind userspace resume listeners for `suspended` + `auto_resume` VMs
+    /// after a daemon restart.
+    ///
+    /// `reconcile_port_forwards_from_state` intentionally skips DNAT restore
+    /// for `suspended` VMs (see above); without this, a suspended VM that was
+    /// relying on a resume listener before the restart would come back up
+    /// with neither kernel DNAT nor a userspace listener on its forwarded
+    /// ports, so nothing would ever auto-resume it on connect. Call after
+    /// `reconcile_port_forwards_from_state` at startup.
+    #[cfg(feature = "linux-net")]
+    pub async fn reinstall_resume_listeners(self: &Arc<Self>)
+    where
+        B: 'static,
+    {
+        let vms = match self.state.list_vms() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to list VMs for resume-listener reinstall");
+                return;
+            }
+        };
+        for vm in vms {
+            if vm.state != "suspended" || !vm.auto_resume {
+                continue;
+            }
+            let forwards = self
+                .state
+                .list_port_forwards_for_vm(vm.id)
+                .unwrap_or_default();
+            if forwards.is_empty() {
+                continue;
+            }
+            self.install_resume_listeners(&vm, &forwards).await;
+        }
+    }
+
+    /// No-op on macOS: the userspace port-forward proxy there relays
+    /// continuously regardless of VM state and has no separate DNAT/listener
+    /// split, so there is nothing to reinstall after a restart.
+    #[cfg(not(feature = "linux-net"))]
+    pub async fn reinstall_resume_listeners(self: &Arc<Self>) {}
 
     /// List VMs owned by a service (core wrapper over state).
     pub fn list_vms_for_service(&self, service_id: Uuid) -> Result<Vec<VmRecord>, CoreError> {
@@ -6343,6 +6400,36 @@ mod tests {
         rec
     }
 
+    /// Persist a `suspended`, `auto_resume` VM with `tap_device`/`guest_ip` set
+    /// (required by `install_resume_listeners`) and one port forward, for
+    /// startup-recovery tests that exercise `reconcile_port_forwards_from_state`
+    /// / `reinstall_resume_listeners` together.
+    #[cfg(feature = "linux-net")]
+    async fn staged_suspended_vm_with_forward(
+        core: &HuskerCore<AutoResumeMockVmm>,
+        name: &str,
+        host_port: u16,
+    ) -> VmRecord {
+        let mut rec = sample_vm_record(name);
+        rec.state = "suspended".into();
+        rec.auto_resume = true;
+        rec.tap_device = Some(format!("tap-{name}"));
+        rec.guest_ip = Some("172.20.0.5".into());
+        core.state.insert_vm(&rec).unwrap();
+        core.state
+            .insert_port_forward(&husker_state::PortForwardRecord {
+                id: 0,
+                vm_id: rec.id,
+                host_port,
+                guest_port: 80,
+                protocol: "tcp".into(),
+                bind_addr: None,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        rec
+    }
+
     /// Minimal `VmmBackend` for exercising `agent_connect`/`agent_connect_ready`
     /// without a real Firecracker process: `restore_vm` always succeeds (so a
     /// `suspended` VM resumes cleanly) and `vsock_connect` either hands back
@@ -6562,6 +6649,32 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "no auto-resume must mean no auto-resume counter bump"
+        );
+    }
+
+    /// A suspended VM's forward must not be restored as kernel DNAT (there is
+    /// no live guest to route to), and `reinstall_resume_listeners` must bind
+    /// a userspace resume listener for it instead so an inbound connection
+    /// still auto-resumes the VM. `test_core` (not `resume_mock_core`) is
+    /// fine here: nothing in this test triggers an actual `nft`/vsock call,
+    /// since the suspended VM is skipped before `husker_net::add_port_forward`
+    /// and `install_resume_listeners` only binds a plain host TCP listener.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn startup_skips_dnat_for_suspended_and_reinstalls_listeners() {
+        let core = test_core().await;
+        let rec = staged_suspended_vm_with_forward(&core, "sv", 18080).await;
+
+        let restored = core.reconcile_port_forwards_from_state().await;
+        assert_eq!(
+            restored, 0,
+            "a suspended VM's forward must not be restored as DNAT"
+        );
+
+        core.reinstall_resume_listeners().await;
+        assert!(
+            core.has_resume_listener_for_test(rec.id),
+            "reinstall_resume_listeners must bind a resume listener for a suspended, auto_resume VM with forwards"
         );
     }
 
