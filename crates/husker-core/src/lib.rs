@@ -1485,7 +1485,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Test-only accessor to the underlying state store, for tests that need
     /// to reach setters (`set_idle_policy`, `set_suspended_at`, ...) not
     /// otherwise exposed on `HuskerCore`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "linux-net"))]
     fn state(&self) -> &husker_state::StateStore {
         &self.state
     }
@@ -1493,7 +1493,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Test-only: force both idle-activity timers to a specific `Instant`
     /// (e.g. in the past), bypassing `note_activity`/`mark_network_active`'s
     /// "now" semantics so a test can stage a VM as already idle.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "linux-net"))]
     fn set_last_active_for_test(&self, id: Uuid, at: std::time::Instant) {
         self.control_plane_last_active
             .lock()
