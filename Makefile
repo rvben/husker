@@ -145,6 +145,8 @@ test-e2e-gated:
 		cargo test --package husker --test e2e -- --ignored; \
 	else \
 		echo "Skipping husker ignored e2e tests (set HUSKER_RUN_IGNORED_E2E=1 to enable)"; \
+		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=e2e gate not run::husker e2e tests were SKIPPED (HUSKER_RUN_IGNORED_E2E is not '1'); this job is green but exercised no e2e"; \
+		true; \
 	fi
 
 # Run ignored husker-net e2e tests only when explicitly enabled.
@@ -153,6 +155,8 @@ test-net-e2e-gated:
 		cargo test --package husker-net --test e2e_bridge -- --ignored; \
 	else \
 		echo "Skipping husker-net ignored e2e tests (set HUSKER_RUN_NET_E2E=1 to enable)"; \
+		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=net e2e gate not run::husker-net e2e tests were SKIPPED (HUSKER_RUN_NET_E2E is not '1'); this job is green but exercised no e2e"; \
+		true; \
 	fi
 
 # Real QEMU boot + vsock e2e (needs Linux KVM + vhost-vsock + qemu + images)
