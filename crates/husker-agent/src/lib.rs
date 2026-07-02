@@ -292,24 +292,48 @@ async fn join_drains_with_grace(
     .await;
 }
 
+/// Per-stream cap on captured exec output. Prevents a chatty command from
+/// growing the buffer without bound and, more importantly, from producing a
+/// response so large it exceeds the agent wire limit
+/// ([`husker_agent_proto::MAX_MESSAGE_SIZE`], 16 MiB) - which previously caused
+/// the ENTIRE response (exit code + all output) to be dropped on the floor
+/// instead of returned truncated. 4 MiB per stream keeps stdout+stderr well
+/// under the wire limit for text output while staying generous for build logs.
+const MAX_EXEC_STREAM_BYTES: usize = 4 * 1024 * 1024;
+
 /// Drain an async reader into a shared buffer until EOF, so a child's output is
 /// captured incrementally and a timeout can still return what was produced.
+///
+/// Appending stops at [`MAX_EXEC_STREAM_BYTES`] (setting `truncated`), but the
+/// reader is still drained to EOF so a command that keeps writing does not block
+/// on a full pipe and hang until the exec timeout.
 fn spawn_drain<R>(
     mut reader: R,
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    use std::sync::atomic::Ordering;
     tokio::spawn(async move {
         let mut chunk = [0u8; 8192];
         loop {
             match reader.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => buf
-                    .lock()
-                    .expect("exec buffer mutex")
-                    .extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    let mut b = buf.lock().expect("exec buffer mutex");
+                    if b.len() >= MAX_EXEC_STREAM_BYTES {
+                        truncated.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    let room = MAX_EXEC_STREAM_BYTES - b.len();
+                    let take = n.min(room);
+                    b.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        truncated.store(true, Ordering::Relaxed);
+                    }
+                }
             }
         }
     })
@@ -323,6 +347,7 @@ async fn run_exec_with_capture(
     mut cmd: tokio::process::Command,
     timeout: std::time::Duration,
 ) -> AgentResponse {
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -339,11 +364,26 @@ async fn run_exec_with_capture(
     let stderr = child.stderr.take().expect("piped stderr");
     let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let out_task = spawn_drain(stdout, out_buf.clone());
-    let err_task = spawn_drain(stderr, err_buf.clone());
+    let out_trunc = Arc::new(AtomicBool::new(false));
+    let err_trunc = Arc::new(AtomicBool::new(false));
+    let out_task = spawn_drain(stdout, out_buf.clone(), out_trunc.clone());
+    let err_task = spawn_drain(stderr, err_buf.clone(), err_trunc.clone());
 
-    let take = |buf: &Arc<Mutex<Vec<u8>>>| {
-        String::from_utf8_lossy(&buf.lock().expect("exec mutex")).into_owned()
+    // Build the captured string, appending a truncation marker when the stream
+    // hit the per-stream cap so the caller can tell partial output apart from
+    // complete output.
+    let finalize = |buf: &Arc<Mutex<Vec<u8>>>, truncated: &Arc<AtomicBool>| {
+        let mut s = String::from_utf8_lossy(&buf.lock().expect("exec mutex")).into_owned();
+        if truncated.load(std::sync::atomic::Ordering::Relaxed) {
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(&format!(
+                "[husker: output truncated at {} MiB]",
+                MAX_EXEC_STREAM_BYTES / (1024 * 1024)
+            ));
+        }
+        s
     };
 
     match tokio::time::timeout(timeout, child.wait()).await {
@@ -351,8 +391,8 @@ async fn run_exec_with_capture(
             join_drains_with_grace(out_task, err_task).await;
             AgentResponse::Exec(ExecResponse {
                 exit_code: status.code().unwrap_or(-1),
-                stdout: take(&out_buf),
-                stderr: take(&err_buf),
+                stdout: finalize(&out_buf, &out_trunc),
+                stderr: finalize(&err_buf, &err_trunc),
             })
         }
         Ok(Err(e)) => AgentResponse::Error(ErrorResponse {
@@ -363,7 +403,7 @@ async fn run_exec_with_capture(
             // Flush whatever buffered before the kill closes the pipes, then
             // collect the partial output.
             join_drains_with_grace(out_task, err_task).await;
-            let mut stderr = take(&err_buf);
+            let mut stderr = finalize(&err_buf, &err_trunc);
             if !stderr.is_empty() && !stderr.ends_with('\n') {
                 stderr.push('\n');
             }
@@ -373,7 +413,7 @@ async fn run_exec_with_capture(
             ));
             AgentResponse::Exec(ExecResponse {
                 exit_code: 124,
-                stdout: take(&out_buf),
+                stdout: finalize(&out_buf, &out_trunc),
                 stderr,
             })
         }
@@ -864,6 +904,34 @@ mod tests {
         // Malformed image entries (no '=') are skipped, not panicked on.
         let merged = merge_exec_env(&["NOTANENTRY".to_string()], &[]);
         assert!(merged.iter().all(|(k, _)| k != "NOTANENTRY"));
+    }
+
+    #[tokio::test]
+    async fn exec_output_is_truncated_not_discarded_when_huge() {
+        // A command emitting well over the per-stream cap of printable output must
+        // return truncated output with a marker and exit 0 - never an error that
+        // discards the whole response (the pre-fix behavior once output exceeded
+        // the agent wire limit).
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("yes ABCDEFGH | head -c 5000000");
+        let resp = run_exec_with_capture(cmd, std::time::Duration::from_secs(30)).await;
+        let AgentResponse::Exec(e) = resp else {
+            panic!("expected an Exec response, output was discarded/errored");
+        };
+        assert_eq!(e.exit_code, 0, "command should succeed");
+        assert!(
+            e.stdout.contains("[husker: output truncated at 4 MiB]"),
+            "stdout should carry the truncation marker"
+        );
+        assert!(
+            e.stdout.len() <= MAX_EXEC_STREAM_BYTES + 64,
+            "stdout should be capped near {MAX_EXEC_STREAM_BYTES} bytes, got {}",
+            e.stdout.len()
+        );
+        assert!(
+            e.stdout.len() > 1_000_000,
+            "captured output must not be discarded"
+        );
     }
 
     #[test]
