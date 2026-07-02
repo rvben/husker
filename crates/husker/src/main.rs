@@ -8026,9 +8026,18 @@ async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
     service_reconcile_interval: u64,
 ) -> Result<()> {
     run_initial_service_reconcile(&core).await;
-    let restored = core.reconcile_port_forwards_from_state().await;
-    if restored > 0 {
-        tracing::info!(restored, "restored persisted port-forward nftables rules");
+    let reconcile = core.reconcile_port_forwards_from_state().await;
+    if reconcile.restored > 0 {
+        tracing::info!(
+            restored = reconcile.restored,
+            "restored persisted port-forward nftables rules"
+        );
+    }
+    if reconcile.skipped_suspended > 0 {
+        tracing::info!(
+            skipped = reconcile.skipped_suspended,
+            "skipped DNAT restore for suspended VMs; re-installing resume listeners instead"
+        );
     }
     core.reinstall_resume_listeners().await;
     spawn_service_reconcile_loop(

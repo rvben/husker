@@ -590,6 +590,21 @@ pub struct ServiceTag {
     pub ordinal: u32,
 }
 
+/// Result of [`HuskerCore::reconcile_port_forwards_from_state`]. Splitting
+/// `skipped_suspended` out from `restored` makes the suspended-VM DNAT skip
+/// independently observable by tests, without requiring a real `nft` call
+/// (which needs root and would otherwise be the only way to prove `restored`
+/// excludes suspended VMs for the right reason).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PortForwardReconcile {
+    /// Number of port-forward DNAT rules successfully re-added.
+    pub restored: usize,
+    /// Number of VMs skipped because they were `suspended` (no live guest to
+    /// route DNAT to; their listeners are re-installed separately by
+    /// `reinstall_resume_listeners`).
+    pub skipped_suspended: usize,
+}
+
 /// Result of one reconcile pass over a single service.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReconcileOutcome {
@@ -4902,21 +4917,23 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// This closes drift after daemon restarts because `init_nat` recreates the
     /// nftables table while port-forward records remain in SQLite.
     #[cfg(feature = "linux-net")]
-    pub async fn reconcile_port_forwards_from_state(&self) -> usize {
+    pub async fn reconcile_port_forwards_from_state(&self) -> PortForwardReconcile {
         let vms = match self.state.list_vms() {
             Ok(vms) => vms,
             Err(e) => {
                 warn!(error = %e, "failed to list VMs for port-forward reconciliation");
-                return 0;
+                return PortForwardReconcile::default();
             }
         };
 
         let mut restored = 0usize;
+        let mut skipped_suspended = 0usize;
         for vm in vms {
             if vm.state == "suspended" {
                 // A suspended VM has no live guest; DNAT would blackhole traffic to a
                 // dead IP and bypass the resume listener. Skip; listeners are
                 // re-installed separately by `reinstall_resume_listeners`.
+                skipped_suspended += 1;
                 continue;
             }
             let Some(guest_ip_str) = vm.guest_ip.as_deref() else {
@@ -4967,7 +4984,10 @@ impl<B: VmmBackend> HuskerCore<B> {
                 }
             }
         }
-        restored
+        PortForwardReconcile {
+            restored,
+            skipped_suspended,
+        }
     }
 
     /// Re-bind userspace resume listeners for `suspended` + `auto_resume` VMs
@@ -6665,9 +6685,19 @@ mod tests {
         let core = test_core().await;
         let rec = staged_suspended_vm_with_forward(&core, "sv", 18080).await;
 
-        let restored = core.reconcile_port_forwards_from_state().await;
+        let reconcile = core.reconcile_port_forwards_from_state().await;
+        // `skipped_suspended` is the load-bearing assertion: it can only be 1
+        // if the `if vm.state == "suspended" { .. continue }` guard actually
+        // ran. `restored == 0` alone is not enough to prove the guard exists
+        // (the only staged VM here is suspended, so `restored` would also be
+        // 0 if the guard were deleted and the VM instead fell through to a
+        // failing/no-op `add_port_forward`), so both are asserted together.
         assert_eq!(
-            restored, 0,
+            reconcile.skipped_suspended, 1,
+            "the suspended VM must be counted as skipped by the DNAT-restore guard"
+        );
+        assert_eq!(
+            reconcile.restored, 0,
             "a suspended VM's forward must not be restored as DNAT"
         );
 

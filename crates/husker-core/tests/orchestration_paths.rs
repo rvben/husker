@@ -1271,7 +1271,7 @@ async fn reconcile_port_forwards_skips_invalid_guest_ip() {
         .unwrap();
 
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
-    assert_eq!(core.reconcile_port_forwards_from_state().await, 0);
+    assert_eq!(core.reconcile_port_forwards_from_state().await.restored, 0);
 }
 
 #[tokio::test]
