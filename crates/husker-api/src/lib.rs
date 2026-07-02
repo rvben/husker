@@ -1460,6 +1460,22 @@ husker_vms_failed {}\n",
         }
     }
 
+    // Idle-policy counters and the currently-suspended gauge.
+    let im = core.idle_metrics();
+    out.push_str(&format!(
+        "# TYPE husker_vm_suspended_total counter\nhusker_vm_suspended_total {}\n\
+# TYPE husker_vm_auto_resumed_total counter\n\
+husker_vm_auto_resumed_total{{trigger=\"control_plane\"}} {}\n\
+husker_vm_auto_resumed_total{{trigger=\"connect\"}} {}\n\
+# TYPE husker_vm_reaped_total counter\nhusker_vm_reaped_total {}\n\
+# TYPE husker_vms_suspended gauge\nhusker_vms_suspended {}\n",
+        im.suspended_total.load(Ordering::Relaxed),
+        im.auto_resumed_control_plane_total.load(Ordering::Relaxed),
+        im.auto_resumed_connect_total.load(Ordering::Relaxed),
+        im.reaped_total.load(Ordering::Relaxed),
+        count("suspended"),
+    ));
+
     out
 }
 
@@ -5439,6 +5455,33 @@ mod tests {
         assert!(
             text.contains("husker_service_current_instances{service=\"svc\"} 1"),
             "missing husker_service_current_instances in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_include_idle_policy_series() {
+        let core = test_core();
+        core.idle_metrics()
+            .suspended_total
+            .fetch_add(2, Ordering::Relaxed);
+        let app = router(core);
+        let response = app
+            .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert!(
+            text.contains("husker_vm_suspended_total 2"),
+            "missing husker_vm_suspended_total in:\n{text}"
+        );
+        assert!(
+            text.contains("husker_vms_suspended "),
+            "missing husker_vms_suspended in:\n{text}"
+        );
+        assert!(
+            text.contains("husker_vm_auto_resumed_total{trigger=\"connect\"}"),
+            "missing husker_vm_auto_resumed_total in:\n{text}"
         );
     }
 
