@@ -7798,7 +7798,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                         .iter()
                         .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
                         .collect(),
-                ),
+                )
+                .with_idle_policy(config.idle_policy.clone().into()),
             )
         };
         #[cfg(not(target_os = "linux"))]
@@ -7835,7 +7836,8 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
                         .iter()
                         .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
                         .collect(),
-                ),
+                )
+                .with_idle_policy(config.idle_policy.clone().into()),
             )
         };
         run_linux_daemon(
@@ -8033,6 +8035,10 @@ async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
         service_reconcile_enabled,
         service_reconcile_interval,
     );
+    spawn_idle_policy_loop(
+        std::sync::Arc::clone(&core),
+        core.idle_policy().poll_interval_secs,
+    );
     spawn_log_rotation(std::sync::Arc::clone(&core));
     spawn_metrics_endpoint(std::sync::Arc::clone(&core), metrics_listen, metrics_token);
     husker_api::serve_with_auth(std::sync::Arc::clone(&core), listen, api_token).await?;
@@ -8081,6 +8087,23 @@ fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
             if let Err(e) = core.create_service_ordinal_index() {
                 tracing::warn!(error = %e, "reconcile loop: failed to create ordinal index");
             }
+        }
+    });
+}
+
+/// Spawn the periodic idle-policy evaluation loop: one `idle_policy_tick` per
+/// poll interval, suspending idle VMs and reaping expired suspends.
+fn spawn_idle_policy_loop<B: husker_vmm::VmmBackend + 'static>(
+    core: Arc<husker_core::HuskerCore<B>>,
+    poll_interval_secs: u64,
+) {
+    let interval = std::time::Duration::from_secs(poll_interval_secs.max(1));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // consume the immediate first tick
+        loop {
+            ticker.tick().await;
+            core.idle_policy_tick().await;
         }
     });
 }

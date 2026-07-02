@@ -1248,6 +1248,227 @@ impl<B: VmmBackend> HuskerCore<B> {
             .insert(id, now);
     }
 
+    /// Time `record` has been idle, or `None` if it is not eligible for idle
+    /// evaluation right now (not running, or an open session pins it active).
+    ///
+    /// Pure read: never inserts into `control_plane_last_active` or
+    /// `network_last_active`. `idle_policy_tick` calls this twice per
+    /// candidate (once for the initial verdict, once for the in-lock
+    /// re-check); if a missing entry were seeded here, the re-check would see
+    /// a freshly-seeded ~0ms-old entry and the suspend would never go
+    /// through. Map entries are populated only by explicit activity events
+    /// (`note_activity`, `mark_network_active`, `seed_activity`).
+    fn idle_for(&self, record: &VmRecord) -> Option<std::time::Duration> {
+        if record.state != "running" || self.active_session_count(record.id) > 0 {
+            return None;
+        }
+        // Fallback when a signal has no in-memory entry (never seen since the
+        // daemon started, or seeding never ran): the DB mirror of the last
+        // control-plane touch. `last_activity_at` is set to `created_at` at
+        // creation, so an untouched-but-old VM is immediately eligible while a
+        // freshly-created one waits out a full window.
+        let db_elapsed = (chrono::Utc::now() - record.last_activity_at)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        let control_plane = self
+            .control_plane_last_active
+            .lock()
+            .expect("control_plane_last_active poisoned")
+            .get(&record.id)
+            .map(|t| t.elapsed())
+            .unwrap_or(db_elapsed);
+        let network = self
+            .network_last_active
+            .lock()
+            .expect("network_last_active poisoned")
+            .get(&record.id)
+            .map(|t| t.elapsed())
+            .unwrap_or(db_elapsed);
+        Some(control_plane.min(network))
+    }
+
+    /// Read every husker-managed port-forward counter in one `nft` call,
+    /// bounded to 500ms so a wedged or slow `nft` invocation cannot stall the
+    /// idle-policy tick. Empty on timeout or error: the caller then treats
+    /// this poll as "no network update this tick" rather than failing it.
+    #[cfg(feature = "linux-net")]
+    async fn snapshot_pf_counters(&self) -> std::collections::HashMap<String, (u64, u64)> {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            husker_net::read_all_port_forward_counters(&self.bridge_name),
+        )
+        .await
+        {
+            Ok(Ok(counters)) => counters,
+            Ok(Err(e)) => {
+                warn!(error = %e, "idle tick: reading port-forward counters failed");
+                std::collections::HashMap::new()
+            }
+            Err(_) => {
+                warn!("idle tick: reading port-forward counters timed out");
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
+    /// Compare `vm`'s port-forward byte counters against the previous tick's
+    /// baseline in `network_counters`; a growing packet count means the
+    /// forward carried traffic since the last poll, so mark the VM network-
+    /// active. Always writes the fresh tuple back, even when it did not grow,
+    /// so a counter that resets after a resume (new < old, since the DNAT
+    /// rule was recreated at 0) just re-baselines instead of raising a false
+    /// positive on every subsequent tick.
+    #[cfg(feature = "linux-net")]
+    fn refresh_network_activity(
+        &self,
+        vm: &VmRecord,
+        counters: &std::collections::HashMap<String, (u64, u64)>,
+    ) {
+        let Some(tap) = vm.tap_device.as_deref() else {
+            return;
+        };
+        let forwards = self
+            .state
+            .list_port_forwards_for_vm(vm.id)
+            .unwrap_or_default();
+        if forwards.is_empty() {
+            return;
+        }
+        let mut became_active = false;
+        {
+            let mut nc = self
+                .network_counters
+                .lock()
+                .expect("network_counters poisoned");
+            for pf in &forwards {
+                let key = format!("husker-pf:{tap}:{}", pf.host_port);
+                let new_counts = counters.get(&key).copied().unwrap_or((0, 0));
+                let old_counts = nc.get(&key).copied().unwrap_or((0, 0));
+                if new_counts.0 > old_counts.0 {
+                    became_active = true;
+                }
+                nc.insert(key, new_counts);
+            }
+        }
+        if became_active {
+            self.mark_network_active(vm.id);
+        }
+    }
+
+    /// One pass of the idle-policy poll loop.
+    ///
+    /// For every VM opted in via `idle_timeout_secs`, refresh its network-
+    /// activity signal (Linux), compute how long it has been idle, and act on
+    /// `evaluate_policy`'s verdict. A `Suspend`/`Reap` verdict from the first
+    /// pass is provisional: before acting on it, the VM's name lock is
+    /// acquired and the record + policy inputs are re-read and re-evaluated
+    /// under that lock. The lock is held across both the re-check and the
+    /// action itself, so no session, connection, or resume can slip in
+    /// between the final `evaluate_policy` call and the suspend/reap (no
+    /// drop-then-reacquire TOCTOU gap).
+    ///
+    /// Calls the `*_locked` inner functions directly, never the public
+    /// `suspend_vm`/`destroy_vm`: those acquire the same per-name lock this
+    /// function already holds, and tokio's `Mutex` is not reentrant, so
+    /// calling them here would deadlock.
+    pub async fn idle_policy_tick(self: &Arc<Self>)
+    where
+        B: 'static,
+    {
+        let vms = match self.state.list_vms() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "idle tick: list_vms");
+                return;
+            }
+        };
+        // One table dump per tick, indexed by comment (Linux). Best-effort.
+        #[cfg(feature = "linux-net")]
+        let counters = self.snapshot_pf_counters().await;
+        for vm in vms {
+            if vm.idle_timeout_secs.is_none() {
+                continue;
+            }
+            #[cfg(feature = "linux-net")]
+            self.refresh_network_activity(&vm, &counters);
+
+            let idle_for = self.idle_for(&vm);
+            let has_active = self.active_session_count(vm.id) > 0;
+            let has_fork = self.state.count_live_forks_of(vm.id).unwrap_or(0) > 0;
+            match evaluate_policy(&vm, chrono::Utc::now(), idle_for, has_active, has_fork) {
+                PolicyAction::None => {}
+                PolicyAction::Suspend => {
+                    // In-lock re-check: see the doc comment above for why the
+                    // lock spans both the re-check and the action.
+                    let _guard = self.vm_name_lock(&vm.name).lock_owned().await;
+                    if let Ok(fresh) = self.state.get_vm(vm.id) {
+                        #[cfg(feature = "linux-net")]
+                        {
+                            let c = self.snapshot_pf_counters().await;
+                            self.refresh_network_activity(&fresh, &c);
+                        }
+                        let re = evaluate_policy(
+                            &fresh,
+                            chrono::Utc::now(),
+                            self.idle_for(&fresh),
+                            self.active_session_count(fresh.id) > 0,
+                            self.state.count_live_forks_of(fresh.id).unwrap_or(0) > 0,
+                        );
+                        if matches!(re, PolicyAction::Suspend)
+                            && self.suspend_vm_locked(&fresh).await.is_ok()
+                        {
+                            self.idle_metrics
+                                .suspended_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+                PolicyAction::Reap => {
+                    let _guard = self.vm_name_lock(&vm.name).lock_owned().await;
+                    if let Ok(fresh) = self.state.get_vm(vm.id) {
+                        let re = evaluate_policy(
+                            &fresh,
+                            chrono::Utc::now(),
+                            None,
+                            self.active_session_count(fresh.id) > 0,
+                            self.state.count_live_forks_of(fresh.id).unwrap_or(0) > 0,
+                        );
+                        if matches!(re, PolicyAction::Reap)
+                            && self.destroy_vm_locked(&fresh).await.is_ok()
+                        {
+                            self.idle_metrics
+                                .reaped_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test-only accessor to the underlying state store, for tests that need
+    /// to reach setters (`set_idle_policy`, `set_suspended_at`, ...) not
+    /// otherwise exposed on `HuskerCore`.
+    #[cfg(test)]
+    fn state(&self) -> &husker_state::StateStore {
+        &self.state
+    }
+
+    /// Test-only: force both idle-activity timers to a specific `Instant`
+    /// (e.g. in the past), bypassing `note_activity`/`mark_network_active`'s
+    /// "now" semantics so a test can stage a VM as already idle.
+    #[cfg(test)]
+    fn set_last_active_for_test(&self, id: Uuid, at: std::time::Instant) {
+        self.control_plane_last_active
+            .lock()
+            .expect("control_plane_last_active poisoned")
+            .insert(id, at);
+        self.network_last_active
+            .lock()
+            .expect("network_last_active poisoned")
+            .insert(id, at);
+    }
+
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.vm_name_locks.lock().expect("vm_name_locks poisoned");
         map.entry(name.to_string())
@@ -1338,7 +1559,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 && (existing.state == "stopped" || existing.state == "failed")
             {
                 info!(name = %req.name, "replacing stopped VM");
-                self.destroy_vm_inner(&existing).await?;
+                self.destroy_vm_locked(&existing).await?;
             } else {
                 return Err(CoreError::VmAlreadyExists(req.name));
             }
@@ -2959,15 +3180,16 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub async fn destroy_vm(&self, name: &str) -> Result<(), CoreError> {
         let record = self.lookup_vm(name)?;
         let _name_guard = self.vm_name_lock(name).lock_owned().await;
-        self.destroy_vm_inner(&record).await
+        self.destroy_vm_locked(&record).await
     }
 
     /// Destroy a VM without acquiring the name lock.
     ///
     /// Callers MUST already hold the per-VM-name lock. Used internally by
     /// `create_vm_record` when replacing a stopped VM atomically within the
-    /// same critical section.
-    async fn destroy_vm_inner(&self, record: &VmRecord) -> Result<(), CoreError> {
+    /// same critical section, and by the idle-policy reap path (see
+    /// `idle_policy_tick`), which holds the lock across its own re-check.
+    async fn destroy_vm_locked(&self, record: &VmRecord) -> Result<(), CoreError> {
         let name = record.name.as_str();
         info!(%name, "destroying VM");
 
@@ -2986,12 +3208,27 @@ impl<B: VmmBackend> HuskerCore<B> {
         // from the bridge.
         #[cfg(feature = "linux-net")]
         {
+            // Read before the DB rows disappear below: needed to build each
+            // forward's `husker-pf:<tap>:<host_port>` comment key so the idle
+            // policy's counter baselines do not outlive the VM they belong to.
+            let forwards = self
+                .state
+                .list_port_forwards_for_vm(record.id)
+                .unwrap_or_default();
+
             if let Some(ref tap) = record.tap_device {
                 if let Err(e) = husker_net::remove_all_port_forwards(tap, &self.bridge_name).await {
                     warn!(%name, tap, error = %e, "failed to remove port forwards during destroy");
                 }
                 if let Err(e) = husker_net::delete_tap(tap).await {
                     warn!(%name, tap, error = %e, "failed to delete TAP device during destroy");
+                }
+                let mut nc = self
+                    .network_counters
+                    .lock()
+                    .expect("network_counters poisoned");
+                for pf in &forwards {
+                    nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
                 }
             }
 
@@ -3000,6 +3237,20 @@ impl<B: VmmBackend> HuskerCore<B> {
                 && let Err(e) = self.ip_allocator.release(guest_ip)
             {
                 warn!(%name, %guest_ip, error = %e, "failed to release IP during destroy");
+            }
+
+            // A reaped *suspended* VM may still have a bound resume-listener
+            // `PortProxy` (installed by `suspend_vm_locked`). Drop it here so
+            // the host port it holds is freed instead of staying bound, which
+            // would otherwise surface as EADDRINUSE the next time the port is
+            // reused.
+            if let Some(proxy) = self
+                .resume_listeners
+                .lock()
+                .expect("resume_listeners poisoned")
+                .remove(&record.id)
+            {
+                proxy.drain_and_close(record.id);
             }
         }
 
@@ -3036,6 +3287,22 @@ impl<B: VmmBackend> HuskerCore<B> {
         {
             warn!(%name, dir = %suspend_slot.display(), error = %e, "failed to remove suspend slot during destroy");
         }
+
+        // Drop this VM's idle-policy bookkeeping. Without this every destroyed
+        // VM leaks a map entry forever (a slow but unbounded memory leak in a
+        // long-running daemon that creates/destroys VMs continuously).
+        self.control_plane_last_active
+            .lock()
+            .expect("control_plane_last_active poisoned")
+            .remove(&record.id);
+        self.network_last_active
+            .lock()
+            .expect("network_last_active poisoned")
+            .remove(&record.id);
+        self.active_sessions
+            .lock()
+            .expect("active_sessions poisoned")
+            .remove(&record.id);
 
         self.state.delete_vm(record.id)?;
         info!(%name, "VM destroyed");
@@ -4497,6 +4764,10 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         husker_net::remove_port_forward(host_port, tap_name, &self.bridge_name).await?;
         self.state.delete_port_forward(host_port)?;
+        self.network_counters
+            .lock()
+            .expect("network_counters poisoned")
+            .remove(&format!("husker-pf:{tap_name}:{host_port}"));
 
         info!(%name, host_port, "port forward removed");
         Ok(())
@@ -4812,7 +5083,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     async fn destroy_instance(&self, vm: &VmRecord, outcome: &mut ReconcileOutcome) -> bool {
         let _name_guard = self.vm_name_lock(&vm.name).lock_owned().await;
-        match self.destroy_vm_inner(vm).await {
+        match self.destroy_vm_locked(vm).await {
             Ok(()) => {
                 outcome.destroyed.push(vm.name.clone());
                 true
@@ -6061,6 +6332,17 @@ mod tests {
         }
     }
 
+    /// Build a policy-eligible `VmRecord` via `sample_vm_record` and persist it
+    /// in `core`'s state store, returning the inserted record. Idle-policy-tick
+    /// tests need a real DB row: `idle_policy_tick` reads VMs via
+    /// `state.list_vms()`/`state.get_vm()`, not an in-memory-only record.
+    #[cfg(feature = "linux-net")]
+    async fn staged_firecracker_vm(core: &HuskerCore<AutoResumeMockVmm>, name: &str) -> VmRecord {
+        let rec = sample_vm_record(name);
+        core.state.insert_vm(&rec).unwrap();
+        rec
+    }
+
     /// Minimal `VmmBackend` for exercising `agent_connect`/`agent_connect_ready`
     /// without a real Firecracker process: `restore_vm` always succeeds (so a
     /// `suspended` VM resumes cleanly) and `vsock_connect` either hands back
@@ -6337,6 +6619,54 @@ mod tests {
         assert!(
             core.network_last_active_elapsed(rec.id).is_none(),
             "resuming from paused must not seed the idle timer; nothing removed its baseline"
+        );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn tick_suspends_idle_vm_and_reaps_expired() {
+        let core = test_core().await;
+        // A firecracker VM with a 1s idle timeout, no session, stale timers.
+        let rec = staged_firecracker_vm(&core, "idle").await;
+        core.state()
+            .set_idle_policy(rec.id, Some(1), Some(1), true)
+            .unwrap();
+        core.set_last_active_for_test(
+            rec.id,
+            std::time::Instant::now() - std::time::Duration::from_secs(5),
+        );
+        core.idle_policy_tick().await;
+        assert_eq!(core.get_vm(&rec.name).unwrap().state, "suspended");
+
+        // Backdate suspended_at beyond the ttl and tick again -> reaped.
+        core.state()
+            .set_suspended_at(
+                rec.id,
+                Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+            )
+            .unwrap();
+        core.idle_policy_tick().await;
+        assert!(core.get_vm(&rec.name).is_err(), "reaped VM must be destroyed");
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn tick_does_not_suspend_when_session_open() {
+        let core = test_core().await;
+        let rec = staged_firecracker_vm(&core, "busy").await;
+        core.state()
+            .set_idle_policy(rec.id, Some(1), Some(0), true)
+            .unwrap();
+        core.set_last_active_for_test(
+            rec.id,
+            std::time::Instant::now() - std::time::Duration::from_secs(5),
+        );
+        let _g = core.begin_session(rec.id);
+        core.idle_policy_tick().await;
+        assert_eq!(
+            core.get_vm(&rec.name).unwrap().state,
+            "running",
+            "an open session must shield the VM from idle suspension"
         );
     }
 
