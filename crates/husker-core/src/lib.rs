@@ -1708,7 +1708,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             None
         };
         let auto_resume = if idle_opted_in {
-            req.auto_resume.unwrap_or(self.idle_policy.default_auto_resume)
+            req.auto_resume
+                .unwrap_or(self.idle_policy.default_auto_resume)
         } else {
             true
         };
@@ -6900,7 +6901,10 @@ mod tests {
             )
             .unwrap();
         core.idle_policy_tick().await;
-        assert!(core.get_vm(&rec.name).is_err(), "reaped VM must be destroyed");
+        assert!(
+            core.get_vm(&rec.name).is_err(),
+            "reaped VM must be destroyed"
+        );
     }
 
     #[cfg(feature = "linux-net")]
