@@ -170,6 +170,24 @@ enum Commands {
         #[arg(long)]
         balloon: bool,
 
+        /// Enable idle auto-suspend using the daemon default window (Firecracker only).
+        /// Conflicts with --idle-timeout.
+        #[arg(long, conflicts_with = "idle_timeout")]
+        idle: bool,
+
+        /// Auto-suspend after this many seconds idle (Firecracker only, 0 = suspend as
+        /// soon as idle).
+        #[arg(long)]
+        idle_timeout: Option<u64>,
+
+        /// Destroy the VM after this many seconds suspended (0/unset = never).
+        #[arg(long)]
+        suspend_ttl: Option<u64>,
+
+        /// Do not auto-resume on activity/connect; require explicit `husker resume`.
+        #[arg(long)]
+        no_auto_resume: bool,
+
         /// Attach a named persistent volume as the second disk (/dev/vdb)
         #[arg(long)]
         volume: Option<String>,
@@ -382,6 +400,24 @@ enum Commands {
         /// automatically returned to the host
         #[arg(long)]
         balloon: bool,
+
+        /// Enable idle auto-suspend using the daemon default window (Firecracker only).
+        /// Conflicts with --idle-timeout.
+        #[arg(long, conflicts_with = "idle_timeout")]
+        idle: bool,
+
+        /// Auto-suspend after this many seconds idle (Firecracker only, 0 = suspend as
+        /// soon as idle).
+        #[arg(long)]
+        idle_timeout: Option<u64>,
+
+        /// Destroy the VM after this many seconds suspended (0/unset = never).
+        #[arg(long)]
+        suspend_ttl: Option<u64>,
+
+        /// Do not auto-resume on activity/connect; require explicit `husker resume`.
+        #[arg(long)]
+        no_auto_resume: bool,
 
         /// Attach a named persistent volume as the second disk (/dev/vdb)
         #[arg(long)]
@@ -1140,6 +1176,9 @@ struct Profile {
     #[serde(default)]
     env: Vec<String>,
     balloon: Option<bool>,
+    idle_timeout_secs: Option<u64>,
+    suspend_ttl_secs: Option<u64>,
+    auto_resume: Option<bool>,
     volume: Option<String>,
     #[serde(default)]
     mounts: Vec<String>,
@@ -1202,6 +1241,9 @@ fn profile_to_daemon(p: &Profile) -> husker_core::DaemonProfile {
         vmm: p.vmm.clone(),
         env: p.env.clone(),
         balloon: p.balloon,
+        idle_timeout_secs: p.idle_timeout_secs,
+        suspend_ttl_secs: p.suspend_ttl_secs,
+        auto_resume: p.auto_resume,
         volume: p.volume.clone(),
         mounts: p.mounts.clone(),
         network: p.network.clone(),
@@ -1227,6 +1269,9 @@ fn daemon_to_profile(d: husker_core::DaemonProfile) -> Profile {
         vmm: d.vmm,
         env: d.env,
         balloon: d.balloon,
+        idle_timeout_secs: d.idle_timeout_secs,
+        suspend_ttl_secs: d.suspend_ttl_secs,
+        auto_resume: d.auto_resume,
         volume: d.volume,
         mounts: d.mounts,
         network: d.network,
@@ -1702,6 +1747,10 @@ struct VmRequestArgs {
     ssh_key: Vec<PathBuf>,
     env: Vec<String>,
     balloon: bool,
+    idle: bool,
+    idle_timeout_secs: Option<u64>,
+    suspend_ttl_secs: Option<u64>,
+    auto_resume: Option<bool>,
     volume: Option<String>,
     mount: Vec<String>,
     network: Option<String>,
@@ -1729,6 +1778,9 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
     if !args.balloon {
         args.balloon = p.balloon.unwrap_or(false);
     }
+    args.idle_timeout_secs = args.idle_timeout_secs.or(p.idle_timeout_secs);
+    args.suspend_ttl_secs = args.suspend_ttl_secs.or(p.suspend_ttl_secs);
+    args.auto_resume = args.auto_resume.or(p.auto_resume);
     args.volume = args.volume.take().or_else(|| p.volume.clone());
     if args.mount.is_empty() {
         args.mount = p.mounts.clone();
@@ -2725,6 +2777,22 @@ fn build_vm_request_body(
         body["balloon"] = serde_json::json!(true);
     }
 
+    if let Some(idle) = args.idle.then_some(true) {
+        body["idle"] = serde_json::json!(idle);
+    }
+
+    if let Some(secs) = args.idle_timeout_secs {
+        body["idle_timeout_secs"] = serde_json::json!(secs);
+    }
+
+    if let Some(secs) = args.suspend_ttl_secs {
+        body["suspend_ttl_secs"] = serde_json::json!(secs);
+    }
+
+    if let Some(auto_resume) = args.auto_resume {
+        body["auto_resume"] = serde_json::json!(auto_resume);
+    }
+
     if let Some(ref vol) = args.volume {
         body["volume"] = serde_json::json!(vol);
     }
@@ -2888,6 +2956,10 @@ async fn run(cli: Cli) -> Result<()> {
             disk_size,
             ssh_key,
             balloon,
+            idle,
+            idle_timeout,
+            suspend_ttl,
+            no_auto_resume,
             volume,
             mount,
             net,
@@ -2967,6 +3039,10 @@ async fn run(cli: Cli) -> Result<()> {
                     ssh_key,
                     env,
                     balloon,
+                    idle,
+                    idle_timeout_secs: idle_timeout,
+                    suspend_ttl_secs: suspend_ttl,
+                    auto_resume: if no_auto_resume { Some(false) } else { None },
                     volume,
                     mount,
                     network: net,
@@ -3528,6 +3604,10 @@ async fn run(cli: Cli) -> Result<()> {
             disk_size,
             ssh_key,
             balloon,
+            idle,
+            idle_timeout,
+            suspend_ttl,
+            no_auto_resume,
             volume,
             mount,
             net,
@@ -3615,6 +3695,10 @@ async fn run(cli: Cli) -> Result<()> {
                     ssh_key,
                     env: Vec::new(),
                     balloon,
+                    idle,
+                    idle_timeout_secs: idle_timeout,
+                    suspend_ttl_secs: suspend_ttl,
+                    auto_resume: if no_auto_resume { Some(false) } else { None },
                     volume,
                     mount,
                     network: net,
@@ -9361,6 +9445,29 @@ mod tests {
         };
         apply_profile(&mut args, &p);
         assert!(!args.balloon, "no profile balloon should leave false");
+    }
+
+    #[test]
+    fn apply_profile_fills_idle_policy_when_unset() {
+        let mut args = VmRequestArgs::default();
+        let p = Profile {
+            idle_timeout_secs: Some(900),
+            suspend_ttl_secs: Some(1800),
+            auto_resume: Some(false),
+            ..Profile::default()
+        };
+        apply_profile(&mut args, &p);
+        assert_eq!(args.idle_timeout_secs, Some(900));
+        assert_eq!(args.suspend_ttl_secs, Some(1800));
+        assert_eq!(args.auto_resume, Some(false));
+
+        // Explicit CLI value wins over profile.
+        let mut args2 = VmRequestArgs {
+            idle_timeout_secs: Some(60),
+            ..VmRequestArgs::default()
+        };
+        apply_profile(&mut args2, &p);
+        assert_eq!(args2.idle_timeout_secs, Some(60));
     }
 
     #[test]

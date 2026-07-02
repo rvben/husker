@@ -121,6 +121,12 @@ pub struct DaemonProfile {
     #[serde(default)]
     pub env: Vec<String>,
     pub balloon: Option<bool>,
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub suspend_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub auto_resume: Option<bool>,
     pub volume: Option<String>,
     #[serde(default)]
     pub mounts: Vec<String>,
