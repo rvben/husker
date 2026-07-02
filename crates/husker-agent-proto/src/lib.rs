@@ -886,6 +886,179 @@ mod tests {
         }
     }
 
+    // --- Framing/argv hardening (kills mutants surfaced by `make mutation-gate`) --
+    //
+    // These pin the length-prefix size guards, the framing constants, the OCI
+    // argv helper, and the read/write round trip. Each targets a specific
+    // cargo-mutants survivor on husker-agent-proto's safety-critical code.
+
+    #[test]
+    fn argv_is_entrypoint_followed_by_cmd() {
+        let cfg = OciRuntimeConfig {
+            entrypoint: vec!["python3".into()],
+            cmd: vec!["app.py".into(), "--verbose".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.argv(), vec!["python3", "app.py", "--verbose"]);
+        // Empty when the image declares neither entrypoint nor cmd.
+        assert!(OciRuntimeConfig::default().argv().is_empty());
+        // Entrypoint-only and cmd-only preserve order and content.
+        let ep_only = OciRuntimeConfig {
+            entrypoint: vec!["/bin/sh".into()],
+            ..Default::default()
+        };
+        assert_eq!(ep_only.argv(), vec!["/bin/sh"]);
+        let cmd_only = OciRuntimeConfig {
+            cmd: vec!["echo".into(), "hi".into()],
+            ..Default::default()
+        };
+        assert_eq!(cmd_only.argv(), vec!["echo", "hi"]);
+    }
+
+    #[test]
+    fn framing_size_constants_are_exact() {
+        assert_eq!(MAX_MESSAGE_SIZE, 16_777_216);
+        assert_eq!(PAYLOAD_READ_CHUNK, 65_536);
+    }
+
+    #[test]
+    fn decode_rejects_prefix_over_max_at_four_bytes() {
+        // Buffer holds only the 4-byte length prefix, declaring MAX+1. The size
+        // guard must reject before the completeness check (`buf.len() < 4` is
+        // false at exactly four bytes).
+        let buf = ((MAX_MESSAGE_SIZE as u32) + 1).to_be_bytes();
+        let result: Result<Option<(AgentRequest, usize)>, _> = decode_message(&buf);
+        assert!(matches!(
+            result,
+            Err(ProtocolError::MessageTooLarge { size }) if size == MAX_MESSAGE_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn decode_allows_prefix_at_exactly_max_and_waits() {
+        // A prefix of exactly MAX is within bounds; with no payload the frame is
+        // incomplete, so decode returns None rather than rejecting it.
+        let buf = (MAX_MESSAGE_SIZE as u32).to_be_bytes();
+        let result: Result<Option<(AgentRequest, usize)>, _> = decode_message(&buf);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn write_message_emits_a_decodable_frame() {
+        let mut sink = Vec::new();
+        write_message(&mut sink, &AgentRequest::Ping).await.unwrap();
+        assert!(!sink.is_empty(), "writer must emit the framed bytes");
+        let (decoded, consumed): (AgentRequest, usize) = decode_message(&sink).unwrap().unwrap();
+        assert_eq!(consumed, sink.len());
+        assert!(matches!(decoded, AgentRequest::Ping));
+    }
+
+    #[tokio::test]
+    async fn encode_and_write_reject_payload_larger_than_max() {
+        // A payload strictly larger than MAX must be rejected by both the sync
+        // encoder and the async writer, not only when it is exactly MAX.
+        let oversize = AgentRequest::Exec(ExecRequest {
+            command: "x".repeat(MAX_MESSAGE_SIZE + 1024),
+            args: vec![],
+            working_dir: None,
+            env: vec![],
+            timeout_secs: None,
+        });
+        assert!(matches!(
+            encode_message(&oversize),
+            Err(ProtocolError::MessageTooLarge { .. })
+        ));
+        let mut sink = Vec::new();
+        let err = write_message(&mut sink, &oversize)
+            .await
+            .expect_err("writer must reject an oversize payload");
+        assert!(matches!(err, ProtocolError::MessageTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn read_message_rejects_prefix_over_max_without_reading_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            writer
+                .write_all(&((MAX_MESSAGE_SIZE as u32) + 1).to_be_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let err =
+            read_message_with_timeout::<AgentRequest, _>(&mut reader, Duration::from_millis(250))
+                .await
+                .expect_err("oversize prefix must be rejected");
+        assert!(matches!(
+            err,
+            ProtocolError::MessageTooLarge { size } if size == MAX_MESSAGE_SIZE + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_message_accepts_max_prefix_then_times_out_awaiting_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            writer
+                .write_all(&(MAX_MESSAGE_SIZE as u32).to_be_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let err =
+            read_message_with_timeout::<AgentRequest, _>(&mut reader, Duration::from_millis(150))
+                .await
+                .expect_err("missing payload must hit the deadline");
+        assert!(matches!(
+            err,
+            ProtocolError::ReadTimeout { declared, .. } if declared == MAX_MESSAGE_SIZE
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_message_surfaces_non_eof_errors() {
+        // A clean EOF on the length prefix means "no message" (Ok(None)); any
+        // other read error must propagate rather than be swallowed as EOF.
+        struct ErroringReader(std::io::ErrorKind);
+        impl tokio::io::AsyncRead for ErroringReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(self.0, "boom")))
+            }
+        }
+
+        let mut reader = ErroringReader(std::io::ErrorKind::ConnectionReset);
+        let result =
+            read_message_with_timeout::<AgentRequest, _>(&mut reader, Duration::from_secs(1)).await;
+        assert!(matches!(result, Err(ProtocolError::Io(_))));
+    }
+
+    #[test]
+    fn default_read_timeout_resolves_env_then_default() {
+        // Directly asserting the resolved Duration catches a resolver that
+        // collapses to Duration::ZERO (which would make every payload read time
+        // out instantly) - the round-trip tests miss it because a pre-buffered
+        // payload completes before even a zero deadline fires.
+        //
+        // SAFETY: no other test in this binary reads the timeout env var (the
+        // rest pass explicit timeouts), so mutating it here is race-free.
+        unsafe {
+            std::env::set_var("HUSKER_PROTO_READ_TIMEOUT_SECS", "5");
+        }
+        assert_eq!(default_read_timeout(), Duration::from_secs(5));
+        unsafe {
+            std::env::remove_var("HUSKER_PROTO_READ_TIMEOUT_SECS");
+        }
+        assert_eq!(default_read_timeout(), Duration::from_secs(30));
+        assert_eq!(
+            default_read_timeout(),
+            Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)
+        );
+    }
+
     proptest! {
         #[test]
         fn prop_base64_roundtrip(data in proptest::collection::vec(any::<u8>(), 0..4096)) {

@@ -213,9 +213,11 @@ test-perf-baseline:
 coverage-ci:
 	cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/husker/src/main.rs|crates/husker-agent/src/main.rs|crates/husker-vmm/src/apple_vz.rs' --fail-under-lines 77 --lcov --output-path target/llvm-cov.info
 
-# Mutation-testing smoke gate (tooling + target discoverability).
+# Mutation-testing gate: runs real mutation testing on the protocol crate and
+# fails if any non-excluded mutant survives (see .cargo/mutants.toml for the
+# documented equivalent/flaky exclusions).
 mutation-gate:
-	cargo mutants --list --package husker-agent-proto > /dev/null
+	cargo mutants --package husker-agent-proto -j 4
 
 # Graceful shutdown drill (SIGTERM path)
 graceful-shutdown-drill:

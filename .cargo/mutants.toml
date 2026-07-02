@@ -1,0 +1,39 @@
+# cargo-mutants configuration for `make mutation-gate`.
+#
+# The gate runs real mutation testing on husker-agent-proto (the length-prefix
+# framing + base64 shared by host and guest agent). Every mutant that models a
+# real behavioural property is killed by a test in `src/lib.rs`. The exclusions
+# below are mutants that are provably equivalent or only observable as a
+# non-deterministic wall-clock timeout, so pinning them would add brittle or
+# flaky tests without catching a real defect. Each is anchored narrowly so it
+# does not mask a genuine survivor.
+#
+# NOTE: the read-loop exclusion is line-anchored (`:360:`) to hit only the loop
+# counter, not the size guard on line 350 which IS tested. If these lines move,
+# update the anchor.
+exclude_re = [
+    # base64 combines NON-overlapping bit fields, e.g. `(x & 0x03) << 4` sets
+    # bits 4-5 while `y >> 4` sets bits 0-3, so bitwise-OR and XOR are identical
+    # here. These `| -> ^` mutants are equivalent and cannot be killed. (The
+    # `& -> ^` mutants on the same lines DO differ and are caught by round trip.)
+    'replace \| with \^ in base64_encode',
+    'replace \| with \^ in base64_decode',
+
+    # The 16 MiB cap is a DoS guard; whether a message of *exactly* MAX bytes is
+    # accepted or rejected is a don't-care (both are safe). The strictly-greater
+    # path is covered by `encode_and_write_reject_payload_larger_than_max`.
+    'replace > with >= in encode_message',
+    'replace > with >= in write_message',
+
+    # Loop-counter mutations that turn a bounded loop into a non-terminating one
+    # are only observable as a wall-clock timeout, which is non-deterministic in
+    # CI. Correct termination for valid inputs is covered by the round-trip and
+    # chunked-read tests.
+    ':360:\d+: replace > with >= in read_message_with_timeout', # `while remaining > 0`
+    'replace \+= with \*= in base64_encode',                    # `i += 3`
+    'replace \+= with \*= in base64_decode',                    # `i += 4`
+    # `PAYLOAD_READ_CHUNK = 64 / 1024 = 0` makes the chunked read loop spin
+    # forever (zero-length chunks). The `* -> +` variant on this line yields a
+    # non-zero chunk and IS caught by `framing_size_constants_are_exact`.
+    ':304:\d+: replace \* with /',
+]
