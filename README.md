@@ -141,6 +141,31 @@ Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` fo
 | macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed), port forwarding (userspace proxy) | Experimental |
 | Linux x86_64 | QEMU/KVM | TAP + nftables NAT, port forwarding | Experimental |
 
+Intel macOS and Windows are not supported (Windows: use WSL2). Linux also
+supports aarch64 (agent-less build - see below).
+
+### Feature support by backend
+
+| Feature | Firecracker (Linux) | QEMU (Linux) | Apple VZ (macOS) |
+|---------|:---:|:---:|:---:|
+| Direct-kernel boot | ✓ | ✓ | ✓ |
+| Cloud images (`--cloud-image`) | — ¹ | ✓ (UEFI/OVMF) | ✓ (EFI) |
+| `exec` / `shell` / file copy | ✓ | ✓ | ✓ |
+| One-shot jobs (`husker job`) | ✓ | ✓ | ✓ |
+| Self-healing services | ✓ | ✓ | ✓ ² |
+| Persistent volumes (`--volume`) | ✓ | ✓ | ✓ ² |
+| Host bind-mounts (`--mount`) | — | ✓ (virtiofs) | — |
+| Memory balloon (`--balloon`) | ✓ | ✓ | ✓ |
+| Bridged LAN (`--net bridged`) | — | ✓ ³ | — |
+| Snapshots | ✓ | — | — |
+| Fork / pool checkout | ✓ | — | — |
+| Idle suspend / resume | ✓ | — | — |
+
+Notes:
+1. Cloud-image boot needs UEFI; Firecracker does direct-kernel boot only, so use `--vmm qemu` on Linux for cloud images.
+2. On macOS, `--volume` and services are not yet supported together with `--cloud-image` (both work with the default rootfs).
+3. Bridged networking requires a cloud-image VM (so `--vmm qemu`) plus the `lan_bridge` config option, and is Linux-only.
+
 Only the two primary targets (Linux x86_64 and macOS ARM64) ship with the
 embedded guest agent. The Linux ARM64 and Intel-macOS builds are agent-less:
 `husker run` boots, but `exec`/`shell`/`cp` and cloud-image VMs need the agent, so
