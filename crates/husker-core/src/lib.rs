@@ -2402,12 +2402,19 @@ impl<B: VmmBackend> HuskerCore<B> {
             let core = Arc::clone(&core);
             async move {
                 match core.resume_vm(&name).await {
-                    Ok(_) => {
+                    // Only a real suspended->running transition counts as an
+                    // auto-resume: concurrent connections racing the same
+                    // suspended VM all land here, but only the first actually
+                    // resumes it (the rest observe `false`, an already-running
+                    // no-op), so gating on `true` keeps the counter from
+                    // over-counting a single resume N times.
+                    Ok(true) => {
                         core.idle_metrics
                             .auto_resumed_connect_total
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Ok(())
                     }
+                    Ok(false) => Ok(()),
                     Err(e) => Err(std::io::Error::other(e.to_string())),
                 }
             }
@@ -2558,16 +2565,21 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Resume a paused or suspended VM.
     ///
-    /// - `paused`: un-pauses the running VMM process.
+    /// - `paused`: un-pauses the running VMM process. Pausing never removed
+    ///   DNAT or installed a resume listener (see `suspend_vm_locked`), so
+    ///   resuming from `paused` touches no networking and is not part of the
+    ///   idle-suspend lifecycle: `suspended_at` and the idle timers are left
+    ///   untouched.
     /// - `suspended`: restores full VM state from the suspend slot on disk,
     ///   re-adds DNAT, drains and closes any resume listener, and resets both
     ///   idle timers so the woken VM gets a fresh full window.
     /// - `running`: idempotent no-op.
     ///
-    /// Returns `true` if this call performed a real transition into `running`
-    /// (from `paused` or `suspended`), `false` for the already-running no-op.
-    /// Callers that bump a "VM was auto-resumed" metric should gate on `true`
-    /// so a resume racing an already-running VM does not double-count.
+    /// Returns `true` only for a real `suspended` -> `running` restore;
+    /// `paused` -> `running` and the already-running no-op both return
+    /// `false`. Callers that bump an "auto-resumed from idle-suspend" metric
+    /// should gate on `true` so neither an already-running race nor an
+    /// unrelated pause/unpause cycle is miscounted as an idle auto-resume.
     pub async fn resume_vm(&self, name: &str) -> Result<bool, CoreError> {
         info!(%name, "resuming VM");
         // Serialize against a concurrent fork/suspend of this VM (see `suspend_vm`):
@@ -2575,6 +2587,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         // source's rootfs aliased to a clone during `/snapshot/load`.
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        // Only a "suspended" restore removed DNAT and installed resume
+        // listeners (see `suspend_vm_locked`); a "paused" VM never touched
+        // networking, so its resume must not either, and it is not part of
+        // the idle-suspend lifecycle (no `suspended_at` to clear, no idle
+        // timers to reset).
+        let restoring_from_suspend = record.state == "suspended";
         match record.state.as_str() {
             "paused" => {
                 self.vmm.resume_vm(record.id).await?;
@@ -2596,73 +2614,76 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
 
-        #[cfg(feature = "linux-net")]
-        {
-            let forwards = self
-                .state
-                .list_port_forwards_for_vm(record.id)
-                .unwrap_or_default();
-            // Re-add DNAT before draining the resume listener, so new
-            // connections use the kernel path while ones already queued on the
-            // userspace listener are still relayed.
-            for pf in &forwards {
-                if let (Some(tap), Some(gip)) =
-                    (record.tap_device.as_deref(), record.guest_ip.as_deref())
-                    && let Ok(gip) = gip.parse()
-                {
-                    let _ = husker_net::add_port_forward(
-                        pf.host_port,
-                        gip,
-                        pf.guest_port,
-                        tap,
-                        &self.bridge_name,
-                    )
-                    .await;
-                }
-            }
-            if let Some(proxy) = self
-                .resume_listeners
-                .lock()
-                .expect("resume_listeners poisoned")
-                .remove(&record.id)
+        if restoring_from_suspend {
+            #[cfg(feature = "linux-net")]
             {
-                proxy.drain_and_close(record.id);
-            }
-            // Drop stale counter baselines: the DNAT rules were just recreated at
-            // 0, so any pre-suspend baseline is invalid. Clear this VM's comment
-            // keys so the next tick re-baselines instead of comparing
-            // new(small) against old(large) and missing traffic.
-            {
-                let mut nc = self
-                    .network_counters
-                    .lock()
-                    .expect("network_counters poisoned");
+                let forwards = self
+                    .state
+                    .list_port_forwards_for_vm(record.id)
+                    .unwrap_or_default();
+                // Re-add DNAT before draining the resume listener, so new
+                // connections use the kernel path while ones already queued on
+                // the userspace listener are still relayed.
                 for pf in &forwards {
-                    if let Some(tap) = record.tap_device.as_deref() {
-                        nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
+                    if let (Some(tap), Some(gip)) =
+                        (record.tap_device.as_deref(), record.guest_ip.as_deref())
+                        && let Ok(gip) = gip.parse()
+                    {
+                        let _ = husker_net::add_port_forward(
+                            pf.host_port,
+                            gip,
+                            pf.guest_port,
+                            tap,
+                            &self.bridge_name,
+                        )
+                        .await;
+                    }
+                }
+                if let Some(proxy) = self
+                    .resume_listeners
+                    .lock()
+                    .expect("resume_listeners poisoned")
+                    .remove(&record.id)
+                {
+                    proxy.drain_and_close(record.id);
+                }
+                // Drop stale counter baselines: the DNAT rules were just
+                // recreated at 0, so any pre-suspend baseline is invalid.
+                // Clear this VM's comment keys so the next tick re-baselines
+                // instead of comparing new(small) against old(large) and
+                // missing traffic.
+                {
+                    let mut nc = self
+                        .network_counters
+                        .lock()
+                        .expect("network_counters poisoned");
+                    for pf in &forwards {
+                        if let Some(tap) = record.tap_device.as_deref() {
+                            nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
+                        }
                     }
                 }
             }
+
+            // Reset idle timers so the woken VM gets a fresh full window
+            // (in-memory + the DB mirror, so the fallback in idle_for is also
+            // fresh if the maps are ever lost).
+            let now = std::time::Instant::now();
+            self.control_plane_last_active
+                .lock()
+                .expect("control_plane_last_active poisoned")
+                .insert(record.id, now);
+            self.network_last_active
+                .lock()
+                .expect("network_last_active poisoned")
+                .insert(record.id, now);
+            let _ = self
+                .state
+                .touch_last_activity(record.id, chrono::Utc::now());
+            self.state.set_suspended_at(record.id, None)?;
         }
 
-        // Reset idle timers so the woken VM gets a fresh full window (in-memory
-        // + the DB mirror, so the fallback in idle_for is also fresh if the
-        // maps are ever lost).
-        let now = std::time::Instant::now();
-        self.control_plane_last_active
-            .lock()
-            .expect("control_plane_last_active poisoned")
-            .insert(record.id, now);
-        self.network_last_active
-            .lock()
-            .expect("network_last_active poisoned")
-            .insert(record.id, now);
-        let _ = self
-            .state
-            .touch_last_activity(record.id, chrono::Utc::now());
-        self.state.set_suspended_at(record.id, None)?;
-
-        Ok(true)
+        Ok(restoring_from_suspend)
     }
 
     /// Fork a suspended VM into a new running VM with a fresh host identity.
@@ -6288,6 +6309,35 @@ mod tests {
             .map(|d| d.as_secs() < 5)
             .unwrap_or(false);
         assert!(recent, "resume must reset the network activity timer");
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn resume_from_paused_does_not_touch_suspend_lifecycle_state() {
+        let core = test_core().await;
+        let mut rec = sample_vm_record("p1");
+        rec.state = "paused".into();
+        // A real `pause_vm` never sets `suspended_at` (only `suspend_vm_locked`
+        // does). Force it here anyway: if the arm-gating regresses and the
+        // "suspended" cleanup runs for "paused" too, this field flipping to
+        // `None` is what catches it.
+        rec.suspended_at = Some(chrono::Utc::now());
+        core.state.insert_vm(&rec).unwrap();
+
+        let transitioned = core.resume_vm("p1").await.unwrap();
+        assert!(
+            !transitioned,
+            "resuming from paused is not an idle-suspend restore, so it must report false"
+        );
+        assert_eq!(core.get_vm("p1").unwrap().state, "running");
+        assert!(
+            core.get_vm("p1").unwrap().suspended_at.is_some(),
+            "resuming from paused must not touch suspended_at; pausing never set it"
+        );
+        assert!(
+            core.network_last_active_elapsed(rec.id).is_none(),
+            "resuming from paused must not seed the idle timer; nothing removed its baseline"
+        );
     }
 
     /// Minimal `VmmBackend` for exercising `fork_vm`: `restore_vm` only
