@@ -9,11 +9,34 @@ ExecStart=/usr/local/bin/husker daemon
 Restart=on-failure
 RestartSec=5
 
-# Hardening
+# Bound shutdown. The daemon drains in-flight connections (~20s) then drains VMs
+# (~30s); this ceiling keeps a wedged client from stranding the stop indefinitely.
+TimeoutStopSec=60
+
+# Hardening.
+#
+# NoNewPrivileges is left off because the daemon spawns the Firecracker/QEMU
+# hypervisor and needs the ambient privileges to manage /dev/kvm, TAP devices,
+# nftables, and cgroups. The directives below reduce blast radius without
+# breaking those needs.
 NoNewPrivileges=no
 ProtectSystem=strict
 ReadWritePaths=/var/lib/husker
 RuntimeDirectory=husker
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Intentionally NOT enabled (each would break a core function):
+#   ProtectControlGroups=true   - the daemon writes cgroup.subtree_control to
+#                                 enforce per-VM resource limits.
+#   ProtectKernelTunables=true  - NAT setup toggles net.ipv4.ip_forward.
+#   MemoryDenyWriteExecute=true - QEMU's TCG JIT needs W+X pages.
+#   User=/CapabilityBoundingSet - the networking/KVM path currently assumes root;
+#                                 a dedicated user + CAP_NET_ADMIN/CAP_NET_RAW is
+#                                 a tracked follow-up (see the excellence audit).
 
 [Install]
 WantedBy=multi-user.target
