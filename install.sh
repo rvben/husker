@@ -50,6 +50,13 @@ os="$(uname -s)"
 case "$os" in
   Linux)  target_os="unknown-linux-gnu" ;;
   Darwin) target_os="apple-darwin" ;;
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    echo "error: husker does not run on native Windows." >&2
+    echo "It is a Linux/macOS microVM manager (needs KVM or Apple Virtualization)." >&2
+    echo "On Windows, install inside WSL2 with nested virtualization enabled:" >&2
+    echo "  wsl --install, then run this script from your WSL2 Linux shell." >&2
+    exit 1
+    ;;
   *) echo "error: unsupported OS: $os" >&2; exit 1 ;;
 esac
 
