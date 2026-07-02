@@ -8195,6 +8195,11 @@ fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
 
 /// Spawn the periodic idle-policy evaluation loop: one `idle_policy_tick` per
 /// poll interval, suspending idle VMs and reaping expired suspends.
+///
+/// Only called from `run_linux_daemon`: suspend/resume relies on the
+/// nftables DNAT removal and userspace resume listeners that `linux-net`
+/// provides, so the idle policy loop has no non-Linux counterpart.
+#[cfg(feature = "linux-net")]
 fn spawn_idle_policy_loop<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     poll_interval_secs: u64,
