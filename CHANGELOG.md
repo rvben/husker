@@ -7,6 +7,52 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.33](https://github.com/rvben/husker/compare/v0.4.32...v0.4.33) - 2026-07-02
+
+### Added
+
+- **api**: add max-VMs admission control to bound host resource use ([82145eb](https://github.com/rvben/husker/commit/82145eb0fea8151de555bc78de183426cd037a26))
+- **vmm**: instrument Firecracker/QEMU teardown with tracing ([51125de](https://github.com/rvben/husker/commit/51125de68ed4418f95f62a9999228f7166d28dca))
+- **cli**: shell completions, all-or-nothing image pull, daemon_reachable flag ([a4cf7b6](https://github.com/rvben/husker/commit/a4cf7b64b9c59e6fa8927bb159d2eea28455a91c))
+- **state**: add clear_vm_guest_ip to null a VM's persisted IP ([7ca858b](https://github.com/rvben/husker/commit/7ca858b1792d31cae141ddf776eee9c3a2abfe47))
+- **husker**: reconcile leaked host resources on daemon startup ([11a8a8d](https://github.com/rvben/husker/commit/11a8a8d3607119218cae3b7f1a7e5e627b6a75a0))
+- **cli**: accept --cpus and --vcpus interchangeably ([05006ec](https://github.com/rvben/husker/commit/05006ec4e9a78be24bb9ac1b9fb0c01b23d166dd))
+- **api**: expose idle-policy metrics on /v1/metrics ([85820b9](https://github.com/rvben/husker/commit/85820b93f90801c998babaebacd2e7638f902fce))
+- **cli**: add --idle/--idle-timeout/--suspend-ttl/--no-auto-resume flags and profile fields ([541495b](https://github.com/rvben/husker/commit/541495b07bf2aa721fcde930ea4249b440644576))
+- **api**: plumb idle-policy fields through create request and VM response; gate non-firecracker ([c3fe90b](https://github.com/rvben/husker/commit/c3fe90b4f38960c878f55fc8591bc7b84e1af501))
+- **core**: skip DNAT for suspended VMs at startup and re-install resume listeners ([c601fbe](https://github.com/rvben/husker/commit/c601fbe397a13b261970e68a81bac66b44367e66))
+- **core**: add idle policy loop with in-lock re-check; wire spawn into daemon ([729a144](https://github.com/rvben/husker/commit/729a14406748af2cb87a8b10bc15100a79d4a04a))
+- **core**: centralize sleep/wake network transition, suspended_at, and idle-timer reset ([e7ee177](https://github.com/rvben/husker/commit/e7ee17783ec7dcfc9bd3a228bc294acb48a4c1ff))
+- **core**: auto-resume and pin active on agent_connect via session-guarded connection ([98fd753](https://github.com/rvben/husker/commit/98fd753a9c6c572505dc61ad132032b0823121da))
+- **core**: generalize port_proxy to Linux with resume dialer and guarded relays ([2070fbf](https://github.com/rvben/husker/commit/2070fbf972bb4147c2ed635200ed37ff3fe2d728))
+- **net**: add traffic counter to DNAT rules and a counter reader ([30569e9](https://github.com/rvben/husker/commit/30569e90acafa74069f32874ab1141bba2d7048c))
+- **core**: add active-session refcount, RAII guard, and idle metrics ([051d6e1](https://github.com/rvben/husker/commit/051d6e15070f2aa7b55909fcd28c343caf9251d0))
+- **cli**: add [idle_policy] config section and env overrides ([1fbfc21](https://github.com/rvben/husker/commit/1fbfc21882ce18fe76bf8401a0c0d306d409bf78))
+- **core**: add pure evaluate_policy idle decision function ([112e5ea](https://github.com/rvben/husker/commit/112e5ea3905072a7f9716a11d9f8a0fcf527cfae))
+- **state**: add idle-policy columns, setters, and fork-lineage query ([02ca610](https://github.com/rvben/husker/commit/02ca6102a4b9a791243d38f16827bb4369210ffc))
+
+### Fixed
+
+- **api**: make /v1/health probe the VMM backend and reflect it in status ([7bb64ef](https://github.com/rvben/husker/commit/7bb64efc0f4267240b02bf21e0eeaee12a727e9e))
+- **core**: reclaim a crashed standalone VM's IP and port forwards ([ea50370](https://github.com/rvben/husker/commit/ea50370cfd2dc0b966350aeeab648cd1e3b8ba54))
+- **husker**: verify the Firecracker download against a pinned checksum ([acfc52e](https://github.com/rvben/husker/commit/acfc52e40fe7ba99772d72f95bc6a5866a59c461))
+- **core**: bound concurrent relay tasks in the macOS port-forward proxy ([8103181](https://github.com/rvben/husker/commit/8103181ae781ac953f8a332ef88fa4b7218f0018))
+- **agent**: cap captured exec output instead of discarding it on overflow ([86d1373](https://github.com/rvben/husker/commit/86d1373845a33a93324bc25d53a9bb7639337649))
+- **api**: deny-by-default auth, constant-time token compare, bounded shutdown ([8c30d1c](https://github.com/rvben/husker/commit/8c30d1c163824f7b564d7cc47f716f9a678e23c1))
+- **husker**: harden daemon startup, remote-bind auth, and destructive-op gates ([02c368e](https://github.com/rvben/husker/commit/02c368e3fdc05b575dfe3a58a7a43ee9b5d97305))
+- **core**: validate fork name and agent-reported guest IP ([6263d09](https://github.com/rvben/husker/commit/6263d0913126ba5cc8cb513579131e4a0f28672c))
+- **core**: gate idle test helpers behind linux-net so make test-macos is dead-code-clean ([396814a](https://github.com/rvben/husker/commit/396814ac991c822d2755e5d4d4020e5469eb6792))
+- **core**: log idle-loop action failures, drop dead getter, reject idle flags with --pool ([2d36e26](https://github.com/rvben/husker/commit/2d36e261e4059543427b78a795d5e98ed45a61e6))
+- **husker**: gate idle-policy loop spawn behind linux-net feature ([ac56e8f](https://github.com/rvben/husker/commit/ac56e8ffe9916ee9faa0a27e2da66e8396832e0e))
+- **core**: gate resume network transition to suspended arm; dedup connect-resume metric ([291a396](https://github.com/rvben/husker/commit/291a3965e6b6f8d8fda679f77650761e2d9a6eb0))
+
+### Performance
+
+- **state**: pool SQLite connections instead of one shared mutex ([33a8177](https://github.com/rvben/husker/commit/33a817782d9d72be6b7e6320059158ac8d9d9d85))
+- **core**: refresh VMs concurrently in list_vms_refreshed ([0726af6](https://github.com/rvben/husker/commit/0726af645dc8758e88734b31ed421ab8668b9e34))
+- **state**: index port_forwards.vm_id and vms.service_id ([04bd3a0](https://github.com/rvben/husker/commit/04bd3a058972dfed4d3bcd0d9f73b39b3a7c0a49))
+
+
 ## [0.4.32](https://github.com/rvben/husker/compare/v0.4.31...v0.4.32) - 2026-07-01
 
 ### Fixed
