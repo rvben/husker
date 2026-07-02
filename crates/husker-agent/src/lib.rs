@@ -934,6 +934,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn exec_that_exceeds_timeout_is_killed_with_exit_124() {
+        // A command that runs past the deadline must be killed and reported with the
+        // conventional timeout exit code 124 plus a note - not left running or
+        // returned as a generic error. Deterministic: sleep 10s vs a 300ms deadline.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 10");
+        let start = std::time::Instant::now();
+        let resp = run_exec_with_capture(cmd, std::time::Duration::from_millis(300)).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the exec must be killed near the deadline, not run to completion"
+        );
+        let AgentResponse::Exec(e) = resp else {
+            panic!("expected an Exec response from a timed-out command");
+        };
+        assert_eq!(e.exit_code, 124, "a timed-out exec must return exit code 124");
+        assert!(
+            e.stderr.contains("timed out"),
+            "stderr must note the timeout, got {:?}",
+            e.stderr
+        );
+    }
+
     #[test]
     fn resolve_working_dir_prefers_request_then_image_then_root() {
         assert_eq!(resolve_working_dir(Some("/req"), Some("/img")), "/req");
