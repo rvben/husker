@@ -475,20 +475,36 @@ impl QemuKvmBackend {
     pub async fn destroy(&self, id: Uuid) -> Result<(), VmmError> {
         let mut instances = self.instances.lock().await;
         let mut inst = instances.remove(&id).ok_or(VmmError::VmNotFound(id))?;
-        let _ = inst.process.kill().await;
+        tracing::debug!(%id, "destroying qemu VM");
+        if let Err(e) = inst.process.kill().await {
+            tracing::warn!(%id, error = %e, "failed to kill qemu process during destroy");
+        }
         // Kill virtiofsd children explicitly; kill_on_drop provides a backstop when
         // inst drops at the end of this block, but an explicit kill lets us await
         // the signal delivery and keeps the shutdown deterministic.
         for vfd in &mut inst.virtiofsds {
             let _ = vfd.kill().await;
         }
-        let _ = tokio::fs::remove_file(&inst.qmp_path).await;
-        let _ = tokio::fs::remove_file(&inst.pidfile_path).await;
-        let _ = tokio::fs::remove_file(&inst.serial_log_path).await;
-        let _ = tokio::fs::remove_file(&inst.boot_log_path).await;
-        let _ = tokio::fs::remove_file(self.ovmf_vars_copy(id)).await;
+        let ovmf_vars_copy = self.ovmf_vars_copy(id);
+        for path in [
+            inst.qmp_path.as_path(),
+            inst.pidfile_path.as_path(),
+            inst.serial_log_path.as_path(),
+            inst.boot_log_path.as_path(),
+            ovmf_vars_copy.as_path(),
+        ] {
+            if let Err(e) = tokio::fs::remove_file(path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%id, path = %path.display(), error = %e, "failed to remove qemu runtime file during destroy");
+            }
+        }
         for sock in &inst.virtiofsd_socks {
-            let _ = tokio::fs::remove_file(sock).await;
+            if let Err(e) = tokio::fs::remove_file(sock).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%id, path = %sock.display(), error = %e, "failed to remove qemu virtiofsd socket during destroy");
+            }
         }
         inst.cgroup.remove();
         Ok(())

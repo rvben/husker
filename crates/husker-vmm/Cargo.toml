@@ -15,6 +15,7 @@ http-body-util = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
+tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

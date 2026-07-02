@@ -1099,6 +1099,7 @@ dependencies = [
  "tokio",
  "tokio-vsock 0.7.2",
  "tower",
+ "tracing",
  "uuid",
 ]
 

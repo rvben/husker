@@ -622,11 +622,22 @@ impl VmmBackend for FirecrackerBackend {
         let mut instances = self.instances.lock().await;
         let mut instance = instances.remove(&id).ok_or(VmmError::VmNotFound(id))?;
 
-        let _ = instance.process.kill().await;
-        let _ = tokio::fs::remove_file(&instance.socket_path).await;
-        let _ = tokio::fs::remove_file(&instance.vsock_path).await;
-        let _ = tokio::fs::remove_file(&instance.boot_log_path).await;
-        let _ = tokio::fs::remove_file(&instance.serial_log_path).await;
+        tracing::debug!(%id, "destroying firecracker VM");
+        if let Err(e) = instance.process.kill().await {
+            tracing::warn!(%id, error = %e, "failed to kill firecracker process during destroy");
+        }
+        for path in [
+            &instance.socket_path,
+            &instance.vsock_path,
+            &instance.boot_log_path,
+            &instance.serial_log_path,
+        ] {
+            if let Err(e) = tokio::fs::remove_file(path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%id, path = %path.display(), error = %e, "failed to remove firecracker runtime file during destroy");
+            }
+        }
         instance.cgroup.remove();
 
         Ok(())
