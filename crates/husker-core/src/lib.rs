@@ -713,7 +713,8 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Last control-plane activity (exec/shell/API touch) per VM, feeding the
     /// idle policy's `idle_for` calculation. In-memory only; a daemon restart
     /// loses history, but `seed_activity` reseeds a VM's clock on next sighting.
-    control_plane_last_active: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
+    control_plane_last_active:
+        Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
     /// Last network activity (port-forward byte delta) per VM, feeding the idle
     /// policy's `idle_for` calculation alongside `control_plane_last_active`.
     network_last_active: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
@@ -731,6 +732,15 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Userspace TCP port-forward proxies, keyed by VM (macOS, no host nftables).
     #[cfg(not(feature = "linux-net"))]
     port_proxy: Arc<crate::port_proxy::PortProxy<crate::port_proxy::ActiveDialer>>,
+    /// Per-VM resume listeners bound while a VM with `auto_resume` and active
+    /// port forwards is suspended: a userspace `PortProxy<ResumeDialer<..>>`
+    /// keeps the forwarded host ports accepting connections (which resume the
+    /// VM) after the DNAT rules are torn down. Type-erased because the
+    /// `ResumeDialer`'s closure type is anonymous and cannot be named here.
+    #[cfg(feature = "linux-net")]
+    resume_listeners: std::sync::Mutex<
+        std::collections::HashMap<Uuid, Box<dyn crate::port_proxy::ResumeListenerHandle>>,
+    >,
 }
 
 /// Per-attempt timeout for agent connect+ping in readiness loops.
@@ -926,6 +936,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             idle_policy: IdlePolicyConfig::default(),
             idle_metrics: Arc::new(IdleMetrics::default()),
+            resume_listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1188,6 +1199,16 @@ impl<B: VmmBackend> HuskerCore<B> {
             .lock()
             .expect("network_last_active poisoned")
             .insert(id, std::time::Instant::now());
+    }
+
+    /// Time elapsed since `id`'s last recorded network activity, or `None` if
+    /// the VM has no entry (never seen, or seeding never ran).
+    pub fn network_last_active_elapsed(&self, id: Uuid) -> Option<std::time::Duration> {
+        self.network_last_active
+            .lock()
+            .expect("network_last_active poisoned")
+            .get(&id)
+            .map(|t| t.elapsed())
     }
 
     /// Number of open sessions (exec/shell streams) currently pinning `id` active.
@@ -2214,7 +2235,15 @@ impl<B: VmmBackend> HuskerCore<B> {
     ///
     /// Networking (TAP/IP/CID) and the VM's rootfs are intentionally preserved so
     /// `resume_vm` can restore the same identity in place. Idempotent.
-    pub async fn suspend_vm(&self, name: &str) -> Result<(), CoreError> {
+    ///
+    /// Takes `Arc<Self>` (rather than `&self`) because a VM suspended with
+    /// `auto_resume` and active port forwards needs `install_resume_listeners`
+    /// to bind a resume hook that owns a clone of the core so it can call
+    /// `resume_vm` on first connection, long after this call returns.
+    pub async fn suspend_vm(self: &Arc<Self>, name: &str) -> Result<(), CoreError>
+    where
+        B: 'static,
+    {
         info!(%name, "suspending VM");
         // Serialize against a concurrent resume/fork of this VM: fork moves the
         // source's rootfs aside during `/snapshot/load` and reuses its vsock path,
@@ -2236,6 +2265,19 @@ impl<B: VmmBackend> HuskerCore<B> {
                 });
             }
         }
+        self.suspend_vm_locked(&record).await
+    }
+
+    /// Suspend logic assuming the caller already holds `name`'s `vm_name_lock`
+    /// and has validated `record.state` is `"running"` or `"paused"`. Captures
+    /// full VM state to disk, then (Linux) transitions the network path from
+    /// kernel DNAT to a userspace resume listener (if `auto_resume`) or tears
+    /// the forward down entirely.
+    async fn suspend_vm_locked(self: &Arc<Self>, record: &VmRecord) -> Result<(), CoreError>
+    where
+        B: 'static,
+    {
+        let name = &record.name;
 
         // Fail fast before pausing: only backends with full-state snapshot can be
         // suspended. Otherwise a QEMU/Apple VZ VM would be paused, hit
@@ -2300,10 +2342,107 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         // The slot is complete and durable; freeing the memory and the final state
         // write are both covered by reconcile (state is already "suspending").
+        // This is the backend process kill (`self.vmm.destroy_vm`), not core's
+        // public `destroy_vm`, which also takes `vm_name_lock` and would deadlock
+        // re-entering it here.
         self.vmm.destroy_vm(record.id).await?;
         self.state.update_vm_state(record.id, "suspended")?;
+
+        // Stamp the reap anchor before the network transition, so a crash mid
+        // transition still leaves a suspended VM whose TTL clock is running.
+        self.state
+            .set_suspended_at(record.id, Some(chrono::Utc::now()))?;
+
+        #[cfg(feature = "linux-net")]
+        {
+            let forwards = self
+                .state
+                .list_port_forwards_for_vm(record.id)
+                .unwrap_or_default();
+            if record.auto_resume && !forwards.is_empty() {
+                // Bind the resume listeners FIRST, so there is no window where
+                // neither the kernel DNAT nor a userspace listener is accepting
+                // connections on the forwarded host ports.
+                self.install_resume_listeners(record, &forwards).await;
+            }
+            for pf in &forwards {
+                if let Some(tap) = record.tap_device.as_deref() {
+                    let _ =
+                        husker_net::remove_port_forward(pf.host_port, tap, &self.bridge_name).await;
+                }
+            }
+        }
+
         info!(%name, "VM suspended");
         Ok(())
+    }
+
+    /// Bind a userspace `PortProxy` per forwarded port so a suspended,
+    /// `auto_resume` VM keeps accepting connections on its host ports after
+    /// the kernel DNAT rule is removed: the first connection resumes the VM
+    /// (idempotently) via the captured `Arc<Self>`, then relays through once
+    /// the guest is back up.
+    #[cfg(feature = "linux-net")]
+    async fn install_resume_listeners(
+        self: &Arc<Self>,
+        record: &VmRecord,
+        forwards: &[husker_state::PortForwardRecord],
+    ) where
+        B: 'static,
+    {
+        if record.tap_device.is_none() {
+            return;
+        }
+        let Some(guest_ip) = record.guest_ip.as_deref().and_then(|ip| ip.parse().ok()) else {
+            return;
+        };
+        let core = Arc::clone(self);
+        let vm_name = record.name.clone();
+        let resume = move |name: String| {
+            let core = Arc::clone(&core);
+            async move {
+                match core.resume_vm(&name).await {
+                    Ok(_) => {
+                        core.idle_metrics
+                            .auto_resumed_connect_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    }
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                }
+            }
+        };
+        let dialer = crate::port_proxy::ResumeDialer::new(
+            crate::port_proxy::DirectIpDialer,
+            vm_name,
+            resume,
+        );
+        let proxy = crate::port_proxy::PortProxy::new(dialer);
+        for pf in forwards {
+            let bind_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+            if let Err(e) = proxy
+                .add_guarded(
+                    record.id,
+                    bind_addr,
+                    pf.host_port,
+                    guest_ip,
+                    pf.guest_port,
+                    Arc::clone(&self.active_sessions),
+                )
+                .await
+            {
+                warn!(
+                    vm = %record.name,
+                    host_port = pf.host_port,
+                    error = %e,
+                    "failed to bind resume listener; suspended VM will not auto-resume on this port"
+                );
+            }
+        }
+        self.resume_listeners
+            .lock()
+            .expect("resume_listeners poisoned")
+            .insert(record.id, Box::new(proxy));
     }
 
     /// Recover VMs interrupted mid-suspend on a previous daemon run.
@@ -2420,9 +2559,16 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Resume a paused or suspended VM.
     ///
     /// - `paused`: un-pauses the running VMM process.
-    /// - `suspended`: restores full VM state from the suspend slot on disk.
+    /// - `suspended`: restores full VM state from the suspend slot on disk,
+    ///   re-adds DNAT, drains and closes any resume listener, and resets both
+    ///   idle timers so the woken VM gets a fresh full window.
     /// - `running`: idempotent no-op.
-    pub async fn resume_vm(&self, name: &str) -> Result<(), CoreError> {
+    ///
+    /// Returns `true` if this call performed a real transition into `running`
+    /// (from `paused` or `suspended`), `false` for the already-running no-op.
+    /// Callers that bump a "VM was auto-resumed" metric should gate on `true`
+    /// so a resume racing an already-running VM does not double-count.
+    pub async fn resume_vm(&self, name: &str) -> Result<bool, CoreError> {
         info!(%name, "resuming VM");
         // Serialize against a concurrent fork/suspend of this VM (see `suspend_vm`):
         // restoring a suspended source must not interleave with a fork that has the
@@ -2439,6 +2585,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             "running" => {
                 debug!(%name, "VM already running; resume is a no-op");
+                return Ok(false);
             }
             _ => {
                 return Err(CoreError::InvalidState {
@@ -2448,7 +2595,74 @@ impl<B: VmmBackend> HuskerCore<B> {
                 });
             }
         }
-        Ok(())
+
+        #[cfg(feature = "linux-net")]
+        {
+            let forwards = self
+                .state
+                .list_port_forwards_for_vm(record.id)
+                .unwrap_or_default();
+            // Re-add DNAT before draining the resume listener, so new
+            // connections use the kernel path while ones already queued on the
+            // userspace listener are still relayed.
+            for pf in &forwards {
+                if let (Some(tap), Some(gip)) =
+                    (record.tap_device.as_deref(), record.guest_ip.as_deref())
+                    && let Ok(gip) = gip.parse()
+                {
+                    let _ = husker_net::add_port_forward(
+                        pf.host_port,
+                        gip,
+                        pf.guest_port,
+                        tap,
+                        &self.bridge_name,
+                    )
+                    .await;
+                }
+            }
+            if let Some(proxy) = self
+                .resume_listeners
+                .lock()
+                .expect("resume_listeners poisoned")
+                .remove(&record.id)
+            {
+                proxy.drain_and_close(record.id);
+            }
+            // Drop stale counter baselines: the DNAT rules were just recreated at
+            // 0, so any pre-suspend baseline is invalid. Clear this VM's comment
+            // keys so the next tick re-baselines instead of comparing
+            // new(small) against old(large) and missing traffic.
+            {
+                let mut nc = self
+                    .network_counters
+                    .lock()
+                    .expect("network_counters poisoned");
+                for pf in &forwards {
+                    if let Some(tap) = record.tap_device.as_deref() {
+                        nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
+                    }
+                }
+            }
+        }
+
+        // Reset idle timers so the woken VM gets a fresh full window (in-memory
+        // + the DB mirror, so the fallback in idle_for is also fresh if the
+        // maps are ever lost).
+        let now = std::time::Instant::now();
+        self.control_plane_last_active
+            .lock()
+            .expect("control_plane_last_active poisoned")
+            .insert(record.id, now);
+        self.network_last_active
+            .lock()
+            .expect("network_last_active poisoned")
+            .insert(record.id, now);
+        let _ = self
+            .state
+            .touch_last_activity(record.id, chrono::Utc::now());
+        self.state.set_suspended_at(record.id, None)?;
+
+        Ok(true)
     }
 
     /// Fork a suspended VM into a new running VM with a fresh host identity.
@@ -2636,7 +2850,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             idle_timeout_secs: None,
             suspend_ttl_secs: None,
             auto_resume: true,
-            forked_from: None,
+            forked_from: Some(source.id),
         };
         self.state.insert_vm(&record).map_err(|e| match e {
             husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
@@ -3205,7 +3419,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// The template is a normal (suspended) VM named after the pool. Firecracker
     /// only (suspend needs full-state snapshot support). On any failure after the
     /// template is created it is destroyed, so the pool name is free again.
-    pub async fn create_pool(&self, req: CreatePoolRequest) -> Result<PoolRecord, CoreError> {
+    pub async fn create_pool(
+        self: &Arc<Self>,
+        req: CreatePoolRequest,
+    ) -> Result<PoolRecord, CoreError>
+    where
+        B: 'static,
+    {
         validate_resource_name("pool", &req.name)?;
         if self.state.get_pool_by_name(&req.name).is_ok() {
             return Err(CoreError::PoolAlreadyExists(req.name.clone()));
@@ -3898,10 +4118,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         let record = self.lookup_vm(name)?;
         if record.state == "suspended" {
             if record.auto_resume {
-                self.resume_vm(name).await?;
-                self.idle_metrics
-                    .auto_resumed_control_plane_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.resume_vm(name).await? {
+                    self.idle_metrics
+                        .auto_resumed_control_plane_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             } else {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
@@ -5727,20 +5948,21 @@ mod tests {
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
     }
 
-    /// Build a `HuskerCore` for tests that only exercise in-memory bookkeeping
-    /// (activity timers, session refcounts) and never touch the VMM or disk.
-    /// The data/runtime paths are placeholders: `HuskerCore::new` and
-    /// `FirecrackerBackend::new` do no I/O, so nothing needs to exist on disk.
+    /// Build a `HuskerCore` for tests that exercise in-memory bookkeeping
+    /// (activity timers, session refcounts) as well as a full suspend/resume
+    /// round trip via the mock backend below. `Arc`-wrapped because
+    /// `suspend_vm` requires an owned `Arc<Self>` to hand to its resume
+    /// listeners. The data/runtime paths are placeholders: `HuskerCore::new`
+    /// does no I/O, so nothing needs to exist on disk ahead of time (the mock
+    /// backend creates the suspend slot's files itself, on demand).
     #[cfg(feature = "linux-net")]
-    async fn test_core() -> HuskerCore<husker_vmm::firecracker::FirecrackerBackend> {
+    async fn test_core() -> Arc<HuskerCore<AutoResumeMockVmm>> {
         let dir = std::env::temp_dir().join(format!("husker-core-test-{}", Uuid::new_v4()));
         let runtime_dir = dir.join("run");
-        HuskerCore::new(
-            husker_vmm::firecracker::FirecrackerBackend::new(
-                std::path::Path::new("firecracker"),
-                &runtime_dir,
-                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
-            ),
+        Arc::new(HuskerCore::new(
+            AutoResumeMockVmm {
+                fail_vsock_connect: false,
+            },
             husker_state::StateStore::open_memory().unwrap(),
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
             husker_storage::StorageConfig {
@@ -5750,7 +5972,7 @@ mod tests {
             "husker0".into(),
             vec![],
             runtime_dir,
-        )
+        ))
     }
 
     #[cfg(feature = "linux-net")]
@@ -5864,11 +6086,18 @@ mod tests {
         async fn snapshot_vm(
             &self,
             _id: Uuid,
-            _dst: &SnapshotPaths,
+            dst: &SnapshotPaths,
         ) -> Result<husker_vmm::SnapshotMeta, husker_vmm::VmmError> {
-            Err(husker_vmm::VmmError::Unsupported(
-                "not used by this test".into(),
-            ))
+            std::fs::create_dir_all(&dst.dir)
+                .map_err(|e| husker_vmm::VmmError::ProcessError(e.to_string()))?;
+            std::fs::write(&dst.memory, b"mem")
+                .map_err(|e| husker_vmm::VmmError::ProcessError(e.to_string()))?;
+            std::fs::write(&dst.vmstate, b"state")
+                .map_err(|e| husker_vmm::VmmError::ProcessError(e.to_string()))?;
+            Ok(husker_vmm::SnapshotMeta {
+                backend: "firecracker".into(),
+                vmm_version: "test".into(),
+            })
         }
 
         async fn restore_vm(
@@ -6031,6 +6260,236 @@ mod tests {
             0,
             "no auto-resume must mean no auto-resume counter bump"
         );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn suspend_stamps_suspended_at_and_resume_clears_it_and_resets_timers() {
+        let core = test_core().await;
+        let rec = sample_vm_record("c1");
+        core.state.insert_vm(&rec).unwrap();
+        core.mark_network_active(rec.id); // simulate old activity, pre-suspend
+
+        core.suspend_vm("c1").await.unwrap();
+        assert_eq!(core.get_vm("c1").unwrap().state, "suspended");
+        assert!(core.get_vm("c1").unwrap().suspended_at.is_some());
+
+        let transitioned = core.resume_vm("c1").await.unwrap();
+        assert!(
+            transitioned,
+            "resume from a genuinely suspended VM must report a real transition"
+        );
+        assert_eq!(core.get_vm("c1").unwrap().state, "running");
+        assert!(core.get_vm("c1").unwrap().suspended_at.is_none());
+        // Both idle timers reset: network_last_active is now recent (< 5s),
+        // even though `mark_network_active` above staged it as old pre-suspend.
+        let recent = core
+            .network_last_active_elapsed(rec.id)
+            .map(|d| d.as_secs() < 5)
+            .unwrap_or(false);
+        assert!(recent, "resume must reset the network activity timer");
+    }
+
+    /// Minimal `VmmBackend` for exercising `fork_vm`: `restore_vm` only
+    /// handles `RestoreTarget::Fork` (the only target `try_fork_vm` ever
+    /// requests), and `vsock_connect` hands back one end of a live
+    /// `UnixStream` pair with `fake_agent_reconfigure_responder` spawned on
+    /// the other end, standing in for the real guest agent. This keeps
+    /// `try_fork_vm`'s network re-home step (`reconfigure_fork_network`) off
+    /// the real, host-mutating `husker_agent::handle_connection` responder,
+    /// which must never run against this shared test host.
+    #[cfg(feature = "linux-net")]
+    struct ForkMockVmm;
+
+    #[cfg(feature = "linux-net")]
+    impl VmmBackend for ForkMockVmm {
+        type VsockStream = tokio::net::UnixStream;
+
+        async fn create_vm(
+            &self,
+            _config: husker_vmm::VmConfig,
+        ) -> Result<VmInfo, husker_vmm::VmmError> {
+            Err(husker_vmm::VmmError::Unsupported(
+                "not used by this test".into(),
+            ))
+        }
+
+        async fn stop_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn destroy_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn vm_info(&self, id: Uuid) -> Result<VmInfo, husker_vmm::VmmError> {
+            Err(husker_vmm::VmmError::VmNotFound(id))
+        }
+
+        async fn pause_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn resume_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+
+        async fn snapshot_vm(
+            &self,
+            _id: Uuid,
+            _dst: &SnapshotPaths,
+        ) -> Result<husker_vmm::SnapshotMeta, husker_vmm::VmmError> {
+            Err(husker_vmm::VmmError::Unsupported(
+                "not used by this test".into(),
+            ))
+        }
+
+        async fn restore_vm(
+            &self,
+            _src: &SnapshotPaths,
+            target: RestoreTarget,
+        ) -> Result<VmInfo, husker_vmm::VmmError> {
+            let RestoreTarget::Fork {
+                id,
+                name,
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+                ..
+            } = target
+            else {
+                return Err(husker_vmm::VmmError::Unsupported(
+                    "resume restore not used by this test".into(),
+                ));
+            };
+            Ok(VmInfo {
+                id,
+                name,
+                state: VmState::Running,
+                pid: Some(1),
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+            })
+        }
+
+        async fn vsock_connect(
+            &self,
+            _id: Uuid,
+            _port: u32,
+        ) -> Result<Self::VsockStream, husker_vmm::VmmError> {
+            let (a, b) = tokio::net::UnixStream::pair()
+                .map_err(|e| husker_vmm::VmmError::ProcessError(e.to_string()))?;
+            tokio::spawn(fake_agent_reconfigure_responder(b));
+            Ok(a)
+        }
+
+        async fn set_balloon(
+            &self,
+            _id: Uuid,
+            _amount_mib: u32,
+        ) -> Result<(), husker_vmm::VmmError> {
+            Ok(())
+        }
+    }
+
+    /// Answers exactly one `ReconfigureNetwork` request with a success
+    /// response, standing in for the real guest agent. Unlike the real
+    /// agent's `apply_network_reconfigure`, this never touches any host or
+    /// guest interface, so it is safe to run against a shared host.
+    #[cfg(feature = "linux-net")]
+    async fn fake_agent_reconfigure_responder(mut stream: tokio::net::UnixStream) {
+        let request: Option<husker_agent_proto::AgentRequest> =
+            husker_agent_proto::read_message(&mut stream)
+                .await
+                .ok()
+                .flatten();
+        let Some(husker_agent_proto::AgentRequest::ReconfigureNetwork(req)) = request else {
+            return;
+        };
+        let response = husker_agent_proto::AgentResponse::ReconfigureNetwork(
+            husker_agent_proto::ReconfigureNetworkResponse {
+                interface: req.interface,
+                ipv4: req.ipv4,
+            },
+        );
+        let _ = husker_agent_proto::write_message(&mut stream, &response).await;
+    }
+
+    /// Like `test_core`, but backed by `ForkMockVmm` and a caller-chosen
+    /// bridge name/subnet, so `fork_records_forked_from` can exercise
+    /// `fork_vm`'s real TAP/bridge syscalls against a dedicated throwaway
+    /// bridge instead of the shared default `husker0`.
+    #[cfg(feature = "linux-net")]
+    async fn fork_mock_core(
+        bridge_name: &str,
+        subnet_base: Ipv4Addr,
+    ) -> (Arc<HuskerCore<ForkMockVmm>>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let core = Arc::new(HuskerCore::new(
+            ForkMockVmm,
+            husker_state::StateStore::open_memory().unwrap(),
+            husker_net::IpAllocator::new(subnet_base, 24),
+            husker_storage::StorageConfig {
+                data_dir: tmp.path().to_path_buf(),
+                state_dir: tmp.path().to_path_buf(),
+            },
+            bridge_name.into(),
+            vec![],
+            runtime_dir,
+        ));
+        (core, tmp)
+    }
+
+    /// `fork_vm` calls `husker_net::create_tap`/`attach_to_bridge` directly
+    /// (not through `VmmBackend`), so no mock backend choice can avoid real
+    /// TAP/bridge syscalls; this needs a live Linux host with `CAP_NET_ADMIN`
+    /// and is gated behind `HUSKER_RUN_NET_E2E`, following the precedent set
+    /// by `orchestration_paths::port_forward_applies_for_qemu_backed_vm`. It
+    /// uses a dedicated throwaway bridge/subnet (distinct from that other
+    /// test's `hpfq0`/`192.0.2.0/24` and from the shared default
+    /// `husker0`/`172.20.0.0/24`) and tears it down at the end.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn fork_records_forked_from() {
+        if std::env::var("HUSKER_RUN_NET_E2E").is_err() {
+            return;
+        }
+        const BRIDGE: &str = "hfrk0";
+        let subnet_base = Ipv4Addr::new(198, 51, 100, 0);
+        husker_net::create_bridge(BRIDGE, Ipv4Addr::new(198, 51, 100, 1), 24)
+            .await
+            .unwrap();
+
+        let (core, tmp) = fork_mock_core(BRIDGE, subnet_base).await;
+        // This test's `StateStore` is a fresh in-memory database, so
+        // `allocate_cid` would otherwise start at CID 3 and collide with
+        // `husker3`/`husker4`/`husker5` TAP devices already in use by
+        // whatever real VMs happen to be running on this shared host.
+        core.state.ensure_cid_base(1000).unwrap();
+
+        let mut src = sample_vm_record("src");
+        src.state = "suspended".into();
+        src.vmm = "firecracker".into();
+        core.state.insert_vm(&src).unwrap();
+
+        // `try_fork_vm` reflink/copies this file into the fork's own dir;
+        // only its existence matters to `clone_rootfs`, not its content.
+        let source_vm_dir = tmp.path().join("vms").join("src");
+        std::fs::create_dir_all(&source_vm_dir).unwrap();
+        std::fs::write(source_vm_dir.join("rootfs.ext4"), b"rootfs").unwrap();
+
+        let fork = core.fork_vm("src", "fk").await.unwrap();
+        assert_eq!(fork.forked_from, Some(src.id));
+
+        // `fork_vm` leaves the fork running; this test never destroys it, so
+        // its TAP is torn down by hand before the bridge (deleting the
+        // bridge alone would leave the TAP orphaned on the shared host).
+        if let Some(tap) = fork.tap_device.as_deref() {
+            husker_net::delete_tap(tap).await.ok();
+        }
+        husker_net::delete_bridge(BRIDGE).await.ok();
     }
 
     /// `agent_connect_ready` mints its own session guard before the retry
@@ -8854,13 +9313,25 @@ mod idle_policy_tests {
         let mut svc = running(Some(1));
         svc.service_id = Some(Uuid::new_v4());
         assert!(matches!(
-            evaluate_policy(&svc, Utc::now(), Some(Duration::from_secs(99)), false, false),
+            evaluate_policy(
+                &svc,
+                Utc::now(),
+                Some(Duration::from_secs(99)),
+                false,
+                false
+            ),
             PolicyAction::None
         ));
         let mut fork = running(Some(1));
         fork.forked_from = Some(Uuid::new_v4());
         assert!(matches!(
-            evaluate_policy(&fork, Utc::now(), Some(Duration::from_secs(99)), false, false),
+            evaluate_policy(
+                &fork,
+                Utc::now(),
+                Some(Duration::from_secs(99)),
+                false,
+                false
+            ),
             PolicyAction::None
         ));
     }

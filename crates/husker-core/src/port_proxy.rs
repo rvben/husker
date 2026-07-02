@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+#[cfg(feature = "linux-net")]
 use crate::ActiveSessionGuard;
 
 /// Connects a host-side accept loop to a service inside the guest.
@@ -40,8 +41,10 @@ impl GuestDialer for DirectIpDialer {
     }
 }
 
-/// The dialer the daemon uses today. Swapping this alias to a vsock-relay
-/// dialer is the only change needed to move to Approach B.
+/// The dialer the daemon uses today on macOS/VZ (no host nftables, so forwards
+/// are userspace-proxied). Swapping this alias to a vsock-relay dialer is the
+/// only change needed to move to Approach B.
+#[cfg(not(feature = "linux-net"))]
 pub type ActiveDialer = DirectIpDialer;
 
 /// Wraps an inner dialer with an async "resume the VM first" hook. Implements
@@ -50,6 +53,7 @@ pub type ActiveDialer = DirectIpDialer;
 /// see a hook that lives on a concrete dialer). `resume` runs inside `dial()`,
 /// before delegating to the inner dialer, so every accepted connection wakes
 /// the captured VM (idempotently) before its bytes are relayed.
+#[cfg(feature = "linux-net")]
 #[derive(Clone)]
 pub struct ResumeDialer<D, F> {
     inner: D,
@@ -57,6 +61,7 @@ pub struct ResumeDialer<D, F> {
     resume: F,
 }
 
+#[cfg(feature = "linux-net")]
 impl<D, F, Fut> ResumeDialer<D, F>
 where
     D: GuestDialer,
@@ -72,6 +77,7 @@ where
     }
 }
 
+#[cfg(feature = "linux-net")]
 impl<D, F, Fut> GuestDialer for ResumeDialer<D, F>
 where
     D: GuestDialer,
@@ -89,7 +95,10 @@ where
 /// Spawns a guarded relay for one connection drained synchronously from the
 /// OS backlog (see `PortProxy::drain_and_close`). Boxed because `Forward`
 /// itself is not generic over `GuestDialer`; the closure captures a concrete
-/// dialer, the guest target, and the shared session map.
+/// dialer, the guest target, and the shared session map. Only the Linux
+/// resume-listener path drains queued connections on suspend; the macOS
+/// plain-forward path (`PortProxy::add`) has no equivalent teardown step.
+#[cfg(feature = "linux-net")]
 type DrainRelay = Box<dyn Fn(TcpStream, SocketAddr) + Send + Sync>;
 
 /// One active forward's accept loop. Aborting on drop frees the bound host port
@@ -99,9 +108,14 @@ type DrainRelay = Box<dyn Fn(TcpStream, SocketAddr) + Send + Sync>;
 /// guest is gone, happens immediately.
 struct Forward {
     handle: JoinHandle<()>,
+    /// Kept alive so `drain_and_close` can poll it synchronously for queued
+    /// connections before closing it; only the Linux resume-listener path
+    /// (`add_guarded`) reads this, since only it drains on suspend.
+    #[cfg(feature = "linux-net")]
     listener: Arc<TcpListener>,
-    /// `None` for forwards created via `add`, which have no session map to
-    /// guard and are torn down by `stop`/`stop_all` without draining.
+    /// `Some` for forwards created via `add_guarded`, which drains queued
+    /// connections through a guarded relay on `drain_and_close`.
+    #[cfg(feature = "linux-net")]
     drain_relay: Option<DrainRelay>,
 }
 
@@ -127,6 +141,7 @@ impl<D: GuestDialer> PortProxy<D> {
 
     /// Bind a host listener and start relaying. Returns the bound host port
     /// (equal to `host_port` unless `host_port == 0`, which asks the OS to pick).
+    #[cfg(not(feature = "linux-net"))]
     pub async fn add(
         &self,
         vm_id: Uuid,
@@ -137,10 +152,9 @@ impl<D: GuestDialer> PortProxy<D> {
     ) -> io::Result<u16> {
         let listener = TcpListener::bind(SocketAddr::new(bind_addr, host_port)).await?;
         let bound = listener.local_addr()?.port();
-        let listener = Arc::new(listener);
         let dialer = self.dialer.clone();
         let handle = tokio::spawn(accept_loop(
-            Arc::clone(&listener),
+            Arc::new(listener),
             dialer,
             guest_ip,
             guest_port,
@@ -150,14 +164,7 @@ impl<D: GuestDialer> PortProxy<D> {
             .expect("port proxy mutex poisoned")
             .entry(vm_id)
             .or_default()
-            .insert(
-                bound,
-                Forward {
-                    handle,
-                    listener,
-                    drain_relay: None,
-                },
-            );
+            .insert(bound, Forward { handle });
         Ok(bound)
     }
 
@@ -166,6 +173,7 @@ impl<D: GuestDialer> PortProxy<D> {
     /// awaiting the dialer - which, for a `ResumeDialer`, transparently
     /// resumes the VM. The accept loop spawns a task per connection
     /// immediately so a slow resume never blocks accepting the next one.
+    #[cfg(feature = "linux-net")]
     pub async fn add_guarded(
         &self,
         vm_id: Uuid,
@@ -220,6 +228,7 @@ impl<D: GuestDialer> PortProxy<D> {
     /// teardown still gets serviced instead of being reset. Non-blocking:
     /// polling the listener never awaits, so in-flight relay tasks are never
     /// waited on.
+    #[cfg(feature = "linux-net")]
     pub fn drain_and_close(&self, vm_id: Uuid) {
         const DRAIN_CAP: usize = 128;
         let Some(map) = self
@@ -250,6 +259,7 @@ impl<D: GuestDialer> PortProxy<D> {
     }
 
     /// Stop and remove one forward. No-op if absent.
+    #[cfg(not(feature = "linux-net"))]
     pub fn stop(&self, vm_id: Uuid, host_port: u16) {
         if let Some(map) = self
             .forwards
@@ -262,6 +272,7 @@ impl<D: GuestDialer> PortProxy<D> {
     }
 
     /// Stop and remove all forwards for a VM. No-op if absent.
+    #[cfg(not(feature = "linux-net"))]
     pub fn stop_all(&self, vm_id: Uuid) {
         self.forwards
             .lock()
@@ -270,10 +281,28 @@ impl<D: GuestDialer> PortProxy<D> {
     }
 }
 
+/// Type-erased handle to a `PortProxy`, so `HuskerCore` can store one keyed by
+/// VM id without naming the concrete `PortProxy<ResumeDialer<D, F>>` type: `F`
+/// is an anonymous closure type generated at the call site that constructs
+/// the resume hook, and closure types cannot be named in a struct field.
+#[cfg(feature = "linux-net")]
+pub trait ResumeListenerHandle: Send + Sync {
+    /// Drain queued connections then close the listener (see `PortProxy::drain_and_close`).
+    fn drain_and_close(&self, vm_id: Uuid);
+}
+
+#[cfg(feature = "linux-net")]
+impl<D: GuestDialer> ResumeListenerHandle for PortProxy<D> {
+    fn drain_and_close(&self, vm_id: Uuid) {
+        PortProxy::drain_and_close(self, vm_id);
+    }
+}
+
 /// Poll `listener` once with a no-op waker: `Ok(Some(_))` if a connection was
 /// already queued, `Ok(None)` if the backlog is empty right now. Used by
 /// `PortProxy::drain_and_close` to drain synchronously without an executor
 /// (tokio's `TcpListener` has no `try_accept`, only `poll_accept`).
+#[cfg(feature = "linux-net")]
 fn try_accept_now(listener: &TcpListener) -> io::Result<Option<(TcpStream, SocketAddr)>> {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     match listener.poll_accept(&mut cx) {
@@ -283,6 +312,7 @@ fn try_accept_now(listener: &TcpListener) -> io::Result<Option<(TcpStream, Socke
     }
 }
 
+#[cfg(not(feature = "linux-net"))]
 async fn accept_loop<D: GuestDialer>(
     listener: Arc<TcpListener>,
     dialer: D,
@@ -321,6 +351,7 @@ async fn accept_loop<D: GuestDialer>(
 /// `spawn_guarded_relay` so it holds an `ActiveSessionGuard` for `vm_id` and
 /// goes through `dialer.dial()` (a `ResumeDialer` resumes the VM there)
 /// rather than being dialed directly in the loop.
+#[cfg(feature = "linux-net")]
 async fn guarded_accept_loop<D: GuestDialer>(
     listener: Arc<TcpListener>,
     dialer: D,
@@ -353,6 +384,7 @@ async fn guarded_accept_loop<D: GuestDialer>(
 /// connection in its own task. The guard is held for the connection's full
 /// lifetime - including the dialer's resume hook - and drops when the
 /// connection closes, releasing the VM's active-session pin.
+#[cfg(feature = "linux-net")]
 fn spawn_guarded_relay<D: GuestDialer>(
     mut inbound: TcpStream,
     peer: SocketAddr,
@@ -416,6 +448,7 @@ mod tests {
         port
     }
 
+    #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
     async fn proxy_relays_bytes_to_guest() {
         let guest_port = spawn_echo().await;
@@ -438,6 +471,7 @@ mod tests {
         assert_eq!(&buf, b"ping");
     }
 
+    #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
     async fn duplicate_host_port_is_conflict() {
         let proxy = PortProxy::new(DirectIpDialer);
@@ -459,6 +493,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     }
 
+    #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
     async fn stop_all_aborts_listeners() {
         let proxy = PortProxy::new(DirectIpDialer);
@@ -481,6 +516,7 @@ mod tests {
         assert!(freed, "port should be free after stop_all");
     }
 
+    #[cfg(feature = "linux-net")]
     #[tokio::test]
     async fn resume_hook_fires_before_dial_and_guard_is_held() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -523,6 +559,7 @@ mod tests {
         assert!(*sessions.lock().unwrap().get(&vm).unwrap_or(&0) >= 1);
     }
 
+    #[cfg(feature = "linux-net")]
     #[tokio::test]
     async fn drain_and_close_relays_pending_connection_then_frees_port() {
         let guest_port = spawn_echo().await;
