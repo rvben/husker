@@ -950,7 +950,10 @@ mod tests {
         let AgentResponse::Exec(e) = resp else {
             panic!("expected an Exec response from a timed-out command");
         };
-        assert_eq!(e.exit_code, 124, "a timed-out exec must return exit code 124");
+        assert_eq!(
+            e.exit_code, 124,
+            "a timed-out exec must return exit code 124"
+        );
         assert!(
             e.stderr.contains("timed out"),
             "stderr must note the timeout, got {:?}",

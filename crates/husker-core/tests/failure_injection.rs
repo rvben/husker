@@ -219,7 +219,10 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
 /// host network state, and collides with a live daemon - not unit-testable. The
 /// Linux create-rollback belongs in a gated e2e or behind a mockable net layer.
 #[cfg(not(feature = "linux-net"))]
-fn fresh_core(data_dir: &std::path::Path, fail_ops: &[&'static str]) -> Arc<HuskerCore<FailingVmm>> {
+fn fresh_core(
+    data_dir: &std::path::Path,
+    fail_ops: &[&'static str],
+) -> Arc<HuskerCore<FailingVmm>> {
     let vmm = FailingVmm::new(fail_ops);
     let state_store = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {

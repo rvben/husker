@@ -179,7 +179,11 @@ pub(crate) async fn health<B: VmmBackend + 'static>(
     };
     checks.insert(
         "vmm_backend".into(),
-        if vmm_ok { "ok".into() } else { "degraded".into() },
+        if vmm_ok {
+            "ok".into()
+        } else {
+            "degraded".into()
+        },
     );
     #[cfg(feature = "linux-net")]
     checks.insert("network_backend".into(), "ok".into());

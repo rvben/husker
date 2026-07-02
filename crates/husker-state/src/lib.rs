@@ -311,8 +311,8 @@ impl StateStore {
     /// visible across every checkout, matching the previous single-`Connection`
     /// behavior.
     pub fn open_memory() -> Result<Self, StateError> {
-        let manager =
-            SqliteConnectionManager::memory().with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
+        let manager = SqliteConnectionManager::memory()
+            .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
         let pool = r2d2::Pool::builder()
             .max_size(1)
             .test_on_check_out(false)
