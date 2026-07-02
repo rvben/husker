@@ -7,3 +7,8 @@
 *.ext4
 vmlinux
 .worktrees/
+# Python packaging test artifacts (the `pip install husker` path leaves these)
+.venv/
+uv.lock
+# Agent worktree/session scratch
+.claire/

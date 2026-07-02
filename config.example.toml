@@ -17,6 +17,22 @@
 #                  unless those are set explicitly.
 # data_dir = "/var/lib/husker"
 
+# Directory for the SQLite state database and daemon lock. Defaults to data_dir.
+# Split it out to keep mutable state on a separate volume from the (larger) image
+# store. Env: HUSKER_STATE_DIR.
+# state_dir = "/var/lib/husker-state"
+
+# When true, `husker setup storage` provisions the data dir on a dedicated
+# loopback/volume image instead of the host filesystem. Env: HUSKER_STORAGE_VOLUME.
+# storage_volume = false
+
+# ── Default VM size ──────────────────────────────────────────────────
+
+# Default vCPU count and memory (MiB) applied when `husker run` omits
+# --cpus / --memory. Env: HUSKER_DEFAULT_CPUS, HUSKER_DEFAULT_MEMORY.
+# default_cpus = 1
+# default_memory = 128
+
 # ── Kernel ───────────────────────────────────────────────────────────
 
 # Default kernel used when --kernel is not passed to `husker run`.
@@ -159,8 +175,8 @@
 # ── Service Reconciler ───────────────────────────────────────────────
 
 # Background reconciler for service workloads.
-# reconcile_interval_secs = 15   # how often the self-healing loop runs
-# enabled = true                 # master switch for the periodic reconcile loop
+# service_reconcile_interval_secs = 15   # how often the self-healing loop runs
+# service_reconcile_enabled = true       # master switch for the periodic reconcile loop
 
 # ── Idle Policy ──────────────────────────────────────────────────────
 
@@ -172,19 +188,54 @@
 # default_suspend_ttl_secs = 0       # 0 = never reap a suspended VM
 # default_auto_resume = true         # wake on control-plane call or inbound connection
 
+# ── Profiles ─────────────────────────────────────────────────────────
+#
+# Named presets selected with `husker run --profile <name>` (and job/service).
+# Every field is optional; a field left out falls back to the CLI flag or the
+# daemon default. Unknown keys are rejected, so a typo fails loudly.
+#
+# [profiles.web]
+# cpus = 2
+# memory = 512
+# rootfs = "/var/lib/husker/images/alpine-x86_64.ext4"
+# env = ["RUST_LOG=info"]
+# idle_timeout_secs = 900
+#
+# [profiles.ubuntu]
+# cloud_image = "ubuntu-24.04-server-cloudimg-arm64.img"
+# disk_size = "10G"
+# ssh_keys = ["~/.ssh/id_ed25519.pub"]
+
 # ── Environment Variable Overrides ─────────────────────────────────
 #
 # All configuration values can be overridden via environment variables.
 # Environment variables take precedence over file-based config.
 #
 #   HUSKER_DATA_DIR                          →  data_dir
+#   HUSKER_STATE_DIR                         →  state_dir
+#   HUSKER_STORAGE_VOLUME                    →  storage_volume (1/true/yes/on)
 #   HUSKER_DEFAULT_KERNEL                    →  default_kernel
 #   HUSKER_DEFAULT_ROOTFS                    →  default_rootfs
 #   HUSKER_DEFAULT_INITRD                    →  default_initrd
 #   HUSKER_DEFAULT_DISK_SIZE                 →  default_disk_size
+#   HUSKER_DEFAULT_CPUS                      →  default_cpus
+#   HUSKER_DEFAULT_MEMORY                    →  default_memory
 #   HUSKER_IMAGES_BASE_URL                   →  images_base_url
+#   HUSKER_API_TOKEN                         →  api_token
+#   HUSKER_METRICS_LISTEN                    →  metrics_listen
+#   HUSKER_METRICS_TOKEN                     →  metrics_token
+#   HUSKER_API_MAX_REQUEST_BYTES             →  api_max_request_bytes
+#   HUSKER_API_MAX_FILE_READ_BYTES           →  api_max_file_read_bytes
+#   HUSKER_API_MAX_FILE_WRITE_BYTES          →  api_max_file_write_bytes
+#   HUSKER_API_SENSITIVE_RATE_LIMIT_PER_MINUTE →  api_sensitive_rate_limit_per_minute
+#   HUSKER_ALLOWED_READ_PATHS                →  allowed_read_paths  (comma-separated)
+#   HUSKER_ALLOWED_WRITE_PATHS               →  allowed_write_paths (comma-separated)
+#   HUSKER_ALLOWED_MOUNT_HOST_PATHS          →  allowed_mount_host_paths (comma-separated)
 #   HUSKER_EXEC_TIMEOUT_SECS                 →  exec_timeout_secs
 #   HUSKER_EXEC_TIMEOUT_MAX_SECS             →  exec_timeout_max_secs
+#   HUSKER_EXEC_ALLOWLIST                    →  exec_allowlist  (comma-separated)
+#   HUSKER_EXEC_DENYLIST                     →  exec_denylist   (comma-separated)
+#   HUSKER_EXEC_ENV_ALLOWLIST                →  exec_env_allowlist (comma-separated)
 #   HUSKER_SERVICE_RECONCILE_INTERVAL        →  service_reconcile_interval_secs
 #   HUSKER_SERVICE_RECONCILE_ENABLED         →  service_reconcile_enabled (1/true/TRUE/yes)
 #   HUSKER_IDLE_POLL_INTERVAL_SECS           →  idle_policy.poll_interval_secs

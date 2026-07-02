@@ -2,7 +2,7 @@
 
 An open-source microVM manager built on [Firecracker](https://firecracker-microvm.github.io/) (Linux) and [Apple Virtualization.framework](https://developer.apple.com/documentation/virtualization) (macOS).
 
-- Boot lightweight VMs in milliseconds
+- Boot lightweight VMs in seconds (about 1s from a warm pool)
 - Execute commands, transfer files, open interactive shells
 - Stream serial console logs
 - Port forwarding (nftables NAT on Linux, a userspace TCP proxy on macOS)
@@ -53,6 +53,9 @@ husker images pull
 # Start the daemon
 husker daemon &
 
+# Confirm it came up (checks the daemon, images, and backend)
+husker doctor
+
 # Boot a VM
 husker run --name hello --cpus 2 --memory 512
 
@@ -68,10 +71,10 @@ husker destroy hello
 
 On Linux, `husker run` needs `firecracker` on `PATH`. If it's missing, husker prompts to download a pinned release into the data directory. For non-interactive use (CI, scripts), set `HUSKER_AUTO_INSTALL_FIRECRACKER=1` to skip the prompt.
 
-`husker images pull` fetches the latest signed image set from the `images-*`
-[GitHub Releases](https://github.com/rvben/husker/releases). If no image
-release is published yet for this arch, the command will fail — use the
-BYO path below in the meantime.
+`husker images pull` fetches the latest image set from the `images-*`
+[GitHub Releases](https://github.com/rvben/husker/releases) and verifies each
+asset against the published `SHA256SUMS`. If no image release is published yet
+for this arch, the command will fail - use the BYO path below in the meantime.
 
 ## BYO kernel / rootfs
 
@@ -137,6 +140,12 @@ Or pass `--config /path/to/config.toml` explicitly. See `config.example.toml` fo
 | Linux x86_64 | Firecracker | TAP + nftables NAT, port forwarding | Usable |
 | macOS ARM64 | Apple Virtualization.framework | Shared NAT (VZ-managed), port forwarding (userspace proxy) | Experimental |
 | Linux x86_64 | QEMU/KVM | TAP + nftables NAT, port forwarding | Experimental |
+
+Only the two primary targets (Linux x86_64 and macOS ARM64) ship with the
+embedded guest agent. The Linux ARM64 and Intel-macOS builds are agent-less:
+`husker run` boots, but `exec`/`shell`/`cp` and cloud-image VMs need the agent, so
+they will report the agent as unreachable. `husker doctor` flags a missing embedded
+agent. Use a primary-target build for full functionality.
 
 ### QEMU/KVM backend (Linux)
 
@@ -217,6 +226,8 @@ CLI (husker) ──> REST API (husker-api) ──> Core (husker-core)
 ```
 
 Host-guest communication uses vsock (port 52). Messages are length-prefixed JSON with base64-encoded binary payloads.
+
+Once the daemon is running, the REST API is browsable at `http://127.0.0.1:7777/docs` (Swagger UI), with the raw OpenAPI schema at `/api-docs/openapi.json`.
 
 ## Security
 

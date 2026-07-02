@@ -1,6 +1,6 @@
 # Threat Model (STRIDE)
 
-Last updated: 2026-02-16
+Last updated: 2026-07-02
 
 ## Scope
 
@@ -21,7 +21,7 @@ Last updated: 2026-02-16
 
 | Category | Threat | Current control(s) | Validation |
 |---|---|---|---|
-| Spoofing | Unauthorized API caller invokes mutating endpoints | Bearer token auth on protected routes; local-only default bind unless `--allow-remote` | `cargo test -p husker-api` auth middleware tests |
+| Spoofing | Unauthorized API caller invokes mutating endpoints | Deny-by-default bearer auth (only `/v1/health` + static docs are unauthenticated); loopback-only default bind, and a non-loopback bind refuses to start without a token | `cargo test -p husker-api` auth middleware tests |
 | Tampering | Guest file operations target unsafe paths | Path normalization + optional read/write allowlists | API integration tests for policy denial |
 | Repudiation | Sensitive actions not attributable | Structured audit logs for `exec`, file read/write, shell start/exit; request ID propagation | API unit/integration tests + log schema checks |
 | Information Disclosure | Excessive file read payload leaks data | Read-size policy limits; explicit policy error code | API integration tests |
@@ -32,8 +32,21 @@ Last updated: 2026-02-16
 ## Residual risk
 
 - Bearer token auth is single-factor; mTLS is not implemented yet.
+- **No multi-tenancy.** The daemon has a single shared bearer token, not
+  per-caller principals. Every authenticated caller has full, unrestricted
+  access to every VM, secret, and volume on the daemon, regardless of who
+  created it - there is no per-caller ownership or isolation. Sharing one daemon
+  between mutually-distrusting users is therefore NOT supported. Run a daemon per
+  trust domain.
+- A remotely-bound daemon (`--allow-remote`) now refuses to start without an
+  `api_token`, and with a token configured every route except `/v1/health` and
+  the static API docs requires it (reads included).
+- `--yes` on destructive CLI commands is a UX guard, not a security control: it
+  is enforced client-side only, so a direct HTTP `DELETE` bypasses it.
 - Host hardening remains deployment-dependent (system user, service manager, firewall).
 - Privileged Linux networking actions still require elevated permissions on host.
+- The Firecracker auto-download path does not yet verify a checksum for the
+  fetched hypervisor binary (tracked; version is pinned).
 
 ## Planned periodic validation
 
