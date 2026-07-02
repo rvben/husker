@@ -1418,11 +1418,13 @@ async fn run(cli: Cli) -> Result<()> {
             // A diagnostic message goes to stderr.
             let resp_result =
                 api_request(with_api_auth(client.get(&url), api_token.as_deref())).await;
+            let mut daemon_reachable = true;
             let vms: Vec<serde_json::Value> = match resp_result {
                 Err(ref e) if e.chain().any(|c| c.is::<DaemonUnreachable>()) => {
                     eprintln!(
                         "daemon not reachable; showing empty list (start with `husker daemon`)"
                     );
+                    daemon_reachable = false;
                     vec![]
                 }
                 Err(e) => return Err(e),
@@ -1461,6 +1463,9 @@ async fn run(cli: Cli) -> Result<()> {
                         "total": total,
                         "limit": limit,
                         "offset": offset,
+                        // false only when the daemon was unreachable, so callers can
+                        // tell an outage (empty list) apart from a genuinely empty fleet.
+                        "daemon_reachable": daemon_reachable,
                     }),
                     "",
                 );
@@ -2898,6 +2903,13 @@ async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
@@ -4291,26 +4303,29 @@ async fn image_command(
                 targets.push((initrd_asset, initrd_dest));
             }
 
-            for (asset, dest) in targets {
-                let sha = manifest.get(&asset).ok_or_else(|| {
-                    anyhow::anyhow!("{asset} missing from manifest at {base_url}")
-                })?;
-                if dest.exists() && !force {
-                    println!(
-                        "Skipping {} (exists; pass --force to overwrite)",
-                        dest.display()
-                    );
-                    continue;
+            // The kernel and initramfs must come from the SAME image release: a
+            // stale kernel paired with a freshly downloaded initramfs fails module
+            // loading. So treat the asset set as all-or-nothing rather than skipping
+            // per-file: only skip when every destination already exists, otherwise
+            // (re)download all of them from this manifest so the set stays matched.
+            let all_present = targets.iter().all(|(_, dest)| dest.exists());
+            if all_present && !force {
+                println!("All default images already present (pass --force to re-download).");
+            } else {
+                for (asset, dest) in &targets {
+                    let sha = manifest.get(asset).ok_or_else(|| {
+                        anyhow::anyhow!("{asset} missing from manifest at {base_url}")
+                    })?;
+                    let url = format!("{}/{}", base_url.trim_end_matches('/'), asset);
+                    println!("Downloading {url} -> {}", dest.display());
+                    husker::images::fetch_and_verify(husker::images::DownloadSpec {
+                        url,
+                        expected_sha256: sha.clone(),
+                        dest: dest.clone(),
+                    })
+                    .await?;
+                    println!("Verified {}", dest.display());
                 }
-                let url = format!("{}/{}", base_url.trim_end_matches('/'), asset);
-                println!("Downloading {url} -> {}", dest.display());
-                husker::images::fetch_and_verify(husker::images::DownloadSpec {
-                    url,
-                    expected_sha256: sha.clone(),
-                    dest: dest.clone(),
-                })
-                .await?;
-                println!("Verified {}", dest.display());
             }
 
             print_output(

@@ -26,6 +26,7 @@ husker-storage = { workspace = true }
 husker-state = { workspace = true }
 husker-agent-proto = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -290,6 +290,7 @@ pub(crate) fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>
             | "context show"
             | "profile list"
             | "doctor"
+            | "completions"
             | "setup storage"
     );
     let output_fields: Vec<&'static str> = match path {

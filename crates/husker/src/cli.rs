@@ -593,6 +593,12 @@ pub(crate) enum Commands {
     /// Tries the daemon first; falls back to a local probe when the target is local
     /// and the daemon is unreachable.
     Doctor,
+
+    /// Generate a shell completion script, e.g. `husker completions zsh`
+    Completions {
+        /// Target shell (bash, zsh, fish, powershell, elvish)
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(clap::Subcommand)]
