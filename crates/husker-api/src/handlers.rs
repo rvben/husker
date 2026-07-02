@@ -163,13 +163,23 @@ pub(crate) async fn health<B: VmmBackend + 'static>(
             "degraded".into()
         },
     );
+    // Probe the VMM backend rather than mirroring the state DB: on Linux both
+    // Firecracker and QEMU require /dev/kvm, so its absence means this daemon
+    // cannot actually boot a VM even though the DB is fine. (VZ on macOS has no
+    // equivalent cheap probe; it is available on supported hardware.)
+    let vmm_ok = {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::metadata("/dev/kvm").is_ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    };
     checks.insert(
         "vmm_backend".into(),
-        if state_db_ok {
-            "ok".into()
-        } else {
-            "degraded".into()
-        },
+        if vmm_ok { "ok".into() } else { "degraded".into() },
     );
     #[cfg(feature = "linux-net")]
     checks.insert("network_backend".into(), "ok".into());
@@ -184,8 +194,15 @@ pub(crate) async fn health<B: VmmBackend + 'static>(
         port_forward: true,
         bridged_net: cfg!(feature = "linux-net"),
     };
+    // Overall status reflects the subsystem checks rather than being hard-coded
+    // "ok", so an orchestrator polling `.status` sees a degraded subsystem.
+    let status = if checks.values().any(|v| v == "degraded") {
+        "degraded"
+    } else {
+        "ok"
+    };
     Json(HealthResponse {
-        status: "ok".into(),
+        status: status.into(),
         version: env!("CARGO_PKG_VERSION").into(),
         vms: VmCounts { total, running },
         checks,
