@@ -18,6 +18,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 use utoipa::OpenApi;
 use utoipa::ToSchema;
@@ -998,13 +999,43 @@ pub async fn serve_with_auth<B: VmmBackend + 'static>(
     let app = router_with_auth(core, auth_token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "husker daemon listening");
-    axum::serve(
+
+    // Bound the graceful drain. Axum's `with_graceful_shutdown` waits for every
+    // in-flight connection to close, and a long-lived shell/exec WebSocket would
+    // otherwise block shutdown indefinitely until systemd SIGKILLs the process
+    // (skipping VM draining entirely). After the signal fires we give open
+    // connections a fixed grace window, then stop regardless so the caller's own
+    // VM-drain step still gets to run before the supervisor's stop timeout.
+    let shutdown_started = Arc::new(tokio::sync::Notify::new());
+    let notify = shutdown_started.clone();
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        notify.notify_one();
+    });
+
+    tokio::select! {
+        res = serve => res,
+        () = async {
+            shutdown_started.notified().await;
+            tokio::time::sleep(GRACEFUL_SHUTDOWN_GRACE).await;
+        } => {
+            warn!(
+                "graceful shutdown exceeded {}s with connections still open; forcing exit",
+                GRACEFUL_SHUTDOWN_GRACE.as_secs()
+            );
+            Ok(())
+        }
+    }
 }
+
+/// How long to wait for in-flight connections to drain after a shutdown signal
+/// before forcing the server to stop. Kept below the caller's VM-drain budget and
+/// systemd's default `TimeoutStopSec` so shutdown stays bounded end to end.
+const GRACEFUL_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 /// Minimal router exposing ONLY `GET /v1/metrics`. Served on a separate bind
 /// (`metrics_listen`) so Prometheus can scrape while the full API - exec, shell,
@@ -1139,28 +1170,23 @@ async fn rate_limit_middleware(
     next.run(req).await
 }
 
-fn is_protected_route(method: &Method, path: &str) -> bool {
-    if path.starts_with("/v1/secrets") {
-        return true;
-    }
-    if path == "/v1/metrics" {
-        return true;
-    }
+/// Routes reachable WITHOUT authentication even when a bearer token is
+/// configured. Explicit allowlist: everything not listed is protected
+/// (deny-by-default), so a newly added route is authenticated by default rather
+/// than silently public, and read endpoints (which expose `guest_ip`, `pid`,
+/// `rootfs_path` and other topology) are not readable by unauthenticated callers
+/// on a token-protected daemon.
+fn is_unauthenticated_route(path: &str) -> bool {
+    // Liveness/readiness for orchestrators and load balancers.
+    path == "/v1/health"
+        // Static, browsable API schema (no runtime data).
+        || path == "/docs"
+        || path.starts_with("/docs/")
+        || path.starts_with("/api-docs")
+}
 
-    if !(path.starts_with("/v1/vms")
-        || path.starts_with("/v1/services")
-        || path.starts_with("/v1/pools")
-        || path.starts_with("/v1/host-groups")
-        || path.starts_with("/v1/images")
-        || path.starts_with("/v1/volumes")
-        || path.starts_with("/v1/snapshots"))
-    {
-        return false;
-    }
-    if *method != Method::GET {
-        return true;
-    }
-    path.ends_with("/shell") || path.ends_with("/logs") || path.ends_with("/ready")
+fn is_protected_route(path: &str) -> bool {
+    !is_unauthenticated_route(path)
 }
 
 async fn auth_middleware(
@@ -1168,7 +1194,7 @@ async fn auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if !is_protected_route(req.method(), req.uri().path()) {
+    if !is_protected_route(req.uri().path()) {
         return next.run(req).await;
     }
 
@@ -1176,7 +1202,10 @@ async fn auth_middleware(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
-    if provided == Some(expected.as_str()) {
+    // Constant-time comparison so the response latency does not leak how many
+    // leading bytes of a guessed token were correct.
+    let authorized = provided.is_some_and(|p| bool::from(p.as_bytes().ct_eq(expected.as_bytes())));
+    if authorized {
         return next.run(req).await;
     }
 
@@ -4845,41 +4874,42 @@ mod tests {
 
     #[test]
     fn protected_route_detection_is_correct() {
-        assert!(!is_protected_route(&Method::GET, "/v1/health"));
-        assert!(!is_protected_route(&Method::GET, "/v1/vms"));
-        assert!(!is_protected_route(&Method::GET, "/v1/vms/example"));
-        assert!(!is_protected_route(&Method::GET, "/v1/services"));
-        assert!(!is_protected_route(&Method::GET, "/v1/host-groups"));
-        assert!(!is_protected_route(&Method::GET, "/v1/images"));
-        assert!(is_protected_route(&Method::GET, "/v1/secrets"));
-        assert!(!is_protected_route(&Method::GET, "/v1/snapshots"));
-        assert!(is_protected_route(&Method::POST, "/v1/services"));
-        assert!(is_protected_route(&Method::POST, "/v1/host-groups"));
-        assert!(is_protected_route(&Method::POST, "/v1/images"));
-        assert!(is_protected_route(&Method::DELETE, "/v1/images/base"));
-        assert!(is_protected_route(&Method::POST, "/v1/secrets"));
-        assert!(is_protected_route(
-            &Method::DELETE,
-            "/v1/secrets/db-password"
-        ));
-        assert!(is_protected_route(&Method::POST, "/v1/snapshots"));
-        assert!(is_protected_route(&Method::DELETE, "/v1/snapshots/snap-1"));
-        assert!(is_protected_route(&Method::POST, "/v1/vms/example/stop"));
-        assert!(is_protected_route(&Method::DELETE, "/v1/vms/example"));
-        assert!(is_protected_route(&Method::GET, "/v1/vms/example/shell"));
-        assert!(is_protected_route(&Method::GET, "/v1/vms/example/logs"));
-        assert!(is_protected_route(&Method::GET, "/v1/vms/example/ready"));
-        assert!(is_protected_route(&Method::GET, "/v1/metrics"));
-        // Volumes hold persistent user data; create/delete must require a token
-        // when one is configured (reads stay public like other resource lists).
-        assert!(!is_protected_route(&Method::GET, "/v1/volumes"));
-        assert!(is_protected_route(&Method::POST, "/v1/volumes"));
-        assert!(is_protected_route(&Method::DELETE, "/v1/volumes/data"));
-        // Pools are a mutating resource family too.
-        assert!(!is_protected_route(&Method::GET, "/v1/pools"));
-        assert!(is_protected_route(&Method::POST, "/v1/pools"));
-        assert!(is_protected_route(&Method::DELETE, "/v1/pools/web"));
-        assert!(is_protected_route(&Method::POST, "/v1/pools/web/checkout"));
+        // Deny-by-default: only an explicit allowlist is reachable without a token.
+        // Health (orchestrator liveness) and the static API docs are public.
+        assert!(!is_protected_route("/v1/health"));
+        assert!(!is_protected_route("/docs"));
+        assert!(!is_protected_route("/docs/index.html"));
+        assert!(!is_protected_route("/api-docs/openapi.json"));
+
+        // Reads expose guest_ip / pid / rootfs_path and other topology, so on a
+        // token-protected daemon they require the token too (this is the SEC-3 fix:
+        // previously these GETs were public).
+        assert!(is_protected_route("/v1/vms"));
+        assert!(is_protected_route("/v1/vms/example"));
+        assert!(is_protected_route("/v1/services"));
+        assert!(is_protected_route("/v1/host-groups"));
+        assert!(is_protected_route("/v1/images"));
+        assert!(is_protected_route("/v1/snapshots"));
+        assert!(is_protected_route("/v1/volumes"));
+        assert!(is_protected_route("/v1/pools"));
+        // Previously outside the checklist entirely (SEC-11): now protected.
+        assert!(is_protected_route("/v1/profiles"));
+        assert!(is_protected_route("/v1/diagnostics"));
+
+        // Secrets, metrics, and every mutation stay protected.
+        assert!(is_protected_route("/v1/secrets"));
+        assert!(is_protected_route("/v1/secrets/db-password"));
+        assert!(is_protected_route("/v1/metrics"));
+        assert!(is_protected_route("/v1/services"));
+        assert!(is_protected_route("/v1/images/base"));
+        assert!(is_protected_route("/v1/snapshots/snap-1"));
+        assert!(is_protected_route("/v1/vms/example/stop"));
+        assert!(is_protected_route("/v1/vms/example"));
+        assert!(is_protected_route("/v1/vms/example/shell"));
+        assert!(is_protected_route("/v1/vms/example/logs"));
+        assert!(is_protected_route("/v1/vms/example/ready"));
+        assert!(is_protected_route("/v1/volumes/data"));
+        assert!(is_protected_route("/v1/pools/web/checkout"));
     }
 
     #[tokio::test]
@@ -4887,6 +4917,36 @@ mod tests {
         let app = router_with_auth(test_core(), Some("secret".into()));
         let response = app
             .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_read_without_token() {
+        // SEC-3 regression: list/detail reads leak guest_ip/pid/rootfs_path, so on a
+        // token-protected daemon they must require the token (previously public).
+        let app = router_with_auth(test_core(), Some("secret".into()));
+        for path in ["/v1/vms", "/v1/pools", "/v1/diagnostics", "/v1/profiles"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "GET {path} must require a token when one is configured"
+            );
+        }
+        // With the token, the same read succeeds.
+        let response = app
+            .oneshot(
+                Request::get("/v1/vms")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

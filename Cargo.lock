@@ -966,6 +966,7 @@ dependencies = [
  "husker-vmm",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-stream",
