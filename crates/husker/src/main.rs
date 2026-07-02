@@ -746,6 +746,9 @@ enum HostGroupAction {
     Delete {
         /// Host group name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -821,6 +824,9 @@ enum ServiceAction {
     Delete {
         /// Service name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -860,6 +866,9 @@ enum PoolAction {
     Delete {
         /// Pool name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -904,6 +913,9 @@ enum SnapshotAction {
     Delete {
         /// Snapshot name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -986,6 +998,9 @@ enum VolumeAction {
     Delete {
         /// Volume name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1023,6 +1038,9 @@ enum SecretAction {
     Delete {
         /// Secret name
         name: String,
+        /// Skip confirmation prompt (required when stdin is not a TTY)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -2482,7 +2500,10 @@ fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
         "wait" => vec!["status", "action", "vm", "ready"],
         "fork" => vec!["status", "action", "source", "vm", "guest_ip"],
         "stop" | "pause" | "resume" | "suspend" | "destroy" => vec!["status", "action", "vm"],
-        "exec" => vec!["exit_code", "stdout", "stderr"],
+        // The exec envelope nests the guest result under `result`
+        // (`{status, action, vm, result:{exit_code, stdout, stderr}}`), so declare
+        // the actual top-level fields rather than the inner ones.
+        "exec" => vec!["status", "action", "vm", "result"],
         "version" => vec!["client_version", "server_version"],
         "service create" | "service scale" => vec!["status", "action", "service", "outcome"],
         "service delete" => vec!["status", "action", "name", "outcome"],
@@ -2931,11 +2952,11 @@ async fn run(cli: Cli) -> Result<()> {
             listen,
             allow_remote,
         } => {
-            validate_daemon_bind(listen, allow_remote)?;
-            let mut config = load_config(config_path.as_deref());
+            let mut config = load_config_strict(config_path.as_deref())?;
             if let Some(token) = cli_api_token.clone() {
                 config.api_token = Some(token);
             }
+            validate_daemon_bind(listen, allow_remote, config.api_token.is_some())?;
             start_daemon(config, listen).await
         }
         Commands::Run {
@@ -3121,18 +3142,16 @@ async fn run(cli: Cli) -> Result<()> {
             // waits for readiness when these flags are set, so a plain `run` stays
             // non-blocking.
             if !dns.is_empty() || !add_host.is_empty() {
-                let ready_timeout = if vm.get("boot_mode").and_then(|b| b.as_str()) == Some("uefi")
-                {
-                    husker_core::UEFI_READY_TIMEOUT_SECS
-                } else {
-                    husker_core::DEFAULT_READY_TIMEOUT_SECS
-                };
+                let boot_mode = vm
+                    .get("boot_mode")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("direct");
                 let ready = wait_for_vm_ready(
                     &client,
                     &api_url,
                     api_token.as_deref(),
                     &name,
-                    std::time::Duration::from_secs(ready_timeout),
+                    husker_core::default_ready_timeout(boot_mode),
                 )
                 .await?;
                 if !ready {
@@ -3814,15 +3833,13 @@ async fn run(cli: Cli) -> Result<()> {
                     anyhow::bail!("{}", msg.message);
                 }
                 let vm: serde_json::Value = resp.json().await?;
-                let ready_timeout = if vm.get("boot_mode").and_then(|b| b.as_str()) == Some("uefi")
-                {
-                    husker_core::UEFI_READY_TIMEOUT_SECS
-                } else {
-                    husker_core::DEFAULT_READY_TIMEOUT_SECS
-                };
+                let boot_mode = vm
+                    .get("boot_mode")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("direct");
                 let ready_url = format!("{api_url}/v1/vms/{name}/ready");
                 let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout);
+                    std::time::Instant::now() + husker_core::default_ready_timeout(boot_mode);
                 let mut backoff = std::time::Duration::from_millis(200);
                 loop {
                     let resp =
@@ -4275,9 +4292,9 @@ async fn run(cli: Cli) -> Result<()> {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let client = reqwest::Client::new();
             let timeout = match timeout {
-                Some(t) => t,
+                Some(t) => std::time::Duration::from_secs(t),
                 None => {
-                    // Boot-mode-aware default: UEFI/cloud VMs boot much slower
+                    // Boot-mode-aware default: UEFI/EFI cloud VMs boot much slower
                     // than direct-kernel microVMs.
                     let info_url = format!("{api_url}/v1/vms/{name}");
                     let resp =
@@ -4288,15 +4305,15 @@ async fn run(cli: Cli) -> Result<()> {
                         exit_with_error(output, msg);
                     }
                     let vm: serde_json::Value = resp.json().await?;
-                    if vm.get("boot_mode").and_then(|b| b.as_str()) == Some("uefi") {
-                        husker_core::UEFI_READY_TIMEOUT_SECS
-                    } else {
-                        husker_core::DEFAULT_READY_TIMEOUT_SECS
-                    }
+                    let boot_mode = vm
+                        .get("boot_mode")
+                        .and_then(|b| b.as_str())
+                        .unwrap_or("direct");
+                    husker_core::default_ready_timeout(boot_mode)
                 }
             };
             let url = format!("{api_url}/v1/vms/{name}/ready");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let deadline = std::time::Instant::now() + timeout;
             let mut backoff = std::time::Duration::from_millis(200);
             loop {
                 let resp =
@@ -4777,15 +4794,45 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn validate_daemon_bind(listen: SocketAddr, allow_remote: bool) -> Result<()> {
+fn validate_daemon_bind(listen: SocketAddr, allow_remote: bool, has_token: bool) -> Result<()> {
     if !listen.ip().is_loopback() && !allow_remote {
         anyhow::bail!(
             "refusing to bind daemon to non-loopback address {listen} without \
              --allow-remote"
         );
     }
+    // A remotely reachable daemon must require authentication. Without this guard,
+    // `husker daemon --listen 0.0.0.0:7777 --allow-remote` with no token would start
+    // silently with every route (exec, shell, secret reveal, destroy) open to anyone
+    // on the network.
+    if !listen.ip().is_loopback() && !has_token {
+        anyhow::bail!(
+            "refusing to bind daemon to non-loopback address {listen} without an api_token: \
+             a remotely reachable daemon must require authentication. Set `api_token` in the \
+             config file, or the HUSKER_API_TOKEN env var, or pass --api-token."
+        );
+    }
     Ok(())
 }
+
+/// Restrict a daemon-owned directory to owner-only (0700). Best-effort: logs on
+/// failure rather than aborting startup. The state and runtime dirs hold the
+/// secrets key, the SQLite DB, and per-VM sockets, so they must not be left
+/// group/world-readable by the process umask on a shared host.
+#[cfg(unix)]
+fn restrict_dir_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "could not restrict directory permissions to 0700"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_permissions(_path: &Path) {}
 
 async fn port_forward(
     api_url: String,
@@ -5030,7 +5077,8 @@ async fn host_group_command(
                 println!("Updated:      {}", s("updated_at"));
             }
         }
-        HostGroupAction::Delete { name } => {
+        HostGroupAction::Delete { name, yes } => {
+            require_confirmation(&format!("Delete host group '{name}'?"), yes, output);
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/host-groups/{name}")),
                 api_token.as_deref(),
@@ -5211,7 +5259,12 @@ async fn pool_command(
                 exit_with_error(output, msg);
             }
         }
-        PoolAction::Delete { name } => {
+        PoolAction::Delete { name, yes } => {
+            require_confirmation(
+                &format!("Delete pool '{name}' and its template?"),
+                yes,
+                output,
+            );
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/pools/{name}")),
                 api_token.as_deref(),
@@ -5578,7 +5631,8 @@ async fn service_command(
                 exit_with_error(output, msg);
             }
         }
-        ServiceAction::Delete { name } => {
+        ServiceAction::Delete { name, yes } => {
+            require_confirmation(&format!("Delete service '{name}'?"), yes, output);
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/services/{name}")),
                 api_token.as_deref(),
@@ -5782,7 +5836,8 @@ async fn snapshot_command(
                 exit_with_error(output, msg);
             }
         }
-        SnapshotAction::Delete { name } => {
+        SnapshotAction::Delete { name, yes } => {
+            require_confirmation(&format!("Delete snapshot '{name}'?"), yes, output);
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/snapshots/{name}")),
                 api_token.as_deref(),
@@ -6195,7 +6250,12 @@ async fn volume_command(
                 println!("Created:  {}", volume["created_at"].as_str().unwrap_or("-"));
             }
         }
-        VolumeAction::Delete { name } => {
+        VolumeAction::Delete { name, yes } => {
+            require_confirmation(
+                &format!("Delete volume '{name}'? This destroys its persistent data."),
+                yes,
+                output,
+            );
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/volumes/{name}")),
                 api_token.as_deref(),
@@ -6374,7 +6434,8 @@ async fn secret_command(
                 exit_with_error(output, msg);
             }
         }
-        SecretAction::Delete { name } => {
+        SecretAction::Delete { name, yes } => {
+            require_confirmation(&format!("Delete secret '{name}'?"), yes, output);
             let resp = api_request(with_api_auth(
                 client.delete(format!("{api_url}/v1/secrets/{name}")),
                 api_token.as_deref(),
@@ -7078,6 +7139,34 @@ fn load_config(explicit_path: Option<&Path>) -> Config {
     config
 }
 
+/// Strict config loader for the daemon: a present-but-unparseable (or otherwise
+/// unreadable) config file is fatal rather than silently falling back to
+/// `Config::default()`. Without this, a typo while editing the config would drop
+/// `api_token` (and exec allow/deny lists, path allowlists, etc.) and bring the
+/// daemon up on insecure defaults after a routine restart. A *missing* file still
+/// falls back to defaults, preserving the documented zero-config path.
+fn load_config_strict(explicit_path: Option<&Path>) -> Result<Config> {
+    let path = resolve_config_path(explicit_path);
+    let mut config = match std::fs::read_to_string(&path) {
+        Ok(contents) => toml::from_str(&contents)
+            .with_context(|| format!("invalid config file {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A missing file at an explicit --config path is a user error; a missing
+            // file at a default discovery location is the zero-config path.
+            if explicit_path.is_some() {
+                anyhow::bail!("config file not found: {}", path.display());
+            }
+            Config::default()
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("could not read config file {}", path.display()));
+        }
+    };
+    apply_env_overrides(&mut config);
+    Ok(config)
+}
+
 /// Parse a CIDR string (e.g. "172.20.0.0/24") into base address and prefix length.
 ///
 /// Validates that:
@@ -7724,6 +7813,7 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
 
     // Daemon lock: refuse to start a second daemon against the same state dir.
     std::fs::create_dir_all(storage.state_dir.clone()).context("creating state directory")?;
+    restrict_dir_permissions(&storage.state_dir);
     let _daemon_lock = acquire_daemon_lock(&storage.lock_path())
         .context("another husker daemon is already running (state dir is locked)")?;
 
@@ -7749,7 +7839,9 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     husker_api::set_policy(api_policy);
 
     std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
+    restrict_dir_permissions(&runtime_dir);
     std::fs::create_dir_all(storage.vms_dir()).context("creating vms directory")?;
+    restrict_dir_permissions(&storage.vms_dir());
 
     let state = husker_state::StateStore::open(&db_path).context("opening state database")?;
 
@@ -9941,14 +10033,24 @@ mod tests {
     #[test]
     fn daemon_bind_loopback_allowed_without_flag() {
         let listen: SocketAddr = "127.0.0.1:7777".parse().unwrap();
-        assert!(validate_daemon_bind(listen, false).is_ok());
+        // Loopback needs neither --allow-remote nor a token.
+        assert!(validate_daemon_bind(listen, false, false).is_ok());
     }
 
     #[test]
     fn daemon_bind_non_loopback_requires_allow_remote() {
         let listen: SocketAddr = "0.0.0.0:7777".parse().unwrap();
-        assert!(validate_daemon_bind(listen, false).is_err());
-        assert!(validate_daemon_bind(listen, true).is_ok());
+        // Without --allow-remote, a non-loopback bind is refused regardless of token.
+        assert!(validate_daemon_bind(listen, false, true).is_err());
+    }
+
+    #[test]
+    fn daemon_bind_remote_requires_token() {
+        let listen: SocketAddr = "0.0.0.0:7777".parse().unwrap();
+        // --allow-remote alone is not enough: a token is mandatory for a remote bind.
+        assert!(validate_daemon_bind(listen, true, false).is_err());
+        // Remote bind with both the flag and a token is allowed.
+        assert!(validate_daemon_bind(listen, true, true).is_ok());
     }
 
     #[test]
@@ -10010,6 +10112,37 @@ mod tests {
         let _env = EnvVarGuard::set("HUSKER_API_TOKEN", "test-token");
         let config = load_config(None);
         assert_eq!(config.api_token.as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn load_config_strict_rejects_invalid_toml() {
+        // A present-but-unparseable config must be fatal for the daemon, not silently
+        // replaced with insecure defaults (which would drop a configured api_token).
+        let config_dir = temp_test_dir("load-config-strict-invalid");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "this is = = not valid toml\n").unwrap();
+        let err = load_config_strict(Some(&config_path)).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid config file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_strict_rejects_missing_explicit_path() {
+        let config_dir = temp_test_dir("load-config-strict-missing");
+        let config_path = config_dir.join("does-not-exist.toml");
+        assert!(load_config_strict(Some(&config_path)).is_err());
+    }
+
+    #[test]
+    fn load_config_strict_accepts_valid_toml() {
+        let _guard = env_mutex().lock().unwrap();
+        let config_dir = temp_test_dir("load-config-strict-valid");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "api_token = \"from-config\"\n").unwrap();
+        let config = load_config_strict(Some(&config_path)).expect("valid config parses");
+        assert_eq!(config.api_token.as_deref(), Some("from-config"));
     }
 
     #[cfg(feature = "linux-net")]
