@@ -1001,6 +1001,7 @@ name = "husker-core"
 version = "0.4.32"
 dependencies = [
  "chrono",
+ "futures-util",
  "husker-agent",
  "husker-agent-proto",
  "husker-cloudinit",

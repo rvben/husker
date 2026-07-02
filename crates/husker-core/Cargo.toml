@@ -19,6 +19,7 @@ husker-oci = { workspace = true }
 husker-state = { workspace = true }
 husker-agent-proto = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }

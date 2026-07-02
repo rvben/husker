@@ -1164,13 +1164,23 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// running EFI VMs all lacking IPs, all with slow or unresponsive agents)
     /// this adds up to N x 2 seconds of latency (two 1-second timeouts per VM).
     pub async fn list_vms_refreshed(&self) -> Result<Vec<VmRecord>, CoreError> {
+        use futures_util::stream::StreamExt;
         let vms = self.state.list_vms()?;
-        let mut out = Vec::with_capacity(vms.len());
-        for vm in &vms {
-            let mut refreshed = self.refresh_vm_liveness(vm).await;
-            self.discover_guest_ip(&mut refreshed).await;
-            out.push(refreshed);
-        }
+        // Each VM's refresh does a backend liveness probe and (for EFI VMs) a vsock
+        // round-trip that can each block up to ~1s. Running them sequentially makes
+        // `list` O(N x 2s) worst-case; overlap the I/O waits with bounded, in-order
+        // concurrency instead. `buffered` preserves input order and never runs more
+        // than the cap at once, so a large fleet cannot fan out unbounded connects.
+        const MAX_CONCURRENT_REFRESHES: usize = 16;
+        let out = futures_util::stream::iter(vms)
+            .map(|vm| async move {
+                let mut refreshed = self.refresh_vm_liveness(&vm).await;
+                self.discover_guest_ip(&mut refreshed).await;
+                refreshed
+            })
+            .buffered(MAX_CONCURRENT_REFRESHES)
+            .collect::<Vec<VmRecord>>()
+            .await;
         Ok(out)
     }
 
