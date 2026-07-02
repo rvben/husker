@@ -63,6 +63,19 @@ pub struct VmResponse {
     pub volume: Option<String>,
     /// Network mode for this VM: "nat" (husker-managed NAT) or "bridged" (LAN bridge via DHCP).
     pub network: String,
+    /// Idle window in seconds before this VM is suspended, if the idle policy is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+    /// Seconds a suspended VM may sit idle before it is reaped. None/0 = never reap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspend_ttl_secs: Option<u64>,
+    /// Whether the VM auto-resumes on activity/connect while suspended. Only present
+    /// when the idle policy is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<bool>,
+    /// Timestamp the VM was suspended at, if currently suspended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3510,6 +3523,12 @@ fn record_to_response(r: VmRecord) -> VmResponse {
         kernel_path: r.kernel_path,
         volume: r.volume,
         network: r.network,
+        idle_timeout_secs: r.idle_timeout_secs,
+        suspend_ttl_secs: r.suspend_ttl_secs,
+        // Only surface auto_resume for VMs that opted into the policy, so the payload
+        // stays tidy for the common (no-policy) case.
+        auto_resume: r.idle_timeout_secs.is_some().then_some(r.auto_resume),
+        suspended_at: r.suspended_at.map(|d| d.to_rfc3339()),
     }
 }
 
@@ -4750,6 +4769,62 @@ mod tests {
         assert_eq!(json["code"], "write_file_too_large");
 
         set_policy(ApiPolicy::default());
+    }
+
+    /// A minimal `VmRecord`: `running`, `firecracker`, no idle policy set by
+    /// default, no service/fork/volume attachments.
+    fn sample_vm_record(name: &str) -> VmRecord {
+        let now = chrono::Utc::now();
+        VmRecord {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            state: "running".into(),
+            pid: None,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 3,
+            tap_device: None,
+            host_ip: None,
+            guest_ip: None,
+            kernel_path: "/boot/vmlinux".into(),
+            rootfs_path: "/images/rootfs.ext4".into(),
+            created_at: now,
+            updated_at: now,
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: "firecracker".into(),
+            boot_mode: "direct".into(),
+            balloon: false,
+            volume: None,
+            network: "nat".into(),
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
+        }
+    }
+
+    #[test]
+    fn vm_response_includes_policy_fields() {
+        let mut r = sample_vm_record("r");
+        r.idle_timeout_secs = Some(120);
+        r.auto_resume = false;
+        let resp = record_to_response(r);
+        assert_eq!(resp.idle_timeout_secs, Some(120));
+        assert_eq!(resp.suspend_ttl_secs, None);
+        assert_eq!(resp.auto_resume, Some(false));
+
+        // A VM that never opted into the idle policy must not surface
+        // `auto_resume` at all, keeping the no-policy payload tidy.
+        let no_policy = sample_vm_record("no-policy");
+        let resp = record_to_response(no_policy);
+        assert_eq!(resp.idle_timeout_secs, None);
+        assert_eq!(resp.auto_resume, None);
     }
 
     #[test]

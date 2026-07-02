@@ -572,6 +572,7 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -610,6 +611,7 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
         .unwrap_err()
@@ -673,6 +675,7 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
         .unwrap_err()
@@ -1624,6 +1627,7 @@ async fn create_vm_rejects_unsafe_names() {
                 volume: None,
                 network: None,
                 mounts: Vec::new(),
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -1958,6 +1962,7 @@ async fn create_vm_accepts_safe_names() {
                 volume: None,
                 network: None,
                 mounts: Vec::new(),
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -1993,6 +1998,7 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -2038,6 +2044,7 @@ async fn concurrent_create_same_name_one_winner() {
                 volume: None,
                 network: None,
                 mounts: Vec::new(),
+                ..Default::default()
             })
             .await
         })
@@ -2177,6 +2184,7 @@ mod kernel_args_composition {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
         .expect("create_vm should succeed");
@@ -2227,6 +2235,7 @@ mod kernel_args_composition {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
         .expect("create_vm should succeed");
@@ -2293,6 +2302,7 @@ mod kernel_args_composition {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
         .expect("create_vm should succeed with daemon defaults");

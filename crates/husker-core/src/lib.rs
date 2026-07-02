@@ -128,7 +128,7 @@ pub struct DaemonProfile {
 }
 
 /// Parameters for creating a new VM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct CreateVmRequest {
     pub name: String,
@@ -185,6 +185,20 @@ pub struct CreateVmRequest {
     /// Supported on Linux with the direct-kernel boot path only.
     #[serde(default)]
     pub mounts: Vec<String>,
+    /// Enable idle policy using the daemon default window (the bare `--idle` flag).
+    #[serde(default)]
+    pub idle: Option<bool>,
+    /// Explicit idle window in seconds (0 = suspend as soon as idle). Requires
+    /// the Firecracker backend (full-state snapshot/restore).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// Seconds a suspended VM may sit idle before it is reaped. None/0 = never reap.
+    #[serde(default)]
+    pub suspend_ttl_secs: Option<u64>,
+    /// Whether the VM auto-resumes on activity/connect while suspended. Only
+    /// meaningful when the idle policy is enabled.
+    #[serde(default)]
+    pub auto_resume: Option<bool>,
 }
 
 /// Parameters for creating a host group.
@@ -1659,6 +1673,46 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
 
+        // Resolve the backend kind once and persist it, so the record reflects the
+        // backend the dispatcher actually runs (an omitted `--vmm` resolves to the
+        // daemon default, not a hardcoded Firecracker). Resolved before any host
+        // resource allocation so the idle-policy gate below fails fast.
+        let resolved_vmm_kind = resolve_vmm_kind(
+            req.vmm.as_deref(),
+            req.cloud_image.is_some(),
+            !req.mounts.is_empty(),
+            self.default_vmm_kind,
+        )?;
+
+        // Resolve the idle policy: an explicit `idle_timeout_secs` wins; otherwise the
+        // bare `--idle` flag opts in using the daemon default window. Resolved without
+        // a sentinel so an explicit `--idle-timeout 0` (suspend as soon as idle) is not
+        // silently overwritten by the default.
+        let idle_timeout_secs = req.idle_timeout_secs.or_else(|| {
+            req.idle
+                .unwrap_or(false)
+                .then_some(self.idle_policy.default_idle_timeout_secs)
+        });
+        let idle_opted_in = idle_timeout_secs.is_some();
+        if idle_opted_in && resolved_vmm_kind != husker_vmm::VmmKind::Firecracker {
+            return Err(CoreError::InvalidArgument(
+                "idle policy requires a full-state snapshot backend (firecracker)".into(),
+            ));
+        }
+        let suspend_ttl_secs = if idle_opted_in {
+            req.suspend_ttl_secs.or_else(|| {
+                (self.idle_policy.default_suspend_ttl_secs > 0)
+                    .then_some(self.idle_policy.default_suspend_ttl_secs)
+            })
+        } else {
+            None
+        };
+        let auto_resume = if idle_opted_in {
+            req.auto_resume.unwrap_or(self.idle_policy.default_auto_resume)
+        } else {
+            true
+        };
+
         // NAT mode: allocate a static IP. Bridged mode: skip allocation; the LAN DHCP
         // server assigns the address. The rollback field stays None so unwind skips it.
         let guest_ip = if network_mode == "nat" {
@@ -1837,16 +1891,6 @@ impl<B: VmmBackend> HuskerCore<B> {
             inject_resolv_conf(&disk_path, &self.dns_servers).await?;
         }
 
-        // Resolve the backend kind once and persist it, so the record reflects the
-        // backend the dispatcher actually runs (an omitted `--vmm` resolves to the
-        // daemon default, not a hardcoded Firecracker).
-        let resolved_vmm_kind = resolve_vmm_kind(
-            req.vmm.as_deref(),
-            is_cloud,
-            !req.mounts.is_empty(),
-            self.default_vmm_kind,
-        )?;
-
         // For direct-kernel boot: resolve the kernel now (validation already ran in
         // create_vm_record; try_create_vm may also be called from tests that skip it).
         let (config_kernel_path, record_kernel_path, record_rootfs_path) = if is_cloud {
@@ -2009,9 +2053,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             network: network_mode.to_string(),
             last_activity_at: now,
             suspended_at: None,
-            idle_timeout_secs: None,
-            suspend_ttl_secs: None,
-            auto_resume: true,
+            idle_timeout_secs,
+            suspend_ttl_secs,
+            auto_resume,
             forked_from: None,
         };
 
@@ -2042,6 +2086,16 @@ impl<B: VmmBackend> HuskerCore<B> {
         if network_mode == "bridged" {
             return Err(CoreError::InvalidArgument(
                 "bridged networking is only supported on Linux".into(),
+            ));
+        }
+
+        // Idle policy requires a full-state snapshot backend (Firecracker); Apple VZ
+        // has no snapshot/restore support, so any opt-in is rejected before any host
+        // resource is allocated. Opt-in is an explicit `idle_timeout_secs` or the
+        // bare `--idle` flag.
+        if req.idle_timeout_secs.is_some() || req.idle.unwrap_or(false) {
+            return Err(CoreError::InvalidArgument(
+                "idle policy requires a full-state snapshot backend (firecracker)".into(),
             ));
         }
 
@@ -3761,6 +3815,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 volume: None,
                 network: None,
                 mounts: Vec::new(),
+                ..Default::default()
             })
             .await
             .map_err(|e| match e {
@@ -3968,6 +4023,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             volume: None,
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         })
         .await
     }
@@ -5358,6 +5414,7 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             // Services always use NAT; bridged networking is not supported for services.
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         }
     } else {
         CreateVmRequest {
@@ -5378,6 +5435,7 @@ pub(crate) fn instance_request(svc: &ServiceRecord, name: &str) -> CreateVmReque
             // Services always use NAT; bridged networking is not supported for services.
             network: None,
             mounts: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -6342,6 +6400,59 @@ mod tests {
             vec![],
             runtime_dir,
         ))
+    }
+
+    /// Like `test_core`, but with the daemon default backend set to QEMU
+    /// instead of the built-in Firecracker default, for tests that exercise
+    /// the idle-policy gate against a non-Firecracker default.
+    #[cfg(feature = "linux-net")]
+    async fn test_core_qemu() -> Arc<HuskerCore<AutoResumeMockVmm>> {
+        let dir = std::env::temp_dir().join(format!("husker-core-test-{}", Uuid::new_v4()));
+        let runtime_dir = dir.join("run");
+        Arc::new(
+            HuskerCore::new(
+                AutoResumeMockVmm {
+                    fail_vsock_connect: false,
+                },
+                husker_state::StateStore::open_memory().unwrap(),
+                husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+                husker_storage::StorageConfig {
+                    data_dir: dir.clone(),
+                    state_dir: dir,
+                },
+                "husker0".into(),
+                vec![],
+                runtime_dir,
+            )
+            .with_default_vmm_kind(husker_vmm::VmmKind::Qemu),
+        )
+    }
+
+    /// An idle-policy opt-in must be rejected outright on a non-Firecracker
+    /// backend: idle suspend/resume relies on full-state snapshot/restore,
+    /// which QEMU (and Apple VZ) do not implement.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn create_rejects_idle_policy_on_non_firecracker() {
+        let core = test_core_qemu().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel_file = tmp.path().join("vmlinux");
+        let rootfs_file = tmp.path().join("rootfs.ext4");
+        std::fs::write(&kernel_file, b"kernel").unwrap();
+        std::fs::write(&rootfs_file, b"rootfs").unwrap();
+
+        let req = CreateVmRequest {
+            name: "q1".into(),
+            kernel_path: Some(kernel_file),
+            rootfs_path: Some(rootfs_file),
+            idle_timeout_secs: Some(60),
+            ..Default::default()
+        };
+        let err = core.create_vm(req).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("firecracker")),
+            "expected InvalidArgument mentioning firecracker, got {err:?}"
+        );
     }
 
     #[cfg(feature = "linux-net")]
@@ -8664,6 +8775,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -8716,6 +8828,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -8836,6 +8949,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -9082,6 +9196,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             network: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -9122,6 +9237,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             network: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -9162,6 +9278,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             network: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm(req).await.unwrap_err();
@@ -9227,6 +9344,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             network: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm(req).await;
@@ -9343,6 +9461,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             volume: None,
             network: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm_record(req, None, true).await.unwrap_err();
@@ -9384,6 +9503,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             volume: None,
             network: None,
             mounts: vec![],
+            ..Default::default()
         };
 
         let err = core.create_vm_record(req, None, true).await.unwrap_err();
