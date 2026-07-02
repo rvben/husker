@@ -144,6 +144,25 @@ static API_POLICY: OnceLock<RwLock<ApiPolicy>> = OnceLock::new();
 static API_METRICS: OnceLock<ApiMetrics> = OnceLock::new();
 static RATE_LIMITER: OnceLock<SlidingWindowRateLimiter> = OnceLock::new();
 pub(crate) static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Max VMs the daemon will admit before rejecting `create` (0 = unlimited).
+/// Set from config at startup; bounds host resource use by a single client.
+static MAX_VMS: AtomicU64 = AtomicU64::new(0);
+
+/// Set the max-VMs admission limit (`None` = unlimited).
+pub fn set_max_vms(max: Option<usize>) {
+    MAX_VMS.store(
+        max.unwrap_or(0) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The configured max-VMs admission limit, or `None` if unlimited.
+pub(crate) fn max_vms() -> Option<usize> {
+    match MAX_VMS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n as usize),
+    }
+}
 
 // ── OpenAPI ───────────────────────────────────────────────────────────
 
@@ -1123,6 +1142,77 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(json["error"].as_str().unwrap().contains("kernel"));
+    }
+
+    #[tokio::test]
+    async fn create_rejected_when_max_vms_reached() {
+        // One VM already exists and the limit is 1, so a create is rejected with
+        // 429 at admission - before it reaches kernel validation (which would 500).
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let now = chrono::Utc::now();
+        state
+            .insert_vm(&husker_state::VmRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "existing".into(),
+                state: "running".into(),
+                pid: Some(1),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 100,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "/tmp/vmlinux".into(),
+                rootfs_path: "/tmp/rootfs.ext4".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+                service_id: None,
+                service_ordinal: None,
+                vmm: "firecracker".into(),
+                boot_mode: "direct".into(),
+                balloon: false,
+                volume: None,
+                network: "nat".into(),
+                last_activity_at: now,
+                suspended_at: None,
+                idle_timeout_secs: None,
+                suspend_ttl_secs: None,
+                auto_resume: true,
+                forked_from: None,
+            })
+            .unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: PathBuf::from("/tmp/husker-maxvms-test"),
+            state_dir: PathBuf::from("/tmp/husker-maxvms-test"),
+        };
+        let core = make_core(state, storage, PathBuf::from("/tmp/husker-maxvms-test/run"));
+
+        set_max_vms(Some(1));
+        let app = router(core);
+        let body = serde_json::json!({
+            "name": "over-limit",
+            "kernel_path": "/nonexistent/vmlinux",
+            "rootfs_path": "/nonexistent/rootfs.ext4",
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/vms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Reset the global before asserting so a failure never leaks the limit to
+        // other tests sharing the process under `cargo test`.
+        set_max_vms(None);
+        let status = response.status();
+        let json = response_json(response).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(json["error"].as_str().unwrap().contains("VM limit reached"));
     }
 
     #[tokio::test]

@@ -54,6 +54,10 @@ pub(crate) struct Config {
     /// Falls back to the built-in 1 when unset.
     #[serde(default)]
     pub(crate) default_cpus: Option<u32>,
+    /// Maximum number of VMs the daemon will admit before rejecting `create`
+    /// (admission control). Unset means unlimited.
+    #[serde(default)]
+    pub(crate) max_vms: Option<usize>,
     #[serde(default = "husker::default_images_base_url")]
     pub(crate) images_base_url: String,
     #[serde(default)]
@@ -365,6 +369,7 @@ impl Default for Config {
             default_disk_size: None,
             default_memory: None,
             default_cpus: None,
+            max_vms: None,
             images_base_url: default_images_base_url(),
             api_token: None,
             metrics_listen: None,
@@ -475,6 +480,11 @@ pub(crate) fn apply_env_overrides(config: &mut Config) {
         && let Ok(parsed) = val.parse::<u32>()
     {
         config.default_memory = Some(parsed);
+    }
+    if let Ok(val) = std::env::var("HUSKER_MAX_VMS")
+        && let Ok(parsed) = val.parse::<usize>()
+    {
+        config.max_vms = Some(parsed);
     }
     if let Ok(val) = std::env::var("HUSKER_DEFAULT_CPUS")
         && let Ok(parsed) = val.parse::<u32>()

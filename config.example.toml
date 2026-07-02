@@ -33,6 +33,10 @@
 # default_cpus = 1
 # default_memory = 128
 
+# Admission control: maximum number of VMs the daemon will admit before
+# rejecting `create` with 429. Unset means unlimited. Env: HUSKER_MAX_VMS.
+# max_vms = 50
+
 # ── Kernel ───────────────────────────────────────────────────────────
 
 # Default kernel used when --kernel is not passed to `husker run`.
@@ -220,6 +224,7 @@
 #   HUSKER_DEFAULT_DISK_SIZE                 →  default_disk_size
 #   HUSKER_DEFAULT_CPUS                      →  default_cpus
 #   HUSKER_DEFAULT_MEMORY                    →  default_memory
+#   HUSKER_MAX_VMS                           →  max_vms
 #   HUSKER_IMAGES_BASE_URL                   →  images_base_url
 #   HUSKER_API_TOKEN                         →  api_token
 #   HUSKER_METRICS_LISTEN                    →  metrics_listen

@@ -404,6 +404,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         exec_env_allowlist: config.exec_env_allowlist.clone(),
     };
     husker_api::set_policy(api_policy);
+    husker_api::set_max_vms(config.max_vms);
 
     std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
     restrict_dir_permissions(&runtime_dir);

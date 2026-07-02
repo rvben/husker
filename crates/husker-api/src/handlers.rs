@@ -27,7 +27,7 @@ use crate::dto::*;
 use crate::errors::{
     ErrorResponse, error_response, error_response_with_hint, map_agent_connect_error, map_error,
 };
-use crate::{ApiPolicy, current_policy, metrics};
+use crate::{ApiPolicy, current_policy, max_vms, metrics};
 
 /// Default agent-readiness wait for exec when the caller does not specify one.
 pub(crate) const DEFAULT_EXEC_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -1073,6 +1073,23 @@ pub(crate) async fn create_vm<B: VmmBackend + 'static>(
     Json(req): Json<CreateVmRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
     let policy = current_policy();
+
+    // Admission control: cap the number of VMs a client can create so a single
+    // caller cannot exhaust host CPU/memory by creating VMs without bound.
+    if let Some(max) = max_vms() {
+        let current = core.list_vms().map(|v| v.len()).unwrap_or(0);
+        if current >= max {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                error_response_with_hint(
+                    "vm_limit_reached",
+                    format!("VM limit reached ({current}/{max})"),
+                    "destroy unused VMs or raise max_vms in the daemon config",
+                ),
+            ));
+        }
+    }
+
     for (i, spec) in req.mounts.iter().enumerate() {
         let share = husker_core::parse_mount_spec(spec, i).map_err(|e| {
             (
