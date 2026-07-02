@@ -313,12 +313,20 @@ fn try_accept_now(listener: &TcpListener) -> io::Result<Option<(TcpStream, Socke
 }
 
 #[cfg(not(feature = "linux-net"))]
+/// Upper bound on concurrent relay tasks per forward. A client that opens many
+/// connections and lets them idle cannot spawn unbounded relay tasks; once the
+/// cap is reached the accept loop applies backpressure (new connections wait in
+/// the kernel backlog) until an existing relay finishes.
+const MAX_CONCURRENT_RELAYS: usize = 512;
+
+#[cfg(not(feature = "linux-net"))]
 async fn accept_loop<D: GuestDialer>(
     listener: Arc<TcpListener>,
     dialer: D,
     guest_ip: Ipv4Addr,
     guest_port: u16,
 ) {
+    let relay_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RELAYS));
     loop {
         let (mut inbound, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -327,10 +335,17 @@ async fn accept_loop<D: GuestDialer>(
                 return;
             }
         };
+        // Wait for a relay slot before taking on the connection. The permit is
+        // held for the connection's lifetime and released when the relay task ends.
+        let permit = match Arc::clone(&relay_slots).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return, // semaphore closed: proxy shutting down
+        };
         // Clone the dialer INTO the task so the returned future owns its
         // captures and is `'static` for tokio::spawn.
         let dialer = dialer.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match dialer.dial(guest_ip, guest_port).await {
                 Ok(mut upstream) => {
                     debug!(%peer, %guest_ip, guest_port, "port-forward connection open");
