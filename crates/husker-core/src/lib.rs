@@ -6427,6 +6427,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn secret_encryption_is_real_and_authenticated() {
+        // Proves the at-rest encryption is not a no-op and is authenticated: a
+        // roundtrip HTTP test would pass even if encryption were the identity.
+        let key = [7u8; SECRET_KEY_LEN];
+        let plaintext = b"super-secret-value";
+
+        let (ciphertext, nonce) = encrypt_secret(&key, plaintext).unwrap();
+        assert_ne!(
+            ciphertext.as_slice(),
+            plaintext.as_slice(),
+            "ciphertext must differ from plaintext"
+        );
+        assert!(
+            ciphertext.len() > plaintext.len(),
+            "ciphertext must carry the GCM auth tag"
+        );
+        assert_eq!(nonce.len(), SECRET_NONCE_LEN);
+
+        // Correct key + nonce round-trips.
+        assert_eq!(
+            decrypt_secret(&key, &nonce, &ciphertext).unwrap(),
+            plaintext
+        );
+
+        // Wrong key fails.
+        assert!(decrypt_secret(&[8u8; SECRET_KEY_LEN], &nonce, &ciphertext).is_err());
+
+        // Tampered ciphertext fails GCM authentication.
+        let mut tampered = ciphertext.clone();
+        tampered[0] ^= 0xff;
+        assert!(decrypt_secret(&key, &nonce, &tampered).is_err());
+
+        // Tampered nonce fails.
+        let mut bad_nonce = nonce.clone();
+        bad_nonce[0] ^= 0xff;
+        assert!(decrypt_secret(&key, &bad_nonce, &ciphertext).is_err());
+
+        // Fresh random nonce per encryption -> same plaintext encrypts differently.
+        let (ciphertext2, nonce2) = encrypt_secret(&key, plaintext).unwrap();
+        assert_ne!(nonce, nonce2, "nonce must be random per encryption");
+        assert_ne!(ciphertext, ciphertext2);
+    }
+
     #[tokio::test]
     async fn write_file_atomic_writes_content_and_removes_temp() {
         let dir = tempfile::tempdir().unwrap();
