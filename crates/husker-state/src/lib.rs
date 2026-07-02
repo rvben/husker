@@ -3384,4 +3384,64 @@ mod tests {
             "legacy VM row without network column must default to nat"
         );
     }
+
+    #[test]
+    fn migrates_a_genuinely_old_on_disk_schema() {
+        // A v0.2-era DB file predates the vmm/boot_mode/network/idle columns.
+        // Opening it must ALTER TABLE the new columns in, backfill their
+        // schema-correct defaults, and preserve the existing row - the real
+        // upgrade path a user hits, which the open_memory migration tests (built by
+        // the current binary) never exercise against a genuinely old file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let vm_id = Uuid::new_v4();
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE vms (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL DEFAULT 'creating',
+                    pid INTEGER,
+                    vcpu_count INTEGER NOT NULL,
+                    mem_size_mib INTEGER NOT NULL,
+                    vsock_cid INTEGER NOT NULL,
+                    tap_device TEXT,
+                    host_ip TEXT,
+                    guest_ip TEXT,
+                    kernel_path TEXT NOT NULL,
+                    rootfs_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO vms (id, name, state, vcpu_count, mem_size_mib, vsock_cid,
+                                  guest_ip, kernel_path, rootfs_path, created_at, updated_at)
+                 VALUES (?1, 'legacy-vm', 'running', 2, 256, 7, '192.0.2.50', '/k', '/r', ?2, ?2)",
+                params![vm_id.to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        } // drop the raw connection so StateStore can reopen the file
+
+        // Opening via StateStore runs migrate() against the old file.
+        let store = StateStore::open(&path).unwrap();
+        let vms = store.list_vms().unwrap();
+        assert_eq!(vms.len(), 1, "the legacy row must survive migration");
+        let vm = &vms[0];
+        // Original data intact.
+        assert_eq!(vm.id, vm_id);
+        assert_eq!(vm.name, "legacy-vm");
+        assert_eq!(vm.state, "running");
+        assert_eq!(vm.vcpu_count, 2);
+        assert_eq!(vm.guest_ip.as_deref(), Some("192.0.2.50"));
+        // New columns backfilled with their schema-correct defaults.
+        assert_eq!(vm.vmm, "firecracker");
+        assert_eq!(vm.boot_mode, "direct");
+        assert_eq!(vm.network, "nat");
+        assert!(vm.auto_resume, "auto_resume defaults to enabled");
+        assert!(!vm.balloon, "balloon defaults to off");
+    }
 }
