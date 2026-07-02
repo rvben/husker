@@ -3575,9 +3575,48 @@ impl<B: VmmBackend> HuskerCore<B> {
         if let Err(e) = self.state.update_vm_state(vm.id, "stopped") {
             warn!(name = %vm.name, error = %e, "failed to persist stopped state");
         }
+
+        // Reclaim network resources of a crashed standalone VM so a repeatedly
+        // crashing fleet cannot exhaust the IP pool, and so a freed IP is never
+        // reused while stale DNAT rules still point at it (which would misdirect
+        // traffic). Service instances are left to the reconciler, which replaces
+        // them; suspended VMs never reach here (this path is running/paused only).
+        // Best-effort: a concurrent destroy holds the name lock, but every step
+        // here is idempotent and clearing guest_ip prevents a double free.
+        #[cfg(feature = "linux-net")]
+        let reclaim_ip = vm.service_id.is_none();
+        #[cfg(feature = "linux-net")]
+        if reclaim_ip {
+            if let Some(tap) = vm.tap_device.as_deref()
+                && let Err(e) = husker_net::remove_all_port_forwards(tap, &self.bridge_name).await
+            {
+                warn!(name = %vm.name, error = %e, "reclaim: remove_all_port_forwards failed");
+            }
+            if let Err(e) = self.state.delete_port_forwards_for_vm(vm.id) {
+                warn!(name = %vm.name, error = %e, "reclaim: delete_port_forwards_for_vm failed");
+            }
+            if let Some(ip) = vm
+                .guest_ip
+                .as_deref()
+                .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                && let Err(e) = self.ip_allocator.release(ip)
+            {
+                warn!(name = %vm.name, %ip, error = %e, "reclaim: ip release failed");
+            }
+            if vm.guest_ip.is_some()
+                && let Err(e) = self.state.clear_vm_guest_ip(vm.id)
+            {
+                warn!(name = %vm.name, error = %e, "reclaim: clear guest_ip failed");
+            }
+        }
+
         let mut updated = vm.clone();
         updated.state = "stopped".to_string();
         updated.pid = None;
+        #[cfg(feature = "linux-net")]
+        if reclaim_ip {
+            updated.guest_ip = None;
+        }
         updated
     }
 
