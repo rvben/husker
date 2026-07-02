@@ -78,6 +78,12 @@ pub(crate) fn build_cli_schema() -> serde_json::Value {
                 "description": "VM, image, snapshot, volume, or secret not found"
             },
             {
+                "kind": "invalid_usage",
+                "exit_code": 2,
+                "retryable": false,
+                "description": "Invalid command-line usage (unknown flag, missing or invalid argument). Shares exit code 2 with not_found; the error `kind` field disambiguates the two."
+            },
+            {
                 "kind": "conflict",
                 "exit_code": 3,
                 "retryable": false,
