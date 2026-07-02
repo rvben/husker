@@ -9,8 +9,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -161,7 +162,6 @@ impl<D: GuestDialer> PortProxy<D> {
         ));
         self.forwards
             .lock()
-            .expect("port proxy mutex poisoned")
             .entry(vm_id)
             .or_default()
             .insert(bound, Forward { handle });
@@ -206,19 +206,14 @@ impl<D: GuestDialer> PortProxy<D> {
                 Arc::clone(&sessions),
             );
         });
-        self.forwards
-            .lock()
-            .expect("port proxy mutex poisoned")
-            .entry(vm_id)
-            .or_default()
-            .insert(
-                bound,
-                Forward {
-                    handle,
-                    listener,
-                    drain_relay: Some(drain_relay),
-                },
-            );
+        self.forwards.lock().entry(vm_id).or_default().insert(
+            bound,
+            Forward {
+                handle,
+                listener,
+                drain_relay: Some(drain_relay),
+            },
+        );
         Ok(bound)
     }
 
@@ -231,12 +226,7 @@ impl<D: GuestDialer> PortProxy<D> {
     #[cfg(feature = "linux-net")]
     pub fn drain_and_close(&self, vm_id: Uuid) {
         const DRAIN_CAP: usize = 128;
-        let Some(map) = self
-            .forwards
-            .lock()
-            .expect("port proxy mutex poisoned")
-            .remove(&vm_id)
-        else {
+        let Some(map) = self.forwards.lock().remove(&vm_id) else {
             return;
         };
         for forward in map.into_values() {
@@ -261,12 +251,7 @@ impl<D: GuestDialer> PortProxy<D> {
     /// Stop and remove one forward. No-op if absent.
     #[cfg(not(feature = "linux-net"))]
     pub fn stop(&self, vm_id: Uuid, host_port: u16) {
-        if let Some(map) = self
-            .forwards
-            .lock()
-            .expect("port proxy mutex poisoned")
-            .get_mut(&vm_id)
-        {
+        if let Some(map) = self.forwards.lock().get_mut(&vm_id) {
             map.remove(&host_port); // Drop aborts the task.
         }
     }
@@ -274,10 +259,7 @@ impl<D: GuestDialer> PortProxy<D> {
     /// Stop and remove all forwards for a VM. No-op if absent.
     #[cfg(not(feature = "linux-net"))]
     pub fn stop_all(&self, vm_id: Uuid) {
-        self.forwards
-            .lock()
-            .expect("port proxy mutex poisoned")
-            .remove(&vm_id); // Drop aborts every task.
+        self.forwards.lock().remove(&vm_id); // Drop aborts every task.
     }
 }
 
@@ -410,11 +392,7 @@ fn spawn_guarded_relay<D: GuestDialer>(
     sessions: Arc<Mutex<HashMap<Uuid, u64>>>,
 ) {
     tokio::spawn(async move {
-        *sessions
-            .lock()
-            .expect("active_sessions poisoned")
-            .entry(vm_id)
-            .or_insert(0) += 1;
+        *sessions.lock().entry(vm_id).or_insert(0) += 1;
         let _guard = ActiveSessionGuard::from_parts(Arc::clone(&sessions), vm_id);
         match dialer.dial(guest_ip, guest_port).await {
             Ok(mut upstream) => {
@@ -538,9 +516,7 @@ mod tests {
 
         let guest_port = spawn_echo().await;
         let resumed = Arc::new(AtomicUsize::new(0));
-        let sessions = Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::<Uuid, u64>::new(),
-        ));
+        let sessions = Arc::new(Mutex::new(std::collections::HashMap::<Uuid, u64>::new()));
         let vm = Uuid::new_v4();
 
         let r = Arc::clone(&resumed);
@@ -571,16 +547,14 @@ mod tests {
         assert_eq!(&buf, b"ping");
         assert_eq!(resumed.load(Ordering::SeqCst), 1);
         // The relay holds a guard for the VM while the connection is open.
-        assert!(*sessions.lock().unwrap().get(&vm).unwrap_or(&0) >= 1);
+        assert!(*sessions.lock().get(&vm).unwrap_or(&0) >= 1);
     }
 
     #[cfg(feature = "linux-net")]
     #[tokio::test]
     async fn drain_and_close_relays_pending_connection_then_frees_port() {
         let guest_port = spawn_echo().await;
-        let sessions = Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::<Uuid, u64>::new(),
-        ));
+        let sessions = Arc::new(Mutex::new(std::collections::HashMap::<Uuid, u64>::new()));
         let vm = Uuid::new_v4();
         let proxy = PortProxy::new(DirectIpDialer);
         let host_port = proxy

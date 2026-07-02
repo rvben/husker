@@ -226,17 +226,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         self.resume_listeners
             .lock()
-            .expect("resume_listeners poisoned")
             .insert(record.id, Box::new(proxy));
     }
 
     /// Test-only: whether a resume listener is currently registered for `id`.
     #[cfg(all(test, feature = "linux-net"))]
     pub(crate) fn has_resume_listener_for_test(&self, id: Uuid) -> bool {
-        self.resume_listeners
-            .lock()
-            .expect("resume_listeners poisoned")
-            .contains_key(&id)
+        self.resume_listeners.lock().contains_key(&id)
     }
 
     /// Recover VMs interrupted mid-suspend on a previous daemon run.
@@ -426,12 +422,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                         .await;
                     }
                 }
-                if let Some(proxy) = self
-                    .resume_listeners
-                    .lock()
-                    .expect("resume_listeners poisoned")
-                    .remove(&record.id)
-                {
+                if let Some(proxy) = self.resume_listeners.lock().remove(&record.id) {
                     proxy.drain_and_close(record.id);
                 }
                 // Drop stale counter baselines: the DNAT rules were just
@@ -440,10 +431,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 // instead of comparing new(small) against old(large) and
                 // missing traffic.
                 {
-                    let mut nc = self
-                        .network_counters
-                        .lock()
-                        .expect("network_counters poisoned");
+                    let mut nc = self.network_counters.lock();
                     for pf in &forwards {
                         if let Some(tap) = record.tap_device.as_deref() {
                             nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
@@ -456,14 +444,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             // (in-memory + the DB mirror, so the fallback in idle_for is also
             // fresh if the maps are ever lost).
             let now = std::time::Instant::now();
-            self.control_plane_last_active
-                .lock()
-                .expect("control_plane_last_active poisoned")
-                .insert(record.id, now);
-            self.network_last_active
-                .lock()
-                .expect("network_last_active poisoned")
-                .insert(record.id, now);
+            self.control_plane_last_active.lock().insert(record.id, now);
+            self.network_last_active.lock().insert(record.id, now);
             let _ = self
                 .state
                 .touch_last_activity(record.id, chrono::Utc::now());

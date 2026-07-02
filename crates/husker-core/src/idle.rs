@@ -6,7 +6,6 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub fn note_activity(&self, id: Uuid) {
         self.control_plane_last_active
             .lock()
-            .expect("control_plane_last_active poisoned")
             .insert(id, std::time::Instant::now());
     }
 
@@ -15,7 +14,6 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub fn mark_network_active(&self, id: Uuid) {
         self.network_last_active
             .lock()
-            .expect("network_last_active poisoned")
             .insert(id, std::time::Instant::now());
     }
 
@@ -24,31 +22,20 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub fn network_last_active_elapsed(&self, id: Uuid) -> Option<std::time::Duration> {
         self.network_last_active
             .lock()
-            .expect("network_last_active poisoned")
             .get(&id)
             .map(|t| t.elapsed())
     }
 
     /// Number of open sessions (exec/shell streams) currently pinning `id` active.
     pub fn active_session_count(&self, id: Uuid) -> u64 {
-        *self
-            .active_sessions
-            .lock()
-            .expect("active_sessions poisoned")
-            .get(&id)
-            .unwrap_or(&0)
+        *self.active_sessions.lock().get(&id).unwrap_or(&0)
     }
 
     /// Increment the active-session refcount for `id` and return an RAII guard
     /// that decrements it on drop, including on cancellation or a panic, so a
     /// session can never leak the count and strand a VM pinned-active.
     pub fn begin_session(&self, id: Uuid) -> ActiveSessionGuard {
-        *self
-            .active_sessions
-            .lock()
-            .expect("active_sessions poisoned")
-            .entry(id)
-            .or_insert(0) += 1;
+        *self.active_sessions.lock().entry(id).or_insert(0) += 1;
         ActiveSessionGuard::from_parts(Arc::clone(&self.active_sessions), id)
     }
 
@@ -56,14 +43,8 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// never-touched VM has a real idle clock instead of a missing entry.
     pub fn seed_activity(&self, id: Uuid) {
         let now = std::time::Instant::now();
-        self.control_plane_last_active
-            .lock()
-            .expect("control_plane_last_active poisoned")
-            .insert(id, now);
-        self.network_last_active
-            .lock()
-            .expect("network_last_active poisoned")
-            .insert(id, now);
+        self.control_plane_last_active.lock().insert(id, now);
+        self.network_last_active.lock().insert(id, now);
     }
 
     /// Time `record` has been idle, or `None` if it is not eligible for idle
@@ -91,14 +72,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         let control_plane = self
             .control_plane_last_active
             .lock()
-            .expect("control_plane_last_active poisoned")
             .get(&record.id)
             .map(|t| t.elapsed())
             .unwrap_or(db_elapsed);
         let network = self
             .network_last_active
             .lock()
-            .expect("network_last_active poisoned")
             .get(&record.id)
             .map(|t| t.elapsed())
             .unwrap_or(db_elapsed);
@@ -154,10 +133,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         let mut became_active = false;
         {
-            let mut nc = self
-                .network_counters
-                .lock()
-                .expect("network_counters poisoned");
+            let mut nc = self.network_counters.lock();
             for pf in &forwards {
                 let key = format!("husker-pf:{tap}:{}", pf.host_port);
                 let new_counts = counters.get(&key).copied().unwrap_or((0, 0));
@@ -287,13 +263,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// "now" semantics so a test can stage a VM as already idle.
     #[cfg(all(test, feature = "linux-net"))]
     pub(crate) fn set_last_active_for_test(&self, id: Uuid, at: std::time::Instant) {
-        self.control_plane_last_active
-            .lock()
-            .expect("control_plane_last_active poisoned")
-            .insert(id, at);
-        self.network_last_active
-            .lock()
-            .expect("network_last_active poisoned")
-            .insert(id, at);
+        self.control_plane_last_active.lock().insert(id, at);
+        self.network_last_active.lock().insert(id, at);
     }
 }

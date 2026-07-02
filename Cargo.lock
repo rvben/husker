@@ -1011,6 +1011,7 @@ dependencies = [
  "husker-storage",
  "husker-vmm",
  "libc",
+ "parking_lot",
  "ring",
  "serde",
  "serde_json",

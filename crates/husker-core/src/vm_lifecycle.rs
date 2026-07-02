@@ -1054,10 +1054,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 if let Err(e) = husker_net::delete_tap(tap).await {
                     warn!(%name, tap, error = %e, "failed to delete TAP device during destroy");
                 }
-                let mut nc = self
-                    .network_counters
-                    .lock()
-                    .expect("network_counters poisoned");
+                let mut nc = self.network_counters.lock();
                 for pf in &forwards {
                     nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
                 }
@@ -1075,12 +1072,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             // the host port it holds is freed instead of staying bound, which
             // would otherwise surface as EADDRINUSE the next time the port is
             // reused.
-            if let Some(proxy) = self
-                .resume_listeners
-                .lock()
-                .expect("resume_listeners poisoned")
-                .remove(&record.id)
-            {
+            if let Some(proxy) = self.resume_listeners.lock().remove(&record.id) {
                 proxy.drain_and_close(record.id);
             }
         }
@@ -1122,18 +1114,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Drop this VM's idle-policy bookkeeping. Without this every destroyed
         // VM leaks a map entry forever (a slow but unbounded memory leak in a
         // long-running daemon that creates/destroys VMs continuously).
-        self.control_plane_last_active
-            .lock()
-            .expect("control_plane_last_active poisoned")
-            .remove(&record.id);
-        self.network_last_active
-            .lock()
-            .expect("network_last_active poisoned")
-            .remove(&record.id);
-        self.active_sessions
-            .lock()
-            .expect("active_sessions poisoned")
-            .remove(&record.id);
+        self.control_plane_last_active.lock().remove(&record.id);
+        self.network_last_active.lock().remove(&record.id);
+        self.active_sessions.lock().remove(&record.id);
 
         self.state.delete_vm(record.id)?;
         info!(%name, "VM destroyed");

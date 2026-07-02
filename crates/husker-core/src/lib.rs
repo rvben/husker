@@ -731,7 +731,7 @@ pub struct HuskerCore<B: VmmBackend> {
     /// filesystem IO (the reflink probe writes a temp file), so the cache bounds
     /// that work to once per `DIAGNOSTICS_CACHE_TTL` even under frequent metrics
     /// scrapes. Shared by `/v1/metrics` and `/v1/diagnostics`.
-    diagnostics_cache: std::sync::Mutex<Option<(std::time::Instant, DiagnosticsReport)>>,
+    diagnostics_cache: parking_lot::Mutex<Option<(std::time::Instant, DiagnosticsReport)>>,
     #[cfg(feature = "linux-net")]
     ovmf_code_path: PathBuf,
     #[cfg(feature = "linux-net")]
@@ -770,26 +770,29 @@ pub struct HuskerCore<B: VmmBackend> {
     profiles: std::collections::HashMap<String, DaemonProfile>,
     runtime_dir: PathBuf,
     /// Per-VM-name locks guarding the create/destroy critical section.
-    vm_name_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    vm_name_locks:
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-service reconcile locks; serialize concurrent reconciles of the same service.
-    reconcile_locks: std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    reconcile_locks:
+        parking_lot::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     /// Last control-plane activity (exec/shell/API touch) per VM, feeding the
     /// idle policy's `idle_for` calculation. In-memory only; a daemon restart
     /// loses history, but `seed_activity` reseeds a VM's clock on next sighting.
     control_plane_last_active:
-        Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
+        Arc<parking_lot::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
     /// Last network activity (port-forward byte delta) per VM, feeding the idle
     /// policy's `idle_for` calculation alongside `control_plane_last_active`.
-    network_last_active: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
+    network_last_active:
+        Arc<parking_lot::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
     /// Last-seen cumulative (packets, bytes) per forward comment, for delta
     /// detection: a growing counter between polls means the forward is active.
     /// Only populated on Linux, where nftables counters exist to diff against.
     #[cfg(feature = "linux-net")]
-    network_counters: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
+    network_counters: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
     /// Open-session refcount per VM (attached exec/shell streams). A non-zero
     /// count shields a VM from idle suspension regardless of its last-activity
     /// timestamps; see [`HuskerCore::begin_session`] and [`ActiveSessionGuard`].
-    active_sessions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+    active_sessions: Arc<parking_lot::Mutex<std::collections::HashMap<Uuid, u64>>>,
     /// Idle-policy defaults applied to opted-in VMs.
     idle_policy: IdlePolicyConfig,
     /// Idle-policy action counters, exposed via `/v1/metrics`.
@@ -803,7 +806,7 @@ pub struct HuskerCore<B: VmmBackend> {
     /// VM) after the DNAT rules are torn down. Type-erased because the
     /// `ResumeDialer`'s closure type is anonymous and cannot be named here.
     #[cfg(feature = "linux-net")]
-    resume_listeners: std::sync::Mutex<
+    resume_listeners: parking_lot::Mutex<
         std::collections::HashMap<Uuid, Box<dyn crate::port_proxy::ResumeListenerHandle>>,
     >,
 }
@@ -975,7 +978,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage_driver: husker_storage::default_storage_driver(),
             storage_volume: false,
             resource_limits: false,
-            diagnostics_cache: std::sync::Mutex::new(None),
+            diagnostics_cache: parking_lot::Mutex::new(None),
             ovmf_code_path: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
             ovmf_vars_template_path: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
             embedded_agent: &[],
@@ -991,17 +994,19 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_cpus: None,
             profiles: std::collections::HashMap::new(),
             runtime_dir,
-            vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            control_plane_last_active: Arc::new(std::sync::Mutex::new(
+            vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            control_plane_last_active: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            network_last_active: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            network_counters: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            network_last_active: Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            network_counters: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            active_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             idle_policy: IdlePolicyConfig::default(),
             idle_metrics: Arc::new(IdleMetrics::default()),
-            resume_listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
+            resume_listeners: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1023,7 +1028,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             storage_driver: husker_storage::default_storage_driver(),
             storage_volume: false,
             resource_limits: false,
-            diagnostics_cache: std::sync::Mutex::new(None),
+            diagnostics_cache: parking_lot::Mutex::new(None),
             embedded_agent: &[],
             default_kernel: None,
             default_rootfs: None,
@@ -1032,13 +1037,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_cpus: None,
             profiles: std::collections::HashMap::new(),
             runtime_dir,
-            vm_name_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            reconcile_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            control_plane_last_active: Arc::new(std::sync::Mutex::new(
+            vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            control_plane_last_active: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            network_last_active: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            network_last_active: Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            active_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             idle_policy: IdlePolicyConfig::default(),
             idle_metrics: Arc::new(IdleMetrics::default()),
             port_proxy: Arc::new(crate::port_proxy::PortProxy::new(
@@ -1121,8 +1128,6 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// callers serialize on it and reuse the single fresh result instead of each
     /// launching a redundant probe (no thundering herd). The probe is short, and
     /// the common case (a hit) acquires and releases the lock immediately.
-    /// Poisoned-lock safe: a poisoned mutex falls back to a fresh, uncached
-    /// computation.
     pub fn diagnostics(&self) -> DiagnosticsReport {
         let build = || {
             let input = DiagnosticsInput {
@@ -1134,9 +1139,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             };
             build_diagnostics(&input)
         };
-        let Ok(mut cache) = self.diagnostics_cache.lock() else {
-            return build();
-        };
+        let mut cache = self.diagnostics_cache.lock();
         if let Some((computed_at, report)) = cache.as_ref()
             && computed_at.elapsed() < DIAGNOSTICS_CACHE_TTL
         {
@@ -1238,7 +1241,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     }
 
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.vm_name_locks.lock().expect("vm_name_locks poisoned");
+        let mut map = self.vm_name_locks.lock();
         map.entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -2174,7 +2177,7 @@ pub fn evaluate_policy(
 /// the per-VM session refcount on drop, so a cancelled or panicking stream can
 /// never leak the count and strand a VM pinned-active.
 pub struct ActiveSessionGuard {
-    sessions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+    sessions: Arc<parking_lot::Mutex<std::collections::HashMap<Uuid, u64>>>,
     id: Uuid,
 }
 
@@ -2183,7 +2186,7 @@ impl ActiveSessionGuard {
     /// within this crate (e.g. the macOS userspace port-forward proxy) that
     /// hold a VM id and the shared session map but not a `HuskerCore` reference.
     pub(crate) fn from_parts(
-        sessions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+        sessions: Arc<parking_lot::Mutex<std::collections::HashMap<Uuid, u64>>>,
         id: Uuid,
     ) -> Self {
         Self { sessions, id }
@@ -2192,7 +2195,7 @@ impl ActiveSessionGuard {
 
 impl Drop for ActiveSessionGuard {
     fn drop(&mut self) {
-        let mut map = self.sessions.lock().expect("active_sessions poisoned");
+        let mut map = self.sessions.lock();
         if let Some(n) = map.get_mut(&self.id) {
             *n = n.saturating_sub(1);
             if *n == 0 {

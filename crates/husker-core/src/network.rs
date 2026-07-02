@@ -220,7 +220,6 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.state.delete_port_forward(host_port)?;
         self.network_counters
             .lock()
-            .expect("network_counters poisoned")
             .remove(&format!("husker-pf:{tap_name}:{host_port}"));
 
         info!(%name, host_port, "port forward removed");
