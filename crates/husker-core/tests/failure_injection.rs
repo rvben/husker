@@ -213,6 +213,12 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
 
 /// A fresh core with no pre-inserted VM, whose data dir is a real temp path so
 /// the create path can clone a rootfs before the (failing) vmm step.
+///
+/// macOS/VZ only: the Linux (`linux-net`) create path performs real `ip tuntap`
+/// TAP creation before reaching the mockable vmm step, which needs root, mutates
+/// host network state, and collides with a live daemon - not unit-testable. The
+/// Linux create-rollback belongs in a gated e2e or behind a mockable net layer.
+#[cfg(not(feature = "linux-net"))]
 fn fresh_core(data_dir: &std::path::Path, fail_ops: &[&'static str]) -> Arc<HuskerCore<FailingVmm>> {
     let vmm = FailingVmm::new(fail_ops);
     let state_store = husker_state::StateStore::open_memory().unwrap();
@@ -221,29 +227,15 @@ fn fresh_core(data_dir: &std::path::Path, fail_ops: &[&'static str]) -> Arc<Husk
         state_dir: data_dir.to_path_buf(),
     };
     let runtime_dir = data_dir.join("run");
-    #[cfg(feature = "linux-net")]
-    {
-        Arc::new(HuskerCore::new(
-            vmm,
-            state_store,
-            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
-            storage,
-            "husker0".into(),
-            vec!["8.8.8.8".into()],
-            runtime_dir,
-        ))
-    }
-    #[cfg(not(feature = "linux-net"))]
-    {
-        Arc::new(HuskerCore::new(vmm, state_store, storage, runtime_dir))
-    }
+    Arc::new(HuskerCore::new(vmm, state_store, storage, runtime_dir))
 }
 
+#[cfg(not(feature = "linux-net"))]
 #[tokio::test]
 async fn create_failure_rolls_back_and_leaves_no_vm_record() {
     // FailingVmm fails create AFTER the core has allocated resources (CID, vm_dir,
-    // vm_id, and on Linux the IP/TAP). The AllocatedResources rollback must unwind
-    // them so no partial VM record is left behind.
+    // vm_id). The AllocatedResources rollback must unwind them so no partial VM
+    // record is left behind.
     let tmp = tempfile::tempdir().unwrap();
     let rootfs = tmp.path().join("rootfs.ext4");
     // A 1 MiB file with the ext4 superblock magic (0xEF53 at byte offset 1080)
