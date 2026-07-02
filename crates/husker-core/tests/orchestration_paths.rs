@@ -1749,6 +1749,32 @@ async fn create_service_rejects_unsafe_names() {
 }
 
 #[tokio::test]
+async fn fork_vm_rejects_unsafe_fork_names() {
+    // fork builds `data_dir/vms/<fork_name>` and recursively deletes/recreates it.
+    // An absolute or `..`-laden fork name must be rejected before any filesystem
+    // operation, exactly like every other resource-creation path.
+    let tmp = tempfile::tempdir().unwrap();
+    let core = make_core(&tmp);
+    for name in PATH_TRAVERSAL_NAMES {
+        let err = core.fork_vm("any-source", name).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(_)),
+            "fork_vm should reject fork name {name:?} with InvalidArgument, got {err:?}"
+        );
+    }
+    // An absolute path is the most dangerous case (PathBuf::join replaces the whole
+    // path), so assert it explicitly too.
+    let err = core
+        .fork_vm("any-source", "/tmp/husker-escape")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::InvalidArgument(_)),
+        "fork_vm should reject an absolute fork name, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn restore_snapshot_rejects_unsafe_target_names() {
     let tmp = tempfile::tempdir().unwrap();
     let core = make_core(&tmp);

@@ -417,6 +417,20 @@ fn validate_resource_name(kind: &str, name: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Whether an agent-reported guest IPv4 is a plausible unicast address for the
+/// host to dial or DNAT to. The guest agent runs inside an untrusted (potentially
+/// compromised) workload, so its self-reported address must be validated before
+/// the host acts on it: otherwise a malicious guest could report `127.0.0.1` and
+/// make a later `port forward` dial/DNAT to the host's own loopback services.
+/// Rejects loopback, link-local, multicast, unspecified (`0.0.0.0`) and broadcast.
+fn is_plausible_guest_ip(ip: &std::net::Ipv4Addr) -> bool {
+    !(ip.is_loopback()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_link_local())
+}
+
 /// Map an OCI/Docker reference to a deterministic catalog image name, so repeat
 /// `run`/`job` of the same reference reuse the cached import. Characters not
 /// allowed in a resource name become `-` (e.g. `python:3.12-alpine` ->
@@ -3012,6 +3026,12 @@ impl<B: VmmBackend> HuskerCore<B> {
     #[cfg(feature = "linux-net")]
     pub async fn fork_vm(&self, source_name: &str, fork_name: &str) -> Result<VmRecord, CoreError> {
         info!(%source_name, %fork_name, "forking VM");
+        // Validate the caller-supplied fork name before it is used to build any
+        // filesystem path (the fork's vm_dir is `data_dir/vms/<fork_name>`, which is
+        // deleted and recreated). Without this, an absolute or `..`-laden name escapes
+        // the data dir. Every other resource-creation path validates its name; fork
+        // must too.
+        validate_resource_name("vm", fork_name)?;
         if source_name == fork_name {
             return Err(CoreError::InvalidArgument(
                 "fork name must differ from the source name".into(),
@@ -3251,8 +3271,11 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub async fn fork_vm(
         &self,
         _source_name: &str,
-        _fork_name: &str,
+        fork_name: &str,
     ) -> Result<VmRecord, CoreError> {
+        // Reject unsafe fork names identically to the Linux path, so the
+        // name-validation contract does not depend on the build feature set.
+        validate_resource_name("vm", fork_name)?;
         Err(CoreError::Vmm(husker_vmm::VmmError::Unsupported(
             "fork is only supported on Linux (Firecracker)".into(),
         )))
@@ -3499,10 +3522,26 @@ impl<B: VmmBackend> HuskerCore<B> {
             return;
         };
 
-        if let Err(e) = self.state.update_vm_guest_ip(vm.id, &ip) {
+        // The agent's reported address is untrusted guest input. Validate it before
+        // persisting, so the host never later dials or DNATs to loopback/link-local/
+        // multicast/etc. off the back of a compromised guest.
+        let parsed = match ip.parse::<std::net::Ipv4Addr>() {
+            Ok(addr) if is_plausible_guest_ip(&addr) => addr,
+            Ok(addr) => {
+                warn!(name = %vm.name, reported = %addr, "discover_guest_ip: agent reported an implausible guest IP (loopback/link-local/multicast/unspecified/broadcast); ignoring");
+                return;
+            }
+            Err(e) => {
+                warn!(name = %vm.name, reported = %ip, error = %e, "discover_guest_ip: agent reported an unparseable IPv4; ignoring");
+                return;
+            }
+        };
+
+        let canonical = parsed.to_string();
+        if let Err(e) = self.state.update_vm_guest_ip(vm.id, &canonical) {
             warn!(name = %vm.name, error = %e, "discover_guest_ip: failed to persist guest IP");
         }
-        vm.guest_ip = Some(ip);
+        vm.guest_ip = Some(canonical);
     }
 
     /// Refresh a persisted VM record against the backend's live process view.
@@ -6359,6 +6398,34 @@ pub struct IdleMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plausible_guest_ip_accepts_lan_and_nat_addresses() {
+        // Typical VZ NAT and private-range guest addresses.
+        for ip in ["192.168.64.2", "10.0.2.15", "172.20.0.3", "198.51.100.7"] {
+            assert!(
+                is_plausible_guest_ip(&ip.parse().unwrap()),
+                "{ip} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn plausible_guest_ip_rejects_untrustworthy_addresses() {
+        // A compromised guest could report any of these; the host must not act on them.
+        for ip in [
+            "127.0.0.1",       // loopback -> would redirect port forwards to host services
+            "0.0.0.0",         // unspecified
+            "255.255.255.255", // broadcast
+            "169.254.10.1",    // link-local
+            "224.0.0.1",       // multicast
+        ] {
+            assert!(
+                !is_plausible_guest_ip(&ip.parse().unwrap()),
+                "{ip} must be rejected"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn write_file_atomic_writes_content_and_removes_temp() {
