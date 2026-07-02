@@ -115,7 +115,7 @@ enum Commands {
         initrd: Option<PathBuf>,
 
         /// Number of vCPUs (default: 1)
-        #[arg(long)]
+        #[arg(long, visible_alias = "vcpus")]
         cpus: Option<u32>,
 
         /// Memory in MiB (default: 128)
@@ -344,7 +344,7 @@ enum Commands {
         initrd: Option<PathBuf>,
 
         /// Number of vCPUs (default: 1)
-        #[arg(long)]
+        #[arg(long, visible_alias = "vcpus")]
         cpus: Option<u32>,
 
         /// Memory in MiB (default: 128)
@@ -778,7 +778,7 @@ enum ServiceAction {
         #[arg(long)]
         initrd: Option<PathBuf>,
         /// Number of vCPUs per instance
-        #[arg(long)]
+        #[arg(long, visible_alias = "cpus")]
         vcpus: Option<u32>,
         /// Memory per instance in MiB
         #[arg(long)]
@@ -842,7 +842,7 @@ enum PoolAction {
         kernel: Option<PathBuf>,
         #[arg(long)]
         initrd: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, visible_alias = "cpus")]
         vcpus: Option<u32>,
         #[arg(long)]
         memory: Option<u32>,
@@ -903,7 +903,7 @@ enum SnapshotAction {
         #[arg(long)]
         initrd: Option<PathBuf>,
         /// Number of vCPUs (omit to use the daemon's configured default)
-        #[arg(long)]
+        #[arg(long, visible_alias = "vcpus")]
         cpus: Option<u32>,
         /// Memory in MiB (omit to use the daemon's configured default)
         #[arg(long)]
