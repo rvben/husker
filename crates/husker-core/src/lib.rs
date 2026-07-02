@@ -755,6 +755,8 @@ pub struct HuskerCore<B: VmmBackend> {
     network_last_active: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
     /// Last-seen cumulative (packets, bytes) per forward comment, for delta
     /// detection: a growing counter between polls means the forward is active.
+    /// Only populated on Linux, where nftables counters exist to diff against.
+    #[cfg(feature = "linux-net")]
     network_counters: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
     /// Open-session refcount per VM (attached exec/shell streams). A non-zero
     /// count shields a VM from idle suspension regardless of its last-activity
@@ -1008,7 +1010,6 @@ impl<B: VmmBackend> HuskerCore<B> {
                 std::collections::HashMap::new(),
             )),
             network_last_active: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            network_counters: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             idle_policy: IdlePolicyConfig::default(),
             idle_metrics: Arc::new(IdleMetrics::default()),
@@ -1206,16 +1207,6 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Idle-policy action counters, exposed via `/v1/metrics`.
     pub fn idle_metrics(&self) -> &IdleMetrics {
         &self.idle_metrics
-    }
-
-    /// Last-seen cumulative (packets, bytes) per forward comment. The idle
-    /// policy's network-activity poll compares a fresh nftables read against
-    /// this map to detect a growing counter (traffic since the last poll) and
-    /// calls [`HuskerCore::mark_network_active`] when it finds one.
-    pub fn network_counters(
-        &self,
-    ) -> &Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>> {
-        &self.network_counters
     }
 
     /// Record control-plane activity (an exec/shell/API touch) against a VM's
@@ -1449,12 +1440,17 @@ impl<B: VmmBackend> HuskerCore<B> {
                             self.active_session_count(fresh.id) > 0,
                             self.state.count_live_forks_of(fresh.id).unwrap_or(0) > 0,
                         );
-                        if matches!(re, PolicyAction::Suspend)
-                            && self.suspend_vm_locked(&fresh).await.is_ok()
-                        {
-                            self.idle_metrics
-                                .suspended_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if matches!(re, PolicyAction::Suspend) {
+                            match self.suspend_vm_locked(&fresh).await {
+                                Ok(_) => {
+                                    self.idle_metrics
+                                        .suspended_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    warn!(vm = %fresh.name, error = %e, "idle tick: suspend failed")
+                                }
+                            }
                         }
                     }
                 }
@@ -1468,12 +1464,17 @@ impl<B: VmmBackend> HuskerCore<B> {
                             self.active_session_count(fresh.id) > 0,
                             self.state.count_live_forks_of(fresh.id).unwrap_or(0) > 0,
                         );
-                        if matches!(re, PolicyAction::Reap)
-                            && self.destroy_vm_locked(&fresh).await.is_ok()
-                        {
-                            self.idle_metrics
-                                .reaped_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if matches!(re, PolicyAction::Reap) {
+                            match self.destroy_vm_locked(&fresh).await {
+                                Ok(_) => {
+                                    self.idle_metrics
+                                        .reaped_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    warn!(vm = %fresh.name, error = %e, "idle tick: reap failed")
+                                }
+                            }
                         }
                     }
                 }
@@ -9921,6 +9922,16 @@ mod idle_policy_tests {
     fn running_idle_past_threshold_suspends() {
         let r = running(Some(60));
         let a = evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(61)), false, false);
+        assert!(matches!(a, PolicyAction::Suspend));
+    }
+
+    #[test]
+    fn running_idle_timeout_zero_suspends_immediately() {
+        // idle_timeout_secs = Some(0) means "suspend as soon as idle" (see the
+        // --idle-timeout help text), not "policy disabled" - guard against a
+        // future refactor reintroducing a `> 0` sentinel that would break this.
+        let r = running(Some(0));
+        let a = evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(0)), false, false);
         assert!(matches!(a, PolicyAction::Suspend));
     }
 

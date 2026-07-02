@@ -3002,11 +3002,15 @@ async fn run(cli: Cli) -> Result<()> {
                     || !env.is_empty()
                     || !dns.is_empty()
                     || !add_host.is_empty()
+                    || idle
+                    || idle_timeout.is_some()
+                    || suspend_ttl.is_some()
+                    || no_auto_resume
                 {
                     exit_with_error(
                         output,
                         format!(
-                            "--pool cannot be combined with rootfs/boot/config flags \
+                            "--pool cannot be combined with rootfs/boot/config/idle flags \
                              (pool '{pool}' defines the VM); pass only --name"
                         ),
                     );
@@ -3662,11 +3666,15 @@ async fn run(cli: Cli) -> Result<()> {
                     || profile.is_some()
                     || balloon
                     || !ssh_key.is_empty()
+                    || idle
+                    || idle_timeout.is_some()
+                    || suspend_ttl.is_some()
+                    || no_auto_resume
                 {
                     exit_with_error(
                         output,
                         format!(
-                            "--pool cannot be combined with rootfs/boot flags (pool '{pool}' \
+                            "--pool cannot be combined with rootfs/boot/idle flags (pool '{pool}' \
                              defines the VM image); pass only --name and the command"
                         ),
                     );
