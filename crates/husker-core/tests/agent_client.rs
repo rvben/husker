@@ -689,6 +689,7 @@ async fn guest_info_returns_info_with_addresses() {
             &mut server,
             &AgentResponse::GuestInfo(GuestInfoResponse {
                 ipv4: vec!["192.0.2.7".into(), "198.51.100.1".into()],
+                protocol_version: husker_agent_proto::PROTOCOL_VERSION,
             }),
         )
         .await
@@ -698,5 +699,6 @@ async fn guest_info_returns_info_with_addresses() {
     let mut conn = AgentConnection::new(client);
     let info = conn.guest_info().await.unwrap();
     assert_eq!(info.ipv4, vec!["192.0.2.7", "198.51.100.1"]);
+    assert_eq!(info.protocol_version, husker_agent_proto::PROTOCOL_VERSION);
     server_task.await.unwrap();
 }

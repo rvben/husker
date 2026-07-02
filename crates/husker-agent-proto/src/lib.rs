@@ -182,6 +182,11 @@ pub struct ErrorResponse {
 pub struct GuestInfoResponse {
     /// Non-loopback IPv4 addresses, primary first.
     pub ipv4: Vec<String>,
+    /// Wire-protocol version the guest agent implements. Absent (deserialized
+    /// as 0) for agents built before protocol versioning; the host uses it to
+    /// detect and warn about a daemon/guest mismatch on connect.
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 /// New network identity to apply to a guest interface after restore/fork.
@@ -292,16 +297,25 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Default vsock port the guest agent listens on.
 pub const AGENT_VSOCK_PORT: u32 = 52;
 
+/// Wire-protocol version implemented by this build of the agent and host.
+///
+/// Bump this whenever the framed message contract changes in a way that a peer
+/// must be aware of. The agent reports it via [`GuestInfoResponse`], and the
+/// host warns when a connected guest reports a different (non-zero) version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Default wall-clock deadline for receiving a single framed payload once
 /// the length prefix has been read. Callers who need a different bound can
 /// use [`read_message_with_timeout`]. Operators can override the default
 /// via the `HUSKER_PROTO_READ_TIMEOUT_SECS` environment variable.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 
-/// Upper bound on a single chunk read while receiving a payload. Growing
-/// the buffer one chunk at a time keeps per-connection memory proportional
-/// to bytes actually received rather than to the length the peer declared.
-const PAYLOAD_READ_CHUNK: usize = 64 * 1024;
+/// Upper bound on a single chunk read while receiving a payload (64 KiB).
+/// Growing the buffer one chunk at a time keeps per-connection memory
+/// proportional to bytes actually received rather than to the length the peer
+/// declared. Written as a literal so mutating an arithmetic operator cannot
+/// silently drive it to zero (which would spin the chunked read loop).
+const PAYLOAD_READ_CHUNK: usize = 65_536;
 
 /// Resolve the payload read timeout, honouring `HUSKER_PROTO_READ_TIMEOUT_SECS`.
 pub fn default_read_timeout() -> Duration {
@@ -354,20 +368,8 @@ where
     // Payload: bounded deadline + chunked allocation. Growing the buffer as
     // bytes arrive means a peer cannot force MAX_MESSAGE_SIZE of RAM to be
     // reserved up front by claiming a large length it never delivers.
-    let payload_fut = async {
-        let mut payload: Vec<u8> = Vec::with_capacity(len.min(PAYLOAD_READ_CHUNK));
-        let mut remaining = len;
-        while remaining > 0 {
-            let this_chunk = remaining.min(PAYLOAD_READ_CHUNK);
-            let start = payload.len();
-            payload.resize(start + this_chunk, 0);
-            stream.read_exact(&mut payload[start..]).await?;
-            remaining -= this_chunk;
-        }
-        Ok::<_, std::io::Error>(payload)
-    };
-
-    let payload = match tokio::time::timeout(payload_timeout, payload_fut).await {
+    let payload = match tokio::time::timeout(payload_timeout, read_exact_chunked(stream, len)).await
+    {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => {
@@ -380,6 +382,25 @@ where
 
     let msg = serde_json::from_slice(&payload)?;
     Ok(Some(msg))
+}
+
+/// Read exactly `len` bytes from `stream`, growing the buffer one
+/// [`PAYLOAD_READ_CHUNK`]-sized piece at a time so a peer cannot force a large
+/// up-front allocation by declaring a length it never delivers.
+async fn read_exact_chunked<S>(stream: &mut S, len: usize) -> std::io::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut payload: Vec<u8> = Vec::with_capacity(len.min(PAYLOAD_READ_CHUNK));
+    let mut remaining = len;
+    while remaining > 0 {
+        let this_chunk = remaining.min(PAYLOAD_READ_CHUNK);
+        let start = payload.len();
+        payload.resize(start + this_chunk, 0);
+        stream.read_exact(&mut payload[start..]).await?;
+        remaining -= this_chunk;
+    }
+    Ok(payload)
 }
 
 /// Write a single length-prefixed JSON message to an async stream.
@@ -537,13 +558,33 @@ mod tests {
 
         let resp = AgentResponse::GuestInfo(GuestInfoResponse {
             ipv4: vec!["192.0.2.7".into()],
+            protocol_version: PROTOCOL_VERSION,
         });
         let bytes = serde_json::to_vec(&resp).unwrap();
         let back: AgentResponse = serde_json::from_slice(&bytes).unwrap();
         match back {
-            AgentResponse::GuestInfo(g) => assert_eq!(g.ipv4, vec!["192.0.2.7".to_string()]),
+            AgentResponse::GuestInfo(g) => {
+                assert_eq!(g.ipv4, vec!["192.0.2.7".to_string()]);
+                assert_eq!(g.protocol_version, PROTOCOL_VERSION);
+            }
             other => panic!("expected GuestInfo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn guest_info_protocol_version_defaults_to_zero_for_legacy_agents() {
+        // An agent built before protocol versioning omits the field entirely;
+        // the host must still decode the response, seeing version 0.
+        let legacy = r#"{"type":"GuestInfo","ipv4":["192.0.2.7"]}"#;
+        let back: AgentResponse = serde_json::from_str(legacy).unwrap();
+        match back {
+            AgentResponse::GuestInfo(g) => {
+                assert_eq!(g.ipv4, vec!["192.0.2.7".to_string()]);
+                assert_eq!(g.protocol_version, 0, "legacy agent reports version 0");
+            }
+            other => panic!("expected GuestInfo, got {other:?}"),
+        }
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 
     #[test]

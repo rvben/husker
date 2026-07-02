@@ -603,7 +603,10 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                         _ => None,
                     })
                     .collect();
-                AgentResponse::GuestInfo(GuestInfoResponse { ipv4 })
+                AgentResponse::GuestInfo(GuestInfoResponse {
+                    ipv4,
+                    protocol_version: husker_agent_proto::PROTOCOL_VERSION,
+                })
             }
             Err(e) => AgentResponse::Error(ErrorResponse {
                 message: format!("get_if_addrs failed: {e}"),

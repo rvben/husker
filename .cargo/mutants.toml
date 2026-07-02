@@ -8,9 +8,11 @@
 # flaky tests without catching a real defect. Each is anchored narrowly so it
 # does not mask a genuine survivor.
 #
-# NOTE: the read-loop exclusion is line-anchored (`:360:`) to hit only the loop
-# counter, not the size guard on line 350 which IS tested. If these lines move,
-# update the anchor.
+# All exclusions are anchored on the containing function name (not line numbers)
+# so they survive edits elsewhere in the file. The chunked payload read lives in
+# its own `read_exact_chunked` helper precisely so its loop-counter mutant can be
+# excluded by name without also excluding the size guard in
+# `read_message_with_timeout`, which IS tested.
 exclude_re = [
     # base64 combines NON-overlapping bit fields, e.g. `(x & 0x03) << 4` sets
     # bits 4-5 while `y >> 4` sets bits 0-3, so bitwise-OR and XOR are identical
@@ -29,11 +31,7 @@ exclude_re = [
     # are only observable as a wall-clock timeout, which is non-deterministic in
     # CI. Correct termination for valid inputs is covered by the round-trip and
     # chunked-read tests.
-    ':360:\d+: replace > with >= in read_message_with_timeout', # `while remaining > 0`
-    'replace \+= with \*= in base64_encode',                    # `i += 3`
-    'replace \+= with \*= in base64_decode',                    # `i += 4`
-    # `PAYLOAD_READ_CHUNK = 64 / 1024 = 0` makes the chunked read loop spin
-    # forever (zero-length chunks). The `* -> +` variant on this line yields a
-    # non-zero chunk and IS caught by `framing_size_constants_are_exact`.
-    ':304:\d+: replace \* with /',
+    'replace > with >= in read_exact_chunked', # `while remaining > 0`
+    'replace \+= with \*= in base64_encode',   # `i += 3`
+    'replace \+= with \*= in base64_decode',   # `i += 4`
 ]

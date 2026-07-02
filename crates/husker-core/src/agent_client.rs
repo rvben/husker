@@ -7,6 +7,7 @@ use husker_agent_proto::{
     base64_encode, read_message, write_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::{debug, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -28,6 +29,27 @@ pub enum AgentError {
         /// level that produced the error has no access to the VM's logs.
         detail: String,
     },
+}
+
+/// Warn when a connected guest agent reports a protocol version that differs
+/// from this daemon's. Version 0 means the agent predates protocol versioning
+/// (logged at debug, not warn, to avoid noise for older guests).
+fn warn_on_protocol_mismatch(guest_version: u32) {
+    use husker_agent_proto::PROTOCOL_VERSION;
+    if guest_version == PROTOCOL_VERSION {
+        debug!(
+            protocol_version = guest_version,
+            "guest agent protocol version matches daemon"
+        );
+    } else if guest_version == 0 {
+        debug!("guest agent predates protocol versioning (reports version 0)");
+    } else {
+        warn!(
+            guest_protocol_version = guest_version,
+            daemon_protocol_version = PROTOCOL_VERSION,
+            "guest agent protocol version differs from daemon; some features may be unavailable"
+        );
+    }
 }
 
 /// Factory for creating agent connections.
@@ -163,7 +185,10 @@ where
             .await?
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
-            AgentResponse::GuestInfo(info) => Ok(info),
+            AgentResponse::GuestInfo(info) => {
+                warn_on_protocol_mismatch(info.protocol_version);
+                Ok(info)
+            }
             AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
             _ => Err(AgentError::UnexpectedResponse),
         }
