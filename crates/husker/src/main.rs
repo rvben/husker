@@ -7775,6 +7775,99 @@ fn storage_mount_satisfied(storage_volume: bool, sentinel_exists: bool) -> bool 
     !storage_volume || sentinel_exists
 }
 
+/// Remove `vms_dir` subdirectories that have no backing VM record. These are
+/// orphaned rootfs clones left by a failed create or an interrupted destroy.
+/// Pure filesystem logic (unit-tested); suspend snapshots live under
+/// `data_dir/suspend/`, not `vms_dir`, so they are never touched.
+fn remove_orphan_clone_dirs(
+    vms_dir: &Path,
+    known_names: &std::collections::HashSet<&str>,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(vms_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !known_names.contains(name) && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Reconcile host resources against DB state on startup: reclaim the TAP devices
+/// and API/vsock sockets of VMs that are no longer running, and remove orphaned
+/// rootfs clone directories. Scoped to this daemon's own state and data dir, so a
+/// co-located daemon's resources are never touched.
+///
+/// Runs after `mark_stale_vms_stopped`, so at this point nothing this daemon
+/// manages is running. Suspended VMs are skipped: they intentionally preserve
+/// their TAP, IP, and rootfs so `resume` can restore the same identity in place.
+async fn reconcile_host_resources(
+    state: &husker_state::StateStore,
+    storage: &husker_storage::StorageConfig,
+    runtime_dir: &Path,
+) {
+    let vms = match state.list_vms() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "host reconcile: could not list VMs");
+            return;
+        }
+    };
+    let known_names: std::collections::HashSet<&str> =
+        vms.iter().map(|v| v.name.as_str()).collect();
+
+    #[cfg(feature = "linux-net")]
+    let mut taps = 0usize;
+    let mut socks = 0usize;
+    for vm in &vms {
+        // Suspended VMs keep their TAP/sockets/rootfs for resume; leave them.
+        if vm.state == "suspended" {
+            continue;
+        }
+        #[cfg(feature = "linux-net")]
+        if let Some(tap) = vm.tap_device.as_deref()
+            && husker_net::delete_tap(tap).await.is_ok()
+        {
+            taps += 1;
+        }
+        for ext in ["sock", "vsock"] {
+            let p = runtime_dir.join(format!("{}.{ext}", vm.id));
+            if p.exists() && std::fs::remove_file(&p).is_ok() {
+                socks += 1;
+            }
+        }
+    }
+
+    let dirs = remove_orphan_clone_dirs(&storage.vms_dir(), &known_names);
+
+    #[cfg(feature = "linux-net")]
+    if taps + socks + dirs > 0 {
+        tracing::info!(
+            taps,
+            socks,
+            dirs,
+            "reconciled leaked host resources from a prior run"
+        );
+    }
+    #[cfg(not(feature = "linux-net"))]
+    if socks + dirs > 0 {
+        tracing::info!(
+            socks,
+            dirs,
+            "reconciled leaked host resources from a prior run"
+        );
+    }
+}
+
 async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     tracing::info!("starting husker daemon");
 
@@ -7859,6 +7952,11 @@ async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
     if stale_count > 0 {
         tracing::info!(stale_count, "marked stale VMs as stopped");
     }
+
+    // Reclaim host resources (TAP devices, sockets, orphaned rootfs clones) that a
+    // prior daemon incarnation may have leaked on an unclean exit. Runs after the
+    // stale-state pass, so nothing this daemon manages is running.
+    reconcile_host_resources(&state, &storage, &runtime_dir).await;
 
     // macOS userspace port-forward proxies do not survive a daemon restart, so
     // every persisted forward is stale. Clear them so `list` reflects reality.
@@ -10143,6 +10241,33 @@ mod tests {
         std::fs::write(&config_path, "api_token = \"from-config\"\n").unwrap();
         let config = load_config_strict(Some(&config_path)).expect("valid config parses");
         assert_eq!(config.api_token.as_deref(), Some("from-config"));
+    }
+
+    #[test]
+    fn remove_orphan_clone_dirs_removes_only_unknown_dirs() {
+        let root = temp_test_dir("orphan-clone-dirs");
+        let vms_dir = root.join("vms");
+        std::fs::create_dir_all(vms_dir.join("keep")).unwrap();
+        std::fs::create_dir_all(vms_dir.join("orphan")).unwrap();
+        std::fs::write(vms_dir.join("keep").join("rootfs.ext4"), b"x").unwrap();
+        std::fs::write(vms_dir.join("orphan").join("rootfs.ext4"), b"x").unwrap();
+        // A stray file (not a directory) must be left untouched.
+        std::fs::write(vms_dir.join("SHA256SUMS"), b"x").unwrap();
+
+        let mut known = std::collections::HashSet::new();
+        known.insert("keep");
+
+        let removed = remove_orphan_clone_dirs(&vms_dir, &known);
+        assert_eq!(removed, 1, "exactly the one orphan dir should be removed");
+        assert!(vms_dir.join("keep").exists(), "known VM dir must be kept");
+        assert!(
+            !vms_dir.join("orphan").exists(),
+            "orphan clone dir must be removed"
+        );
+        assert!(
+            vms_dir.join("SHA256SUMS").exists(),
+            "non-directory entries must be left alone"
+        );
     }
 
     #[cfg(feature = "linux-net")]
