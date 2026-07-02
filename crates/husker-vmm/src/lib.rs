@@ -377,18 +377,34 @@ pub trait VmmBackend: Send + Sync {
     ///
     /// The caller MUST pause the VM first (`pause_vm`); backends do not pause
     /// implicitly. Returns backend metadata for the manifest.
+    ///
+    /// Defaults to `Unsupported`; only Firecracker implements snapshotting today.
     fn snapshot_vm(
         &self,
-        id: Uuid,
-        dst: &SnapshotPaths,
-    ) -> impl std::future::Future<Output = Result<SnapshotMeta, VmmError>> + Send;
+        _id: Uuid,
+        _dst: &SnapshotPaths,
+    ) -> impl std::future::Future<Output = Result<SnapshotMeta, VmmError>> + Send {
+        async {
+            Err(VmmError::Unsupported(
+                "snapshot_vm not supported by this backend".into(),
+            ))
+        }
+    }
 
     /// Restore a VM from a full-state snapshot.
+    ///
+    /// Defaults to `Unsupported`; only Firecracker implements restore today.
     fn restore_vm(
         &self,
-        src: &SnapshotPaths,
-        target: RestoreTarget,
-    ) -> impl std::future::Future<Output = Result<VmInfo, VmmError>> + Send;
+        _src: &SnapshotPaths,
+        _target: RestoreTarget,
+    ) -> impl std::future::Future<Output = Result<VmInfo, VmmError>> + Send {
+        async {
+            Err(VmmError::Unsupported(
+                "restore_vm not supported by this backend".into(),
+            ))
+        }
+    }
 
     /// Connect to a VM's vsock at the given port.
     ///
