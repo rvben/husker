@@ -211,6 +211,81 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
     }
 }
 
+/// A fresh core with no pre-inserted VM, whose data dir is a real temp path so
+/// the create path can clone a rootfs before the (failing) vmm step.
+fn fresh_core(data_dir: &std::path::Path, fail_ops: &[&'static str]) -> Arc<HuskerCore<FailingVmm>> {
+    let vmm = FailingVmm::new(fail_ops);
+    let state_store = husker_state::StateStore::open_memory().unwrap();
+    let storage = husker_storage::StorageConfig {
+        data_dir: data_dir.to_path_buf(),
+        state_dir: data_dir.to_path_buf(),
+    };
+    let runtime_dir = data_dir.join("run");
+    #[cfg(feature = "linux-net")]
+    {
+        Arc::new(HuskerCore::new(
+            vmm,
+            state_store,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec!["8.8.8.8".into()],
+            runtime_dir,
+        ))
+    }
+    #[cfg(not(feature = "linux-net"))]
+    {
+        Arc::new(HuskerCore::new(vmm, state_store, storage, runtime_dir))
+    }
+}
+
+#[tokio::test]
+async fn create_failure_rolls_back_and_leaves_no_vm_record() {
+    // FailingVmm fails create AFTER the core has allocated resources (CID, vm_dir,
+    // vm_id, and on Linux the IP/TAP). The AllocatedResources rollback must unwind
+    // them so no partial VM record is left behind.
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    // A 1 MiB file with the ext4 superblock magic (0xEF53 at byte offset 1080)
+    // so rootfs validation passes and create reaches the (failing) vmm step.
+    let mut rbytes = vec![0u8; 1024 * 1024];
+    rbytes[1080] = 0x53;
+    rbytes[1081] = 0xef;
+    std::fs::write(&rootfs, &rbytes).unwrap();
+    // A kernel large enough with the ARM64 Image magic at offset 56 (VZ) / an ELF
+    // header (Linux) so kernel validation passes on either backend.
+    let kernel = tmp.path().join("vmlinux");
+    let mut kbytes = vec![0u8; 128];
+    kbytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']); // ELF magic (Linux)
+    kbytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes()); // ARM64 Image magic (VZ)
+    std::fs::write(&kernel, &kbytes).unwrap();
+
+    let core = fresh_core(tmp.path(), &["create"]);
+    let err = core
+        .create_vm(husker_core::CreateVmRequest {
+            name: "doomed".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::Vmm(VmmError::ApiError(_))),
+        "expected the injected vmm create failure, got {err:?}"
+    );
+    assert!(
+        core.list_vms().unwrap().is_empty(),
+        "a failed create must roll back its VM record, not leak it"
+    );
+    assert!(
+        core.get_vm("doomed").is_err(),
+        "the rolled-back VM must not be looked up"
+    );
+}
+
 #[tokio::test]
 async fn stop_failure_keeps_vm_running_in_state_store() {
     let core = core_with_vm("vm-stop-fail", "running", &["stop"]);
