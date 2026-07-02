@@ -469,6 +469,19 @@ impl StateStore {
             "CREATE INDEX IF NOT EXISTS idx_vms_forked_from ON vms(forked_from)",
             [],
         )?;
+        // Per-VM port-forward lookups/deletes (`list_port_forwards_for_vm`,
+        // `DELETE ... WHERE vm_id = ?`) and per-service VM enumeration
+        // (`list_vms_for_service`) run in hot loops (destroy, idle-policy tick,
+        // reconciler); index their filter columns so they don't full-scan as the
+        // fleet grows.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_port_forwards_vm_id ON port_forwards(vm_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vms_service_id ON vms(service_id)",
+            [],
+        )?;
 
         Ok(())
     }
