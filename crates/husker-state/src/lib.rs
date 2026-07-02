@@ -713,6 +713,20 @@ impl StateStore {
         Ok(())
     }
 
+    /// Clear a VM's persisted guest IP (set it to NULL).
+    ///
+    /// Used when reclaiming a crashed VM's IP allocation so that a later destroy
+    /// does not double-free the (now reusable) address and a daemon restart does
+    /// not re-reserve it from the stale record.
+    pub fn clear_vm_guest_ip(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE vms SET guest_ip = NULL, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Delete a VM record.
     pub fn delete_vm(&self, id: Uuid) -> Result<(), StateError> {
         let conn = self.lock()?;
@@ -2044,6 +2058,21 @@ mod tests {
         store.update_vm_guest_ip(rec.id, "192.0.2.9").unwrap();
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.guest_ip.as_deref(), Some("192.0.2.9"));
+    }
+
+    #[test]
+    fn clear_vm_guest_ip_sets_null() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("ip-clear-test");
+        store.insert_vm(&rec).unwrap();
+        store.update_vm_guest_ip(rec.id, "192.0.2.9").unwrap();
+
+        store.clear_vm_guest_ip(rec.id).unwrap();
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(
+            fetched.guest_ip, None,
+            "guest_ip must be cleared to NULL so it is not re-reserved or double-freed"
+        );
     }
 
     #[test]
