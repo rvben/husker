@@ -92,6 +92,10 @@ H="${TARGET_DIR}/debug/husker"
 # Defensively clear anything a prior aborted run left behind so reruns start clean.
 reset_net
 log "starting isolated daemon on ${BASE} (bridge ${BRIDGE})"
+# The isolated e2e daemon does no resource enforcement; disable it so it does not
+# fail cgroup setup inside the CI runner's service scope (which has no io
+# controller delegated: "cgroup.subtree_control: Device or resource busy").
+HUSKER_RESOURCE_LIMITS=0 \
 HUSKER_DATA_DIR="${DATA_DIR}" HUSKER_DEFAULT_KERNEL="${KERNEL}" \
   HUSKER_BRIDGE_NAME="${BRIDGE}" \
   HUSKER_BRIDGE_SUBNET="172.30.0.0/24" \
