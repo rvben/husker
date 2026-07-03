@@ -117,10 +117,22 @@ async fn idle_suspend_then_resume_on_connect_roundtrip() {
         .args(["delete", "table", "ip", &table])
         .output()
         .await;
+    // ...and any TAP devices in this run's CID range (husker2000..): a run that
+    // panicked after create_vm strands its TAP, which fails the next run's
+    // `ip tuntap add` with "Device or resource busy".
+    for cid in 2000..2010 {
+        husker_net::delete_tap(&format!("husker{cid}")).await.ok();
+    }
 
     husker_net::create_bridge(BRIDGE, GATEWAY, 24)
         .await
         .expect("create throwaway bridge (needs root/CAP_NET_ADMIN)");
+    // Initialise the nftables NAT table + prerouting chain for this bridge, the
+    // same setup the daemon does at startup. Without it, add_port_forward below
+    // fails because its DNAT rule has no `husker_hidl0` table to attach to.
+    husker_net::init_nat(BRIDGE, "203.0.113.0/24", "eth0")
+        .await
+        .expect("init nftables NAT/table for the throwaway bridge");
 
     let core = Arc::new(HuskerCore::new(
         FirecrackerBackend::new(
