@@ -224,7 +224,7 @@ async fn multiple_taps_on_bridge() {
 #[tokio::test]
 #[ignore]
 async fn nftables_init_and_cleanup() {
-    let bridge = "huskertest0";
+    let bridge = "huskernft0";
 
     // Clean up from prior runs
     let _ = husker_net::cleanup_nat(bridge).await;
@@ -285,7 +285,7 @@ async fn nftables_init_and_cleanup() {
 #[tokio::test]
 #[ignore]
 async fn port_forward_add_and_remove() {
-    let bridge = "huskertest0";
+    let bridge = "huskerpf0";
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // Init NAT first (creates the table and chains)
@@ -455,7 +455,7 @@ async fn full_lifecycle_bridge_tap_nat() {
 #[tokio::test]
 #[ignore]
 async fn init_nat_is_idempotent() {
-    let bridge = "huskertest0";
+    let bridge = "huskeridem0";
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // First init

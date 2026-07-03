@@ -150,9 +150,13 @@ test-e2e-gated:
 	fi
 
 # Run ignored husker-net e2e tests only when explicitly enabled.
+# --test-threads=1 matches the suite's own documented contract: the tests mutate
+# global host network state (the ip_forward sysctl, shared routing) and are run
+# one at a time. Each test also uses a unique bridge/table name so a stray thread
+# can never clobber another's nftables table.
 test-net-e2e-gated:
 	@if [ "$${HUSKER_RUN_NET_E2E:-0}" = "1" ]; then \
-		cargo test --package husker-net --test e2e_bridge -- --ignored; \
+		cargo test --package husker-net --test e2e_bridge -- --ignored --test-threads=1; \
 	else \
 		echo "Skipping husker-net ignored e2e tests (set HUSKER_RUN_NET_E2E=1 to enable)"; \
 		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=net e2e gate not run::husker-net e2e tests were SKIPPED (HUSKER_RUN_NET_E2E is not '1'); this job is green but exercised no e2e"; \
