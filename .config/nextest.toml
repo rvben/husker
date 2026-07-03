@@ -7,9 +7,20 @@
 # without this group two of these tests clobber that one host file between write
 # and exec and read each other's script (crossed exit codes). This group forces
 # them to run one at a time across processes.
+# The gated VZ cloud-image tests each ad-hoc-codesign the *shared*
+# `CARGO_BIN_EXE_husker` binary (the VZ entitlement) before spawning it. codesign
+# replaces the file atomically, so two of these tests running in parallel race on
+# that one path - the loser sees "No such file or directory" or codesign exits 1.
+# nextest isolates tests in separate processes, so no in-process lock can serialize
+# them; this group forces them to run one at a time.
 [test-groups]
 husker-userdata-serial = { max-threads = 1 }
+husker-vz-codesign-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(husker-core) and test(run_userdata)'
 test-group = 'husker-userdata-serial'
+
+[[profile.default.overrides]]
+filter = 'package(husker) and test(vz_cloud)'
+test-group = 'husker-vz-codesign-serial'
