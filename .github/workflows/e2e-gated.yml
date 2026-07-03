@@ -1,0 +1,72 @@
+name: E2E (Gated)
+
+# The general husker daemon e2e (crates/husker/tests/e2e.rs: lifecycle, exec,
+# file transfer, interactive shell, serial logs, suspend/resume/fork) and the
+# husker-net bridge e2e (crates/husker-net/tests/e2e_bridge.rs: bridge/TAP/
+# nftables primitives). Both need real kernel resources - KVM + Firecracker +
+# TAP/nftables + root - that GitHub-hosted runners lack, so they run on the
+# self-hosted runner labelled (self-hosted, husker, linux).
+#
+# Previously a ci.yml job "ran" these on ubuntu-latest, where they could only
+# no-op (repo vars unset) or fail (no KVM); this workflow runs them for real.
+# Runs nightly and on manual dispatch.
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly; staggered after the qemu gate (one runner, runs serially).
+    - cron: "30 7 * * *"
+
+jobs:
+  e2e-gated:
+    name: E2E Gated (self-hosted, KVM)
+    runs-on: [self-hosted, husker, linux]
+    steps:
+      - uses: actions/checkout@v6
+
+      # husker-net bridge primitives: root + nftables only, no images or daemon.
+      - name: Bridge net e2e
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            HUSKER_RUN_NET_E2E=1 \
+            make test-net-e2e-gated
+
+      # Resolve kernel + rootfs + initrd from the latest images-* release for the
+      # general daemon e2e, which boots real Firecracker VMs.
+      - name: Fetch guest images
+        id: images
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tag="$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            'https://api.github.com/repos/rvben/husker/releases?per_page=100' \
+            | grep -oE 'images-[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)"
+          [ -n "$tag" ] || { echo "no images-* release found" >&2; exit 1; }
+          url="https://github.com/rvben/husker/releases/download/${tag}"
+          curl -fsSL "${url}/kernel-x86_64"      -o "${work}/kernel"
+          curl -fsSL "${url}/rootfs-x86_64.ext4" -o "${work}/rootfs.ext4"
+          curl -fsSL "${url}/initramfs-x86_64.gz" -o "${work}/initramfs.gz"
+          {
+            echo "kernel=${work}/kernel"
+            echo "rootfs=${work}/rootfs.ext4"
+            echo "initrd=${work}/initramfs.gz"
+          } >> "$GITHUB_OUTPUT"
+
+      # The general daemon e2e stands up an isolated daemon (own bridge/subnet/
+      # CID/data-dir/high port) and boots real VMs against it - safe alongside
+      # the production daemon on this host. musl-gcc links the embedded agent.
+      - name: General daemon e2e
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            HUSKER_E2E_KERNEL="${{ steps.images.outputs.kernel }}" \
+            HUSKER_E2E_ROOTFS="${{ steps.images.outputs.rootfs }}" \
+            HUSKER_E2E_INITRD="${{ steps.images.outputs.initrd }}" \
+            bash scripts/ci/general_e2e.sh

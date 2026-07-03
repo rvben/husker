@@ -98,18 +98,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make graceful-shutdown-drill
 
-  ignored-e2e-gated:
-    name: Ignored E2E (Gated)
-    runs-on: ubuntu-latest
-    env:
-      HUSKER_RUN_IGNORED_E2E: ${{ vars.HUSKER_RUN_IGNORED_E2E }}
-      HUSKER_RUN_NET_E2E: ${{ vars.HUSKER_RUN_NET_E2E }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: make test-e2e-gated
-      - run: make test-net-e2e-gated
+  # The real ignored e2e (general daemon + husker-net bridge) needs KVM +
+  # Firecracker + root, which ubuntu-latest lacks - the old job here could only
+  # no-op or fail. It now runs for real nightly on the self-hosted runner:
+  # see .github/workflows/e2e-gated.yml (plus idle-policy/qemu/vz-cloud gates).
 
   check-macos:
     name: Check (macOS)
