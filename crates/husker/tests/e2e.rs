@@ -51,6 +51,21 @@ macro_rules! require_e2e {
     };
 }
 
+/// Resolve the daemon base URL for e2e tests.
+///
+/// Reads `HUSKER_E2E_API_URL`, falling back to `http://127.0.0.1:7777`. Making it
+/// configurable lets the suite run against an isolated daemon on a non-default
+/// port (e.g. a CI-spawned one), so it never collides with a production daemon
+/// already bound to 7777 on the same host. Returned as a `'static str` so the
+/// existing `let base = ...;` call sites keep their `&str` type unchanged.
+fn api_base() -> &'static str {
+    static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        std::env::var("HUSKER_E2E_API_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:7777".to_string())
+    })
+}
+
 /// Resolve the kernel path for e2e tests.
 ///
 /// Reads `HUSKER_E2E_KERNEL` or falls back to `default_kernel_path()`, the same
@@ -198,9 +213,15 @@ async fn destroy_vm(client: &reqwest::Client, base_url: &str, vm_name: &str) {
 fn spawn_shell_with_pty(vm_name: &str) -> tokio::process::Child {
     use tokio::process::Command;
 
+    // Use the freshly-built binary (not whatever `husker` is on PATH) and point
+    // it at the same daemon the test drives via `HUSKER_API_URL`, so the shell
+    // subprocess talks to the isolated e2e daemon rather than a default 7777.
+    let bin = env!("CARGO_BIN_EXE_husker");
+
     #[cfg(target_os = "macos")]
     let child = Command::new("script")
-        .args(["-q", "/dev/null", "husker", "shell", vm_name])
+        .args(["-q", "/dev/null", bin, "shell", vm_name])
+        .env("HUSKER_API_URL", api_base())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -209,7 +230,8 @@ fn spawn_shell_with_pty(vm_name: &str) -> tokio::process::Child {
 
     #[cfg(target_os = "linux")]
     let child = Command::new("script")
-        .args(["-qec", &format!("husker shell {vm_name}"), "/dev/null"])
+        .args(["-qec", &format!("'{bin}' shell {vm_name}"), "/dev/null"])
+        .env("HUSKER_API_URL", api_base())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -271,7 +293,7 @@ async fn read_until_match(
 async fn vm_lifecycle() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
 
     // 1. Health check
     let resp = client
@@ -385,7 +407,7 @@ async fn vm_lifecycle() {
 async fn vm_suspend_resume() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
 
     // 1. Create a VM and wait for its agent (uses the resolved default images,
     //    same as the production CLI - not a hardcoded path).
@@ -511,7 +533,7 @@ async fn vm_suspend_resume() {
 async fn vm_suspend_fork() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
 
     let src = "e2e-fork-src";
     let child = "e2e-fork-child";
@@ -619,7 +641,7 @@ async fn vm_suspend_fork() {
 async fn duplicate_vm_name_returns_conflict() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
 
     let name = "e2e-dup";
     predelete_vm(&client, base, name).await;
@@ -670,7 +692,7 @@ async fn duplicate_vm_name_returns_conflict() {
 async fn exec_nonzero_exit_code() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-exec-nonzero";
 
     create_and_wait_for_vm(&client, base, name).await;
@@ -699,7 +721,7 @@ async fn exec_nonzero_exit_code() {
 async fn exec_with_env_through_api() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-exec-env";
 
     create_and_wait_for_vm(&client, base, name).await;
@@ -729,7 +751,7 @@ async fn exec_with_env_through_api() {
 async fn large_file_transfer_through_api() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-large-file";
 
     create_and_wait_for_vm(&client, base, name).await;
@@ -790,7 +812,7 @@ async fn shell_interactive_session() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-shell-interactive";
 
     create_and_wait_for_vm(&client, base, name).await;
@@ -862,7 +884,7 @@ async fn shell_exit_code_propagation() {
     use tokio::io::AsyncWriteExt;
 
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-shell-exitcode";
 
     create_and_wait_for_vm(&client, base, name).await;
@@ -894,8 +916,9 @@ async fn shell_nonexistent_vm_fails() {
     require_e2e!();
     use tokio::process::Command;
 
-    let output = Command::new("husker")
+    let output = Command::new(env!("CARGO_BIN_EXE_husker"))
         .args(["shell", "no-such-vm-e2e-test"])
+        .env("HUSKER_API_URL", api_base())
         .output()
         .await
         .expect("failed to spawn husker shell");
@@ -920,7 +943,7 @@ async fn shell_nonexistent_vm_fails() {
 async fn pause_resume_cycle_macos() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-pause-resume";
 
     create_and_wait_for_vm(&client, base, name).await;
@@ -984,7 +1007,7 @@ async fn shell_after_pause_resume_macos() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-shell-pause-resume";
 
     create_and_wait_for_vm(&client, base, name).await;
@@ -1061,7 +1084,7 @@ async fn shell_after_pause_resume_macos() {
 async fn vm_lifecycle_macos() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-lifecycle-macos";
 
     // 1. Health check
@@ -1186,7 +1209,7 @@ async fn vm_lifecycle_macos() {
 async fn logs_serial_output() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-logs";
 
     // 1. Create a VM
@@ -1272,7 +1295,7 @@ async fn logs_serial_output() {
 async fn logs_serial_output_macos() {
     require_e2e!();
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:7777";
+    let base = api_base();
     let name = "e2e-logs-macos";
 
     // 1. Create a VM
