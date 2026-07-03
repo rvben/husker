@@ -29,7 +29,7 @@ fn generated_script_migrates_and_data_survives() {
     let config_file = root.path().join("config.toml");
     std::fs::write(
         &config_file,
-        "dns_servers = [\"10.0.0.1\"]\n\n[profiles.demo]\nrootfs = \"x\"\n",
+        "dns_servers = [\"192.0.2.1\"]\n\n[profiles.demo]\nrootfs = \"x\"\n",
     )
     .unwrap();
 

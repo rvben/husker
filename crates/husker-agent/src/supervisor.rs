@@ -592,7 +592,7 @@ mod tests {
     fn parse_shares_empty_when_no_shares() {
         assert!(
             parse_shares(
-                "console=ttyS0 husker.init=1 ip=10.0.0.1::10.0.0.0:255.255.255.0::eth0:off"
+                "console=ttyS0 husker.init=1 ip=192.0.2.1::192.0.2.0:255.255.255.0::eth0:off"
             )
             .is_empty()
         );
