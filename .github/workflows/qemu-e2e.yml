@@ -3,24 +3,14 @@ name: QEMU E2E
 # Real QEMU/KVM boot + vsock e2e on the self-hosted Linux runner
 # (crates/husker-vmm/tests/qemu_e2e.rs::qemu_boots_and_vsock, #[ignore]).
 #
-# Unlike the Firecracker gates, the guest kernel must support virtio over PCI
-# (CONFIG_VIRTIO_PCI); the standard images-* Firecracker/MMIO kernel will NOT
-# find the root disk here. So this gate is dispatch-only: point it at a
-# virtio-PCI kernel + a disposable rootfs already staged on the runner. Wire it
-# into the nightly schedule once such an image is published.
+# The runner's staged kernel (/var/lib/husker/kernels/vmlinux) is the
+# microvm-kernel with CONFIG_VIRTIO_PCI, so it boots under QEMU's q35 machine.
+# Verified booting on husker-dev-fc. Runs nightly and on manual dispatch.
 on:
   workflow_dispatch:
-    inputs:
-      kernel:
-        description: "Runner path to a virtio-PCI kernel (HUSKER_E2E_KERNEL)"
-        required: true
-      rootfs:
-        description: "Runner path to a disposable rootfs (HUSKER_E2E_ROOTFS)"
-        required: true
-      initrd:
-        description: "Optional initramfs path (HUSKER_E2E_INITRD)"
-        required: false
-        default: ""
+  schedule:
+    # Nightly; staggered after the idle-policy gate (one runner, runs serially).
+    - cron: "30 6 * * *"
 
 jobs:
   qemu-e2e:
@@ -28,14 +18,26 @@ jobs:
     runs-on: [self-hosted, husker, linux]
     steps:
       - uses: actions/checkout@v6
+
+      # The gated targets use cargo-nextest; ensure it exists for root (which
+      # runs the e2e via sudo). Idempotent, survives a runner wipe.
+      - name: Ensure cargo-nextest (root)
+        run: |
+          sudo bash -c 'command -v /root/.cargo/bin/cargo-nextest >/dev/null \
+            || curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /root/.cargo/bin'
+
       - name: QEMU e2e gate
         run: |
+          # The test writes to the rootfs (cache=writeback); use a disposable copy.
+          rootfs="$(mktemp --tmpdir=/var/tmp qemu-e2e-rootfs.XXXXXX.ext4)"
+          sudo cp /var/lib/husker/images/alpine-x86_64.ext4 "$rootfs"
           sudo env \
             HOME=/root \
             PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
             HUSKER_RUN_QEMU_E2E=1 \
-            HUSKER_E2E_KERNEL="${{ inputs.kernel }}" \
-            HUSKER_E2E_ROOTFS="${{ inputs.rootfs }}" \
-            HUSKER_E2E_INITRD="${{ inputs.initrd }}" \
+            HUSKER_E2E_KERNEL=/var/lib/husker/kernels/vmlinux \
+            HUSKER_E2E_ROOTFS="$rootfs" \
+            HUSKER_E2E_INITRD=/var/lib/husker/kernels/initramfs-x86_64-virt.gz \
             make test-qemu-e2e-gated
+          rm -f "$rootfs"

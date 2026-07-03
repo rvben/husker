@@ -47,6 +47,12 @@ jobs:
             echo "initrd=${work}/initramfs.gz"
           } >> "$GITHUB_OUTPUT"
 
+      # The gated target uses cargo-nextest; ensure it exists for root.
+      - name: Ensure cargo-nextest (root)
+        run: |
+          sudo bash -c 'command -v /root/.cargo/bin/cargo-nextest >/dev/null \
+            || curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /root/.cargo/bin'
+
       # Runs entirely as root (HOME=/root) on the runner's root toolchain, with an
       # out-of-tree CARGO_TARGET_DIR so the ubuntu-owned checkout stays clean.
       - name: Idle-policy e2e gate
