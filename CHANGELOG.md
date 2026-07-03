@@ -7,6 +7,21 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.34](https://github.com/rvben/husker/compare/v0.4.33...v0.4.34) - 2026-07-03
+
+### Added
+
+- **core**: reclaim host resources from crashed VMs ([c3819fb](https://github.com/rvben/husker/commit/c3819fbd79a640a57b442c157c2aac40975aed7e))
+- **agent-proto**: report and check guest agent protocol version ([4483b88](https://github.com/rvben/husker/commit/4483b88b40f306a594cb32ee72b074ce1047cb5c))
+
+### Fixed
+
+- **install**: give native Windows a clear WSL2 message ([c9e23b6](https://github.com/rvben/husker/commit/c9e23b654a58abd7415c902f8a8acfd86e18d154))
+
+### Performance
+
+- **core**: release the fork source lock after the disk phase ([6b0296a](https://github.com/rvben/husker/commit/6b0296af4fc833f2d8c71bb8f897462f3b2148ae))
+
 ## [0.4.33](https://github.com/rvben/husker/compare/v0.4.32...v0.4.33) - 2026-07-02
 
 ### Added
