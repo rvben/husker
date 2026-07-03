@@ -32,7 +32,9 @@ jobs:
         run: |
           uv venv "${RUNNER_TEMP}/build-venv"
           uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" ziglang cargo-zigbuild
-          echo "${RUNNER_TEMP}/build-venv/bin" >> "$GITHUB_PATH"
+          # $GITHUB_PATH only affects later steps; cargo-zigbuild must be on PATH
+          # for the make invocation in this same step.
+          export PATH="${RUNNER_TEMP}/build-venv/bin:$PATH"
           rustup target add aarch64-unknown-linux-musl
           make build-agent-aarch64
           echo "HUSKER_EMBED_AGENT_BIN=$PWD/target/aarch64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
