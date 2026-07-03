@@ -7,6 +7,16 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.35](https://github.com/rvben/husker/compare/v0.4.34...v0.4.35) - 2026-07-03
+
+### Breaking Changes
+
+- **api**: the REST error envelope's identifier field is renamed `code` -> `kind`, unifying it with the CLI error output and the clispec contract ([4e97136](https://github.com/rvben/husker/commit/4e97136caadaff189e70557565ce5ec275984b16))
+
+### Added
+
+- **state**: versioned schema migrations layered over the idempotent baseline schema ([c1709cf](https://github.com/rvben/husker/commit/c1709cfb8e04314f6b8ffe90a2ecd3a5dd0f3c80))
+
 ## [0.4.34](https://github.com/rvben/husker/compare/v0.4.33...v0.4.34) - 2026-07-03
 
 ### Added
