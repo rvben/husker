@@ -1,20 +1,26 @@
 name: VZ Cloud-Image E2E
 
 # Apple VZ cloud-image e2e on the self-hosted mac-mini (Apple Silicon):
-# convert + boot a stock Ubuntu arm64 cloud image under Virtualization.framework
-# and confirm the guest agent reports its DHCP IP
-# (crates/husker/tests/vz_cloud_e2e.rs::vz_cloud_image_boots_and_reports_ip).
-# The test ad-hoc-codesigns the daemon binary it spawns (VZ entitlement), so the
-# gate only needs the aarch64 agent embedded, qemu-img (qcow2->raw), and nextest.
+# convert + boot a stock Ubuntu arm64 cloud image under Virtualization.framework,
+# confirm the guest agent reports its DHCP IP, and reach the guest through a port
+# forward (crates/husker/tests/vz_cloud_e2e.rs). The test ad-hoc-codesigns the
+# daemon binary it spawns (VZ entitlement), so the gate only needs the aarch64
+# agent embedded, qemu-img (qcow2->raw), and nextest.
 #
-# Dispatch-only until a run validates it end to end, then move to a schedule.
+# Runs nightly and on manual dispatch. The stock Ubuntu cloud image is cached
+# under the runner's home and downloaded on first use, so the nightly does not
+# depend on a manually-staged file surviving in /tmp.
 on:
   workflow_dispatch:
     inputs:
       image:
-        description: "mac-mini path to an Ubuntu arm64 cloud image"
+        description: "Optional mac-mini path to an Ubuntu arm64 cloud image (blank = download stock noble)"
         required: false
-        default: "/tmp/noble-arm64.img"
+        default: ""
+  schedule:
+    # Nightly, on the mac-mini (a different runner from the Linux e2e gates, so
+    # no serialization concern with them).
+    - cron: "0 7 * * *"
 
 jobs:
   vz-cloud-e2e:
@@ -44,10 +50,38 @@ jobs:
           command -v cargo-nextest >/dev/null \
             || curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "$HOME/.cargo/bin"
 
+      # Resolve the cloud image: use a dispatch-provided path if it exists,
+      # otherwise a cached stock Ubuntu noble arm64 cloud image (downloaded once).
+      # husker converts a per-VM raw copy and never mutates the source, so the
+      # cached qcow2 stays reusable across nightly runs.
+      - name: Ensure cloud image
+        id: image
+        env:
+          REQUESTED: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          if [ -n "${REQUESTED:-}" ] && [ -f "${REQUESTED}" ]; then
+            echo "using dispatch-provided image ${REQUESTED}"
+            echo "path=${REQUESTED}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cache="${HOME}/.cache/husker-e2e"
+          img="${cache}/noble-arm64.img"
+          mkdir -p "${cache}"
+          if [ ! -f "${img}" ]; then
+            echo "downloading stock Ubuntu noble arm64 cloud image"
+            curl -fsSL \
+              'https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img' \
+              -o "${img}.tmp"
+            mv "${img}.tmp" "${img}"
+          fi
+          echo "using cached image ${img}"
+          echo "path=${img}" >> "$GITHUB_OUTPUT"
+
       - name: VZ cloud-image e2e gate
         env:
           HUSKER_RUN_VZ_CLOUD_E2E: "1"
-          HUSKER_VZ_CLOUD_IMAGE: ${{ inputs.image }}
+          HUSKER_VZ_CLOUD_IMAGE: ${{ steps.image.outputs.path }}
         run: |
           # qemu-img (qcow2 -> raw) comes from Homebrew.
           export PATH="/opt/homebrew/bin:$PATH"
