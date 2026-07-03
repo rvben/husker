@@ -4,16 +4,17 @@ name: VZ Cloud-Image E2E
 # convert + boot a stock Ubuntu arm64 cloud image under Virtualization.framework
 # and confirm the guest agent reports its DHCP IP
 # (crates/husker/tests/vz_cloud_e2e.rs::vz_cloud_image_boots_and_reports_ip).
+# The test ad-hoc-codesigns the daemon binary it spawns (VZ entitlement), so the
+# gate only needs the aarch64 agent embedded, qemu-img (qcow2->raw), and nextest.
 #
-# Dispatch-only: point it at a local Ubuntu arm64 cloud image staged on the
-# runner (HUSKER_VZ_CLOUD_IMAGE). Needs qemu-img (qcow2->raw) and the aarch64
-# guest agent embedded, plus an ad-hoc codesign for the VZ entitlement.
+# Dispatch-only until a run validates it end to end, then move to a schedule.
 on:
   workflow_dispatch:
     inputs:
       image:
-        description: "mac-mini path to an Ubuntu arm64 cloud image (HUSKER_VZ_CLOUD_IMAGE)"
-        required: true
+        description: "mac-mini path to an Ubuntu arm64 cloud image"
+        required: false
+        default: "/tmp/noble-arm64.img"
 
 jobs:
   vz-cloud-e2e:
@@ -22,13 +23,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      # The cloud-image path embeds the aarch64-musl guest agent; build it so the
-      # daemon under test seeds it into the VM.
-      - name: Build aarch64 guest agent
-        run: make build-agent-aarch64
+
+      # zig + cargo-zigbuild (via a uv venv, mirroring release.yml) to
+      # cross-build the aarch64-musl guest agent the cloud-image path embeds.
+      - name: Set up zig toolchain + aarch64 agent
+        run: |
+          uv venv "${RUNNER_TEMP}/build-venv"
+          uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" ziglang cargo-zigbuild
+          echo "${RUNNER_TEMP}/build-venv/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-unknown-linux-musl
+          make build-agent-aarch64
+          echo "HUSKER_EMBED_AGENT_BIN=$PWD/target/aarch64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
+
+      - name: Ensure cargo-nextest
+        run: |
+          command -v cargo-nextest >/dev/null \
+            || curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "$HOME/.cargo/bin"
+
       - name: VZ cloud-image e2e gate
         env:
           HUSKER_RUN_VZ_CLOUD_E2E: "1"
           HUSKER_VZ_CLOUD_IMAGE: ${{ inputs.image }}
-          HUSKER_EMBED_AGENT_BIN: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/agent/husker-agent
-        run: make test-vz-cloud-e2e-gated
+        run: |
+          # qemu-img (qcow2 -> raw) comes from Homebrew.
+          export PATH="/opt/homebrew/bin:$PATH"
+          make test-vz-cloud-e2e-gated
