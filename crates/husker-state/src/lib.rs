@@ -280,6 +280,64 @@ fn add_column(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
     }
 }
 
+/// Baseline schema version established by the idempotent `CREATE TABLE` /
+/// `ADD COLUMN` block in [`StateStore::migrate`]. Every database - fresh, or one
+/// created before versioning existed (`user_version` 0) - reaches this version.
+///
+/// From here on, every schema change is a numbered entry in [`MIGRATIONS`] and
+/// is recorded in `PRAGMA user_version`, so the version fully describes the
+/// schema. Do NOT extend the idempotent baseline block for new schema - add a
+/// migration instead. (The block stays only to bootstrap any database to the
+/// baseline, including ones that predate this system.)
+const BASELINE_SCHEMA_VERSION: u32 = 1;
+
+/// Ordered, one-shot migrations applied after the baseline, each bringing the
+/// database TO its version number. Unlike the idempotent baseline these may be
+/// non-additive (column rename/drop, type change, data backfill) and each runs
+/// exactly once, in its own transaction, when `user_version` is below its
+/// number. Append-only: never edit, reorder, or renumber a migration that has
+/// shipped; keep the numbers strictly ascending and greater than the baseline.
+const MIGRATIONS: &[(u32, &str)] = &[
+    // (2, "ALTER TABLE vms RENAME COLUMN old TO new"),
+];
+
+/// Bring a database's schema version up to date: stamp the baseline onto a
+/// database that predates versioning, then apply every migration newer than the
+/// recorded `user_version`, in order, each in its own transaction so a
+/// mid-migration failure rolls back cleanly. Idempotent - re-running applies
+/// nothing already recorded, so an already-applied migration is never re-run
+/// (which for an additive one would fail with a duplicate column).
+fn apply_migrations(
+    conn: &Connection,
+    baseline: u32,
+    migrations: &[(u32, &str)],
+) -> rusqlite::Result<()> {
+    debug_assert!(
+        migrations.windows(2).all(|w| w[0].0 < w[1].0)
+            && migrations.first().is_none_or(|m| m.0 > baseline),
+        "migrations must be strictly ascending and greater than the baseline"
+    );
+
+    let mut current = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as u32;
+    // A fresh or pre-versioning database (user_version 0) was just brought to
+    // the baseline schema by migrate()'s idempotent block; record that so the
+    // baseline is never re-bootstrapped as if it were a migration.
+    if current < baseline {
+        conn.execute_batch(&format!("PRAGMA user_version = {baseline};"))?;
+        current = baseline;
+    }
+    for &(target, sql) in migrations {
+        if target > current {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(sql)?;
+            tx.execute_batch(&format!("PRAGMA user_version = {target};"))?;
+            tx.commit()?;
+            current = target;
+        }
+    }
+    Ok(())
+}
+
 impl StateStore {
     /// Open or create the state database (file-backed, pooled for concurrency).
     pub fn open(path: &Path) -> Result<Self, StateError> {
@@ -511,6 +569,10 @@ impl StateStore {
             "CREATE INDEX IF NOT EXISTS idx_vms_service_id ON vms(service_id)",
             [],
         )?;
+
+        // The idempotent block above has brought the schema to the baseline;
+        // stamp the version and apply any newer numbered migrations.
+        apply_migrations(&conn, BASELINE_SCHEMA_VERSION, MIGRATIONS)?;
 
         Ok(())
     }
@@ -3547,5 +3609,93 @@ mod tests {
         assert_eq!(vm.network, "nat");
         assert!(vm.auto_resume, "auto_resume defaults to enabled");
         assert!(!vm.balloon, "balloon defaults to off");
+
+        // The pre-versioning file (user_version 0) is stamped up to the baseline
+        // without re-bootstrapping - the legacy row above survives, proving
+        // baselining is safe on a real old database.
+        let version: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version as u32, BASELINE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn fresh_db_starts_at_baseline_version() {
+        let store = StateStore::open_memory().unwrap();
+        let version: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version as u32, BASELINE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn apply_migrations_stamps_baseline_then_applies_in_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
+        let migrations: &[(u32, &str)] = &[
+            (2, "ALTER TABLE t ADD COLUMN a TEXT"),
+            (3, "ALTER TABLE t ADD COLUMN b TEXT"),
+        ];
+        apply_migrations(&conn, 1, migrations).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3, "version advances to the last migration");
+        // Both columns exist (the INSERT would fail otherwise).
+        conn.execute("INSERT INTO t (id, a, b) VALUES (1, 'x', 'y')", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn apply_migrations_never_reruns_a_recorded_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
+        let m1: &[(u32, &str)] = &[(2, "ALTER TABLE t ADD COLUMN a TEXT")];
+        apply_migrations(&conn, 1, m1).unwrap();
+        // Re-running the same set is a no-op: migration 2 is already recorded,
+        // so it is NOT re-applied (which would fail with "duplicate column a").
+        apply_migrations(&conn, 1, m1).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        // Extending the set resumes from where it left off: only migration 3
+        // runs; migration 2 is still skipped.
+        let m2: &[(u32, &str)] = &[
+            (2, "ALTER TABLE t ADD COLUMN a TEXT"),
+            (3, "ALTER TABLE t ADD COLUMN b TEXT"),
+        ];
+        apply_migrations(&conn, 1, m2).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn apply_migrations_rolls_back_a_failing_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
+        // Migration 2 succeeds; migration 3 is invalid SQL and must fail.
+        let migrations: &[(u32, &str)] = &[
+            (2, "ALTER TABLE t ADD COLUMN a TEXT"),
+            (3, "THIS IS NOT VALID SQL"),
+        ];
+        assert!(apply_migrations(&conn, 1, migrations).is_err());
+        // Migration 2 committed and its version is recorded; the failed
+        // migration 3 left the version at 2 (its transaction rolled back).
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 2,
+            "a failed migration does not advance the version"
+        );
     }
 }
