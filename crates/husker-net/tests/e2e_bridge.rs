@@ -7,8 +7,15 @@
 //!
 //! `--test-threads=1` is required because tests share kernel state.
 //!
-//! Each test cleans up after itself. Unique interface names per test prevent
-//! bridge/TAP interference.
+//! Each test cleans up after itself, and uses a unique bridge/TAP/table name so
+//! a stray thread can never clobber another test's kernel state.
+//!
+//! All addresses are RFC 5737 documentation ranges (192.0.2.0/24 = TEST-NET-1,
+//! 198.51.100.0/24 = TEST-NET-2, 203.0.113.0/24 = TEST-NET-3), which never route
+//! on a real network. There are only three such /24s but four bridge-creating
+//! tests, so `full_lifecycle_bridge_tap_nat` reuses TEST-NET-1: safe because the
+//! suite is serial and every test deletes its own bridge before creating it, so
+//! the two TEST-NET-1 bridges (`huskertest0`, `huskertst8`) never coexist.
 
 use std::net::Ipv4Addr;
 use std::process::Command;
@@ -69,14 +76,14 @@ async fn bridge_create_and_delete() {
     let _ = husker_net::delete_bridge(bridge).await;
 
     // Create bridge
-    husker_net::create_bridge(bridge, Ipv4Addr::new(10, 99, 0, 1), 24)
+    husker_net::create_bridge(bridge, Ipv4Addr::new(192, 0, 2, 1), 24)
         .await
         .expect("create_bridge should succeed");
 
     // Verify: interface exists, is up, has correct address
     assert!(interface_exists(bridge), "bridge interface should exist");
     assert!(
-        interface_has_address(bridge, "10.99.0.1/24"),
+        interface_has_address(bridge, "192.0.2.1/24"),
         "bridge should have gateway address"
     );
 
@@ -141,7 +148,7 @@ async fn tap_attaches_to_bridge() {
     let _ = husker_net::delete_bridge(bridge).await;
 
     // Create bridge and TAP
-    husker_net::create_bridge(bridge, Ipv4Addr::new(10, 99, 1, 1), 24)
+    husker_net::create_bridge(bridge, Ipv4Addr::new(198, 51, 100, 1), 24)
         .await
         .expect("create_bridge");
     husker_net::create_tap(tap).await.expect("create_tap");
@@ -186,7 +193,7 @@ async fn multiple_taps_on_bridge() {
     }
     let _ = husker_net::delete_bridge(bridge).await;
 
-    husker_net::create_bridge(bridge, Ipv4Addr::new(10, 99, 2, 1), 24)
+    husker_net::create_bridge(bridge, Ipv4Addr::new(203, 0, 113, 1), 24)
         .await
         .expect("create_bridge");
 
@@ -230,7 +237,7 @@ async fn nftables_init_and_cleanup() {
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // Initialize NAT with test bridge
-    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
         .await
         .expect("init_nat should succeed");
 
@@ -289,12 +296,12 @@ async fn port_forward_add_and_remove() {
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // Init NAT first (creates the table and chains)
-    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
         .await
         .expect("init_nat");
 
     // Add a port forward
-    husker_net::add_port_forward(8080, Ipv4Addr::new(10, 99, 0, 2), 80, "huskertst1", bridge)
+    husker_net::add_port_forward(8080, Ipv4Addr::new(192, 0, 2, 2), 80, "huskertst1", bridge)
         .await
         .expect("add_port_forward");
 
@@ -306,7 +313,7 @@ async fn port_forward_add_and_remove() {
     );
 
     // Add a second port forward
-    husker_net::add_port_forward(9090, Ipv4Addr::new(10, 99, 0, 3), 443, "huskertst2", bridge)
+    husker_net::add_port_forward(9090, Ipv4Addr::new(192, 0, 2, 3), 443, "huskertst2", bridge)
         .await
         .expect("add_port_forward 2");
 
@@ -354,26 +361,26 @@ async fn full_lifecycle_bridge_tap_nat() {
     let _ = husker_net::delete_bridge(bridge).await;
 
     // 1. Create allocator
-    let alloc = husker_net::IpAllocator::new(Ipv4Addr::new(10, 99, 3, 0), 24);
+    let alloc = husker_net::IpAllocator::new(Ipv4Addr::new(192, 0, 2, 0), 24);
     let gateway = alloc.gateway();
     let prefix_len = alloc.prefix_len();
-    assert_eq!(gateway, Ipv4Addr::new(10, 99, 3, 1));
+    assert_eq!(gateway, Ipv4Addr::new(192, 0, 2, 1));
 
     // 2. Create bridge
     husker_net::create_bridge(bridge, gateway, prefix_len)
         .await
         .expect("create_bridge");
     assert!(interface_exists(bridge));
-    assert!(interface_has_address(bridge, "10.99.3.1/24"));
+    assert!(interface_has_address(bridge, "192.0.2.1/24"));
 
     // 3. Init NAT
-    husker_net::init_nat(bridge, "10.99.3.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
         .await
         .expect("init_nat");
 
     // 4. Simulate creating VM 1
     let vm1_ip = alloc.allocate().expect("allocate vm1");
-    assert_eq!(vm1_ip, Ipv4Addr::new(10, 99, 3, 2));
+    assert_eq!(vm1_ip, Ipv4Addr::new(192, 0, 2, 2));
 
     let tap1 = "huskertst9";
     husker_net::create_tap(tap1).await.expect("create_tap vm1");
@@ -384,11 +391,11 @@ async fn full_lifecycle_bridge_tap_nat() {
     // Verify kernel args would be correct
     let netmask = husker_net::prefix_len_to_netmask(prefix_len);
     let kernel_ip = format!("ip={vm1_ip}::{gateway}:{netmask}::eth0:off");
-    assert_eq!(kernel_ip, "ip=10.99.3.2::10.99.3.1:255.255.255.0::eth0:off");
+    assert_eq!(kernel_ip, "ip=192.0.2.2::192.0.2.1:255.255.255.0::eth0:off");
 
     // 5. Simulate creating VM 2
     let vm2_ip = alloc.allocate().expect("allocate vm2");
-    assert_eq!(vm2_ip, Ipv4Addr::new(10, 99, 3, 3));
+    assert_eq!(vm2_ip, Ipv4Addr::new(192, 0, 2, 3));
 
     let tap2 = "hskts10";
     husker_net::create_tap(tap2).await.expect("create_tap vm2");
@@ -459,12 +466,12 @@ async fn init_nat_is_idempotent() {
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // First init
-    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
         .await
         .expect("first init_nat");
 
     // Second init (should not error — deletes and recreates)
-    husker_net::init_nat(bridge, "10.99.0.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
         .await
         .expect("second init_nat should also succeed");
 
@@ -489,16 +496,16 @@ async fn two_bridges_do_not_clobber_each_others_nat() {
     let _ = husker_net::cleanup_nat(bridge_a).await;
     let _ = husker_net::cleanup_nat(bridge_b).await;
 
-    husker_net::init_nat(bridge_a, "10.99.10.0/24", "eth0")
+    husker_net::init_nat(bridge_a, "198.51.100.0/24", "eth0")
         .await
         .expect("init_nat A");
-    husker_net::init_nat(bridge_b, "10.99.11.0/24", "eth0")
+    husker_net::init_nat(bridge_b, "203.0.113.0/24", "eth0")
         .await
         .expect("init_nat B");
 
     husker_net::add_port_forward(
         18080,
-        Ipv4Addr::new(10, 99, 10, 2),
+        Ipv4Addr::new(198, 51, 100, 2),
         80,
         "huskercoexa",
         bridge_a,
@@ -507,7 +514,7 @@ async fn two_bridges_do_not_clobber_each_others_nat() {
     .expect("pf A");
     husker_net::add_port_forward(
         18081,
-        Ipv4Addr::new(10, 99, 11, 2),
+        Ipv4Addr::new(203, 0, 113, 2),
         80,
         "huskercoexb",
         bridge_b,
