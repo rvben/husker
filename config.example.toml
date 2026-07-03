@@ -181,6 +181,7 @@
 # Background reconciler for service workloads.
 # service_reconcile_interval_secs = 15   # how often the self-healing loop runs
 # service_reconcile_enabled = true       # master switch for the periodic reconcile loop
+# reclaim_grace_secs = 300               # (Linux) free a crashed VM's leaked TAP/nft/IP this long after it stops; 0 disables
 
 # ── Idle Policy ──────────────────────────────────────────────────────
 
@@ -243,6 +244,7 @@
 #   HUSKER_EXEC_ENV_ALLOWLIST                →  exec_env_allowlist (comma-separated)
 #   HUSKER_SERVICE_RECONCILE_INTERVAL        →  service_reconcile_interval_secs
 #   HUSKER_SERVICE_RECONCILE_ENABLED         →  service_reconcile_enabled (1/true/TRUE/yes)
+#   HUSKER_RECLAIM_GRACE_SECS                →  reclaim_grace_secs (Linux; 0 disables)
 #   HUSKER_IDLE_POLL_INTERVAL_SECS           →  idle_policy.poll_interval_secs
 #   HUSKER_IDLE_DEFAULT_TIMEOUT_SECS         →  idle_policy.default_idle_timeout_secs
 #   HUSKER_IDLE_DEFAULT_SUSPEND_TTL_SECS     →  idle_policy.default_suspend_ttl_secs

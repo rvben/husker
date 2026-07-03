@@ -14,6 +14,7 @@ mod idle;
 mod images;
 mod network;
 mod pools;
+mod reclaim;
 mod secrets;
 mod services;
 mod snapshots;
@@ -2471,6 +2472,73 @@ mod tests {
         let rec = sample_vm_record(name);
         core.state.insert_vm(&rec).unwrap();
         rec
+    }
+
+    /// A stopped, abandoned VM (old `updated_at`) still holding a TAP + IP.
+    #[cfg(feature = "linux-net")]
+    fn abandoned_crashed_vm(name: &str) -> VmRecord {
+        let mut rec = sample_vm_record(name);
+        rec.state = "stopped".into();
+        rec.tap_device = Some(format!("tap-{name}"));
+        rec.host_ip = Some("192.0.2.1".into());
+        rec.guest_ip = Some("192.0.2.2".into());
+        rec.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        rec
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn reclaim_sweep_clears_abandoned_vm_and_deletes_forwards() {
+        let core = test_core().await;
+        let rec = abandoned_crashed_vm("crashed");
+        core.state.insert_vm(&rec).unwrap();
+        core.state
+            .insert_port_forward(&husker_state::PortForwardRecord {
+                id: 0,
+                vm_id: rec.id,
+                host_port: 18080,
+                guest_port: 80,
+                protocol: "tcp".into(),
+                bind_addr: None,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        // grace = 60s; the VM stopped 3600s ago, so it is reclaimed. The
+        // best-effort husker_net TAP/IP release is a no-op here (no real device);
+        // the state mutation is what this asserts.
+        let reclaimed = core.reclaim_abandoned_vms(60).await;
+        assert_eq!(reclaimed, 1);
+
+        let after = core.state.get_vm(rec.id).unwrap();
+        assert_eq!(after.state, "stopped", "record is kept, not destroyed");
+        assert!(after.tap_device.is_none(), "tap_device cleared");
+        assert!(after.host_ip.is_none(), "host_ip cleared");
+        assert!(after.guest_ip.is_none(), "guest_ip cleared");
+        assert!(
+            core.state
+                .list_port_forwards_for_vm(rec.id)
+                .unwrap()
+                .is_empty(),
+            "port-forward rows deleted"
+        );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn reclaim_sweep_leaves_recently_stopped_vm_untouched() {
+        let core = test_core().await;
+        let mut rec = abandoned_crashed_vm("recent");
+        // Stopped only 5s ago: within the 60s grace, so not reclaimed.
+        rec.updated_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        core.state.insert_vm(&rec).unwrap();
+
+        assert_eq!(core.reclaim_abandoned_vms(60).await, 0);
+        let after = core.state.get_vm(rec.id).unwrap();
+        assert!(
+            after.guest_ip.is_some() && after.tap_device.is_some(),
+            "a just-stopped VM keeps its network identity"
+        );
     }
 
     /// Persist a `suspended`, `auto_resume` VM with `tap_device`/`guest_ip` set

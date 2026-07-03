@@ -611,8 +611,11 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
             api_token.clone(),
             config.metrics_listen,
             config.metrics_token.clone(),
-            service_reconcile_enabled,
-            service_reconcile_interval,
+            BackgroundLoops {
+                service_reconcile_enabled,
+                service_reconcile_interval,
+                reclaim_grace_secs: config.reclaim_grace_secs,
+            },
         )
         .await?;
 
@@ -780,6 +783,15 @@ pub(crate) fn spawn_metrics_endpoint<B: husker_vmm::VmmBackend + 'static>(
 ///
 /// Runs service reconcile, restores port-forward rules, spawns background loops,
 /// serves the API, and drains VMs on shutdown.
+/// Knobs for the daemon's periodic background loops (self-healing reconcile and
+/// crashed-VM reclaim). Bundled to keep `run_linux_daemon`'s arity manageable.
+#[cfg(feature = "linux-net")]
+pub(crate) struct BackgroundLoops {
+    pub service_reconcile_enabled: bool,
+    pub service_reconcile_interval: u64,
+    pub reclaim_grace_secs: u64,
+}
+
 #[cfg(feature = "linux-net")]
 pub(crate) async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
     core: std::sync::Arc<husker_core::HuskerCore<B>>,
@@ -787,8 +799,7 @@ pub(crate) async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
     api_token: Option<String>,
     metrics_listen: Option<std::net::SocketAddr>,
     metrics_token: Option<String>,
-    service_reconcile_enabled: bool,
-    service_reconcile_interval: u64,
+    loops: BackgroundLoops,
 ) -> Result<()> {
     run_initial_service_reconcile(&core).await;
     let reconcile = core.reconcile_port_forwards_from_state().await;
@@ -807,9 +818,10 @@ pub(crate) async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
     core.reinstall_resume_listeners().await;
     spawn_service_reconcile_loop(
         std::sync::Arc::clone(&core),
-        service_reconcile_enabled,
-        service_reconcile_interval,
+        loops.service_reconcile_enabled,
+        loops.service_reconcile_interval,
     );
+    spawn_reclaim_loop(std::sync::Arc::clone(&core), loops.reclaim_grace_secs);
     spawn_idle_policy_loop(
         std::sync::Arc::clone(&core),
         core.idle_policy().poll_interval_secs,
@@ -822,6 +834,36 @@ pub(crate) async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
 }
 
 /// Spawn the periodic self-healing reconcile loop (only when enabled).
+/// Spawn the crashed-VM reclaim sweep: periodically release leaked host
+/// resources (TAP/nftables/IP) from VMs abandoned past `grace_secs`, keeping the
+/// stopped record. Disabled when `grace_secs == 0`. Linux only.
+#[cfg(feature = "linux-net")]
+pub(crate) fn spawn_reclaim_loop<B: husker_vmm::VmmBackend + 'static>(
+    core: Arc<husker_core::HuskerCore<B>>,
+    grace_secs: u64,
+) {
+    if grace_secs == 0 {
+        return;
+    }
+    // Sweep at roughly half the grace period, bounded to [30s, 300s], so a leak
+    // is reclaimed reasonably soon after the grace expires without busy-looping.
+    let interval = std::time::Duration::from_secs((grace_secs / 2).clamp(30, 300));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // consume the immediate first tick
+        loop {
+            ticker.tick().await;
+            let n = core.reclaim_abandoned_vms(grace_secs).await;
+            if n > 0 {
+                tracing::info!(
+                    reclaimed = n,
+                    "reclaim sweep released abandoned VM resources"
+                );
+            }
+        }
+    });
+}
+
 pub(crate) fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     enabled: bool,

@@ -111,6 +111,12 @@ pub(crate) struct Config {
     pub(crate) service_reconcile_interval_secs: u64,
     #[serde(default = "default_true")]
     pub(crate) service_reconcile_enabled: bool,
+    /// Grace period (seconds) after a VM stops before the reclaim sweep frees
+    /// its leaked host network resources (TAP/nftables/IP). 0 disables the
+    /// sweep. Linux only.
+    #[cfg(feature = "linux-net")]
+    #[serde(default = "default_reclaim_grace_secs")]
+    pub(crate) reclaim_grace_secs: u64,
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_host_interface")]
     pub(crate) host_interface: String,
@@ -314,6 +320,11 @@ fn default_service_reconcile_interval() -> u64 {
     15
 }
 
+#[cfg(feature = "linux-net")]
+fn default_reclaim_grace_secs() -> u64 {
+    300
+}
+
 fn default_true() -> bool {
     true
 }
@@ -391,6 +402,8 @@ impl Default for Config {
             exec_env_allowlist: Vec::new(),
             service_reconcile_interval_secs: default_service_reconcile_interval(),
             service_reconcile_enabled: default_true(),
+            #[cfg(feature = "linux-net")]
+            reclaim_grace_secs: default_reclaim_grace_secs(),
             #[cfg(feature = "linux-net")]
             host_interface: default_host_interface(),
             #[cfg(feature = "linux-net")]
@@ -595,6 +608,12 @@ pub(crate) fn apply_env_overrides(config: &mut Config) {
     }
     if let Ok(val) = std::env::var("HUSKER_SERVICE_RECONCILE_ENABLED") {
         config.service_reconcile_enabled = matches!(val.as_str(), "1" | "true" | "TRUE" | "yes");
+    }
+    #[cfg(feature = "linux-net")]
+    if let Ok(val) = std::env::var("HUSKER_RECLAIM_GRACE_SECS")
+        && let Ok(parsed) = val.parse::<u64>()
+    {
+        config.reclaim_grace_secs = parsed;
     }
     if let Ok(val) = std::env::var("HUSKER_IDLE_POLL_INTERVAL_SECS")
         && let Ok(n) = val.parse::<u64>()

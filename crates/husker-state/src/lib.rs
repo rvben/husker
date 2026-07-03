@@ -664,6 +664,23 @@ impl StateStore {
         Ok(())
     }
 
+    /// Clear a VM's host network fields (`tap_device`, `host_ip`, `guest_ip`)
+    /// after its leaked resources have been reclaimed, keeping the (stopped)
+    /// record. The record no longer references a freed TAP/IP, so a later
+    /// same-name re-create replaces it without double-releasing.
+    pub fn clear_vm_network_resources(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE vms SET tap_device = NULL, host_ip = NULL, guest_ip = NULL, updated_at = ?2 \
+             WHERE id = ?1",
+            params![id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        if updated == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Update the debounced last-activity mirror.
     pub fn touch_last_activity(&self, id: Uuid, at: DateTime<Utc>) -> Result<(), StateError> {
         let conn = self.lock()?;
@@ -2035,6 +2052,35 @@ mod tests {
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.name, "test-vm");
         assert_eq!(fetched.vcpu_count, 2);
+    }
+
+    #[test]
+    fn clear_vm_network_resources_nulls_fields_and_keeps_record() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("crashed-vm");
+        rec.state = "stopped".into();
+        rec.tap_device = Some("tap-crashed".into());
+        rec.host_ip = Some("192.0.2.1".into());
+        rec.guest_ip = Some("192.0.2.2".into());
+        store.insert_vm(&rec).unwrap();
+
+        store.clear_vm_network_resources(rec.id).unwrap();
+
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(fetched.name, "crashed-vm", "record is kept");
+        assert_eq!(fetched.state, "stopped", "non-network state preserved");
+        assert!(fetched.tap_device.is_none(), "tap_device cleared");
+        assert!(fetched.host_ip.is_none(), "host_ip cleared");
+        assert!(fetched.guest_ip.is_none(), "guest_ip cleared");
+    }
+
+    #[test]
+    fn clear_vm_network_resources_unknown_id_is_not_found() {
+        let store = StateStore::open_memory().unwrap();
+        let err = store
+            .clear_vm_network_resources(Uuid::new_v4())
+            .unwrap_err();
+        assert!(matches!(err, StateError::VmNotFound(_)));
     }
 
     #[test]
