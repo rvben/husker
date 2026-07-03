@@ -61,8 +61,7 @@ macro_rules! require_e2e {
 fn api_base() -> &'static str {
     static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BASE.get_or_init(|| {
-        std::env::var("HUSKER_E2E_API_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:7777".to_string())
+        std::env::var("HUSKER_E2E_API_URL").unwrap_or_else(|_| "http://127.0.0.1:7777".to_string())
     })
 }
 
