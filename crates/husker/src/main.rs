@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 mod cli;
 mod config;
 mod daemon;
+mod job;
 mod schema;
 
 use crate::cli::*;
@@ -269,7 +270,7 @@ fn merge_env(env_files: &[PathBuf], env_flags: Vec<String>) -> anyhow::Result<Ve
 /// times out waiting for boot is diagnosable without the user knowing to reach
 /// for `husker logs`. Returns a string with a leading newline (or a shorter
 /// pointer if the console is empty or unreachable).
-async fn serial_boot_hint(
+pub(crate) async fn serial_boot_hint(
     client: &reqwest::Client,
     api_url: &str,
     api_token: Option<&str>,
@@ -386,7 +387,7 @@ fn merge_etc_hosts(existing: &str, additions: &[(String, String)]) -> String {
 /// Apply per-VM DNS and host entries by writing `/etc/resolv.conf` (replacing it
 /// with `--dns` nameservers) and merging `--add-host` entries into `/etc/hosts`,
 /// both via the guest file API. Scoped to this VM only - no daemon-wide change.
-async fn apply_dns_hosts(
+pub(crate) async fn apply_dns_hosts(
     client: &reqwest::Client,
     api_url: &str,
     api_token: Option<&str>,
@@ -568,11 +569,11 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
 /// machine-readable `code` (the daemon's stable error code), the process
 /// exit code to return, and an optional actionable hint. `String`/`&str`
 /// convert in as a generic error.
-struct ApiFailure {
-    message: String,
-    code: Option<String>,
-    exit_code: i32,
-    hint: Option<String>,
+pub(crate) struct ApiFailure {
+    pub(crate) message: String,
+    pub(crate) code: Option<String>,
+    pub(crate) exit_code: i32,
+    pub(crate) hint: Option<String>,
 }
 
 impl From<String> for ApiFailure {
@@ -607,7 +608,7 @@ impl std::error::Error for DaemonUnreachable {}
 
 /// Build an `ApiFailure` from a non-success API response: derive the exit code
 /// from the HTTP status, capture the daemon's stable `code`, and the message.
-async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFailure {
+pub(crate) async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFailure {
     let status = resp.status();
     let exit_code = match status.as_u16() {
         404 => exit_code::NOT_FOUND,
@@ -661,7 +662,7 @@ fn set_daemon_url(url: &str) {
 /// Wraps connection errors with a hint about whether the daemon is running,
 /// naming the URL so users running a daemon on a non-default port can
 /// correct their `--api-url`/`HUSKER_API_URL` setting.
-async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+pub(crate) async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     request.send().await.map_err(|e| {
         if e.is_connect() {
             let url = DAEMON_URL.get().map(String::as_str).unwrap_or("the daemon");
@@ -675,7 +676,7 @@ async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Respon
     })
 }
 
-fn with_api_auth(
+pub(crate) fn with_api_auth(
     request: reqwest::RequestBuilder,
     api_token: Option<&str>,
 ) -> reqwest::RequestBuilder {
@@ -1903,29 +1904,32 @@ async fn run(cli: Cli) -> Result<()> {
             // still go to the exec). Otherwise build the create body (env goes to
             // the EXEC request, not the body; pass empty to the builder).
             let body = if let Some(ref pool) = pool {
-                if rootfs.is_some()
-                    || kernel.is_some()
-                    || initrd.is_some()
-                    || cpus.is_some()
-                    || memory.is_some()
-                    || vmm.is_some()
-                    || cloud_image.is_some()
-                    || disk_size.is_some()
-                    || volume.is_some()
-                    || net.is_some()
-                    || profile.is_some()
-                    || balloon
-                    || !ssh_key.is_empty()
-                    || idle
-                    || idle_timeout.is_some()
-                    || suspend_ttl.is_some()
-                    || no_auto_resume
-                {
+                let conflicts = job::pool_conflicting_flags(&job::PoolFlags {
+                    rootfs: rootfs.is_some(),
+                    kernel: kernel.is_some(),
+                    initrd: initrd.is_some(),
+                    cpus: cpus.is_some(),
+                    memory: memory.is_some(),
+                    vmm: vmm.is_some(),
+                    cloud_image: cloud_image.is_some(),
+                    disk_size: disk_size.is_some(),
+                    volume: volume.is_some(),
+                    net: net.is_some(),
+                    profile: profile.is_some(),
+                    balloon,
+                    ssh_key: !ssh_key.is_empty(),
+                    idle,
+                    idle_timeout: idle_timeout.is_some(),
+                    suspend_ttl: suspend_ttl.is_some(),
+                    no_auto_resume,
+                });
+                if !conflicts.is_empty() {
                     exit_with_error(
                         output,
                         format!(
-                            "--pool cannot be combined with rootfs/boot/idle flags (pool '{pool}' \
-                             defines the VM image); pass only --name and the command"
+                            "--pool cannot be combined with {} (pool '{pool}' defines the VM \
+                             image); pass only --name and the command",
+                            conflicts.join(", ")
                         ),
                     );
                 }
@@ -1996,238 +2000,24 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
 
-            let work = async {
-                // 1. Create the VM: fork it from the pool, or boot from the body.
-                let resp = if let Some(ref pool) = pool {
-                    api_request(
-                        with_api_auth(
-                            client.post(format!("{api_url}/v1/pools/{pool}/checkout")),
-                            api_token.as_deref(),
-                        )
-                        .json(&serde_json::json!({ "vm_name": &name })),
-                    )
-                    .await?
-                } else {
-                    api_request(
-                        with_api_auth(
-                            client.post(format!("{api_url}/v1/vms")),
-                            api_token.as_deref(),
-                        )
-                        .json(body.as_ref().expect("non-pool job builds a create body")),
-                    )
-                    .await?
-                };
-                if !resp.status().is_success() {
-                    let msg = api_error(resp, &format!("VM '{name}'")).await;
-                    exit_with_error(output, msg);
-                }
-                if output == OutputFormat::Text {
-                    eprintln!("[job] vm {name} created, waiting for agent...");
-                }
-
-                // Old-daemon warning: if the requested timeout exceeds the historical
-                // 30-second exec default, check the daemon version. Daemons older than
-                // 0.4.2 ignore timeout_secs and cap execution at exec_timeout_secs.
-                if timeout > 30 {
-                    let health_client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(2))
-                        .build()
-                        .unwrap_or_default();
-                    if let Ok(resp) = health_client
-                        .get(format!("{api_url}/v1/health"))
-                        .send()
-                        .await
-                        && resp.status().is_success()
-                        && let Ok(health) = resp.json::<serde_json::Value>().await
-                        && let Some(ver_str) = health["version"].as_str()
-                    {
-                        let parts: Vec<u64> =
-                            ver_str.split('.').filter_map(|p| p.parse().ok()).collect();
-                        if let [major, minor, patch] = parts.as_slice()
-                            && (*major, *minor, *patch) < (0, 4, 2)
-                        {
-                            eprintln!(
-                                "[job] warning: daemon {ver_str} does not support \
-                                 --timeout; execution will be capped at the daemon's \
-                                 exec_timeout_secs setting"
-                            );
-                        }
-                    }
-                }
-
-                // 2. Boot-mode-aware readiness wait (mirrors Commands::Wait logic).
-                let info_url = format!("{api_url}/v1/vms/{name}");
-                let resp =
-                    api_request(with_api_auth(client.get(&info_url), api_token.as_deref())).await?;
-                if !resp.status().is_success() {
-                    let msg = api_error(resp, &format!("VM '{name}'")).await;
-                    anyhow::bail!("{}", msg.message);
-                }
-                let vm: serde_json::Value = resp.json().await?;
-                let boot_mode = vm
-                    .get("boot_mode")
-                    .and_then(|b| b.as_str())
-                    .unwrap_or("direct");
-                let ready_url = format!("{api_url}/v1/vms/{name}/ready");
-                let deadline =
-                    std::time::Instant::now() + husker_core::default_ready_timeout(boot_mode);
-                let mut backoff = std::time::Duration::from_millis(200);
-                loop {
-                    let resp =
-                        api_request(with_api_auth(client.get(&ready_url), api_token.as_deref()))
-                            .await?;
-                    if !resp.status().is_success() {
-                        let msg = api_error(resp, &format!("VM '{name}'")).await;
-                        anyhow::bail!("{}", msg.message);
-                    }
-                    let rdy: serde_json::Value = resp.json().await?;
-                    if rdy.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
-                        break;
-                    }
-                    if std::time::Instant::now() + backoff >= deadline {
-                        let hint =
-                            serial_boot_hint(&client, &api_url, api_token.as_deref(), &name).await;
-                        anyhow::bail!("timed out waiting for VM '{name}' to become ready{hint}");
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
-                }
-
-                // 2.4 Apply per-VM DNS / host overrides before running the command.
-                apply_dns_hosts(
-                    &client,
-                    &api_url,
-                    api_token.as_deref(),
-                    &name,
-                    &dns,
-                    &add_host,
-                )
-                .await?;
-
-                // 2.5 Optionally sync the working tree into the VM (git-aware, clean-room):
-                // upload a tar.gz of the cwd and wrap the command to extract and run it
-                // inside the guest. The host filesystem is never modified unless the
-                // command's results are explicitly pulled back (--out / --write-back).
-                let mut retrieve_paths: Vec<PathBuf> = Vec::new();
-                let mut sync_cwd_dir: Option<PathBuf> = None;
-                let (exec_command, exec_args): (String, Vec<String>) = if sync_cwd {
-                    let cwd = std::env::current_dir()
-                        .context("resolving current directory for --sync-cwd")?;
-                    if output == OutputFormat::Text {
-                        eprintln!("[job] syncing working tree from {}", cwd.display());
-                    }
-                    let archive = build_sync_archive(&cwd)?;
-                    let encoded = husker_agent_proto::base64_encode(&archive);
-                    let write_resp = api_request(
-                        with_api_auth(
-                            client.post(format!("{api_url}/v1/vms/{name}/files/write")),
-                            api_token.as_deref(),
-                        )
-                        .json(&serde_json::json!({
-                            "path": SYNC_ARCHIVE_GUEST_PATH,
-                            "data": encoded,
-                        })),
-                    )
-                    .await?;
-                    if !write_resp.status().is_success() {
-                        let msg = api_error(write_resp, &format!("VM '{name}'")).await;
-                        anyhow::bail!("{}", msg.message);
-                    }
-                    // --write-back returns the synced files as the command left them
-                    // (modifications only; new build artifacts are never pulled back).
-                    if write_back {
-                        retrieve_paths.extend(collect_sync_paths(&cwd)?);
-                    }
-                    // --out returns the named paths (files or dirs).
-                    retrieve_paths.extend(out.iter().cloned());
-                    retrieve_paths.sort();
-                    retrieve_paths.dedup();
-                    sync_cwd_dir = Some(cwd);
-                    wrap_sync_command(
-                        SYNC_ARCHIVE_GUEST_PATH,
-                        SYNC_WORKDIR,
-                        &command,
-                        SYNC_OUTPUT_GUEST_PATH,
-                        &retrieve_paths,
-                    )
-                } else if command.is_empty() {
-                    // Run the image's default entrypoint + cmd: an empty command
-                    // tells the guest agent to resolve it from the OCI config.
-                    (String::new(), Vec::new())
-                } else {
-                    (command[0].clone(), command[1..].to_vec())
-                };
-
-                // 3. Run the command via exec.
-                if output == OutputFormat::Text {
-                    eprintln!("[job] running command");
-                }
-                let env_map: std::collections::HashMap<String, String> = env
-                    .iter()
-                    .filter_map(|s| {
-                        let (k, v) = s.split_once('=')?;
-                        Some((k.to_string(), v.to_string()))
-                    })
-                    .collect();
-                let mut exec_body = serde_json::json!({
-                    "command": exec_command,
-                    "args": exec_args,
-                    "env": env_map,
-                    "timeout_secs": timeout,
-                });
-                if !secret_env.is_empty() {
-                    exec_body["secret_env"] = serde_json::Value::Object(secret_env.clone());
-                }
-                let resp = api_request(
-                    with_api_auth(
-                        client.post(format!("{api_url}/v1/vms/{name}/exec")),
-                        api_token.as_deref(),
-                    )
-                    .json(&exec_body),
-                )
-                .await?;
-                if !resp.status().is_success() {
-                    let msg = api_error(resp, &format!("VM '{name}'")).await;
-                    anyhow::bail!("{}", msg.message);
-                }
-                let result: serde_json::Value = resp.json().await?;
-
-                // 3.5 Pull requested results back to the host (--out / --write-back).
-                if let Some(cwd) = &sync_cwd_dir
-                    && !retrieve_paths.is_empty()
-                {
-                    let read_resp = api_request(
-                        with_api_auth(
-                            client.post(format!("{api_url}/v1/vms/{name}/files/read")),
-                            api_token.as_deref(),
-                        )
-                        .json(&serde_json::json!({ "path": SYNC_OUTPUT_GUEST_PATH })),
-                    )
-                    .await?;
-                    if read_resp.status().is_success() {
-                        let body: serde_json::Value = read_resp.json().await?;
-                        if let Some(b64) = body["data"].as_str()
-                            && let Ok(bytes) = husker_agent_proto::base64_decode(b64)
-                            && !bytes.is_empty()
-                        {
-                            let written = extract_archive_over(&bytes, cwd)?;
-                            if output == OutputFormat::Text {
-                                if written.is_empty() {
-                                    eprintln!("[job] nothing matched --out/--write-back");
-                                } else {
-                                    eprintln!("[job] retrieved {} file(s) to host:", written.len());
-                                    for f in &written {
-                                        eprintln!("  {f}");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // A missing output archive means the command produced none of the
-                    // requested paths; that is not an error.
-                }
-                Ok::<serde_json::Value, anyhow::Error>(result)
-            };
+            let work = job::run_job(job::JobRequest {
+                client: &client,
+                api_url: &api_url,
+                api_token: api_token.as_deref(),
+                output,
+                name: &name,
+                pool: pool.as_deref(),
+                body: body.as_ref(),
+                timeout,
+                dns: &dns,
+                add_host: &add_host,
+                sync_cwd,
+                write_back,
+                out: &out,
+                command: &command,
+                env: &env,
+                secret_env: &secret_env,
+            });
 
             // Ctrl-C destroys the VM (unless --keep) and exits 130.
             let result = tokio::select! {
@@ -5493,18 +5283,18 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
 }
 
 /// Default guest path the working-tree archive is uploaded to for `--sync-cwd`.
-const SYNC_ARCHIVE_GUEST_PATH: &str = "/tmp/.husker-sync.tgz";
+pub(crate) const SYNC_ARCHIVE_GUEST_PATH: &str = "/tmp/.husker-sync.tgz";
 /// Default guest directory the working tree is extracted into for `--sync-cwd`.
-const SYNC_WORKDIR: &str = "/work";
+pub(crate) const SYNC_WORKDIR: &str = "/work";
 /// Guest path the retrieval archive (`--out`/`--write-back`) is built at.
-const SYNC_OUTPUT_GUEST_PATH: &str = "/tmp/.husker-out.tgz";
+pub(crate) const SYNC_OUTPUT_GUEST_PATH: &str = "/tmp/.husker-out.tgz";
 
 /// Collect the set of files to sync into a `--sync-cwd` sandbox, relative to `dir`.
 ///
 /// In a git repository the list is git-aware: tracked plus untracked-but-not-ignored
 /// files (so gitignored build dirs like `target/` are excluded by construction). Outside
 /// a git repo it falls back to every file under `dir`, skipping any `.git` directory.
-fn collect_sync_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_sync_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     if dir.join(".git").is_dir() {
         // git-aware: tracked (--cached) plus untracked-but-not-ignored (--others
         // --exclude-standard), so gitignored build dirs are excluded by construction.
@@ -5563,7 +5353,7 @@ fn collect_walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Build a gzip-compressed tar archive of the `--sync-cwd` file set rooted at `dir`.
-fn build_sync_archive(dir: &Path) -> Result<Vec<u8>> {
+pub(crate) fn build_sync_archive(dir: &Path) -> Result<Vec<u8>> {
     let paths = collect_sync_paths(dir)?;
     let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(enc);
@@ -5593,7 +5383,7 @@ fn shell_single_quote(s: &str) -> String {
 /// back; the user command's exit code is preserved. Packing is best-effort (paths
 /// the command did not produce are skipped). Paths are single-quoted, so `--out`
 /// values cannot inject shell. busybox-safe: no `tar -T`/`--null`.
-fn wrap_sync_command(
+pub(crate) fn wrap_sync_command(
     archive_guest_path: &str,
     workdir: &str,
     command: &[String],
@@ -5627,7 +5417,7 @@ fn wrap_sync_command(
 
 /// Unpack a gzip+tar archive over `dst`, returning the relative paths written.
 /// Entries that would escape `dst` (absolute paths, `..`) are skipped.
-fn extract_archive_over(bytes: &[u8], dst: &Path) -> Result<Vec<String>> {
+pub(crate) fn extract_archive_over(bytes: &[u8], dst: &Path) -> Result<Vec<String>> {
     let gz = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(gz);
     let mut written = Vec::new();

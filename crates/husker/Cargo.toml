@@ -50,3 +50,5 @@ libc = "0.2"
 assert_cmd = "2"
 tempfile = "3"
 jsonschema = { version = "0.46", default-features = false }
+# Stub daemon for the `job` behavioural tests (already a workspace dep via husker-api).
+axum = { workspace = true }
