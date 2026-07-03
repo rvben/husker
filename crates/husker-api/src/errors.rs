@@ -9,7 +9,10 @@ use husker_core::CoreError;
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
-    pub code: String,
+    /// Stable snake_case error identifier consumers branch on. Named `kind` to
+    /// match the clispec CLI contract (`husker schema`) and the CLI's error
+    /// envelope, so every husker surface uses the same identifier field.
+    pub kind: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -20,10 +23,10 @@ pub struct ErrorResponse {
     pub error: Option<String>,
 }
 
-pub(crate) fn error_response(code: &str, message: impl Into<String>) -> Json<ErrorResponse> {
+pub(crate) fn error_response(kind: &str, message: impl Into<String>) -> Json<ErrorResponse> {
     let message = message.into();
     Json(ErrorResponse {
-        code: code.to_string(),
+        kind: kind.to_string(),
         message: message.clone(),
         hint: None,
         details: None,
@@ -32,13 +35,13 @@ pub(crate) fn error_response(code: &str, message: impl Into<String>) -> Json<Err
 }
 
 pub(crate) fn error_response_with_hint(
-    code: &str,
+    kind: &str,
     message: impl Into<String>,
     hint: impl Into<String>,
 ) -> Json<ErrorResponse> {
     let message = message.into();
     Json(ErrorResponse {
-        code: code.to_string(),
+        kind: kind.to_string(),
         message: message.clone(),
         hint: Some(hint.into()),
         details: None,
@@ -47,7 +50,7 @@ pub(crate) fn error_response_with_hint(
 }
 
 pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
-    let (status, code, message) = match &err {
+    let (status, kind, message) = match &err {
         CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, "vm_not_found", err.to_string()),
         CoreError::HostGroupNotFound(_) => (
             StatusCode::NOT_FOUND,
@@ -168,7 +171,7 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             err.to_string(),
         ),
     };
-    (status, error_response(code, message))
+    (status, error_response(kind, message))
 }
 
 pub(crate) fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {

@@ -136,7 +136,7 @@ async fn openapi_error_response_schema_is_stable() {
     let properties = err["properties"]
         .as_object()
         .expect("ErrorResponse.properties must be an object");
-    for key in ["code", "message", "hint", "details", "error"] {
+    for key in ["kind", "message", "hint", "details", "error"] {
         assert!(
             properties.contains_key(key),
             "ErrorResponse missing property: {key}"

@@ -691,7 +691,7 @@ async fn restore_missing_snapshot_returns_404() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let json = response_json(response).await;
-    assert_eq!(json["code"], "snapshot_not_found");
+    assert_eq!(json["kind"], "snapshot_not_found");
 }
 
 #[tokio::test]
@@ -715,7 +715,7 @@ async fn create_service_with_missing_host_group_returns_404() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let json = response_json(response).await;
-    assert_eq!(json["code"], "host_group_not_found");
+    assert_eq!(json["kind"], "host_group_not_found");
 }
 
 #[tokio::test]
@@ -766,7 +766,7 @@ async fn get_nonexistent_vm_returns_404_with_error_body() {
         error.contains("not found"),
         "error should mention 'not found', got: {error}"
     );
-    assert_eq!(json["code"], "vm_not_found");
+    assert_eq!(json["kind"], "vm_not_found");
     assert_eq!(json["message"], error);
 }
 

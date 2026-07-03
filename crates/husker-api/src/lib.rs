@@ -688,7 +688,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "host_group_not_found");
+        assert_eq!(json["kind"], "host_group_not_found");
     }
 
     #[tokio::test]
@@ -1101,7 +1101,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "snapshot_not_found");
+        assert_eq!(json["kind"], "snapshot_not_found");
     }
 
     #[tokio::test]
@@ -1325,7 +1325,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(serial.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response_json(serial).await["code"], "serial_log_not_found");
+        assert_eq!(response_json(serial).await["kind"], "serial_log_not_found");
 
         let userdata = app
             .clone()
@@ -1338,7 +1338,7 @@ mod tests {
             .unwrap();
         assert_eq!(userdata.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            response_json(userdata).await["code"],
+            response_json(userdata).await["kind"],
             "userdata_log_not_found"
         );
 
@@ -1353,7 +1353,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(boot.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response_json(boot).await["code"], "boot_log_not_found");
+        assert_eq!(response_json(boot).await["kind"], "boot_log_not_found");
 
         // source=serial via explicit param works like default.
         let serial2 = app
@@ -1366,7 +1366,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(serial2.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response_json(serial2).await["code"], "serial_log_not_found");
+        assert_eq!(response_json(serial2).await["kind"], "serial_log_not_found");
 
         // Unknown source yields 400 invalid_log_source.
         let bad = app
@@ -1378,7 +1378,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(response_json(bad).await["code"], "invalid_log_source");
+        assert_eq!(response_json(bad).await["kind"], "invalid_log_source");
     }
 
     #[tokio::test]
@@ -1460,7 +1460,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "invalid_argument");
+        assert_eq!(json["kind"], "invalid_argument");
         assert!(
             json["message"].as_str().unwrap_or("").contains("--balloon"),
             "error message should mention --balloon"
@@ -1571,7 +1571,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "policy_read_path_denied");
+        assert_eq!(json["kind"], "policy_read_path_denied");
 
         set_policy(ApiPolicy::default());
     }
@@ -1602,7 +1602,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "policy_write_path_denied");
+        assert_eq!(json["kind"], "policy_write_path_denied");
 
         set_policy(ApiPolicy::default());
     }
@@ -1633,7 +1633,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "write_file_too_large");
+        assert_eq!(json["kind"], "write_file_too_large");
 
         set_policy(ApiPolicy::default());
     }
@@ -2283,7 +2283,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
         let payload = body.0;
-        assert_eq!(payload.code, "agent_not_ready");
+        assert_eq!(payload.kind, "agent_not_ready");
         assert_eq!(
             payload.hint.as_deref(),
             Some("retry after the VM boot sequence has completed")
@@ -2392,7 +2392,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "volume_not_found");
+        assert_eq!(json["kind"], "volume_not_found");
     }
 
     #[tokio::test]
@@ -2408,7 +2408,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "volume_not_found");
+        assert_eq!(json["kind"], "volume_not_found");
     }
 
     #[tokio::test]
@@ -2485,7 +2485,7 @@ mod tests {
         // delete while attached returns 409 (Conflict)
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let json = response_json(response).await;
-        assert_eq!(json["code"], "volume_attached");
+        assert_eq!(json["kind"], "volume_attached");
     }
 
     #[test]

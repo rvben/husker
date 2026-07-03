@@ -566,12 +566,12 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
 }
 
 /// A failure to surface to the user: a human-readable `message`, an optional
-/// machine-readable `code` (the daemon's stable error code), the process
-/// exit code to return, and an optional actionable hint. `String`/`&str`
-/// convert in as a generic error.
+/// machine-readable `kind` (the daemon's stable error identifier, matching the
+/// clispec error envelope), the process exit code to return, and an optional
+/// actionable hint. `String`/`&str` convert in as a generic error.
 pub(crate) struct ApiFailure {
     pub(crate) message: String,
-    pub(crate) code: Option<String>,
+    pub(crate) kind: Option<String>,
     pub(crate) exit_code: i32,
     pub(crate) hint: Option<String>,
 }
@@ -580,7 +580,7 @@ impl From<String> for ApiFailure {
     fn from(message: String) -> Self {
         Self {
             message,
-            code: None,
+            kind: None,
             exit_code: exit_code::GENERAL,
             hint: None,
         }
@@ -607,7 +607,7 @@ impl std::fmt::Display for DaemonUnreachable {
 impl std::error::Error for DaemonUnreachable {}
 
 /// Build an `ApiFailure` from a non-success API response: derive the exit code
-/// from the HTTP status, capture the daemon's stable `code`, and the message.
+/// from the HTTP status, capture the daemon's stable `kind`, and the message.
 pub(crate) async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFailure {
     let status = resp.status();
     let exit_code = match status.as_u16() {
@@ -616,11 +616,11 @@ pub(crate) async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFail
         401 | 403 => exit_code::DENIED,
         _ => exit_code::GENERAL,
     };
-    let mut code = None;
+    let mut kind = None;
     let message = match resp.text().await {
         Ok(body) if !body.is_empty() => match serde_json::from_str::<serde_json::Value>(&body) {
             Ok(json) => {
-                code = json["code"].as_str().map(String::from);
+                kind = json["kind"].as_str().map(String::from);
                 if let Some(msg) = json["message"].as_str() {
                     match json["hint"].as_str() {
                         Some(hint) => format!("{msg} (hint: {hint})"),
@@ -642,7 +642,7 @@ pub(crate) async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFail
     };
     ApiFailure {
         message,
-        code,
+        kind,
         exit_code,
         hint: None,
     }
@@ -717,7 +717,7 @@ fn print_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<
 fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
     let err = error.into();
     let kind = err
-        .code
+        .kind
         .as_deref()
         .unwrap_or_else(|| exit_code_to_kind(err.exit_code));
     // The structured error envelope is always written to stderr as the last line.
@@ -754,7 +754,7 @@ fn require_confirmation(prompt: &str, yes: bool, format: OutputFormat) {
             format,
             ApiFailure {
                 message: format!("{prompt} requires confirmation"),
-                code: Some("confirmation_required".into()),
+                kind: Some("confirmation_required".into()),
                 exit_code: exit_code::CONFIRMATION_REQUIRED,
                 hint: Some("Re-run with --yes to confirm.".into()),
             },
@@ -2669,7 +2669,7 @@ async fn run(cli: Cli) -> Result<()> {
                         output,
                         ApiFailure {
                             message: format!("daemon unreachable: {e}"),
-                            code: None,
+                            kind: None,
                             exit_code: exit_code::DAEMON_UNREACHABLE,
                             hint: None,
                         },
@@ -2761,7 +2761,7 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
                         message: format!(
                             "unknown context '{name}' (list with `husker context list`)"
                         ),
-                        code: Some("not_found".into()),
+                        kind: Some("not_found".into()),
                         exit_code: exit_code::NOT_FOUND,
                         hint: None,
                     },
@@ -2781,7 +2781,7 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
                     output,
                     ApiFailure {
                         message: format!("unknown context '{name}'"),
-                        code: Some("not_found".into()),
+                        kind: Some("not_found".into()),
                         exit_code: exit_code::NOT_FOUND,
                         hint: None,
                     },
@@ -4573,7 +4573,7 @@ async fn run_shell_ws(
             output,
             ApiFailure {
                 message,
-                code: Some("vm_not_running".into()),
+                kind: Some("vm_not_running".into()),
                 exit_code: exit_code::CONFLICT,
                 hint: None,
             },
@@ -7392,19 +7392,19 @@ default_auto_resume = false
     }
 
     #[tokio::test]
-    async fn api_error_maps_status_and_code_to_exit_code() {
+    async fn api_error_maps_status_and_kind_to_exit_code() {
         let conflict = api_error(
             request_single_response(
                 "409 Conflict",
                 "application/json",
-                r#"{"code":"vm_exists"}"#,
+                r#"{"kind":"vm_exists"}"#,
             )
             .await,
             "vm",
         )
         .await;
         assert_eq!(conflict.exit_code, exit_code::CONFLICT);
-        assert_eq!(conflict.code.as_deref(), Some("vm_exists"));
+        assert_eq!(conflict.kind.as_deref(), Some("vm_exists"));
 
         let denied = api_error(
             request_single_response("403 Forbidden", "text/plain", "").await,
