@@ -33,7 +33,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         // Serialize forks of the same source (the rootfs alias moves the source's
         // disk aside during load) and guard the new name against a racing create.
-        let _src_guard = self.vm_name_lock(source_name).lock_owned().await;
+        // `src_guard` is released inside try_fork_vm as soon as the disk work is
+        // done (see PERF-1 there); `_fork_guard` is held for the whole operation.
+        let src_guard = self.vm_name_lock(source_name).lock_owned().await;
         let _fork_guard = self.vm_name_lock(fork_name).lock_owned().await;
 
         let source = self.lookup_vm(source_name)?;
@@ -70,7 +72,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         let mut resources = AllocatedResources::default();
-        match self.try_fork_vm(&source, fork_name, &mut resources).await {
+        match self
+            .try_fork_vm(&source, fork_name, &mut resources, src_guard)
+            .await
+        {
             Ok(rec) => {
                 info!(%source_name, %fork_name, "VM forked");
                 self.seed_activity(rec.id);
@@ -93,12 +98,16 @@ impl<B: VmmBackend> HuskerCore<B> {
         source: &VmRecord,
         fork_name: &str,
         resources: &mut AllocatedResources,
+        src_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<VmRecord, CoreError> {
         // Fresh host identity for the fork. `cid` is the fork's host-side id: it
         // names the TAP (`husker{cid}`) and derives the MAC, and is what we
         // persist. The guest's internal vsock CID stays the source's (baked in
         // the snapshot), which is harmless because host->guest agent connections
         // are Unix-socket-path based, not CID-addressed.
+        // PERF-1 measurement: split the source-lock-serialized disk work
+        // (allocate/clone/restore) from the fork-only tail (reconfigure/attach).
+        let t_start = std::time::Instant::now();
         let guest_ip = self.ip_allocator.allocate()?;
         resources.guest_ip = Some(guest_ip);
         let cid = self.state.allocate_cid()?;
@@ -152,6 +161,18 @@ impl<B: VmmBackend> HuskerCore<B> {
             )
             .await?;
         resources.vm_id = Some(info.id);
+        let disk_phase = t_start.elapsed();
+
+        // PERF-1: the source name lock only needs to cover the disk work above.
+        // The FC snapshot restore aliases the source rootfs aside and reverts it
+        // before `restore_vm` returns, and everything below operates solely on
+        // the fork (its own clone, VMM instance, and TAP). Release the source
+        // lock now so a slow guest agent during the network re-home cannot stall
+        // concurrent checkouts from the same pool. Measured ~240ms (28% of a
+        // ~860ms fork) was held here needlessly on the happy path, and far more
+        // as the reconfigure retries toward its 10s deadline. Rollback on a later
+        // failure touches only the fork's resources, so it does not need this.
+        drop(src_guard);
 
         // Re-home the guest's network identity (new MAC + IP + gateway + DNS) live.
         self.reconfigure_fork_network(info.id, &guest_ip, prefix_len, gateway, &mac)
@@ -198,6 +219,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
             other => CoreError::State(other),
         })?;
+        let total = t_start.elapsed();
+        info!(
+            source = %source.name,
+            fork = %fork_name,
+            disk_phase_ms = disk_phase.as_millis() as u64,
+            tail_ms = (total - disk_phase).as_millis() as u64,
+            total_ms = total.as_millis() as u64,
+            "fork phase timing (disk_phase holds the source lock; tail is fork-only)"
+        );
         Ok(record)
     }
 
