@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -159,15 +159,39 @@ test-net-e2e-gated:
 		true; \
 	fi
 
-# Real QEMU boot + vsock e2e (needs Linux KVM + vhost-vsock + qemu + images)
-test-qemu-e2e-gated: ## Real QEMU boot + vsock e2e (needs Linux KVM + vhost-vsock + qemu + images)
-	HUSKER_RUN_IGNORED_E2E=1 cargo nextest run -p husker-vmm --run-ignored all qemu_boots_and_vsock
+# Real QEMU boot + vsock e2e (needs Linux KVM + vhost-vsock + qemu + a virtio-PCI
+# kernel; the Firecracker/MMIO release kernel will NOT boot here).
+test-qemu-e2e-gated: ## Real QEMU boot + vsock e2e (needs Linux/KVM/qemu + a virtio-PCI kernel)
+	@if [ "$${HUSKER_RUN_QEMU_E2E:-0}" = "1" ]; then \
+		HUSKER_RUN_IGNORED_E2E=1 cargo nextest run -p husker-vmm --run-ignored all qemu_boots_and_vsock; \
+	else \
+		echo "Skipping QEMU e2e (set HUSKER_RUN_QEMU_E2E=1; needs Linux/KVM/qemu/vhost-vsock + a virtio-PCI kernel via HUSKER_E2E_KERNEL/ROOTFS)"; \
+		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=qemu e2e gate not run::QEMU e2e was SKIPPED (HUSKER_RUN_QEMU_E2E is not '1'); this job is green but exercised no e2e"; \
+		true; \
+	fi
 
 # Gated Apple VZ cloud-image e2e (macOS only; needs qemu-img + a local Ubuntu arm64 image).
-# Usage: HUSKER_VZ_CLOUD_IMAGE=/tmp/noble-arm64.img make test-vz-cloud-e2e-gated
+# Usage: HUSKER_VZ_CLOUD_IMAGE=/tmp/noble-arm64.img HUSKER_RUN_VZ_CLOUD_E2E=1 make test-vz-cloud-e2e-gated
 test-vz-cloud-e2e-gated: ## Gated VZ cloud-image e2e (macOS only)
-	HUSKER_RUN_VZ_CLOUD_E2E=1 cargo nextest run -p husker --no-default-features \
-		--run-ignored all vz_cloud
+	@if [ "$${HUSKER_RUN_VZ_CLOUD_E2E:-0}" = "1" ]; then \
+		cargo nextest run -p husker --no-default-features --run-ignored all vz_cloud; \
+	else \
+		echo "Skipping VZ cloud-image e2e (set HUSKER_RUN_VZ_CLOUD_E2E=1; macOS + qemu-img + HUSKER_VZ_CLOUD_IMAGE)"; \
+		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=vz cloud e2e gate not run::VZ cloud-image e2e was SKIPPED (HUSKER_RUN_VZ_CLOUD_E2E is not '1'); this job is green but exercised no e2e"; \
+		true; \
+	fi
+
+# Gated idle-policy suspend/resume-on-connect e2e on real Firecracker (Linux/KVM/
+# Firecracker/root). Needs HUSKER_E2E_KERNEL/ROOTFS (the standard images-* release
+# works here, unlike the QEMU gate). The test is #[ignore] + linux-net-only.
+test-idle-policy-e2e-gated: ## Gated idle-policy suspend/resume e2e (Linux/KVM/Firecracker)
+	@if [ "$${HUSKER_RUN_IDLE_POLICY_E2E:-0}" = "1" ]; then \
+		HUSKER_RUN_IGNORED_E2E=1 cargo nextest run -p husker-core --test idle_policy_e2e --run-ignored all; \
+	else \
+		echo "Skipping idle-policy e2e (set HUSKER_RUN_IDLE_POLICY_E2E=1; needs Linux/KVM/Firecracker + HUSKER_E2E_KERNEL/ROOTFS)"; \
+		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=idle-policy e2e gate not run::idle-policy e2e was SKIPPED (HUSKER_RUN_IDLE_POLICY_E2E is not '1'); this job is green but exercised no e2e"; \
+		true; \
+	fi
 
 # Gated OCI-import boot e2e: import a Docker image and boot it as an
 # agent-supervised microVM (the OCI-native sandbox keystone). Needs Linux with

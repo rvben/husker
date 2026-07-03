@@ -1,0 +1,34 @@
+name: VZ Cloud-Image E2E
+
+# Apple VZ cloud-image e2e on the self-hosted mac-mini (Apple Silicon):
+# convert + boot a stock Ubuntu arm64 cloud image under Virtualization.framework
+# and confirm the guest agent reports its DHCP IP
+# (crates/husker/tests/vz_cloud_e2e.rs::vz_cloud_image_boots_and_reports_ip).
+#
+# Dispatch-only: point it at a local Ubuntu arm64 cloud image staged on the
+# runner (HUSKER_VZ_CLOUD_IMAGE). Needs qemu-img (qcow2->raw) and the aarch64
+# guest agent embedded, plus an ad-hoc codesign for the VZ entitlement.
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "mac-mini path to an Ubuntu arm64 cloud image (HUSKER_VZ_CLOUD_IMAGE)"
+        required: true
+
+jobs:
+  vz-cloud-e2e:
+    name: VZ Cloud-Image E2E (mac-mini)
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      # The cloud-image path embeds the aarch64-musl guest agent; build it so the
+      # daemon under test seeds it into the VM.
+      - name: Build aarch64 guest agent
+        run: make build-agent-aarch64
+      - name: VZ cloud-image e2e gate
+        env:
+          HUSKER_RUN_VZ_CLOUD_E2E: "1"
+          HUSKER_VZ_CLOUD_IMAGE: ${{ inputs.image }}
+          HUSKER_EMBED_AGENT_BIN: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/agent/husker-agent
+        run: make test-vz-cloud-e2e-gated

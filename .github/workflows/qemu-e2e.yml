@@ -1,0 +1,41 @@
+name: QEMU E2E
+
+# Real QEMU/KVM boot + vsock e2e on the self-hosted Linux runner
+# (crates/husker-vmm/tests/qemu_e2e.rs::qemu_boots_and_vsock, #[ignore]).
+#
+# Unlike the Firecracker gates, the guest kernel must support virtio over PCI
+# (CONFIG_VIRTIO_PCI); the standard images-* Firecracker/MMIO kernel will NOT
+# find the root disk here. So this gate is dispatch-only: point it at a
+# virtio-PCI kernel + a disposable rootfs already staged on the runner. Wire it
+# into the nightly schedule once such an image is published.
+on:
+  workflow_dispatch:
+    inputs:
+      kernel:
+        description: "Runner path to a virtio-PCI kernel (HUSKER_E2E_KERNEL)"
+        required: true
+      rootfs:
+        description: "Runner path to a disposable rootfs (HUSKER_E2E_ROOTFS)"
+        required: true
+      initrd:
+        description: "Optional initramfs path (HUSKER_E2E_INITRD)"
+        required: false
+        default: ""
+
+jobs:
+  qemu-e2e:
+    name: QEMU E2E (self-hosted, KVM)
+    runs-on: [self-hosted, husker, linux]
+    steps:
+      - uses: actions/checkout@v6
+      - name: QEMU e2e gate
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            HUSKER_RUN_QEMU_E2E=1 \
+            HUSKER_E2E_KERNEL="${{ inputs.kernel }}" \
+            HUSKER_E2E_ROOTFS="${{ inputs.rootfs }}" \
+            HUSKER_E2E_INITRD="${{ inputs.initrd }}" \
+            make test-qemu-e2e-gated
