@@ -263,6 +263,77 @@ pub async fn resize_disk(path: &Path, new_size_bytes: u64) -> Result<(), Storage
     Ok(())
 }
 
+/// Grow a raw ext4 rootfs image to `new_size_bytes` offline.
+///
+/// Used for plain-rootfs VMs (`--disk-size` with a catalog/OCI image), which
+/// have no cloud-init to grow the filesystem on first boot: extend the file
+/// (sparse, so the growth costs no host disk until written), then run
+/// `e2fsck -fp` + `resize2fs` to grow the filesystem into it. Both tools ship
+/// in e2fsprogs, the same package that provides the `mkfs.ext4` used at
+/// import time. Shrinking is refused.
+pub async fn grow_rootfs_ext4(path: &Path, new_size_bytes: u64) -> Result<(), StorageError> {
+    let current = tokio::fs::metadata(path)
+        .await
+        .map_err(StorageError::Io)?
+        .len();
+    if new_size_bytes < current {
+        return Err(StorageError::CommandFailed(format!(
+            "disk_size {new_size_bytes} bytes is smaller than the rootfs image \
+             ({current} bytes); shrinking is not supported"
+        )));
+    }
+    if new_size_bytes == current {
+        return Ok(());
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(StorageError::Io)?;
+    file.set_len(new_size_bytes)
+        .await
+        .map_err(StorageError::Io)?;
+    drop(file);
+
+    // resize2fs refuses a filesystem that has not been checked since its last
+    // mount; -f forces the check, -p auto-fixes. Exit code 1 means "errors
+    // corrected", which is fine for a freshly cloned image.
+    let fsck = tokio::process::Command::new("e2fsck")
+        .arg("-fp")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| {
+            StorageError::CommandFailed(format!(
+                "e2fsck not runnable ({e}); growing a rootfs image needs e2fsprogs"
+            ))
+        })?;
+    if !matches!(fsck.status.code(), Some(0) | Some(1)) {
+        return Err(StorageError::CommandFailed(format!(
+            "e2fsck {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&fsck.stderr).trim()
+        )));
+    }
+    let resize = tokio::process::Command::new("resize2fs")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| {
+            StorageError::CommandFailed(format!(
+                "resize2fs not runnable ({e}); growing a rootfs image needs e2fsprogs"
+            ))
+        })?;
+    if !resize.status.success() {
+        return Err(StorageError::CommandFailed(format!(
+            "resize2fs {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&resize.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Virtual size of a qcow2 image in bytes, via `qemu-img info`.
 ///
 /// Returns the number of bytes the guest OS sees as the disk's capacity,

@@ -895,9 +895,6 @@ fn build_vm_request_body(
         }
     }
 
-    if args.disk_size.is_some() && args.cloud_image.is_none() {
-        exit_with_error(output, "--disk-size requires --cloud-image".to_string());
-    }
     if !args.ssh_key.is_empty() && args.cloud_image.is_none() {
         exit_with_error(output, "--ssh-key requires --cloud-image".to_string());
     }
@@ -924,18 +921,29 @@ fn build_vm_request_body(
         body["vmm"] = serde_json::json!(vmm_kind);
     }
 
-    if let Some(ref img) = args.cloud_image.clone() {
-        body["cloud_image"] = serde_json::json!(img);
+    // An explicit --disk-size applies to any image kind: cloud images grow via
+    // cloud-init on first boot, plain rootfs images are resized offline by the
+    // daemon. The config default_disk_size stays cloud-image-only so a config
+    // knob cannot silently start resizing every rootfs VM.
+    let effective_disk_size = args.disk_size.clone().or_else(|| {
+        args.cloud_image
+            .is_some()
+            .then(|| config.default_disk_size.clone())
+            .flatten()
+    });
+    if let Some(ref size) = effective_disk_size {
         let disk_size_source = if args.disk_size.is_some() {
             "--disk-size"
         } else {
             "config default_disk_size"
         };
-        if let Some(ref size) = args.disk_size.clone().or(config.default_disk_size.clone()) {
-            let bytes = husker::parse_disk_size(size)
-                .map_err(|e| anyhow::anyhow!("{disk_size_source}: {e}"))?;
-            body["disk_size"] = serde_json::json!(bytes);
-        }
+        let bytes = husker::parse_disk_size(size)
+            .map_err(|e| anyhow::anyhow!("{disk_size_source}: {e}"))?;
+        body["disk_size"] = serde_json::json!(bytes);
+    }
+
+    if let Some(ref img) = args.cloud_image.clone() {
+        body["cloud_image"] = serde_json::json!(img);
         if !args.ssh_key.is_empty() {
             let mut keys: Vec<String> = Vec::new();
             for path in &args.ssh_key {
@@ -3374,13 +3382,13 @@ async fn service_command(
             }
             if let Some(ref ci) = cloud_image {
                 body["cloud_image"] = serde_json::json!(ci);
-                if let Some(ref size) = disk_size {
-                    let bytes = husker::parse_disk_size(size)
-                        .map_err(|e| anyhow::anyhow!("--disk-size: {e}"))?;
-                    body["disk_size"] = serde_json::json!(bytes);
-                }
-            } else if disk_size.is_some() {
-                exit_with_error(output, "--disk-size requires --cloud-image".to_string());
+            }
+            // Applies to cloud images (grown by cloud-init on first boot) and
+            // plain rootfs images (resized offline by the daemon) alike.
+            if let Some(ref size) = disk_size {
+                let bytes = husker::parse_disk_size(size)
+                    .map_err(|e| anyhow::anyhow!("--disk-size: {e}"))?;
+                body["disk_size"] = serde_json::json!(bytes);
             }
             if balloon {
                 body["balloon"] = serde_json::json!(true);

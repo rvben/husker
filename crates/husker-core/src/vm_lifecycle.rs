@@ -363,6 +363,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             })?;
             let vm_rootfs = vm_dir.join("rootfs.ext4");
             self.storage_driver.clone_rootfs(rootfs, &vm_rootfs).await?;
+            // Plain rootfs images have no cloud-init to grow the filesystem on
+            // first boot, so an explicit disk_size is applied offline here.
+            if let Some(size) = req.disk_size {
+                husker_storage::grow_rootfs_ext4(&vm_rootfs, size).await?;
+            }
             (
                 vm_rootfs,
                 husker_vmm::BootMode::DirectKernel,
@@ -793,6 +798,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         })?;
         let vm_rootfs = vm_dir.join("rootfs.ext4");
         self.storage_driver.clone_rootfs(rootfs, &vm_rootfs).await?;
+        // Plain rootfs images have no cloud-init to grow the filesystem on
+        // first boot, so an explicit disk_size is applied offline here.
+        if let Some(size) = req.disk_size {
+            husker_storage::grow_rootfs_ext4(&vm_rootfs, size).await?;
+        }
         resources.vm_dir = Some(vm_dir);
 
         // Resolve the named volume to its image path. The exclusivity check runs

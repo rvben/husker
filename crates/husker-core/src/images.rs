@@ -140,7 +140,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "imported rootfs is {tree_size} bytes, over the {MAX_ROOTFS_BYTES}-byte limit"
             )));
         }
-        let size_bytes = (tree_size * 2).max(128 * 1024 * 1024) + 64 * 1024 * 1024;
+        let size_bytes = oci_rootfs_size_bytes(tree_size);
         husker_storage::build_ext4_from_dir(&rootfs_dir, &image_path, size_bytes).await?;
 
         let metadata = tokio::fs::metadata(&image_path)
@@ -232,5 +232,43 @@ impl<B: VmmBackend> HuskerCore<B> {
             husker_state::StateError::ImageNotFound(_) => CoreError::ImageNotFound(name.into()),
             other => CoreError::State(other),
         })
+    }
+}
+
+/// Size an imported OCI rootfs: the tree itself, growth headroom (the tree
+/// again, floored at 512 MiB) so package installs (`pip`/`apk`/`npm`) have
+/// real room out of the box, and a 64 MiB base for ext4 metadata/journal.
+/// The built file is sparse, so headroom costs no host disk until written;
+/// non-reflink hosts pay per-clone only for blocks that carry data. Workloads
+/// needing more room pass `--disk-size` at run/job time.
+#[cfg(feature = "linux-net")]
+fn oci_rootfs_size_bytes(tree_size: u64) -> u64 {
+    const MIN_HEADROOM: u64 = 512 * 1024 * 1024;
+    const EXT4_BASE: u64 = 64 * 1024 * 1024;
+    tree_size + tree_size.max(MIN_HEADROOM) + EXT4_BASE
+}
+
+#[cfg(all(test, feature = "linux-net"))]
+mod tests {
+    use super::oci_rootfs_size_bytes;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn small_images_get_the_headroom_floor() {
+        // A python:3.12-slim-sized tree (~135 MiB) used to become a ~334 MiB
+        // image with ~114 MiB free - pip install of a data stack hit ENOSPC.
+        let size = oci_rootfs_size_bytes(135 * MIB);
+        assert_eq!(size, (135 + 512 + 64) * MIB);
+        // Even a tiny alpine tree gets the full floor.
+        assert_eq!(oci_rootfs_size_bytes(8 * MIB), (8 + 512 + 64) * MIB);
+    }
+
+    #[test]
+    fn large_images_keep_proportional_headroom() {
+        // Above the floor the headroom is the tree size itself (2x + base),
+        // matching the old formula so big toolchain images do not regress.
+        let tree = 2200 * MIB;
+        assert_eq!(oci_rootfs_size_bytes(tree), tree * 2 + 64 * MIB);
     }
 }

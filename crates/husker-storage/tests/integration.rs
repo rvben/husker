@@ -38,6 +38,75 @@ fn vm_dir_returns_expected_path() {
     assert_eq!(config.vm_dir("my-vm"), PathBuf::from("/data/vms/my-vm"));
 }
 
+// ── grow_rootfs_ext4 ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn grow_rootfs_ext4_refuses_shrink() {
+    let dir = tempdir().unwrap();
+    let img = dir.path().join("img.ext4");
+    std::fs::write(&img, vec![0u8; 1024 * 1024]).unwrap();
+
+    let err = husker_storage::grow_rootfs_ext4(&img, 1024)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("shrinking is not supported"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn grow_rootfs_ext4_same_size_is_a_noop() {
+    let dir = tempdir().unwrap();
+    let img = dir.path().join("img.ext4");
+    std::fs::write(&img, vec![0u8; 1024 * 1024]).unwrap();
+
+    // Equal size returns before any e2fsprogs invocation, so this passes on
+    // hosts without the tools too.
+    husker_storage::grow_rootfs_ext4(&img, 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 1024 * 1024);
+}
+
+/// End-to-end grow of a real ext4 image. Skips quietly on hosts without
+/// e2fsprogs (e.g. stock macOS); Linux CI and dev hosts exercise it.
+#[tokio::test]
+async fn grow_rootfs_ext4_grows_a_real_filesystem() {
+    for tool in ["mkfs.ext4", "e2fsck", "resize2fs"] {
+        if std::process::Command::new(tool).arg("-V").output().is_err() {
+            eprintln!("skipping: {tool} not available on this host");
+            return;
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("hello.txt"), b"hello").unwrap();
+    let img = dir.path().join("img.ext4");
+    husker_storage::build_ext4_from_dir(&tree, &img, 8 * 1024 * 1024)
+        .await
+        .unwrap();
+
+    husker_storage::grow_rootfs_ext4(&img, 16 * 1024 * 1024)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 16 * 1024 * 1024);
+    // The grown filesystem must still be clean (e2fsck -fn = read-only check).
+    let fsck = std::process::Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck after grow: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
 // ── clone_rootfs ────────────────────────────────────────────────────
 
 #[tokio::test]

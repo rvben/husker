@@ -129,7 +129,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         cloud_image: Option<PathBuf>,
 
-        /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
+        /// Resize the VM disk before boot, e.g. 10G. Cloud images grow on first boot (cloud-init); rootfs images are resized offline (needs e2fsprogs on the daemon host)
         #[arg(long)]
         disk_size: Option<String>,
 
@@ -360,7 +360,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         cloud_image: Option<PathBuf>,
 
-        /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
+        /// Resize the VM disk before boot, e.g. 10G. Cloud images grow on first boot (cloud-init); rootfs images are resized offline (needs e2fsprogs on the daemon host)
         #[arg(long)]
         disk_size: Option<String>,
 
@@ -776,7 +776,7 @@ pub(crate) enum ServiceAction {
         /// when set, --rootfs and --kernel become optional
         #[arg(long)]
         cloud_image: Option<String>,
-        /// Resize the cloud-image disk before boot, e.g. 10G (cloud-image only)
+        /// Resize the VM disk before boot, e.g. 10G. Cloud images grow on first boot (cloud-init); rootfs images are resized offline (needs e2fsprogs on the daemon host)
         #[arg(long)]
         disk_size: Option<String>,
         /// Attach a virtio memory balloon to each instance
