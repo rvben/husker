@@ -491,10 +491,22 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
             .await
             .context("creating bridge")?;
 
+        // Resolve the NAT uplink ("auto" follows the IPv4 default route) and
+        // surface anything that would silently leave guests without WAN.
+        let uplink = husker_net::resolve_host_interface(&config.host_interface);
+        for warning in &uplink.warnings {
+            tracing::warn!("{warning}");
+        }
+        tracing::info!(
+            iface = %uplink.effective,
+            source = ?uplink.source,
+            "guest NAT uplink"
+        );
+
         husker_net::init_nat(
             &config.bridge_name,
             &config.bridge_subnet,
-            &config.host_interface,
+            &uplink.effective,
         )
         .await
         .context("initializing nftables")?;
@@ -547,7 +559,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
                 .with_storage_volume(config.storage_volume)
                 .with_resource_limits(config.resource_limits)
-                .with_host_interface(config.host_interface.clone())
+                .with_host_interface(uplink.effective.clone())
                 .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
                 .with_lan_bridge(config.lan_bridge.clone())
                 .with_default_vmm_kind(default_kind)
@@ -588,7 +600,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                 )
                 .with_storage_volume(config.storage_volume)
                 .with_resource_limits(config.resource_limits)
-                .with_host_interface(config.host_interface.clone())
+                .with_host_interface(uplink.effective.clone())
                 .with_default_images(
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),

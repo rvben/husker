@@ -516,6 +516,151 @@ pub async fn init_nat(
     Ok(())
 }
 
+// ── Host uplink resolution ─────────────────────────────────────────────
+
+/// Sentinel config value meaning "pick the default-route interface at startup".
+pub const HOST_INTERFACE_AUTO: &str = "auto";
+
+/// Historical fallback uplink when no default route can be found.
+const HOST_INTERFACE_FALLBACK: &str = "eth0";
+
+/// How the effective guest-NAT uplink interface was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostInterfaceSource {
+    /// Operator-configured name, used verbatim.
+    Configured,
+    /// Auto-detected from the host's IPv4 default route.
+    DefaultRoute,
+    /// No default route found; fell back to the historical default.
+    Fallback,
+}
+
+/// Result of [`resolve_host_interface`]: the interface the masquerade rule
+/// pins, plus any problems worth surfacing to the operator.
+#[derive(Debug)]
+pub struct HostInterfaceResolution {
+    pub effective: String,
+    pub source: HostInterfaceSource,
+    /// Human-readable problems (missing/down/route mismatch). NAT rules are
+    /// still installed; these explain why guests may have no WAN until fixed.
+    pub warnings: Vec<String>,
+}
+
+/// Resolve the guest-NAT uplink from the configured value.
+///
+/// `"auto"` (or empty) picks the interface carrying the IPv4 default route.
+/// An explicit name is honored verbatim but validated: a missing or down
+/// interface, or one that does not carry the default route, silently breaks
+/// guest egress (the masquerade rule never matches any packet), so each of
+/// those conditions becomes a warning.
+pub fn resolve_host_interface(configured: &str) -> HostInterfaceResolution {
+    resolve_host_interface_with(
+        configured,
+        default_route_interface().as_deref(),
+        |iface| std::path::Path::new(&format!("/sys/class/net/{iface}")).exists(),
+        interface_operstate,
+    )
+}
+
+fn resolve_host_interface_with(
+    configured: &str,
+    default_route: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+    operstate: impl Fn(&str) -> Option<String>,
+) -> HostInterfaceResolution {
+    let configured = configured.trim();
+    if configured.is_empty() || configured.eq_ignore_ascii_case(HOST_INTERFACE_AUTO) {
+        return match default_route {
+            Some(iface) => HostInterfaceResolution {
+                effective: iface.to_string(),
+                source: HostInterfaceSource::DefaultRoute,
+                warnings: Vec::new(),
+            },
+            None => HostInterfaceResolution {
+                effective: HOST_INTERFACE_FALLBACK.into(),
+                source: HostInterfaceSource::Fallback,
+                warnings: vec![format!(
+                    "no IPv4 default route found; guest NAT falls back to \
+                     '{HOST_INTERFACE_FALLBACK}' - guests have no WAN until the host \
+                     gains an uplink (then restart the daemon)"
+                )],
+            },
+        };
+    }
+
+    let mut warnings = Vec::new();
+    if !exists(configured) {
+        warnings.push(format!(
+            "host_interface '{configured}' does not exist - guests get no WAN/DNS \
+             (set host_interface = \"auto\" to follow the default route)"
+        ));
+    } else if let Some(state) = operstate(configured)
+        && (state == "down" || state == "lowerlayerdown")
+    {
+        warnings.push(format!(
+            "host_interface '{configured}' is {state} (no carrier?) - guests get \
+             no WAN/DNS until it comes up"
+        ));
+    }
+    if let Some(route_iface) = default_route
+        && route_iface != configured
+    {
+        warnings.push(format!(
+            "IPv4 default route is via '{route_iface}' but guest NAT masquerades \
+             via '{configured}'; guest egress will not be NATed (set \
+             host_interface = \"auto\" or \"{route_iface}\")"
+        ));
+    }
+    HostInterfaceResolution {
+        effective: configured.to_string(),
+        source: HostInterfaceSource::Configured,
+        warnings,
+    }
+}
+
+/// The interface carrying the host's IPv4 default route (lowest metric wins),
+/// read from `/proc/net/route`.
+pub fn default_route_interface() -> Option<String> {
+    let content = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_default_route_interface(&content)
+}
+
+fn parse_default_route_interface(route_table: &str) -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    for line in route_table.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        // Destination and mask both zero = default route.
+        if fields[1] != "00000000" || fields[7] != "00000000" {
+            continue;
+        }
+        // RTF_UP (0x1): skip routes that are not up.
+        let flags = u32::from_str_radix(fields[3], 16).unwrap_or(0);
+        if flags & 0x1 == 0 {
+            continue;
+        }
+        let metric = fields[6].parse::<u32>().unwrap_or(u32::MAX);
+        let better = match &best {
+            Some((m, _)) => metric < *m,
+            None => true,
+        };
+        if better {
+            best = Some((metric, fields[0].to_string()));
+        }
+    }
+    best.map(|(_, iface)| iface)
+}
+
+/// The kernel operstate for an interface (`up`, `down`, `unknown`, ...), if
+/// readable from sysfs.
+pub fn interface_operstate(iface: &str) -> Option<String> {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 // ── Port Forwarding ───────────────────────────────────────────────────
 
 /// Add a port forward from `host_port` to `guest_ip:guest_port` in the nftables table for `bridge_name`.
@@ -1002,6 +1147,103 @@ pub async fn check_subnet_conflict(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // ── Host uplink resolution ─────────────────────────────────────────
+
+    const ROUTE_TABLE: &str = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+        enp1s0\t00000000\t010014AC\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+        enp1s0\t000014AC\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n\
+        wlan0\t00000000\t010014AC\t0003\t0\t0\t600\t00000000\t0\t0\t0\n";
+
+    #[test]
+    fn default_route_picks_lowest_metric() {
+        assert_eq!(
+            parse_default_route_interface(ROUTE_TABLE).as_deref(),
+            Some("enp1s0"),
+            "wired default (metric 100) beats wifi (metric 600)"
+        );
+    }
+
+    #[test]
+    fn default_route_skips_non_default_and_down_routes() {
+        // Only a non-default route: no answer.
+        let non_default = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+            eth0\t000014AC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(parse_default_route_interface(non_default), None);
+        // A default route without RTF_UP is ignored.
+        let down = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+            eth0\t00000000\t010014AC\t0002\t0\t0\t0\t00000000\t0\t0\t0\n";
+        assert_eq!(parse_default_route_interface(down), None);
+        assert_eq!(parse_default_route_interface(""), None);
+    }
+
+    #[test]
+    fn resolve_auto_follows_default_route() {
+        for configured in ["auto", "AUTO", "", "  "] {
+            let r = resolve_host_interface_with(
+                configured,
+                Some("enp1s0"),
+                |_| true,
+                |_| Some("up".into()),
+            );
+            assert_eq!(r.effective, "enp1s0");
+            assert_eq!(r.source, HostInterfaceSource::DefaultRoute);
+            assert!(r.warnings.is_empty(), "warnings: {:?}", r.warnings);
+        }
+    }
+
+    #[test]
+    fn resolve_auto_without_default_route_falls_back_with_warning() {
+        let r = resolve_host_interface_with("auto", None, |_| true, |_| Some("up".into()));
+        assert_eq!(r.effective, "eth0");
+        assert_eq!(r.source, HostInterfaceSource::Fallback);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("no IPv4 default route"));
+    }
+
+    #[test]
+    fn resolve_configured_healthy_interface_has_no_warnings() {
+        let r =
+            resolve_host_interface_with("enp1s0", Some("enp1s0"), |_| true, |_| Some("up".into()));
+        assert_eq!(r.effective, "enp1s0");
+        assert_eq!(r.source, HostInterfaceSource::Configured);
+        assert!(r.warnings.is_empty(), "warnings: {:?}", r.warnings);
+    }
+
+    #[test]
+    fn resolve_configured_missing_interface_warns() {
+        let r = resolve_host_interface_with("eth9", None, |_| false, |_| None);
+        assert_eq!(r.effective, "eth9", "explicit config is honored verbatim");
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("does not exist"));
+    }
+
+    #[test]
+    fn resolve_configured_down_interface_warns() {
+        let r = resolve_host_interface_with(
+            "enp4s0",
+            Some("enp4s0"),
+            |_| true,
+            |_| Some("down".into()),
+        );
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("is down"));
+    }
+
+    #[test]
+    fn resolve_configured_route_mismatch_warns() {
+        // The husker01 incident: pinned iface exists but is down AND the
+        // default route runs via another NIC - both problems surface.
+        let r = resolve_host_interface_with(
+            "enp4s0",
+            Some("enp1s0"),
+            |_| true,
+            |_| Some("down".into()),
+        );
+        assert_eq!(r.effective, "enp4s0");
+        assert_eq!(r.warnings.len(), 2, "warnings: {:?}", r.warnings);
+        assert!(r.warnings[1].contains("default route is via 'enp1s0'"));
+    }
 
     // ── Subnet conflict detection ──────────────────────────────────────
 

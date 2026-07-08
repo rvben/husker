@@ -1955,19 +1955,40 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         let nft = binary_on_path("nft");
-        let iface_ok = match input.host_interface {
-            Some(iface) => std::path::Path::new(&format!("/sys/class/net/{iface}")).exists(),
-            // Unknown uplink (daemon did not report one): skip the interface probe.
-            None => true,
-        };
-        let (status, message) = if !iface_ok {
-            (
-                CheckStatus::Fail,
-                format!(
-                    "host_interface {} not found (guests get no WAN/DNS)",
-                    input.host_interface.unwrap_or("?")
-                ),
-            )
+        // Uplink problems, most fundamental first: a missing interface, a
+        // downed link, or a masquerade pinned off the default-route device all
+        // leave guests without WAN while everything else looks healthy.
+        let mut iface_problem: Option<String> = None;
+        if let Some(iface) = input.host_interface {
+            if !std::path::Path::new(&format!("/sys/class/net/{iface}")).exists() {
+                iface_problem = Some(format!(
+                    "host_interface {iface} not found (guests get no WAN/DNS)"
+                ));
+            }
+            #[cfg(feature = "linux-net")]
+            {
+                if iface_problem.is_none() {
+                    if let Some(state) = husker_net::interface_operstate(iface) {
+                        if state == "down" || state == "lowerlayerdown" {
+                            iface_problem = Some(format!(
+                                "host_interface {iface} is {state} - no carrier, guests get no WAN/DNS"
+                            ));
+                        }
+                    }
+                }
+                if iface_problem.is_none() {
+                    if let Some(route_iface) = husker_net::default_route_interface() {
+                        if route_iface != iface {
+                            iface_problem = Some(format!(
+                                "IPv4 default route is via {route_iface} but guest NAT masquerades via {iface}; guests get no WAN (set host_interface = \"auto\")"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let (status, message) = if let Some(problem) = iface_problem {
+            (CheckStatus::Fail, problem)
         } else if !ip_forward {
             (
                 CheckStatus::Fail,

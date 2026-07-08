@@ -2641,8 +2641,11 @@ async fn run(cli: Cli) -> Result<()> {
                     };
                     let storage_volume = config.storage_volume;
                     let embedded_agent_present = husker::agent_embedded();
+                    // Resolve "auto" the same way the daemon does so the probe
+                    // checks the interface NAT would actually pin.
                     #[cfg(feature = "linux-net")]
-                    let host_interface = Some(config.host_interface.clone());
+                    let host_interface =
+                        Some(husker_net::resolve_host_interface(&config.host_interface).effective);
                     #[cfg(not(feature = "linux-net"))]
                     let host_interface: Option<String> = None;
                     match tokio::task::spawn_blocking(move || {
@@ -5096,18 +5099,26 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
             }
         }
 
-        // host_interface
-        let iface = &config.host_interface;
+        // host_interface: resolve exactly like the daemon will ("auto" follows
+        // the default route) and fail on anything that breaks guest egress.
         let iface_env_hint = if iface_from_env {
             " (from HUSKER_HOST_INTERFACE)"
         } else {
             ""
         };
-        let iface_path = PathBuf::from(format!("/sys/class/net/{iface}"));
-        if iface_path.exists() {
-            println!("  host_interface ({iface}) ... OK{iface_env_hint}");
+        let uplink = husker_net::resolve_host_interface(&config.host_interface);
+        let shown = if uplink.source == husker_net::HostInterfaceSource::Configured {
+            uplink.effective.clone()
         } else {
-            println!("  host_interface ({iface}) ... FAIL (not found){iface_env_hint}");
+            format!("{} -> {}", config.host_interface, uplink.effective)
+        };
+        if uplink.warnings.is_empty() {
+            println!("  host_interface ({shown}) ... OK{iface_env_hint}");
+        } else {
+            println!(
+                "  host_interface ({shown}) ... FAIL ({}){iface_env_hint}",
+                uplink.warnings.join("; ")
+            );
             all_ok = false;
         }
 

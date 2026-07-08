@@ -129,8 +129,12 @@
 
 # ── Networking (Linux only) ──────────────────────────────────────────
 
-# Host interface used for outbound NAT from guest VMs.
-# host_interface = "eth0"
+# Host interface used for outbound NAT from guest VMs. The default "auto"
+# follows the IPv4 default route at daemon startup; set an explicit name only
+# to pin a specific uplink. If the uplink changes (cable moved, failover),
+# restart the daemon to re-resolve. The daemon logs a warning when the
+# effective interface is missing, down, or not the default-route device.
+# host_interface = "auto"
 
 # Bridge device created by the daemon for guest networking.
 # bridge_name = "husker0"

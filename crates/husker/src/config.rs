@@ -331,7 +331,11 @@ fn default_true() -> bool {
 
 #[cfg(feature = "linux-net")]
 fn default_host_interface() -> String {
-    "eth0".into()
+    // "auto" = pin the masquerade to whichever interface carries the IPv4
+    // default route at daemon startup. A hardcoded name (the old "eth0"
+    // default) silently breaks guest WAN on any host where that name is not
+    // the real uplink.
+    husker_net::HOST_INTERFACE_AUTO.into()
 }
 
 #[cfg(feature = "linux-net")]
