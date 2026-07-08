@@ -1967,23 +1967,21 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
             }
             #[cfg(feature = "linux-net")]
             {
-                if iface_problem.is_none() {
-                    if let Some(state) = husker_net::interface_operstate(iface) {
-                        if state == "down" || state == "lowerlayerdown" {
-                            iface_problem = Some(format!(
-                                "host_interface {iface} is {state} - no carrier, guests get no WAN/DNS"
-                            ));
-                        }
-                    }
+                if iface_problem.is_none()
+                    && let Some(state) = husker_net::interface_operstate(iface)
+                    && (state == "down" || state == "lowerlayerdown")
+                {
+                    iface_problem = Some(format!(
+                        "host_interface {iface} is {state} - no carrier, guests get no WAN/DNS"
+                    ));
                 }
-                if iface_problem.is_none() {
-                    if let Some(route_iface) = husker_net::default_route_interface() {
-                        if route_iface != iface {
-                            iface_problem = Some(format!(
-                                "IPv4 default route is via {route_iface} but guest NAT masquerades via {iface}; guests get no WAN (set host_interface = \"auto\")"
-                            ));
-                        }
-                    }
+                if iface_problem.is_none()
+                    && let Some(route_iface) = husker_net::default_route_interface()
+                    && route_iface != iface
+                {
+                    iface_problem = Some(format!(
+                        "IPv4 default route is via {route_iface} but guest NAT masquerades via {iface}; guests get no WAN (set host_interface = \"auto\")"
+                    ));
                 }
             }
         }
