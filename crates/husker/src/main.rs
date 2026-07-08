@@ -5392,8 +5392,11 @@ fn shell_single_quote(s: &str) -> String {
 /// When `retrieve_paths` is non-empty, the command is run (not `exec`-ed) so that
 /// afterwards the named paths are packed into `output_path` for the host to pull
 /// back; the user command's exit code is preserved. Packing is best-effort (paths
-/// the command did not produce are skipped). Paths are single-quoted, so `--out`
-/// values cannot inject shell. busybox-safe: no `tar -T`/`--null`.
+/// the command did not produce are skipped). Each path may be a glob: patterns
+/// are single-quoted (so `--out` values cannot inject shell) and then expanded
+/// guest-side via unquoted word expansion - pathname expansion only, never
+/// shell re-parsing - so they match files the command created. busybox-safe:
+/// no arrays, no `tar -T`/`--null`.
 pub(crate) fn wrap_sync_command(
     archive_guest_path: &str,
     workdir: &str,
@@ -5408,8 +5411,13 @@ pub(crate) fn wrap_sync_command(
     let script = if retrieve_paths.is_empty() {
         format!("{setup}exec \"$@\"")
     } else {
-        // `./`-prefix each path so a leading `-` can never look like a tar option,
-        // and single-quote so `--out` values cannot inject shell.
+        // `./`-prefix each pattern so a leading `-` can never look like a tar
+        // option, and single-quote so `--out` values cannot inject shell. The
+        // guest loop re-expands each pattern UNQUOTED, which performs pathname
+        // expansion (globbing) but never shell re-parsing; a pattern with no
+        // matches stays literal and is dropped by the `-e` test. Matches
+        // accumulate in the positional parameters (the user command has
+        // already run, so `$@` is free to reuse).
         let quoted = retrieve_paths
             .iter()
             .map(|p| shell_single_quote(&format!("./{}", p.to_string_lossy())))
@@ -5417,7 +5425,10 @@ pub(crate) fn wrap_sync_command(
             .join(" ");
         format!(
             "{setup}set +e; \"$@\"; __rc=$?; \
-             tar -czf {output_path} {quoted} 2>/dev/null || true; \
+             set --; \
+             for __p in {quoted}; do for __m in $__p; do \
+             [ -e \"$__m\" ] && set -- \"$@\" \"$__m\"; done; done; \
+             if [ $# -gt 0 ]; then tar -czf {output_path} \"$@\" 2>/dev/null || true; fi; \
              exit $__rc"
         )
     };
@@ -6001,6 +6012,107 @@ mod tests {
         assert_eq!(
             &args[args.len() - 2..],
             &["cargo".to_string(), "test".to_string()]
+        );
+    }
+
+    /// Runs the generated retrieval script through a real `sh`: globs must
+    /// expand against files the command CREATED (they did not exist at sync
+    /// time), non-matching patterns must be dropped rather than passed to tar
+    /// as literals, and the command's exit code must survive.
+    #[test]
+    fn wrap_sync_command_expands_globs_guest_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("work");
+        let archive = tmp.path().join("sync.tgz");
+        let out = tmp.path().join("out.tgz");
+
+        // Minimal sync archive (one seed file) for the setup step to extract.
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "seed.txt", std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let (cmd, args) = wrap_sync_command(
+            archive.to_str().unwrap(),
+            workdir.to_str().unwrap(),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p results && touch results/a.log results/b.log && exit 3".to_string(),
+            ],
+            out.to_str().unwrap(),
+            &[PathBuf::from("results/*"), PathBuf::from("nope/*")],
+        );
+        let status = std::process::Command::new(cmd)
+            .args(&args)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(3), "user command exit code preserved");
+
+        let gz = flate2::read::GzDecoder::new(std::fs::File::open(&out).unwrap());
+        let mut names: Vec<String> = tar::Archive::new(gz)
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path().unwrap().to_string_lossy().into_owned();
+                p.trim_start_matches("./").to_string()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["results/a.log".to_string(), "results/b.log".to_string()],
+            "glob matched exactly the created files; 'nope/*' was dropped"
+        );
+    }
+
+    /// A retrieval where no pattern matches anything must not create the
+    /// output archive at all (the CLI then warns "nothing matched --out").
+    #[test]
+    fn wrap_sync_command_no_matches_produces_no_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("work");
+        let archive = tmp.path().join("sync.tgz");
+        let out = tmp.path().join("out.tgz");
+
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "seed.txt", std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let (cmd, args) = wrap_sync_command(
+            archive.to_str().unwrap(),
+            workdir.to_str().unwrap(),
+            &["true".to_string()],
+            out.to_str().unwrap(),
+            &[PathBuf::from("missing/*")],
+        );
+        let status = std::process::Command::new(cmd)
+            .args(&args)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(
+            !out.exists(),
+            "no output archive when nothing matched (host warns instead)"
         );
     }
 

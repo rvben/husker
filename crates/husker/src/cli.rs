@@ -428,9 +428,11 @@ pub(crate) enum Commands {
         #[arg(long = "sync-cwd")]
         sync_cwd: bool,
 
-        /// Copy a path (file or dir, relative to the synced tree) back to the host
-        /// after the command, at the same relative location. Repeatable.
-        /// Requires --sync-cwd. Build artifacts you do not name never come back.
+        /// Copy a path or glob (file or dir, relative to the synced tree) back to
+        /// the host after the command, at the same relative location. Globs expand
+        /// inside the guest after the command runs (quote them so your local shell
+        /// does not), e.g. --out 'target/release/*'. Repeatable. Requires
+        /// --sync-cwd. Build artifacts you do not name never come back.
         #[arg(long = "out", requires = "sync_cwd")]
         out: Vec<PathBuf>,
 

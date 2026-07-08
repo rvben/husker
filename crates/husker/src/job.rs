@@ -306,27 +306,29 @@ pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<serde_json::Value> {
             .json(&serde_json::json!({ "path": SYNC_OUTPUT_GUEST_PATH })),
         )
         .await?;
+        // A missing/empty output archive means the command produced none of
+        // the requested paths. Not an error, but never silent: an --out that
+        // matched nothing is the classic "artifacts didn't come back" trap.
+        let mut written: Vec<String> = Vec::new();
         if read_resp.status().is_success() {
             let body: serde_json::Value = read_resp.json().await?;
             if let Some(b64) = body["data"].as_str()
                 && let Ok(bytes) = husker_agent_proto::base64_decode(b64)
                 && !bytes.is_empty()
             {
-                let written = extract_archive_over(&bytes, cwd)?;
-                if output == OutputFormat::Text {
-                    if written.is_empty() {
-                        eprintln!("[job] nothing matched --out/--write-back");
-                    } else {
-                        eprintln!("[job] retrieved {} file(s) to host:", written.len());
-                        for f in &written {
-                            eprintln!("  {f}");
-                        }
-                    }
+                written = extract_archive_over(&bytes, cwd)?;
+            }
+        }
+        if output == OutputFormat::Text {
+            if written.is_empty() {
+                eprintln!("[job] nothing matched --out/--write-back");
+            } else {
+                eprintln!("[job] retrieved {} file(s) to host:", written.len());
+                for f in &written {
+                    eprintln!("  {f}");
                 }
             }
         }
-        // A missing output archive means the command produced none of the
-        // requested paths; that is not an error.
     }
     Ok(result)
 }
