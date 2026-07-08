@@ -7,6 +7,17 @@ All notable changes to this project are documented in this file.
 
 
 
+## [0.4.36](https://github.com/rvben/husker/compare/v0.4.35...v0.4.36) - 2026-07-08
+
+### Added
+
+- **core**: apply `--disk-size` to plain-rootfs VMs (offline `resize2fs` after clone; previously cloud-image only) and give imported OCI images a 512 MiB growth-headroom floor so package installs no longer die on ENOSPC ([f27a7e3](https://github.com/rvben/husker/commit/f27a7e38863f1f836b44ce28d49ab4d426196268))
+
+### Fixed
+
+- **net**: resolve the guest NAT uplink from the IPv4 default route (`host_interface = "auto"`, the new default) instead of pinning a hardcoded interface name; daemon startup, `config check`, and `doctor` now warn when the uplink is missing, down, or not the default-route device ([777edd3](https://github.com/rvben/husker/commit/777edd3921b45bff26b053988b550a1442efe84a))
+- **husker**: `--out` glob patterns now expand inside the guest against the files the command produced (previously passed to tar as quoted literals, silently matching nothing), and a retrieval that matches nothing is always reported ([cd39f14](https://github.com/rvben/husker/commit/cd39f147fd6fbad6924fd3af1a24007b7eb940ab))
+
 ## [0.4.35](https://github.com/rvben/husker/compare/v0.4.34...v0.4.35) - 2026-07-03
 
 ### Breaking Changes
