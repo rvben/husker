@@ -36,7 +36,7 @@ clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8", features = ["json", "ws"] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -44,7 +44,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Logging
 tracing = "0.1"
@@ -64,14 +64,14 @@ fatfs = "0.3"
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Terminal
-crossterm = "0.28"
+crossterm = "0.29"
 
 # WebSocket
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 
 # Hyper for Unix socket HTTP
