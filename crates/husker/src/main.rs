@@ -726,7 +726,7 @@ fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
     if resolve_format(format) == OutputFormat::Json {
         eprintln!("{structured}");
     } else {
-        eprintln!("Error: {}", &err.message);
+        eprintln!("Error: {}", err.message);
         eprintln!("{structured}");
     }
     std::process::exit(err.exit_code);
