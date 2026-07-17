@@ -61,7 +61,7 @@ fn decompress_layer(blob: &[u8]) -> Result<Box<dyn std::io::Read + '_>, OciError
     if blob.starts_with(&[0x1f, 0x8b]) {
         Ok(Box::new(GzDecoder::new(blob)))
     } else if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        let decoder = ruzstd::StreamingDecoder::new(blob)
+        let decoder = ruzstd::decoding::StreamingDecoder::new(blob)
             .map_err(|e| OciError::Extract(format!("zstd decode: {e}")))?;
         Ok(Box::new(decoder))
     } else {

@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 fn sha256_digest(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("sha256:{:x}", h.finalize())
+    format!("sha256:{}", hex::encode(h.finalize()))
 }
 
 fn tar_one(name: &str, data: &[u8]) -> Vec<u8> {
