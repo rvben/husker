@@ -100,7 +100,7 @@ async fn listen_vsock() -> Result<()> {
     info!("listening on vsock port {port}");
 
     let addr = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, port);
-    let mut listener = VsockListener::bind(addr).map_err(|e| vsock_bind_error(port, e))?;
+    let listener = VsockListener::bind(addr).map_err(|e| vsock_bind_error(port, e))?;
 
     loop {
         let (stream, addr) = listener.accept().await?;
