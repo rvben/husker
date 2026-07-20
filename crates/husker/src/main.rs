@@ -6062,6 +6062,12 @@ mod tests {
         );
         let status = std::process::Command::new(cmd)
             .args(&args)
+            // This script runs inside a Linux guest, whose tar writes only the
+            // globbed files. A macOS host's bsdtar also emits a `._name`
+            // AppleDouble entry per file to carry extended attributes, which
+            // would appear in the archive as extra members. Disable that so the
+            // harness archives what the guest would.
+            .env("COPYFILE_DISABLE", "1")
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(3), "user command exit code preserved");

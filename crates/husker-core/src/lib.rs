@@ -2425,7 +2425,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let kernel_file = tmp.path().join("vmlinux");
         let rootfs_file = tmp.path().join("rootfs.ext4");
-        std::fs::write(&kernel_file, b"kernel").unwrap();
+        // Write a kernel stub with the ARM64 Image magic at offset 56 so that
+        // validate_kernel_format (macOS-only) passes and the request reaches the
+        // idle-policy gate this test is about.
+        let mut kernel_stub = vec![0u8; 64];
+        kernel_stub[56..60].copy_from_slice(&[0x41, 0x52, 0x4d, 0x64]); // "ARMd" LE = 0x644d5241
+        std::fs::write(&kernel_file, &kernel_stub).unwrap();
         std::fs::write(&rootfs_file, b"rootfs").unwrap();
 
         let req = CreateVmRequest {
