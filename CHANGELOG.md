@@ -7,6 +7,19 @@ All notable changes to this project are documented in this file.
 
 
 
+
+## [0.4.37](https://github.com/rvben/husker/compare/v0.4.36...v0.4.37) - 2026-07-20
+
+### Fixed
+
+- **cli**: drop useless borrow in error print ([45a1fba](https://github.com/rvben/husker/commit/45a1fbaa0e87b78379e34a8e300fdf6b2acaef08))
+- **agent**: drop stale mut on vsock listener ([1c8b09c](https://github.com/rvben/husker/commit/1c8b09c5a40e5695bb6321313d10de1d272aac59))
+- **deps**: adapt to reqwest 0.13 and ruzstd 0.8 API changes ([46419f0](https://github.com/rvben/husker/commit/46419f08ef3f406ff3e0c18ed7501a16f4667c12))
+
+### Performance
+
+- **boot**: suppress legacy hardware probes on the guest kernel cmdline ([e8a9c71](https://github.com/rvben/husker/commit/e8a9c71a11556dea544e1f1c5b3ee84f74ab68b2))
+
 ## [0.4.36](https://github.com/rvben/husker/compare/v0.4.35...v0.4.36) - 2026-07-08
 
 ### Added
