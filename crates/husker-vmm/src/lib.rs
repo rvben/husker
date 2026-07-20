@@ -28,6 +28,20 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+/// Kernel parameters that suppress probes for legacy hardware no direct-kernel
+/// guest can have.
+///
+/// The i8042 PS/2 controller probe sits on a timeout waiting for a keyboard that
+/// a microVM never exposes. Measured on an Intel N100 (husker01, 2026-07-20):
+/// time to `Run /bin/sh as init process` drops from a median 1.019s to 0.525s
+/// with these four parameters, i.e. ~0.49s and 46% of guest kernel boot, with no
+/// other change. The guest kernel still compiles the driver in, so this is the
+/// cmdline half of the fix; removing `CONFIG_SERIO_I8042` would make it moot.
+///
+/// Applies to direct-kernel boots only. Cloud images boot their own bootloader
+/// and do not take a husker-built cmdline.
+pub const LEGACY_PROBE_SUPPRESSION: &str = "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd";
+
 /// A host directory shared into the guest over virtiofs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostShare {

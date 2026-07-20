@@ -293,10 +293,18 @@ impl FirecrackerBackend {
     /// When booting without an initrd the kernel must mount the root filesystem
     /// itself, so `root=/dev/vda rw` is appended after `pci=off`. With an
     /// initrd present the initrd handles root mounting and the argument is omitted.
+    ///
+    /// husker-core always supplies `kernel_args` for direct-kernel boots, so this
+    /// is a fallback for external callers; it carries
+    /// [`crate::LEGACY_PROBE_SUPPRESSION`] so those callers get the same boot
+    /// latency as the managed path.
     fn default_boot_args(has_initrd: bool) -> String {
         let base = "console=ttyS0 reboot=k panic=1 pci=off";
         let root = if has_initrd { "" } else { " root=/dev/vda rw" };
-        format!("{base}{root} ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off")
+        format!(
+            "{base} {probe}{root} ip=172.20.0.2::172.20.0.1:255.255.255.252::eth0:off",
+            probe = crate::LEGACY_PROBE_SUPPRESSION,
+        )
     }
 
     fn boot_source_payload(
@@ -1219,6 +1227,21 @@ mod tests {
             "console arg missing: {args}"
         );
         assert!(args.contains("pci=off"), "pci=off missing: {args}");
+    }
+
+    /// Callers that supply no `kernel_args` must not silently get a slower boot
+    /// than the husker-core managed path. See [`crate::LEGACY_PROBE_SUPPRESSION`].
+    #[test]
+    fn default_boot_args_suppress_legacy_hardware_probes() {
+        for has_initrd in [true, false] {
+            let args = FirecrackerBackend::default_boot_args(has_initrd);
+            for token in crate::LEGACY_PROBE_SUPPRESSION.split_whitespace() {
+                assert!(
+                    args.split_whitespace().any(|t| t == token),
+                    "missing {token} (has_initrd={has_initrd}): {args}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

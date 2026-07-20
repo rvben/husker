@@ -450,16 +450,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             None
         } else {
             // Direct-kernel boots are always NAT (bridged requires cloud image).
-            // Without an initrd the kernel must mount root itself; append root=/dev/vda rw.
-            let root = if initrd_path.is_none() {
-                " root=/dev/vda rw"
-            } else {
-                ""
-            };
-            let base = format!(
-                "console=ttyS0 reboot=k panic=1 pci=off{root} \
-                 ip={ip}::{gateway}:{netmask}::eth0:off",
-                ip = guest_ip.expect("direct-kernel boot is always NAT")
+            let base = direct_kernel_base_args(
+                guest_ip.expect("direct-kernel boot is always NAT"),
+                gateway,
+                netmask,
+                initrd_path.is_some(),
             );
             let mut args = apply_boot_init(&base, boot_init.as_deref());
             // Append one token per virtiofs share; the guest init reads these to

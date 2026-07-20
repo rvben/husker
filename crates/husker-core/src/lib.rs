@@ -873,6 +873,31 @@ fn resolve_vmm_kind(
     }
 }
 
+/// Build the base kernel cmdline for a direct-kernel (non-cloud) boot.
+///
+/// Direct-kernel boots are always NAT, so the guest takes its static address from
+/// `ip=`. Without an initrd the kernel must mount the root filesystem itself, so
+/// `root=/dev/vda rw` is appended.
+///
+/// [`husker_vmm::LEGACY_PROBE_SUPPRESSION`] belongs here, not only at the backend
+/// layer: this is the cmdline production actually boots with. The backends'
+/// `default_boot_args` only apply when a caller supplies no `kernel_args`, which
+/// this path never does.
+#[cfg(feature = "linux-net")]
+fn direct_kernel_base_args(
+    ip: std::net::Ipv4Addr,
+    gateway: std::net::Ipv4Addr,
+    netmask: std::net::Ipv4Addr,
+    has_initrd: bool,
+) -> String {
+    let root = if has_initrd { "" } else { " root=/dev/vda rw" };
+    format!(
+        "console=ttyS0 reboot=k panic=1 pci=off {probe}{root} \
+         ip={ip}::{gateway}:{netmask}::eth0:off",
+        probe = husker_vmm::LEGACY_PROBE_SUPPRESSION,
+    )
+}
+
 /// Append the agent-supervisor boot tokens to a direct-kernel cmdline when the
 /// booting image declares a `boot_init` (set by `import-oci`). A user-supplied
 /// explicit `init=` already on the cmdline wins and is left untouched.
@@ -3271,6 +3296,72 @@ mod tests {
         );
         bystander.kill().ok();
         bystander.wait().ok();
+    }
+
+    /// The i8042 PS/2 probe costs ~0.49s of guest kernel boot (measured on an
+    /// Intel N100: 1.019s -> 0.525s to userspace). It is suppressed on the
+    /// cmdline, and this is the cmdline production boots with, so a regression
+    /// here silently doubles kernel boot time with no other visible symptom.
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn direct_kernel_base_args_suppresses_legacy_hardware_probes() {
+        let args = direct_kernel_base_args(
+            "172.20.0.2".parse().unwrap(),
+            "172.20.0.1".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            true,
+        );
+        for token in husker_vmm::LEGACY_PROBE_SUPPRESSION.split_whitespace() {
+            assert!(
+                args.split_whitespace().any(|t| t == token),
+                "missing {token} in production cmdline: {args}"
+            );
+        }
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn direct_kernel_base_args_sets_root_only_without_initrd() {
+        let addr = |s: &str| s.parse().unwrap();
+        let with_initrd = direct_kernel_base_args(
+            addr("172.20.0.2"),
+            addr("172.20.0.1"),
+            addr("255.255.255.0"),
+            true,
+        );
+        let without_initrd = direct_kernel_base_args(
+            addr("172.20.0.2"),
+            addr("172.20.0.1"),
+            addr("255.255.255.0"),
+            false,
+        );
+        assert!(!with_initrd.contains("root=/dev/vda"));
+        assert!(without_initrd.contains("root=/dev/vda rw"));
+        // The static NAT address must survive either way.
+        for args in [&with_initrd, &without_initrd] {
+            assert!(
+                args.contains("ip=172.20.0.2::172.20.0.1:255.255.255.0::eth0:off"),
+                "network args malformed: {args}"
+            );
+        }
+    }
+
+    /// `apply_boot_init` appends to whatever `direct_kernel_base_args` produced,
+    /// so the two must compose without the suppression tokens being dropped or
+    /// the appended `init=` colliding with them.
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn boot_init_composes_with_probe_suppression() {
+        let base = direct_kernel_base_args(
+            "172.20.0.2".parse().unwrap(),
+            "172.20.0.1".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            true,
+        );
+        let full = apply_boot_init(&base, Some("/usr/local/bin/husker-agent"));
+        assert!(full.contains("i8042.noaux"));
+        assert!(full.contains("init=/usr/local/bin/husker-agent"));
+        assert!(full.contains("husker.init=1"));
     }
 
     #[cfg(feature = "linux-net")]
