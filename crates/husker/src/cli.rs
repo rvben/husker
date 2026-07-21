@@ -172,9 +172,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         mount: Vec<String>,
 
-        /// Network mode: nat (default, husker-managed NAT) or bridged (attach VM to the
-        /// configured lan_bridge; cloud-image only, Linux only)
-        #[arg(long, value_parser = ["nat", "bridged"])]
+        /// Network mode: nat (default, husker-managed NAT), bridged (attach VM to the
+        /// configured lan_bridge; cloud-image only, Linux only), or none (no interface
+        /// at all; exec, file transfer and the agent still work over vsock)
+        #[arg(long, value_parser = ["nat", "bridged", "none"])]
         net: Option<String>,
 
         /// Apply a named VM preset from config (explicit flags win)
@@ -403,9 +404,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         mount: Vec<String>,
 
-        /// Network mode: nat (default, husker-managed NAT) or bridged (attach VM to the
-        /// configured lan_bridge; cloud-image only, Linux only)
-        #[arg(long, value_parser = ["nat", "bridged"])]
+        /// Network mode: nat (default, husker-managed NAT), bridged (attach VM to the
+        /// configured lan_bridge; cloud-image only, Linux only), or none (no interface
+        /// at all; exec, file transfer and the agent still work over vsock)
+        #[arg(long, value_parser = ["nat", "bridged", "none"])]
         net: Option<String>,
 
         /// Apply a named VM preset from config (explicit flags win)

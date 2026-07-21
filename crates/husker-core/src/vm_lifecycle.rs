@@ -226,19 +226,27 @@ impl<B: VmmBackend> HuskerCore<B> {
             debug!(tap = %tap_name, cid, "bridged resources allocated (no IP)");
         }
 
-        husker_net::create_tap(&tap_name).await?;
-        resources.tap_name = Some(tap_name.clone());
+        // `none` gets no host network plumbing at all: no TAP, so no interface in
+        // the guest, nothing attached to a bridge, and no L2 adjacency to any other
+        // guest. Isolation is structural rather than filtered, so it cannot be
+        // bypassed by a rule-ordering mistake, link-local IPv6, or ARP tricks.
+        // vsock is unaffected, so exec, file transfer and the agent still work.
+        let has_host_networking = network_mode != "none";
+        if has_host_networking {
+            husker_net::create_tap(&tap_name).await?;
+            resources.tap_name = Some(tap_name.clone());
 
-        // Attach the TAP to the appropriate bridge: the LAN bridge for bridged mode,
-        // or the husker NAT bridge for NAT mode.
-        let attach_bridge = if network_mode == "bridged" {
-            self.lan_bridge
-                .as_deref()
-                .expect("lan_bridge checked above")
-        } else {
-            &self.bridge_name
-        };
-        husker_net::attach_to_bridge(&tap_name, attach_bridge).await?;
+            // Attach the TAP to the appropriate bridge: the LAN bridge for bridged mode,
+            // or the husker NAT bridge for NAT mode.
+            let attach_bridge = if network_mode == "bridged" {
+                self.lan_bridge
+                    .as_deref()
+                    .expect("lan_bridge checked above")
+            } else {
+                &self.bridge_name
+            };
+            husker_net::attach_to_bridge(&tap_name, attach_bridge).await?;
+        }
 
         let vm_dir = self.storage.vm_dir(&req.name);
         if vm_dir.exists() {
@@ -449,13 +457,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         let kernel_args = if is_cloud {
             None
         } else {
-            // Direct-kernel boots are always NAT (bridged requires cloud image).
-            let base = direct_kernel_base_args(
-                guest_ip.expect("direct-kernel boot is always NAT"),
-                gateway,
-                netmask,
-                initrd_path.is_some(),
-            );
+            // Direct-kernel boots are NAT or none (bridged requires a cloud image).
+            // `none` passes no `ip=`, so the guest configures nothing.
+            let base = direct_kernel_base_args(guest_ip, gateway, netmask, initrd_path.is_some());
             let mut args = apply_boot_init(&base, boot_init.as_deref());
             // Append one token per virtiofs share; the guest init reads these to
             // determine which tags to mount and where.
@@ -482,8 +486,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             kernel_args,
             initrd_path,
             vsock_cid: cid,
-            tap_device: Some(tap_name.clone()),
-            guest_mac: Some(mac),
+            tap_device: has_host_networking.then(|| tap_name.clone()),
+            guest_mac: has_host_networking.then_some(mac),
             vmm: Some(resolved_vmm_kind),
             boot,
             seed_path,
@@ -513,7 +517,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vcpu_count: info.vcpu_count,
             mem_size_mib: info.mem_size_mib,
             vsock_cid: cid,
-            tap_device: Some(tap_name),
+            tap_device: has_host_networking.then_some(tap_name),
             host_ip: record_host_ip,
             guest_ip: record_guest_ip,
             kernel_path: record_kernel_path,

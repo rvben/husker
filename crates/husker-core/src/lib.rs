@@ -875,9 +875,10 @@ fn resolve_vmm_kind(
 
 /// Build the base kernel cmdline for a direct-kernel (non-cloud) boot.
 ///
-/// Direct-kernel boots are always NAT, so the guest takes its static address from
-/// `ip=`. Without an initrd the kernel must mount the root filesystem itself, so
-/// `root=/dev/vda rw` is appended.
+/// `ip` is `None` for `--net none`, where the guest gets no interface at all and
+/// must not be handed a static address to configure. NAT boots pass `Some(addr)`
+/// and the guest configures `eth0` from `ip=`. Without an initrd the kernel must
+/// mount the root filesystem itself, so `root=/dev/vda rw` is appended.
 ///
 /// [`husker_vmm::LEGACY_PROBE_SUPPRESSION`] belongs here, not only at the backend
 /// layer: this is the cmdline production actually boots with. The backends'
@@ -885,15 +886,18 @@ fn resolve_vmm_kind(
 /// this path never does.
 #[cfg(feature = "linux-net")]
 fn direct_kernel_base_args(
-    ip: std::net::Ipv4Addr,
+    ip: Option<std::net::Ipv4Addr>,
     gateway: std::net::Ipv4Addr,
     netmask: std::net::Ipv4Addr,
     has_initrd: bool,
 ) -> String {
     let root = if has_initrd { "" } else { " root=/dev/vda rw" };
+    let net = match ip {
+        Some(ip) => format!(" ip={ip}::{gateway}:{netmask}::eth0:off"),
+        None => String::new(),
+    };
     format!(
-        "console=ttyS0 reboot=k panic=1 pci=off {probe}{root} \
-         ip={ip}::{gateway}:{netmask}::eth0:off",
+        "console=ttyS0 reboot=k panic=1 pci=off {probe}{root}{net}",
         probe = husker_vmm::LEGACY_PROBE_SUPPRESSION,
     )
 }
@@ -1480,8 +1484,9 @@ pub fn validate_network_mode(n: Option<&str>) -> Result<&'static str, CoreError>
     match n {
         None | Some("nat") => Ok("nat"),
         Some("bridged") => Ok("bridged"),
+        Some("none") => Ok("none"),
         Some(other) => Err(CoreError::InvalidArgument(format!(
-            "unknown network mode '{other}' (accepted: nat, bridged)"
+            "unknown network mode '{other}' (accepted: nat, bridged, none)"
         ))),
     }
 }
@@ -3307,11 +3312,43 @@ mod tests {
     /// Intel N100: 1.019s -> 0.525s to userspace). It is suppressed on the
     /// cmdline, and this is the cmdline production boots with, so a regression
     /// here silently doubles kernel boot time with no other visible symptom.
+    /// `--net none` must hand the guest no address to configure. An `ip=` token
+    /// here would have the kernel bring up an interface that has no TAP behind
+    /// it, which is a confusing half-state rather than the intended "no network".
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn direct_kernel_base_args_omits_ip_when_no_network() {
+        let args = direct_kernel_base_args(
+            None,
+            "172.20.0.1".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            true,
+        );
+        assert!(!args.contains("ip="), "no ip= for --net none: {args}");
+        assert!(!args.contains("eth0"), "no interface config: {args}");
+        // The rest of the cmdline is unaffected.
+        assert!(args.contains("console=ttyS0"));
+        assert!(args.contains("i8042.noaux"));
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn validate_network_mode_accepts_none_and_rejects_unknown() {
+        assert_eq!(validate_network_mode(Some("none")).unwrap(), "none");
+        assert_eq!(validate_network_mode(Some("nat")).unwrap(), "nat");
+        assert_eq!(validate_network_mode(Some("bridged")).unwrap(), "bridged");
+        let err = validate_network_mode(Some("off")).unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument(ref m) if m.contains("none")),
+            "the error must list the accepted modes, got {err:?}"
+        );
+    }
+
     #[cfg(feature = "linux-net")]
     #[test]
     fn direct_kernel_base_args_suppresses_legacy_hardware_probes() {
         let args = direct_kernel_base_args(
-            "172.20.0.2".parse().unwrap(),
+            Some("172.20.0.2".parse().unwrap()),
             "172.20.0.1".parse().unwrap(),
             "255.255.255.0".parse().unwrap(),
             true,
@@ -3329,13 +3366,13 @@ mod tests {
     fn direct_kernel_base_args_sets_root_only_without_initrd() {
         let addr = |s: &str| s.parse().unwrap();
         let with_initrd = direct_kernel_base_args(
-            addr("172.20.0.2"),
+            Some(addr("172.20.0.2")),
             addr("172.20.0.1"),
             addr("255.255.255.0"),
             true,
         );
         let without_initrd = direct_kernel_base_args(
-            addr("172.20.0.2"),
+            Some(addr("172.20.0.2")),
             addr("172.20.0.1"),
             addr("255.255.255.0"),
             false,
@@ -3358,7 +3395,7 @@ mod tests {
     #[test]
     fn boot_init_composes_with_probe_suppression() {
         let base = direct_kernel_base_args(
-            "172.20.0.2".parse().unwrap(),
+            Some("172.20.0.2".parse().unwrap()),
             "172.20.0.1".parse().unwrap(),
             "255.255.255.0".parse().unwrap(),
             true,
