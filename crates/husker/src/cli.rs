@@ -696,8 +696,10 @@ pub(crate) enum PortForwardAction {
         host_port: u16,
         /// Guest port
         guest_port: u16,
-        /// Host address to bind (macOS only; default 127.0.0.1). Use 0.0.0.0 to
-        /// expose on all interfaces.
+        /// Host address to bind. On macOS the default is 127.0.0.1 and 0.0.0.0
+        /// exposes the forward on all interfaces. On Linux the nftables backend
+        /// always exposes forwards on every host interface, so only 0.0.0.0 is
+        /// accepted there and a specific address is rejected.
         #[arg(long)]
         bind: Option<String>,
     },
