@@ -1525,7 +1525,7 @@ pub(crate) async fn write_file_handler<B: VmmBackend + 'static>(
                     data.len(),
                     policy.max_file_write_bytes
                 ),
-                "increase max_file_write_bytes policy if needed",
+                "split the file and write the parts, or raise api_max_file_write_bytes in the daemon config",
             ),
         ));
     }
