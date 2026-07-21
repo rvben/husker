@@ -503,10 +503,24 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
             "guest NAT uplink"
         );
 
+        // Build the isolation policy from config. Resolvers that parse as IPv4
+        // become DNS carve-outs so guests keep name resolution under the deny.
+        let isolation = config.guest_isolation.then(|| {
+            let resolvers = config
+                .dns_servers
+                .iter()
+                .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                .collect();
+            husker_net::IsolationPolicy { resolvers }
+        });
+        if isolation.is_some() {
+            tracing::info!("guest isolation enabled: NAT guests denied LAN + host access");
+        }
         husker_net::init_nat(
             &config.bridge_name,
             &config.bridge_subnet,
             &uplink.effective,
+            isolation.as_ref(),
         )
         .await
         .context("initializing nftables")?;

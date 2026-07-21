@@ -1137,7 +1137,7 @@ async fn port_forward_applies_for_qemu_backed_vm() {
     husker_net::create_bridge(BRIDGE, std::net::Ipv4Addr::new(192, 0, 2, 1), 24)
         .await
         .unwrap();
-    husker_net::init_nat(BRIDGE, "192.0.2.0/24", &host_iface)
+    husker_net::init_nat(BRIDGE, "192.0.2.0/24", &host_iface, None)
         .await
         .ok();
 

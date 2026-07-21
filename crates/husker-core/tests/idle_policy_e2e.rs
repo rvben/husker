@@ -130,7 +130,7 @@ async fn idle_suspend_then_resume_on_connect_roundtrip() {
     // Initialise the nftables NAT table + prerouting chain for this bridge, the
     // same setup the daemon does at startup. Without it, add_port_forward below
     // fails because its DNAT rule has no `husker_hidl0` table to attach to.
-    husker_net::init_nat(BRIDGE, "203.0.113.0/24", "eth0")
+    husker_net::init_nat(BRIDGE, "203.0.113.0/24", "eth0", None)
         .await
         .expect("init nftables NAT/table for the throwaway bridge");
 

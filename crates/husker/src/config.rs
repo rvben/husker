@@ -129,6 +129,13 @@ pub(crate) struct Config {
     #[cfg(feature = "linux-net")]
     #[serde(default = "default_dns_servers")]
     pub(crate) dns_servers: Vec<String>,
+    /// Deny NAT guests every private (LAN/homelab) destination and block them
+    /// from the host itself, while keeping internet egress and DNS. A daemon-wide
+    /// policy for hosts that run untrusted code. Default false (permissive), so
+    /// existing deployments are unchanged; a sandbox host sets it true.
+    #[cfg(feature = "linux-net")]
+    #[serde(default)]
+    pub(crate) guest_isolation: bool,
     /// Starting CID for vsock and TAP-name allocation (`husker<cid>`). Two
     /// co-located daemons must use distinct non-overlapping bases so their CID
     /// and TAP-name spaces are disjoint. Default 3 (no separation; suitable
@@ -417,6 +424,8 @@ impl Default for Config {
             #[cfg(feature = "linux-net")]
             dns_servers: default_dns_servers(),
             #[cfg(feature = "linux-net")]
+            guest_isolation: false,
+            #[cfg(feature = "linux-net")]
             cid_base: default_cid_base(),
             #[cfg(all(feature = "linux-net", target_os = "linux"))]
             lan_bridge: None,
@@ -675,6 +684,9 @@ pub(crate) fn apply_env_overrides(config: &mut Config) {
         }
         if let Ok(val) = std::env::var("HUSKER_DNS_SERVERS") {
             config.dns_servers = val.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Ok(val) = std::env::var("HUSKER_GUEST_ISOLATION") {
+            config.guest_isolation = matches!(val.as_str(), "1" | "true" | "yes");
         }
         if let Ok(val) = std::env::var("HUSKER_CID_BASE")
             && let Ok(parsed) = val.parse::<u32>()

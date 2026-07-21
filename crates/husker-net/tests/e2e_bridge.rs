@@ -237,7 +237,7 @@ async fn nftables_init_and_cleanup() {
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // Initialize NAT with test bridge
-    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0", None)
         .await
         .expect("init_nat should succeed");
 
@@ -296,7 +296,7 @@ async fn port_forward_add_and_remove() {
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // Init NAT first (creates the table and chains)
-    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0", None)
         .await
         .expect("init_nat");
 
@@ -374,7 +374,7 @@ async fn full_lifecycle_bridge_tap_nat() {
     assert!(interface_has_address(bridge, "192.0.2.1/24"));
 
     // 3. Init NAT
-    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0", None)
         .await
         .expect("init_nat");
 
@@ -466,12 +466,12 @@ async fn init_nat_is_idempotent() {
     let _ = husker_net::cleanup_nat(bridge).await;
 
     // First init
-    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0", None)
         .await
         .expect("first init_nat");
 
     // Second init (should not error — deletes and recreates)
-    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0")
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0", None)
         .await
         .expect("second init_nat should also succeed");
 
@@ -496,10 +496,10 @@ async fn two_bridges_do_not_clobber_each_others_nat() {
     let _ = husker_net::cleanup_nat(bridge_a).await;
     let _ = husker_net::cleanup_nat(bridge_b).await;
 
-    husker_net::init_nat(bridge_a, "198.51.100.0/24", "eth0")
+    husker_net::init_nat(bridge_a, "198.51.100.0/24", "eth0", None)
         .await
         .expect("init_nat A");
-    husker_net::init_nat(bridge_b, "203.0.113.0/24", "eth0")
+    husker_net::init_nat(bridge_b, "203.0.113.0/24", "eth0", None)
         .await
         .expect("init_nat B");
 
@@ -542,4 +542,90 @@ async fn two_bridges_do_not_clobber_each_others_nat() {
     );
 
     husker_net::cleanup_nat(bridge_b).await.expect("cleanup B");
+}
+
+// ── guest isolation ──────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn isolation_installs_deny_carveout_and_host_guard_in_order() {
+    let bridge = "huskeriso0";
+    let subnet = "192.0.2.0/24";
+    let _ = husker_net::cleanup_nat(bridge).await;
+
+    // A private resolver (inside the deny set) must earn a carve-out; a public
+    // one must not.
+    let policy = husker_net::IsolationPolicy {
+        resolvers: vec!["10.0.0.53".parse().unwrap(), "1.1.1.1".parse().unwrap()],
+    };
+    husker_net::init_nat(bridge, subnet, "eth0", Some(&policy))
+        .await
+        .expect("init_nat with isolation");
+
+    let output = nft_table_output(bridge);
+
+    // The isolation rules are present.
+    assert!(
+        output.contains("husker:isolation-deny-private"),
+        "deny-private rule missing: {output}"
+    );
+    assert!(
+        output.contains("husker:isolation-dns") && output.contains("10.0.0.53"),
+        "private resolver DNS carve-out missing: {output}"
+    );
+    assert!(
+        !output.contains("1.1.1.1"),
+        "public resolver must not get a carve-out: {output}"
+    );
+    assert!(
+        output.contains("husker:isolation-host-guard"),
+        "host-guard input rule missing: {output}"
+    );
+    assert!(
+        output.contains("type filter hook input"),
+        "isolation must add an input chain: {output}"
+    );
+
+    // Ordering within the forward chain: the DNS carve-out and the deny must
+    // both appear before the broad bridge accept, or they are dead rules.
+    let dns_at = output.find("husker:isolation-dns").expect("dns rule");
+    let deny_at = output
+        .find("husker:isolation-deny-private")
+        .expect("deny rule");
+    let accept_at = output.find("husker:bridge-fwd-out").expect("accept rule");
+    assert!(
+        dns_at < deny_at && deny_at < accept_at,
+        "order must be dns < deny < accept; got dns={dns_at} deny={deny_at} accept={accept_at}\n{output}"
+    );
+
+    // cleanup_nat removes the whole table, isolation rules included.
+    husker_net::cleanup_nat(bridge).await.expect("cleanup");
+    assert!(
+        !nft_table_exists(bridge),
+        "table should be gone after cleanup"
+    );
+}
+
+/// Isolation off (the upstream default) must not add any deny/guard rules.
+#[tokio::test]
+#[ignore]
+async fn no_isolation_leaves_forward_open() {
+    let bridge = "huskeriso1";
+    let _ = husker_net::cleanup_nat(bridge).await;
+
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0", None)
+        .await
+        .expect("init_nat without isolation");
+
+    let output = nft_table_output(bridge);
+    assert!(
+        !output.contains("isolation"),
+        "no isolation rules expected: {output}"
+    );
+    assert!(
+        !output.contains("type filter hook input"),
+        "no input chain without isolation: {output}"
+    );
+
+    husker_net::cleanup_nat(bridge).await.expect("cleanup");
 }

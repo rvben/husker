@@ -385,14 +385,148 @@ pub async fn delete_tap(name: &str) -> Result<(), NetError> {
     Ok(())
 }
 
+// ── Guest network isolation ────────────────────────────────────────────
+
+/// Private destination ranges an isolated guest may not reach: RFC1918 plus
+/// the CGNAT block (100.64/10, which the tailnet uses). Same-bridge traffic is
+/// L2 and never reaches the forward hook, so a guest's own subnet does not need
+/// excluding here.
+const PRIVATE_DEST_RANGES: &str = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10";
+
+/// Policy applied by [`init_nat`] when guest isolation is enabled.
+///
+/// Isolation denies an untrusted guest every private (LAN/homelab) destination
+/// while keeping internet egress, and blocks the guest from reaching the host
+/// itself. It is a daemon-wide policy over the shared bridge, not per-VM.
+///
+/// It filters IPv4 only. Guests get no IPv6 egress (no v6 NAT, address, or
+/// route), so there is nothing to deny there; the one remaining v6 surface is a
+/// guest reaching another guest's, or the host's, link-local `fe80::` across the
+/// shared L2 segment, which no ip-family rule can see. That is dissolved by the
+/// planned per-tap-routed rework (which removes the shared segment), not here.
+#[derive(Debug, Clone, Default)]
+pub struct IsolationPolicy {
+    /// Resolver IPs to carve out on port 53 so DNS survives the private-address
+    /// deny. Only resolvers inside a private range need (and get) a carve-out; a
+    /// public resolver is reachable anyway.
+    pub resolvers: Vec<Ipv4Addr>,
+}
+
+/// Whether `ip` is in an RFC1918 or CGNAT range, i.e. a destination the
+/// private-address deny would otherwise drop.
+fn is_private_v4(ip: Ipv4Addr) -> bool {
+    ip.is_private() || matches!(ip.octets(), [100, b, ..] if (64..=127).contains(&b))
+}
+
+/// DNS carve-out rules: accept UDP/TCP port 53 to each private resolver.
+///
+/// Keyed on `iifname <bridge>` and the resolver's destination address only,
+/// never on the guest source address (which a guest fully controls and can
+/// spoof). Used in both the forward chain (for a routed resolver like a LAN
+/// Pi-hole) and the input chain (for a host-local resolver, whose packets are
+/// local delivery and never reach forward); one of the two matches per resolver,
+/// the other is inert.
+fn dns_carveout_rules(bridge: &str, policy: &IsolationPolicy) -> Vec<Vec<String>> {
+    let mut rules = Vec::new();
+    for r in policy.resolvers.iter().filter(|r| is_private_v4(**r)) {
+        for proto in ["udp", "tcp"] {
+            rules.push(vec![
+                "iifname".into(),
+                bridge.into(),
+                "ip".into(),
+                "daddr".into(),
+                r.to_string(),
+                proto.into(),
+                "dport".into(),
+                "53".into(),
+                "accept".into(),
+                "comment".into(),
+                "\"husker:isolation-dns\"".into(),
+            ]);
+        }
+    }
+    rules
+}
+
+/// The forward-chain rules an isolation policy installs, in order, each as an
+/// `nft` argument vector (after `add rule ip <table> forward`). Returned as data
+/// so the exact rules and their ordering can be unit-tested without running
+/// `nft`. These must be added BEFORE the broad `iifname <bridge> accept` rules,
+/// or the accept shadows them and they are dead.
+///
+/// Matching is keyed on `iifname <bridge>` (the ingress interface, which the
+/// kernel sets and a guest cannot forge), never on the guest source address. A
+/// guest that spoofs its source IP outside the bridge subnet would slip past a
+/// source-matched deny into the broad accept below.
+fn isolation_forward_rules(bridge: &str, policy: &IsolationPolicy) -> Vec<Vec<String>> {
+    let mut rules = Vec::new();
+    // Established/related first: a guest's reply to a client that reached it
+    // through a DNAT port forward has the client's (possibly private) address as
+    // destination and would otherwise be dropped by the private-address deny
+    // below. Conntrack lets those replies through without opening guest-initiated
+    // access, since a guest-initiated flow to the LAN is `ct state new` and never
+    // reaches established state (the deny drops its first packet).
+    rules.push(vec![
+        "iifname".into(),
+        bridge.into(),
+        "ct".into(),
+        "state".into(),
+        "established,related".into(),
+        "accept".into(),
+        "comment".into(),
+        "\"husker:isolation-est\"".into(),
+    ]);
+    // DNS carve-out: a private resolver must be reachable on port 53 before the
+    // private-address deny below would drop it.
+    rules.extend(dns_carveout_rules(bridge, policy));
+    // Deny every private destination beyond the bridge (LAN + homelab).
+    rules.push(vec![
+        "iifname".into(),
+        bridge.into(),
+        "ip".into(),
+        "daddr".into(),
+        format!("{{ {PRIVATE_DEST_RANGES} }}"),
+        "drop".into(),
+        "comment".into(),
+        "\"husker:isolation-deny-private\"".into(),
+    ]);
+    rules
+}
+
+/// The input-chain rules that stop an isolated guest reaching the host itself.
+///
+/// A guest addresses the host's own IPs (the bridge gateway, and any host LAN IP
+/// it routes to) as local delivery, so those packets hit the INPUT hook, not
+/// FORWARD; a forward-chain deny never sees them. A guest needs nothing from the
+/// host EXCEPT a resolver that runs on the host, so the DNS carve-outs precede
+/// the drop; then all remaining guest-originated input traffic is dropped.
+///
+/// Keyed on `iifname <bridge>`, not the guest source address, for the same
+/// anti-spoofing reason as the forward rules.
+fn isolation_input_rules(bridge: &str, policy: &IsolationPolicy) -> Vec<Vec<String>> {
+    let mut rules = dns_carveout_rules(bridge, policy);
+    rules.push(vec![
+        "iifname".into(),
+        bridge.into(),
+        "drop".into(),
+        "comment".into(),
+        "\"husker:isolation-host-guard\"".into(),
+    ]);
+    rules
+}
+
 // ── nftables NAT ───────────────────────────────────────────────────────
 
 /// Initialize the husker nftables table with bridge-level rules.
 ///
-/// Installs three permanent rules covering the entire bridge subnet:
+/// Installs the permanent rules covering the entire bridge subnet:
 /// - Masquerade outbound traffic from the bridge subnet
 /// - Accept forwarding from the bridge
 /// - Accept forwarding to the bridge
+///
+/// When `isolation` is `Some`, also installs (before the accepts) a DNS
+/// carve-out and a private-destination deny in the forward chain, plus an input
+/// chain that blocks the guest from reaching the host. See [`IsolationPolicy`].
 ///
 /// Port-forward DNAT rules are added per-VM in the prerouting chain.
 /// Call once at daemon startup. Requires root or `CAP_NET_ADMIN`.
@@ -400,6 +534,7 @@ pub async fn init_nat(
     bridge_name: &str,
     bridge_subnet: &str,
     host_interface: &str,
+    isolation: Option<&IsolationPolicy>,
 ) -> Result<(), NetError> {
     info!(
         bridge = bridge_name,
@@ -466,6 +601,17 @@ pub async fn init_nat(
         ],
     )
     .await?;
+
+    // Isolation forward rules (DNS carve-out + private-destination deny) MUST
+    // precede the broad bridge accepts below, or the accept shadows them.
+    if let Some(policy) = isolation {
+        for rule in isolation_forward_rules(bridge_name, policy) {
+            let mut args = vec!["add", "rule", "ip", &table, "forward"];
+            args.extend(rule.iter().map(String::as_str));
+            run_cmd("nft", &args).await?;
+        }
+    }
+
     run_cmd(
         "nft",
         &[
@@ -512,6 +658,30 @@ pub async fn init_nat(
         ],
     )
     .await?;
+
+    // Isolation host guard: a separate input chain so the guest cannot reach the
+    // host's own addresses (which are local delivery, hitting INPUT, not the
+    // forward chain above). Lives in this same table so `cleanup_nat` removes it.
+    if let Some(policy) = isolation {
+        run_cmd(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                &table,
+                "input",
+                "{ type filter hook input priority filter; policy accept; }",
+            ],
+        )
+        .await?;
+        // DNS carve-outs (for a host-local resolver) precede the host-guard drop.
+        for rule in isolation_input_rules(bridge_name, policy) {
+            let mut args = vec!["add", "rule", "ip", &table, "input"];
+            args.extend(rule.iter().map(String::as_str));
+            run_cmd("nft", &args).await?;
+        }
+    }
 
     Ok(())
 }
@@ -1147,6 +1317,145 @@ pub async fn check_subnet_conflict(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // ── Guest isolation rules ──────────────────────────────────────────
+
+    fn rule_str(rule: &[String]) -> String {
+        rule.join(" ")
+    }
+
+    #[test]
+    fn is_private_v4_covers_rfc1918_and_cgnat() {
+        for ip in ["10.10.30.10", "192.168.1.1", "172.20.0.1", "100.64.0.5"] {
+            assert!(is_private_v4(ip.parse().unwrap()), "{ip} should be private");
+        }
+        for ip in ["1.1.1.1", "8.8.8.8", "203.0.113.5"] {
+            assert!(!is_private_v4(ip.parse().unwrap()), "{ip} should be public");
+        }
+    }
+
+    #[test]
+    fn isolation_forward_rules_deny_private_after_dns_carveout() {
+        let policy = IsolationPolicy {
+            resolvers: vec!["10.10.30.10".parse().unwrap()],
+        };
+        let rules = isolation_forward_rules("husker0", &policy);
+        let joined: Vec<String> = rules.iter().map(|r| rule_str(r)).collect();
+
+        // DNS carve-out for the private resolver on port 53, udp and tcp.
+        assert!(joined.iter().any(|r| r.contains("10.10.30.10")
+            && r.contains("udp dport 53")
+            && r.contains("accept")));
+        assert!(joined.iter().any(|r| r.contains("10.10.30.10")
+            && r.contains("tcp dport 53")
+            && r.contains("accept")));
+        // Private-destination deny is present.
+        let deny_idx = joined.iter().position(|r| r.contains("drop")).unwrap();
+        assert!(joined[deny_idx].contains("10.0.0.0/8"));
+        assert!(joined[deny_idx].contains("192.168.0.0/16"));
+        assert!(joined[deny_idx].contains("100.64.0.0/10"));
+        // Every carve-out accept precedes the deny, or the deny shadows DNS.
+        let last_accept = joined.iter().rposition(|r| r.contains("accept")).unwrap();
+        assert!(
+            last_accept < deny_idx,
+            "DNS carve-out must precede the deny; got {joined:?}"
+        );
+    }
+
+    /// The deny and carve-out must key on the ingress interface, never on the
+    /// guest source address: a guest fully controls its source and would spoof
+    /// a non-subnet address to slip a private-destination packet past a
+    /// source-matched deny into the broad bridge accept.
+    #[test]
+    fn isolation_rules_do_not_key_on_guest_source_address() {
+        let policy = IsolationPolicy {
+            resolvers: vec!["10.10.30.10".parse().unwrap()],
+        };
+        for rule in isolation_forward_rules("husker0", &policy)
+            .iter()
+            .chain(isolation_input_rules("husker0", &policy).iter())
+        {
+            let s = rule_str(rule);
+            assert!(
+                !s.contains("saddr"),
+                "isolation rule must not match on guest source: {s}"
+            );
+            assert!(
+                s.contains("iifname husker0"),
+                "isolation rule must key on ingress interface: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn isolation_forward_rules_skip_carveout_for_public_resolver() {
+        // A public resolver is reachable anyway, so it earns no carve-out rule.
+        let policy = IsolationPolicy {
+            resolvers: vec!["1.1.1.1".parse().unwrap()],
+        };
+        let rules = isolation_forward_rules("husker0", &policy);
+        let joined: Vec<String> = rules.iter().map(|r| rule_str(r)).collect();
+        assert!(!joined.iter().any(|r| r.contains("1.1.1.1")));
+        // Just the established accept and the deny, no DNS carve-out.
+        assert_eq!(rules.len(), 2, "expected [established, deny]: {joined:?}");
+        assert!(joined[0].contains("ct state established,related"));
+        assert!(joined[1].contains("drop"));
+    }
+
+    /// Reply traffic for a connection reaching a guest through a DNAT port
+    /// forward must be accepted before the private-destination deny, or forwards
+    /// from a private (LAN/VPN) client break. It must not open guest-initiated
+    /// access: a guest-initiated LAN flow is `ct state new`, never established.
+    #[test]
+    fn isolation_forward_rules_accept_established_before_deny() {
+        let policy = IsolationPolicy {
+            resolvers: vec!["10.10.30.10".parse().unwrap()],
+        };
+        let joined: Vec<String> = isolation_forward_rules("husker0", &policy)
+            .iter()
+            .map(|r| rule_str(r))
+            .collect();
+        let est_idx = joined
+            .iter()
+            .position(|r| r.contains("ct state established,related") && r.contains("accept"))
+            .expect("established accept present");
+        let deny_idx = joined.iter().position(|r| r.contains("drop")).unwrap();
+        assert!(
+            est_idx < deny_idx,
+            "established accept must precede the deny: {joined:?}"
+        );
+        // Only established/related, never a blanket `ct state new` accept that
+        // would let guest-initiated LAN traffic through.
+        assert!(!joined[est_idx].contains("new"));
+    }
+
+    /// The input chain must let a host-local resolver's DNS through before the
+    /// host guard drops everything else, or enabling isolation breaks DNS for
+    /// deployments whose resolver runs on the host.
+    #[test]
+    fn isolation_input_rules_carve_out_dns_before_host_guard() {
+        let policy = IsolationPolicy {
+            resolvers: vec!["10.10.30.10".parse().unwrap()],
+        };
+        let rules = isolation_input_rules("husker0", &policy);
+        let joined: Vec<String> = rules.iter().map(|r| rule_str(r)).collect();
+        let dns_idx = joined
+            .iter()
+            .position(|r| r.contains("10.10.30.10") && r.contains("dport 53"))
+            .expect("input DNS carve-out present");
+        let guard_idx = joined
+            .iter()
+            .position(|r| r.contains("isolation-host-guard"))
+            .expect("host guard present");
+        assert!(
+            dns_idx < guard_idx,
+            "DNS carve-out must precede the guard: {joined:?}"
+        );
+        // The guard drops all guest-bridge input, not a source-scoped subset.
+        assert!(joined[guard_idx].contains("iifname husker0"));
+        assert!(joined[guard_idx].contains("drop"));
+        assert!(!joined[guard_idx].contains("saddr"));
+    }
 
     // ── Host uplink resolution ─────────────────────────────────────────
 
