@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file.
 
 
 
+
+## [0.4.38](https://github.com/rvben/husker/compare/v0.4.37...v0.4.38) - 2026-07-21
+
+### Added
+
+- **net**: add guest_isolation to deny NAT guests LAN and host access ([631c201](https://github.com/rvben/husker/commit/631c201462eba3e4b7af9789ed5aaf35c1338459))
+- **net**: add --net none for a guest with no network at all ([08fefda](https://github.com/rvben/husker/commit/08fefda903a561dd41568196d7e60b26a0c1cecf))
+
 ## [0.4.37](https://github.com/rvben/husker/compare/v0.4.36...v0.4.37) - 2026-07-20
 
 ### Fixed
