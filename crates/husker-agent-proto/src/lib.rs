@@ -165,6 +165,14 @@ pub struct WriteFileRequest {
     /// Base64-encoded file contents.
     pub data: String,
     pub mode: Option<u32>,
+    /// Open the destination for append instead of truncating it. Used by the
+    /// host to send a large file as a sequence of chunks: the first chunk
+    /// truncates, later chunks append. `#[serde(default)]` so a sender built
+    /// before this field existed still decodes, and an agent older than
+    /// [`MIN_PROTOCOL_VERSION_FOR_APPEND`] always truncates regardless of what
+    /// a sender puts here, since it has no code path for append at all.
+    #[serde(default)]
+    pub append: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,7 +310,15 @@ pub const AGENT_VSOCK_PORT: u32 = 52;
 /// Bump this whenever the framed message contract changes in a way that a peer
 /// must be aware of. The agent reports it via [`GuestInfoResponse`], and the
 /// host warns when a connected guest reports a different (non-zero) version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Minimum [`PROTOCOL_VERSION`] an agent must report for `WriteFileRequest.append`
+/// to be honoured. An agent older than this always truncates on every write, so
+/// a chunked transfer against it would silently keep only the final chunk. Hosts
+/// that chunk a large file must check the connected guest's reported version
+/// against this constant before sending any append-mode chunk, and fail loudly
+/// rather than let a legacy agent produce a corrupt file that reports success.
+pub const MIN_PROTOCOL_VERSION_FOR_APPEND: u32 = 2;
 
 /// Default wall-clock deadline for receiving a single framed payload once
 /// the length prefix has been read. Callers who need a different bound can
@@ -584,7 +600,39 @@ mod tests {
             }
             other => panic!("expected GuestInfo, got {other:?}"),
         }
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn write_file_request_append_defaults_to_false_for_legacy_senders() {
+        // A sender built before `append` existed omits the field entirely; the
+        // agent must still decode the request, and treat it as a truncating
+        // write (the only behaviour that existed before append was added).
+        let legacy = r#"{"type":"WriteFile","path":"/tmp/f","data":"aGk=","mode":null}"#;
+        let back: AgentRequest = serde_json::from_str(legacy).unwrap();
+        match back {
+            AgentRequest::WriteFile(w) => {
+                assert_eq!(w.path, "/tmp/f");
+                assert!(!w.append, "legacy sender must decode as append = false");
+            }
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_file_request_append_round_trips_true() {
+        let req = AgentRequest::WriteFile(WriteFileRequest {
+            path: "/tmp/f".into(),
+            data: base64_encode(b"chunk"),
+            mode: None,
+            append: true,
+        });
+        let encoded = encode_message(&req).unwrap();
+        let (decoded, _): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            AgentRequest::WriteFile(w) => assert!(w.append),
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
     }
 
     #[test]

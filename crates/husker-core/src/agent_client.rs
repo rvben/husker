@@ -290,17 +290,27 @@ where
         }
     }
 
-    /// Write a file to the guest filesystem.
+    /// Write a file to the guest filesystem. `append` opens the destination
+    /// for append instead of truncating it, so a caller can send a large file
+    /// as a sequence of chunks (first chunk `append = false`, later chunks
+    /// `append = true`). Callers that chunk must first confirm the connected
+    /// guest's protocol version is at least
+    /// [`husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND`] via
+    /// [`AgentConnection::guest_info`]; an older agent silently ignores
+    /// `append` and truncates on every write, which would corrupt the
+    /// destination to only the last chunk sent.
     pub async fn write_file(
         &mut self,
         path: &str,
         data: &[u8],
         mode: Option<u32>,
+        append: bool,
     ) -> Result<u64, AgentError> {
         let request = AgentRequest::WriteFile(WriteFileRequest {
             path: path.into(),
             data: base64_encode(data),
             mode,
+            append,
         });
         write_message(&mut self.stream, &request).await?;
 

@@ -157,7 +157,10 @@ async fn client_write_and_read_file() {
 
     let mut conn = AgentClient::connect_unix(&path).await.unwrap();
 
-    let bytes_written = conn.write_file(&file_path_str, data, None).await.unwrap();
+    let bytes_written = conn
+        .write_file(&file_path_str, data, None, false)
+        .await
+        .unwrap();
     assert_eq!(bytes_written, data.len() as u64);
 
     let read_back = conn.read_file(&file_path_str).await.unwrap();
@@ -431,7 +434,7 @@ async fn write_file_rejects_unexpected_response_variant() {
 
     let mut conn = AgentConnection::new(client);
     let err = conn
-        .write_file("/tmp/out", b"abc", Some(0o644))
+        .write_file("/tmp/out", b"abc", Some(0o644), false)
         .await
         .unwrap_err();
     assert!(matches!(err, AgentError::UnexpectedResponse));
@@ -456,7 +459,7 @@ async fn write_file_maps_agent_error_response() {
 
     let mut conn = AgentConnection::new(client);
     let err = conn
-        .write_file("/tmp/out", b"abc", Some(0o644))
+        .write_file("/tmp/out", b"abc", Some(0o644), false)
         .await
         .unwrap_err();
     assert!(matches!(err, AgentError::Agent(msg) if msg == "write denied"));

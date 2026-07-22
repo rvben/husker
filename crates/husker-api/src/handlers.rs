@@ -1534,7 +1534,7 @@ pub(crate) async fn write_file_handler<B: VmmBackend + 'static>(
         .await
         .map_err(map_agent_connect_error)?;
     let bytes_written = conn
-        .write_file(&req.path, &data, req.mode)
+        .write_file(&req.path, &data, req.mode, req.append)
         .await
         .map_err(|e| map_error(e.into()))?;
     metrics().file_writes_total.fetch_add(1, Ordering::Relaxed);
@@ -1762,6 +1762,34 @@ pub(crate) async fn get_ready<B: VmmBackend + 'static>(
     core.get_vm_refreshed(&name).await.map_err(map_error)?;
     let ready = core.probe_ready(&name).await.map_err(map_error)?;
     Ok(Json(ReadyResponse { vm: name, ready }))
+}
+
+// ── Guest Info Handler ───────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/v1/vms/{name}/guest-info",
+    tag = "vms",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 200, description = "Guest agent network and protocol info", body = GuestInfoResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 503, description = "Agent not ready", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_guest_info<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+) -> Result<Json<GuestInfoResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut conn = core
+        .agent_connect(&name)
+        .await
+        .map_err(map_agent_connect_error)?;
+    let info = conn.guest_info().await.map_err(|e| map_error(e.into()))?;
+    Ok(Json(GuestInfoResponse {
+        ipv4: info.ipv4,
+        protocol_version: info.protocol_version,
+    }))
 }
 
 // ── Logs Handler ─────────────────────────────────────────────────────

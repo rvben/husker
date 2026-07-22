@@ -201,8 +201,13 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .agent_connect_ready(name, default_ready_timeout(&record.boot_mode))
                 .await?;
 
-            conn.write_file("/tmp/husker-userdata.sh", script.as_bytes(), Some(0o755))
-                .await?;
+            conn.write_file(
+                "/tmp/husker-userdata.sh",
+                script.as_bytes(),
+                Some(0o755),
+                false,
+            )
+            .await?;
 
             let env_pairs: Vec<(String, String)> = record
                 .userdata_env

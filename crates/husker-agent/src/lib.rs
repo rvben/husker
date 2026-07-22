@@ -689,10 +689,15 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                 }
             };
             let len = data.len() as u64;
+            // `append` lets the host send a large file as a sequence of
+            // chunks: the first chunk truncates (append = false, the
+            // pre-chunking default), later chunks open for append so they add
+            // to what is already on disk instead of replacing it.
             let open = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
-                .truncate(true)
+                .truncate(!req.append)
+                .append(req.append)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&req.path)
                 .await;

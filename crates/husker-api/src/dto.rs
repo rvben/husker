@@ -291,6 +291,13 @@ pub struct WriteFileRequest {
     /// Base64-encoded file data.
     pub data: String,
     pub mode: Option<u32>,
+    /// Open the destination for append instead of truncating it. Used by a
+    /// client sending a large file as a sequence of chunks: the first chunk
+    /// omits this (or sets it false) to truncate, later chunks set it true
+    /// to append. Defaults to false so a request built before this field
+    /// existed still decodes and keeps today's truncate-and-write behavior.
+    #[serde(default)]
+    pub append: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -354,6 +361,15 @@ fn default_rows() -> u16 {
 pub struct ReadyResponse {
     pub vm: String,
     pub ready: bool,
+}
+
+/// Guest network and protocol information, used by a client to preflight
+/// whether the connected agent supports a feature (e.g. append-mode writes)
+/// before relying on it.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct GuestInfoResponse {
+    pub ipv4: Vec<String>,
+    pub protocol_version: u32,
 }
 
 /// Named VM presets configured in the daemon and served to clients.

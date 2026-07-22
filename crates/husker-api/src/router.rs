@@ -128,6 +128,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/shell", get(shell_ws::<B>))
         .route("/v1/vms/{name}/logs", get(get_logs::<B>))
         .route("/v1/vms/{name}/ready", get(get_ready::<B>))
+        .route("/v1/vms/{name}/guest-info", get(get_guest_info::<B>))
         .route("/v1/metrics", get(metrics_handler::<B>))
         .route("/v1/profiles", get(list_profiles::<B>))
         .route("/v1/diagnostics", get(diagnostics::<B>));

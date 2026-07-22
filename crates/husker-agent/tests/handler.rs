@@ -241,6 +241,7 @@ async fn write_then_read_file() {
         path: file_path.clone(),
         data: base64_encode(content),
         mode: None,
+        append: false,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -280,6 +281,7 @@ async fn write_file_applies_requested_mode() {
         path: file_path.clone(),
         data: base64_encode(b"#!/bin/sh\necho hi\n"),
         mode: Some(0o755),
+        append: false,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -293,6 +295,92 @@ async fn write_file_applies_requested_mode() {
     // chmod (e.g. on an executable userdata script) is a real failure.
     let mode = std::fs::metadata(&file_path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755);
+}
+
+#[tokio::test]
+async fn write_file_append_true_appends_instead_of_truncating() {
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir
+        .path()
+        .join("appended.txt")
+        .to_string_lossy()
+        .into_owned();
+
+    // First write: append = false truncates (creates the file with its
+    // initial content), matching the pre-chunking behaviour exactly.
+    let request = AgentRequest::WriteFile(WriteFileRequest {
+        path: file_path.clone(),
+        data: base64_encode(b"first-"),
+        mode: None,
+        append: false,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    assert!(matches!(response, AgentResponse::WriteFile(_)));
+
+    // Second write: append = true must add to the file rather than replace it.
+    let request = AgentRequest::WriteFile(WriteFileRequest {
+        path: file_path.clone(),
+        data: base64_encode(b"second"),
+        mode: None,
+        append: true,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    assert!(matches!(response, AgentResponse::WriteFile(_)));
+
+    let contents = std::fs::read(&file_path).unwrap();
+    assert_eq!(
+        contents, b"first-second",
+        "append = true must add to the existing file, not replace it"
+    );
+}
+
+#[tokio::test]
+async fn write_file_chunked_round_trip_with_non_multiple_boundary() {
+    // Exercises the exact shape a chunked `husker cp` produces: the first
+    // chunk truncates, later chunks append, and the final chunk is smaller
+    // than the others (total size is not an exact multiple of chunk size).
+    // This is the boundary case most likely to drop or duplicate bytes.
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir
+        .path()
+        .join("chunked.bin")
+        .to_string_lossy()
+        .into_owned();
+
+    const CHUNK_SIZE: usize = 7;
+    let original: Vec<u8> = (0..=255u32).cycle().take(100).map(|b| b as u8).collect();
+    assert_ne!(
+        original.len() % CHUNK_SIZE,
+        0,
+        "test data must not be an exact multiple of the chunk size"
+    );
+
+    for (i, chunk) in original.chunks(CHUNK_SIZE).enumerate() {
+        let request = AgentRequest::WriteFile(WriteFileRequest {
+            path: file_path.clone(),
+            data: base64_encode(chunk),
+            mode: None,
+            append: i > 0,
+        });
+        write_message(&mut stream, &request).await.unwrap();
+        let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+        match response {
+            AgentResponse::WriteFile(w) => assert_eq!(w.bytes_written, chunk.len() as u64),
+            other => panic!("expected WriteFile response, got {other:?}"),
+        }
+    }
+
+    let contents = std::fs::read(&file_path).unwrap();
+    assert_eq!(
+        contents, original,
+        "chunked append writes must reconstruct the original file byte-for-byte"
+    );
 }
 
 #[tokio::test]
@@ -361,6 +449,7 @@ async fn write_file_refuses_symlink_target() {
         path: link.to_string_lossy().into_owned(),
         data: base64_encode(b"attacker payload"),
         mode: None,
+        append: false,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -417,6 +506,7 @@ async fn write_file_invalid_base64_returns_error() {
         path: "/tmp/husker-invalid-b64".into(),
         data: "***".into(),
         mode: None,
+        append: false,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -738,6 +828,7 @@ async fn normal_requests_still_work_with_shell_protocol() {
         path: file_path.clone(),
         data: base64_encode(content),
         mode: None,
+        append: false,
     });
     write_message(&mut stream, &request).await.unwrap();
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();

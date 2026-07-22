@@ -110,7 +110,10 @@ async fn write_and_read_large_file() {
 
     let mut conn = AgentClient::connect_unix(&path).await.unwrap();
 
-    let bytes_written = conn.write_file(&file_path_str, &data, None).await.unwrap();
+    let bytes_written = conn
+        .write_file(&file_path_str, &data, None, false)
+        .await
+        .unwrap();
     assert_eq!(bytes_written, data.len() as u64);
 
     let read_back = conn.read_file(&file_path_str).await.unwrap();
@@ -127,11 +130,51 @@ async fn write_and_read_empty_file() {
 
     let mut conn = AgentClient::connect_unix(&path).await.unwrap();
 
-    let bytes_written = conn.write_file(&file_path_str, &[], None).await.unwrap();
+    let bytes_written = conn
+        .write_file(&file_path_str, &[], None, false)
+        .await
+        .unwrap();
     assert_eq!(bytes_written, 0);
 
     let read_back = conn.read_file(&file_path_str).await.unwrap();
     assert!(read_back.is_empty());
+}
+
+#[tokio::test]
+async fn write_file_chunked_via_agent_connection_round_trips_at_client_layer() {
+    // Pins the husker-core AgentConnection::write_file(..., append) signature
+    // and behaviour: chunk a file that is not an exact multiple of the chunk
+    // size, sending append = false for the first chunk and append = true for
+    // the rest, then confirm the guest reconstructs it byte-for-byte. This is
+    // the same request shape `husker cp` sends once chunking is enabled.
+    let (_dir, path) = spawn_agent().await;
+    let file_dir = tempfile::tempdir().unwrap();
+    let file_path = file_dir.path().join("client-chunked.bin");
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    const CHUNK_SIZE: usize = 4096;
+    let data: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+    assert_ne!(
+        data.len() % CHUNK_SIZE,
+        0,
+        "test data must not be an exact multiple of the chunk size"
+    );
+
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+
+    let mut total_written = 0u64;
+    for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+        let bytes_written = conn
+            .write_file(&file_path_str, chunk, None, i > 0)
+            .await
+            .unwrap();
+        assert_eq!(bytes_written, chunk.len() as u64);
+        total_written += bytes_written;
+    }
+    assert_eq!(total_written, data.len() as u64);
+
+    let read_back = conn.read_file(&file_path_str).await.unwrap();
+    assert_eq!(read_back, data);
 }
 
 // ── Error Recovery ───────────────────────────────────────────────────
@@ -174,7 +217,7 @@ async fn connection_recovers_after_failed_exec() {
     let file_path_str = file_path.to_string_lossy().to_string();
 
     let bytes = conn
-        .write_file(&file_path_str, b"recovered", None)
+        .write_file(&file_path_str, b"recovered", None, false)
         .await
         .unwrap();
     assert_eq!(bytes, 9);
@@ -192,7 +235,7 @@ async fn sequential_file_operations() {
     let mut conn = AgentClient::connect_unix(&path).await.unwrap();
 
     // Write initial content
-    conn.write_file(&file_path_str, b"version 1", None)
+    conn.write_file(&file_path_str, b"version 1", None, false)
         .await
         .unwrap();
 
@@ -200,8 +243,10 @@ async fn sequential_file_operations() {
     let data = conn.read_file(&file_path_str).await.unwrap();
     assert_eq!(data, b"version 1");
 
-    // Overwrite with new content
-    conn.write_file(&file_path_str, b"version 2", None)
+    // Overwrite with new content (append = false must still truncate, not add to
+    // the existing content - this is the regression the append feature must not
+    // break for the default/non-chunked write path).
+    conn.write_file(&file_path_str, b"version 2", None, false)
         .await
         .unwrap();
 
@@ -224,6 +269,7 @@ async fn interleaved_exec_and_file_ops() {
         &script_path_str,
         b"#!/bin/sh\necho hello from script",
         Some(0o755),
+        false,
     )
     .await
     .unwrap();
@@ -251,7 +297,7 @@ async fn write_file_with_permissions() {
 
     let mut conn = AgentClient::connect_unix(&path).await.unwrap();
 
-    conn.write_file(&file_path_str, b"#!/bin/sh\necho perms", Some(0o755))
+    conn.write_file(&file_path_str, b"#!/bin/sh\necho perms", Some(0o755), false)
         .await
         .unwrap();
 
@@ -275,7 +321,9 @@ async fn binary_data_with_all_byte_values() {
 
     let mut conn = AgentClient::connect_unix(&path).await.unwrap();
 
-    conn.write_file(&file_path_str, &data, None).await.unwrap();
+    conn.write_file(&file_path_str, &data, None, false)
+        .await
+        .unwrap();
     let read_back = conn.read_file(&file_path_str).await.unwrap();
 
     assert_eq!(read_back, data);
@@ -300,7 +348,7 @@ async fn raw_stream_connection_full_workflow() {
     let file_path = file_dir.path().join("raw.txt");
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    conn.write_file(&file_path_str, b"from raw stream", None)
+    conn.write_file(&file_path_str, b"from raw stream", None, false)
         .await
         .unwrap();
 
