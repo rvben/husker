@@ -704,6 +704,18 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
             match open {
                 Ok(mut file) => match file.write_all(&data).await {
                     Ok(()) => {
+                        // Flush before responding. tokio::fs::File dispatches the
+                        // write to a background thread, so write_all can return
+                        // before the bytes reach the OS, and dropping the file does
+                        // not complete that write. Without the flush the response
+                        // claims durability the data does not yet have, so a chunked
+                        // append or a read-back can race ahead of bytes that never
+                        // landed.
+                        if let Err(e) = file.flush().await {
+                            return AgentResponse::Error(ErrorResponse {
+                                message: format!("write failed: {e}"),
+                            });
+                        }
                         #[cfg(unix)]
                         if let Some(mode) = req.mode {
                             use std::os::unix::fs::PermissionsExt;
