@@ -9,6 +9,19 @@ All notable changes to this project are documented in this file.
 
 
 
+
+## [0.4.39](https://github.com/rvben/husker/compare/v0.4.38...v0.4.39) - 2026-07-23
+
+### Added
+
+- **cp**: chunk large file copies past the write-size limit ([d5c566b](https://github.com/rvben/husker/commit/d5c566bfd89d552d6703498267f476b038555bdf))
+
+### Fixed
+
+- **agent**: flush file writes before responding so chunked appends land ([91908b0](https://github.com/rvben/husker/commit/91908b0bca6bd27cbc8617d0776e39b194df18a0))
+- **api**: make the file-write size error actionable for cp callers ([af0db4a](https://github.com/rvben/husker/commit/af0db4adea8148b1e7cd47a8c91d4a7b38e1e120))
+- **cli**: correct the port-forward --bind help for Linux ([6a5cd6b](https://github.com/rvben/husker/commit/6a5cd6b8bd83471642678012aa9ad793bf4f5d89))
+
 ## [0.4.38](https://github.com/rvben/husker/compare/v0.4.37...v0.4.38) - 2026-07-21
 
 ### Added
