@@ -255,6 +255,12 @@ fn oci_rootfs_size_bytes(tree_size: u64) -> u64 {
 /// The `source_path` recorded for an OCI-imported image, and the value
 /// `image list` reports. Carries exactly one `oci://` scheme whatever form the
 /// caller used, so the reported value can be fed straight back to `import-oci`.
+///
+/// The only caller is `import_oci_image`, which needs `linux-net`. The function
+/// itself is pure string handling, so it stays compiled everywhere and its test
+/// runs on macOS too; without that feature it simply has no caller outside the
+/// test.
+#[cfg_attr(not(feature = "linux-net"), allow(dead_code))]
 fn oci_source_path(reference: &str) -> String {
     format!("oci://{}", husker_oci::strip_oci_scheme(reference))
 }
