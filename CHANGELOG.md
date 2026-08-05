@@ -2,13 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.40](https://github.com/rvben/husker/compare/v0.4.39...v0.4.40) - 2026-08-05
 
+### Added
 
+- **agent**: serve byte ranges from files/read ([d1dfed0](https://github.com/rvben/husker/commit/d1dfed0ebc0ff153e15678ce812e62637bf71da8))
 
+### Fixed
 
-
-
-
+- **cli**: keep an --out pattern containing a space as one pattern ([d4ec59e](https://github.com/rvben/husker/commit/d4ec59e9baae9e0a8e91816df3de6b8338e61eb8))
+- **agent**: detect a file replaced mid-transfer by its modification time ([f715c68](https://github.com/rvben/husker/commit/f715c68ae46e7a09c262c32c8885cc2b5cf872f6))
+- **agent**: refuse a positional read a guest cannot serve, and honour an offset without a length ([dec19ea](https://github.com/rvben/husker/commit/dec19eada4636d2a3eb599710c148e9216527da6))
+- **cli**: retrieve --out artifacts larger than one read response ([a630263](https://github.com/rvben/husker/commit/a630263834e54df356285c35bcc93ada07f97b48))
 
 ## [0.4.39](https://github.com/rvben/husker/compare/v0.4.38...v0.4.39) - 2026-07-23
 
