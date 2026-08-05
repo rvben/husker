@@ -13,7 +13,7 @@ mod flatten;
 mod reference;
 
 pub use flatten::{WhiteoutKind, classify_entry, flatten_layers};
-pub use reference::ImageReference;
+pub use reference::{ImageReference, strip_oci_scheme};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OciError {

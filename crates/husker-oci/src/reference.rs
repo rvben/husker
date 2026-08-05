@@ -14,12 +14,24 @@ pub struct ImageReference {
     pub reference: String,
 }
 
+/// Strip the `oci://` scheme husker records in an imported image's `source_path`,
+/// so the value husker prints can be fed straight back in.
+///
+/// Without this the scheme parses as a registry host (`oci`), which yields a
+/// request to `https://oci/...` rather than an error, so the mistake surfaces as
+/// a confusing network failure instead of an invalid reference.
+pub fn strip_oci_scheme(input: &str) -> &str {
+    input.strip_prefix("oci://").unwrap_or(input)
+}
+
 impl ImageReference {
     /// Parse a reference like `alpine`, `alpine:3.20`, `ghcr.io/o/i:tag`, or
     /// `repo@sha256:...`. Docker Hub is the default registry, and bare names
-    /// there are namespaced under `library/`.
+    /// there are namespaced under `library/`. An `oci://` prefix is accepted so
+    /// the `source_path` husker reports round-trips.
     pub fn parse(input: &str) -> Result<Self, OciError> {
         let bad = |m: &str| OciError::InvalidReference(input.to_string(), m.to_string());
+        let input = strip_oci_scheme(input);
         if input.is_empty() {
             return Err(bad("empty reference"));
         }
@@ -187,5 +199,37 @@ mod tests {
     #[test]
     fn empty_is_rejected() {
         assert!(ImageReference::parse("").is_err());
+        // `oci://` with nothing after it is empty, not a repository named "".
+        assert!(ImageReference::parse("oci://").is_err());
+    }
+
+    #[test]
+    fn oci_scheme_round_trips_the_reported_source_path() {
+        // `image list` reports an imported image as `oci://<reference>`. Feeding
+        // that back must reach the same registry, not a host called "oci".
+        for reference in [
+            "alpine:3.20",
+            "ghcr.io/rvben/husker:v1",
+            "alpine@sha256:abc",
+        ] {
+            let bare = parse(reference);
+            let prefixed = parse(&format!("oci://{reference}"));
+            assert_eq!(
+                prefixed, bare,
+                "oci://{reference} must parse identically to {reference}"
+            );
+            assert_ne!(
+                prefixed.registry, "oci",
+                "the scheme must not be read as a registry host"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_oci_scheme_only_strips_the_scheme() {
+        assert_eq!(strip_oci_scheme("oci://alpine:3.20"), "alpine:3.20");
+        // A repository legitimately named `oci` keeps its name; only the scheme goes.
+        assert_eq!(strip_oci_scheme("oci:3.20"), "oci:3.20");
+        assert_eq!(strip_oci_scheme("ghcr.io/oci/img:v1"), "ghcr.io/oci/img:v1");
     }
 }

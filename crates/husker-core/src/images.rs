@@ -81,6 +81,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         reference: &str,
     ) -> Result<ImageRecord, CoreError> {
         validate_resource_name("image", name)?;
+        // Canonicalise before anything records or reports it: an image's
+        // `source_path` is `oci://<reference>`, and re-importing that value must
+        // not stack a second scheme onto the one already there.
+        let reference = husker_oci::strip_oci_scheme(reference);
         if self.embedded_agent.is_empty() {
             return Err(CoreError::InvalidArgument(
                 "OCI import needs the embedded guest agent; build the daemon with \
@@ -149,7 +153,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let record = ImageRecord {
             id: Uuid::new_v4(),
             name: name.into(),
-            source_path: format!("oci://{reference}"),
+            source_path: oci_source_path(reference),
             file_path: image_path.to_string_lossy().into_owned(),
             format: "ext4".into(),
             kind: "rootfs".into(),
@@ -248,12 +252,45 @@ fn oci_rootfs_size_bytes(tree_size: u64) -> u64 {
     tree_size + tree_size.max(MIN_HEADROOM) + EXT4_BASE
 }
 
-#[cfg(all(test, feature = "linux-net"))]
-mod tests {
-    use super::oci_rootfs_size_bytes;
+/// The `source_path` recorded for an OCI-imported image, and the value
+/// `image list` reports. Carries exactly one `oci://` scheme whatever form the
+/// caller used, so the reported value can be fed straight back to `import-oci`.
+fn oci_source_path(reference: &str) -> String {
+    format!("oci://{}", husker_oci::strip_oci_scheme(reference))
+}
 
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "linux-net")]
+    use super::oci_rootfs_size_bytes;
+    use super::oci_source_path;
+
+    #[test]
+    fn reported_source_path_carries_exactly_one_scheme() {
+        // The bug this guards: `image list` prints `oci://alpine:3.20`, and
+        // re-importing that value used to record `oci://oci://alpine:3.20`, whose
+        // scheme then parses as a registry host called `oci`.
+        for reference in ["alpine:3.20", "ghcr.io/rvben/husker:v1"] {
+            let reported = oci_source_path(reference);
+            assert_eq!(reported, format!("oci://{reference}"));
+            assert_eq!(
+                oci_source_path(&reported),
+                reported,
+                "re-importing the reported source_path must not stack a second scheme"
+            );
+            let parsed = husker_oci::ImageReference::parse(&reported)
+                .expect("the reported source_path must parse as a reference");
+            assert_ne!(
+                parsed.registry, "oci",
+                "the scheme must not be read as a registry host"
+            );
+        }
+    }
+
+    #[cfg(feature = "linux-net")]
     const MIB: u64 = 1024 * 1024;
 
+    #[cfg(feature = "linux-net")]
     #[test]
     fn small_images_get_the_headroom_floor() {
         // A python:3.12-slim-sized tree (~135 MiB) used to become a ~334 MiB
@@ -264,6 +301,7 @@ mod tests {
         assert_eq!(oci_rootfs_size_bytes(8 * MIB), (8 + 512 + 64) * MIB);
     }
 
+    #[cfg(feature = "linux-net")]
     #[test]
     fn large_images_keep_proportional_headroom() {
         // Above the floor the headroom is the tree size itself (2x + base),
