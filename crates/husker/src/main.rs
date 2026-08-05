@@ -856,6 +856,13 @@ fn dirs_config_husker() -> PathBuf {
 /// Derive a default catalog image name from an OCI reference: the last path
 /// component with its tag, sanitized (e.g. `alpine:3.20` -> `alpine-3.20`,
 /// `ghcr.io/o/img:v1` -> `img-v1`).
+///
+/// An `oci://` prefix yields the same name as the bare reference: the scheme
+/// ends in `/`, so the `rsplit` below already drops it. That matters because
+/// `image list` reports `source_path` as `oci://<ref>` and users feed it back
+/// to `import-oci`; it is enforced by
+/// `oci_scheme_does_not_reach_the_default_image_name` rather than left to the
+/// reader to re-derive.
 fn oci_default_image_name(reference: &str) -> String {
     let last = reference.rsplit('/').next().unwrap_or(reference);
     let name: String = last
@@ -7202,6 +7209,25 @@ mod tests {
         let name = oci_default_image_name(&digest);
         assert!(name.len() <= 48, "name too long: {} chars", name.len());
         assert!(name.starts_with("alpine-sha256-a"));
+    }
+
+    #[test]
+    fn oci_scheme_does_not_reach_the_default_image_name() {
+        // `image list` reports `source_path` as `oci://<ref>`, and that value is
+        // meant to be usable as-is against `import-oci`. Re-importing a reported
+        // path must therefore land on the same catalog name as the bare
+        // reference, or the round trip silently creates a second image.
+        for bare in ["alpine:3.20", "ghcr.io/o/img:v1", "alpine"] {
+            let prefixed = format!("oci://{bare}");
+            assert_eq!(
+                oci_default_image_name(&prefixed),
+                oci_default_image_name(bare),
+                "`{prefixed}` must name the same image as `{bare}`"
+            );
+        }
+        // Spelled out, so the assertion above cannot pass by both sides being
+        // equally wrong.
+        assert_eq!(oci_default_image_name("oci://alpine:3.20"), "alpine-3.20");
     }
 
     #[test]
