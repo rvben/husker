@@ -460,6 +460,30 @@ async fn read_file_refuses_a_whole_oversized_file_but_serves_a_range_of_it() {
             other => panic!("expected ReadFile response, got {other:?}"),
         }
     }
+    // An omitted `len` means "as much as the ceiling allows", so a request that
+    // carries only an offset is still a range: it is answered with the slice
+    // that starts there, not refused for being an oversized whole-file read.
+    // The caller has already shown it can come back for the remainder.
+    let request = AgentRequest::ReadFile(ReadFileRequest {
+        path: path.clone(),
+        offset: 32,
+        len: None,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    let offset_only = match response {
+        AgentResponse::ReadFile(r) => {
+            assert_eq!(r.total_size, Some(content.len() as u64));
+            husker_agent_proto::base64_decode(&r.data).unwrap()
+        }
+        other => panic!("an offset without a length is a range, not a whole-file read: {other:?}"),
+    };
+    assert_eq!(
+        offset_only,
+        content[32..96],
+        "an offset-only read returns the ceiling's worth of bytes from the offset"
+    );
+
     unsafe {
         std::env::remove_var("HUSKER_AGENT_MAX_READ_BYTES");
     }

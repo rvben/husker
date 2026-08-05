@@ -131,6 +131,13 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "agent_not_ready",
             err.to_string(),
         ),
+        // The guest, not the request, is what cannot serve this. Retrying will
+        // never succeed against the same image, so it is not a 503.
+        CoreError::Agent(husker_core::AgentError::RangedReadUnsupported { .. }) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "guest_ranged_read_unsupported",
+            err.to_string(),
+        ),
         CoreError::Io(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "io_error",

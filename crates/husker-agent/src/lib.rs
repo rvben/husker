@@ -665,7 +665,13 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                     // total_size and comes back for the rest. Only an
                     // unranged read of an oversized file still errors, since
                     // such a caller has no way to ask for the remainder.
+                    //
+                    // An omitted `len` means "to the ceiling", so a request
+                    // that carries an offset is ranged whether or not it also
+                    // carries a length: its caller has already shown it can
+                    // ask for the remainder.
                     let want = req.len.unwrap_or(max).min(max);
+                    let ranged = req.len.is_some() || req.offset > 0;
                     if req.offset > 0
                         && let Err(e) = file.seek(std::io::SeekFrom::Start(req.offset)).await
                     {
@@ -680,7 +686,7 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                     match limited.read_to_end(&mut data).await {
                         Ok(_) => {
                             if data.len() as u64 > want {
-                                if req.len.is_none() {
+                                if !ranged {
                                     return AgentResponse::Error(ErrorResponse {
                                         message: format!(
                                             "read failed: file exceeds max read size of {max} bytes"

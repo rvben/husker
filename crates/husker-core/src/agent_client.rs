@@ -21,6 +21,13 @@ pub enum AgentError {
     UnexpectedResponse,
     #[error("agent returned error: {0}")]
     Agent(String),
+    #[error(
+        "the guest agent cannot read from a byte offset: it answered a read at offset {offset} \
+         with the start of the file. The VM's image predates ranged reads in husker-agent \
+         (protocol {required} or newer); rebuild or re-import the image with a current \
+         husker-agent."
+    )]
+    RangedReadUnsupported { offset: u64, required: u32 },
     #[error("agent not ready after {timeout:?}{detail}")]
     NotReady {
         timeout: Duration,
@@ -296,12 +303,19 @@ where
     /// caller can pull a file larger than one response carries as a sequence
     /// of requests. `len` of `None` reads to the agent's ceiling.
     ///
-    /// Callers that chunk must first confirm the guest's protocol version is at
-    /// least [`husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_RANGED_READ`] via
-    /// [`AgentConnection::guest_info`]. An older agent ignores `offset`
-    /// entirely and answers every request with the start of the file, so the
-    /// reassembled result would be the first chunk repeated: right length,
-    /// wrong bytes, reported as success.
+    /// An agent older than
+    /// [`husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_RANGED_READ`] ignores
+    /// `offset` entirely and answers every request with the start of the file,
+    /// so a reassembled result would be the first chunk repeated: right length,
+    /// wrong bytes, reported as success. Such an agent is recognised by the
+    /// absence of `total_size` in its response, and a read it answered from the
+    /// wrong place is refused here with
+    /// [`AgentError::RangedReadUnsupported`] rather than returned as bytes.
+    ///
+    /// A read at offset 0 is passed through, because the whole file a legacy
+    /// agent returns does start where the caller asked. Its missing
+    /// `total_size` tells the caller the range was not applied and the answer
+    /// is the complete file, which is the only thing such an agent can serve.
     pub async fn read_file_range(
         &mut self,
         path: &str,
@@ -320,6 +334,12 @@ where
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
             AgentResponse::ReadFile(r) => {
+                if offset > 0 && r.total_size.is_none() {
+                    return Err(AgentError::RangedReadUnsupported {
+                        offset,
+                        required: husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_RANGED_READ,
+                    });
+                }
                 let data = base64_decode(&r.data)
                     .map_err(|e| AgentError::Agent(format!("base64 decode failed: {e}")))?;
                 Ok(RangedRead {

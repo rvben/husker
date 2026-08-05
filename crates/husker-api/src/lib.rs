@@ -2271,6 +2271,29 @@ mod tests {
         }
     }
 
+    /// A guest that cannot read from an offset is a property of the VM's image,
+    /// not of the request, so the status must not be one that invites a retry.
+    /// The kind is what a client branches on to tell "rebuild the image" from
+    /// "the daemon is briefly unavailable".
+    #[test]
+    fn map_error_reports_an_offset_a_guest_cannot_serve_as_not_implemented() {
+        let (status, body) = map_error(CoreError::Agent(
+            husker_core::AgentError::RangedReadUnsupported {
+                offset: 1_048_576,
+                required: husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_RANGED_READ,
+            },
+        ));
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+
+        let payload = body.0;
+        assert_eq!(payload.kind, "guest_ranged_read_unsupported");
+        assert!(
+            payload.message.contains("rebuild or re-import the image"),
+            "the message must name the fix: {}",
+            payload.message
+        );
+    }
+
     #[test]
     fn map_agent_connect_error_falls_back_for_non_agent_errors() {
         let (status, _) = map_agent_connect_error(CoreError::VmNotFound("vm".into()));

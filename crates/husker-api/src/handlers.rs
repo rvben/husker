@@ -1413,6 +1413,7 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
     responses(
         (status = 200, description = "File content (base64-encoded)", body = ReadFileResponse),
         (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 501, description = "Guest agent cannot read from a byte offset", body = ErrorResponse),
         (status = 503, description = "Agent not ready", body = ErrorResponse)
     )
 )]

@@ -405,6 +405,77 @@ async fn read_file_invalid_base64_maps_to_agent_error() {
     server_task.await.unwrap();
 }
 
+/// An agent too old for ranged reads ignores `offset` and answers with the
+/// start of the file. Handing those bytes back as the requested slice is how a
+/// caller ends up with a file of exactly the right length and entirely the
+/// wrong contents, so the mismatch is refused rather than returned. The tell is
+/// the absent `total_size`: only an agent that honours ranges reports it.
+#[tokio::test]
+async fn a_legacy_agent_answering_a_ranged_read_from_the_start_is_an_error() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::ReadFile(_)));
+        write_message(
+            &mut server,
+            &AgentResponse::ReadFile(ReadFileResponse {
+                data: husker_agent_proto::base64_encode(b"the start of the file"),
+                size: 21,
+                total_size: None,
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.read_file_range("/tmp/test", 4096, Some(1024)).await;
+    let err = err.unwrap_err();
+    assert!(
+        matches!(err, AgentError::RangedReadUnsupported { offset, .. } if offset == 4096),
+        "expected a refused range, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("rebuild or re-import the image"),
+        "the message must name the fix: {err}"
+    );
+    server_task.await.unwrap();
+}
+
+/// The same legacy answer at offset 0 is kept, because the whole file it
+/// returns does start where the caller asked. Refusing it too would leave a
+/// chunking client unable to read anything at all from an older image, rather
+/// than only files too big for one response. This is the positive control for
+/// the test above: it proves the refusal keys on the offset and not merely on
+/// the missing `total_size`.
+#[tokio::test]
+async fn a_legacy_agent_answering_from_offset_zero_is_accepted_as_the_whole_file() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::ReadFile(_)));
+        write_message(
+            &mut server,
+            &AgentResponse::ReadFile(ReadFileResponse {
+                data: husker_agent_proto::base64_encode(b"the whole file"),
+                size: 14,
+                total_size: None,
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let read = conn.read_file_range("/tmp/test", 0, Some(4)).await.unwrap();
+    assert_eq!(read.data, b"the whole file");
+    assert_eq!(
+        read.total_size, None,
+        "the absent size is what tells the caller the range was not applied"
+    );
+    server_task.await.unwrap();
+}
+
 #[tokio::test]
 async fn read_file_rejects_unexpected_response_variant() {
     let (client, mut server) = tokio::io::duplex(2048);

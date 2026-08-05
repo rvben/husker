@@ -298,8 +298,13 @@ pub struct ReadFileResponse {
     pub size: u64,
     /// Size of the entire file on the guest. A client chunking a large read
     /// compares it against the bytes received so far to know when it is done.
-    /// Null from a guest agent too old to report it, which means unknown
-    /// rather than empty.
+    ///
+    /// Null from a guest agent too old to serve a byte range, which means
+    /// unknown rather than empty, and also says the range was not applied:
+    /// such an agent returns the whole file (or fails), so `data` is the
+    /// complete file and may exceed the requested `len`. A request with a
+    /// non-zero `offset` fails with 501 against that agent rather than
+    /// returning bytes from the wrong part of the file.
     pub total_size: Option<u64>,
 }
 
