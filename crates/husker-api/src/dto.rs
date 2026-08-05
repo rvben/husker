@@ -277,12 +277,30 @@ pub struct ExecResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ReadFileRequest {
     pub path: String,
+    /// Byte offset to begin reading at. A client pulling a file larger than
+    /// the `max_file_read_bytes` policy allows in one response requests
+    /// successive ranges instead of asking for the whole file and being
+    /// refused. Defaults to 0 so a request built before this field existed
+    /// still decodes and reads from the start.
+    #[serde(default)]
+    pub offset: u64,
+    /// Maximum bytes to return starting at `offset`. Omit to read as much as
+    /// the guest agent's own ceiling allows.
+    #[serde(default)]
+    pub len: Option<u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadFileResponse {
     pub data: String,
+    /// Bytes carried by this response, which for a ranged request is the
+    /// requested slice rather than the whole file.
     pub size: u64,
+    /// Size of the entire file on the guest. A client chunking a large read
+    /// compares it against the bytes received so far to know when it is done.
+    /// Null from a guest agent too old to report it, which means unknown
+    /// rather than empty.
+    pub total_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

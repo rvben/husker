@@ -1437,11 +1437,15 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
         .agent_connect(&name)
         .await
         .map_err(map_agent_connect_error)?;
-    let data = conn
-        .read_file(&req.path)
+    let read = conn
+        .read_file_range(&req.path, req.offset, req.len)
         .await
         .map_err(|e| map_error(e.into()))?;
+    let data = read.data;
     if data.len() > policy.max_file_read_bytes {
+        // The limit bounds one response, so a ranged caller stays under it by
+        // asking for smaller slices. The hint says so, because "increase the
+        // policy" is the wrong lesson for a client that can simply chunk.
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             error_response_with_hint(
@@ -1451,7 +1455,7 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
                     data.len(),
                     policy.max_file_read_bytes
                 ),
-                "increase max_file_read_bytes policy if needed",
+                "request a byte range with offset/len, or increase max_file_read_bytes policy",
             ),
         ));
     }
@@ -1466,6 +1470,7 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
     Ok(Json(ReadFileResponse {
         data: husker_agent_proto::base64_encode(&data),
         size,
+        total_size: read.total_size,
     }))
 }
 

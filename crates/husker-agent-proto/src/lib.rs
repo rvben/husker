@@ -150,13 +150,37 @@ pub struct ExecResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileRequest {
     pub path: String,
+    /// Byte offset to begin reading at. Lets the host pull a file larger than
+    /// one response can carry as a sequence of ranged reads. `#[serde(default)]`
+    /// so a sender built before this field existed still decodes. An agent
+    /// older than [`MIN_PROTOCOL_VERSION_FOR_RANGED_READ`] has no code path for
+    /// offsets and returns the file from the start whatever this says, which is
+    /// why a chunking host must check the guest's reported version first rather
+    /// than trust the offset to be honoured.
+    #[serde(default)]
+    pub offset: u64,
+    /// Maximum bytes to return starting at `offset`. `None` means "as much as
+    /// the agent's own ceiling allows", the behaviour from before ranged reads.
+    #[serde(default)]
+    pub len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileResponse {
-    /// Base64-encoded file contents.
+    /// Base64-encoded file contents. For a ranged request this carries only the
+    /// requested slice, not the whole file.
     pub data: String,
+    /// Bytes carried by this response, which for a ranged read is the slice
+    /// rather than the file. Read [`ReadFileResponse::total_size`] for the file.
     pub size: u64,
+    /// Size of the whole file on the guest, independent of how much of it this
+    /// response carries. A chunking host needs it to know when it has read
+    /// everything, and to notice a file rewritten underneath a transfer that
+    /// takes several requests. `None` from an agent predating ranged reads,
+    /// which is indistinguishable from a genuinely unknown size and so must
+    /// never be defaulted to zero.
+    #[serde(default)]
+    pub total_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,7 +334,7 @@ pub const AGENT_VSOCK_PORT: u32 = 52;
 /// Bump this whenever the framed message contract changes in a way that a peer
 /// must be aware of. The agent reports it via [`GuestInfoResponse`], and the
 /// host warns when a connected guest reports a different (non-zero) version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Minimum [`PROTOCOL_VERSION`] an agent must report for `WriteFileRequest.append`
 /// to be honoured. An agent older than this always truncates on every write, so
@@ -319,6 +343,15 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// against this constant before sending any append-mode chunk, and fail loudly
 /// rather than let a legacy agent produce a corrupt file that reports success.
 pub const MIN_PROTOCOL_VERSION_FOR_APPEND: u32 = 2;
+
+/// Minimum [`PROTOCOL_VERSION`] an agent must report for `ReadFileRequest`'s
+/// `offset`/`len` to be honoured. An older agent ignores both and returns the
+/// file from the start, so a host that chunked a read against it would
+/// reassemble the first chunk repeated N times: a file of exactly the right
+/// length and entirely wrong contents, reported as a success. Hosts that chunk
+/// a read must check the guest's reported version against this constant and
+/// fail loudly instead.
+pub const MIN_PROTOCOL_VERSION_FOR_RANGED_READ: u32 = 3;
 
 /// Default wall-clock deadline for receiving a single framed payload once
 /// the length prefix has been read. Callers who need a different bound can
@@ -600,7 +633,41 @@ mod tests {
             }
             other => panic!("expected GuestInfo, got {other:?}"),
         }
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
+    fn read_file_request_range_defaults_to_whole_file_for_legacy_senders() {
+        // A sender built before ranged reads omits both fields; the agent must
+        // still decode the request and read the file from the start, which is
+        // the only behaviour that existed before offsets were added.
+        let legacy = r#"{"type":"ReadFile","path":"/tmp/f"}"#;
+        let back: AgentRequest = serde_json::from_str(legacy).unwrap();
+        match back {
+            AgentRequest::ReadFile(r) => {
+                assert_eq!(r.path, "/tmp/f");
+                assert_eq!(r.offset, 0, "legacy sender must decode as offset 0");
+                assert_eq!(r.len, None, "legacy sender must decode as read-to-ceiling");
+            }
+            other => panic!("expected ReadFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_file_response_total_size_is_none_from_a_legacy_agent() {
+        // An agent predating ranged reads omits total_size. It must decode as
+        // None rather than 0: a host cannot tell "size unknown" from "the file
+        // is empty" if the absent value is coerced into a real one, and it
+        // would then treat a zero-length answer as a complete transfer.
+        let legacy = r#"{"type":"ReadFile","data":"aGk=","size":2}"#;
+        let back: AgentResponse = serde_json::from_str(legacy).unwrap();
+        match back {
+            AgentResponse::ReadFile(r) => {
+                assert_eq!(r.size, 2);
+                assert_eq!(r.total_size, None, "absent total_size must stay unknown");
+            }
+            other => panic!("expected ReadFile, got {other:?}"),
+        }
     }
 
     #[test]

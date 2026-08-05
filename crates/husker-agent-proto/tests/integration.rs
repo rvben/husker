@@ -123,6 +123,7 @@ async fn large_message_roundtrip() {
         let response = AgentResponse::ReadFile(ReadFileResponse {
             data: large_data_clone,
             size: 64 * 1024,
+            total_size: Some(64 * 1024),
         });
         write_message(&mut client, &response).await.unwrap();
     });

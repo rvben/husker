@@ -52,6 +52,18 @@ fn warn_on_protocol_mismatch(guest_version: u32) {
     }
 }
 
+/// One slice of a guest file, plus the size of the whole file it came from.
+#[derive(Debug, Clone)]
+pub struct RangedRead {
+    /// The bytes returned for the requested range.
+    pub data: Vec<u8>,
+    /// Size of the entire file on the guest, which a chunking caller compares
+    /// against bytes received so far to know when it is done. `None` from an
+    /// agent that predates ranged reads; that is "unknown", not zero, and a
+    /// caller must not treat it as a complete transfer.
+    pub total_size: Option<u64>,
+}
+
 /// Factory for creating agent connections.
 pub struct AgentClient;
 
@@ -274,17 +286,47 @@ where
         }
     }
 
-    /// Read a file from the guest filesystem.
+    /// Read a file from the guest filesystem in full, subject to the agent's
+    /// own single-response ceiling.
     pub async fn read_file(&mut self, path: &str) -> Result<Vec<u8>, AgentError> {
-        let request = AgentRequest::ReadFile(ReadFileRequest { path: path.into() });
+        self.read_file_range(path, 0, None).await.map(|r| r.data)
+    }
+
+    /// Read at most `len` bytes of a guest file starting at `offset`, so a
+    /// caller can pull a file larger than one response carries as a sequence
+    /// of requests. `len` of `None` reads to the agent's ceiling.
+    ///
+    /// Callers that chunk must first confirm the guest's protocol version is at
+    /// least [`husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_RANGED_READ`] via
+    /// [`AgentConnection::guest_info`]. An older agent ignores `offset`
+    /// entirely and answers every request with the start of the file, so the
+    /// reassembled result would be the first chunk repeated: right length,
+    /// wrong bytes, reported as success.
+    pub async fn read_file_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<RangedRead, AgentError> {
+        let request = AgentRequest::ReadFile(ReadFileRequest {
+            path: path.into(),
+            offset,
+            len,
+        });
         write_message(&mut self.stream, &request).await?;
 
         let response: AgentResponse = read_message(&mut self.stream)
             .await?
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
-            AgentResponse::ReadFile(r) => base64_decode(&r.data)
-                .map_err(|e| AgentError::Agent(format!("base64 decode failed: {e}"))),
+            AgentResponse::ReadFile(r) => {
+                let data = base64_decode(&r.data)
+                    .map_err(|e| AgentError::Agent(format!("base64 decode failed: {e}")))?;
+                Ok(RangedRead {
+                    data,
+                    total_size: r.total_size,
+                })
+            }
             AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
             _ => Err(AgentError::UnexpectedResponse),
         }

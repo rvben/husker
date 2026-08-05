@@ -254,7 +254,11 @@ async fn write_then_read_file() {
     }
 
     // Read it back
-    let request = AgentRequest::ReadFile(ReadFileRequest { path: file_path });
+    let request = AgentRequest::ReadFile(ReadFileRequest {
+        path: file_path,
+        offset: 0,
+        len: None,
+    });
     write_message(&mut stream, &request).await.unwrap();
 
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
@@ -383,8 +387,16 @@ async fn write_file_chunked_round_trip_with_non_multiple_boundary() {
     );
 }
 
+/// The deliberate asymmetry around the agent's read ceiling: a caller that asks
+/// for the whole of an oversized file is refused, because it has no way to ask
+/// for the remainder and a truncated answer would look like the file. A caller
+/// that asks for a byte range is served, clamped to the ceiling, and told the
+/// real size so it can come back for the rest.
+///
+/// Both halves live in one test because they share the ceiling env var, which
+/// is process-global; splitting them would race.
 #[tokio::test]
-async fn read_file_rejects_oversized_file() {
+async fn read_file_refuses_a_whole_oversized_file_but_serves_a_range_of_it() {
     // Safety: no other test reads this env var concurrently.
     unsafe {
         std::env::set_var("HUSKER_AGENT_MAX_READ_BYTES", "64");
@@ -393,17 +405,17 @@ async fn read_file_rejects_oversized_file() {
 
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("big.bin");
-    std::fs::write(&file_path, vec![0u8; 128]).unwrap();
+    let content: Vec<u8> = (0..128u16).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&file_path, &content).unwrap();
+    let path = file_path.to_string_lossy().into_owned();
 
     let request = AgentRequest::ReadFile(ReadFileRequest {
-        path: file_path.to_string_lossy().into_owned(),
+        path: path.clone(),
+        offset: 0,
+        len: None,
     });
     write_message(&mut stream, &request).await.unwrap();
-
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
-    unsafe {
-        std::env::remove_var("HUSKER_AGENT_MAX_READ_BYTES");
-    }
     match response {
         AgentResponse::Error(e) => {
             assert!(
@@ -414,6 +426,109 @@ async fn read_file_rejects_oversized_file() {
         }
         other => panic!("expected Error, got {other:?}"),
     }
+
+    // The same file, read as ranges. Each answer is capped at the ceiling and
+    // carries the whole file's size, which is what lets the host loop.
+    let mut assembled = Vec::new();
+    let mut reported_total = None;
+    while assembled.len() < content.len() {
+        let request = AgentRequest::ReadFile(ReadFileRequest {
+            path: path.clone(),
+            offset: assembled.len() as u64,
+            // Deliberately more than the ceiling: an over-large range is
+            // clamped, not refused, or a host would have to know the ceiling
+            // to ask a valid question.
+            len: Some(1024),
+        });
+        write_message(&mut stream, &request).await.unwrap();
+        let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+        match response {
+            AgentResponse::ReadFile(r) => {
+                assert!(
+                    r.size <= 64,
+                    "a range must not exceed the ceiling: {}",
+                    r.size
+                );
+                assert_eq!(
+                    r.total_size,
+                    Some(content.len() as u64),
+                    "every response reports the whole file's size"
+                );
+                reported_total = r.total_size;
+                assembled.extend_from_slice(&husker_agent_proto::base64_decode(&r.data).unwrap());
+            }
+            other => panic!("expected ReadFile response, got {other:?}"),
+        }
+    }
+    unsafe {
+        std::env::remove_var("HUSKER_AGENT_MAX_READ_BYTES");
+    }
+
+    assert_eq!(reported_total, Some(128));
+    assert_eq!(
+        assembled, content,
+        "ranged reads must reassemble the file byte-for-byte, in order"
+    );
+}
+
+/// A range starting at or past the end returns nothing, and still reports the
+/// file's size. Answering from the start of the file instead would make a host
+/// loop reassemble the beginning forever.
+#[tokio::test]
+async fn read_file_range_past_the_end_is_empty_not_the_start_of_the_file() {
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("short.bin");
+    std::fs::write(&file_path, b"0123456789").unwrap();
+
+    let request = AgentRequest::ReadFile(ReadFileRequest {
+        path: file_path.to_string_lossy().into_owned(),
+        offset: 10,
+        len: Some(16),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::ReadFile(r) => {
+            assert_eq!(r.size, 0);
+            assert_eq!(r.total_size, Some(10));
+            assert!(
+                husker_agent_proto::base64_decode(&r.data)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        other => panic!("expected ReadFile response, got {other:?}"),
+    }
+}
+
+/// A range in the middle of a file returns exactly that slice.
+#[tokio::test]
+async fn read_file_range_returns_the_requested_slice() {
+    let mut stream = spawn_agent().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("slice.bin");
+    std::fs::write(&file_path, b"abcdefghij").unwrap();
+
+    let request = AgentRequest::ReadFile(ReadFileRequest {
+        path: file_path.to_string_lossy().into_owned(),
+        offset: 3,
+        len: Some(4),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::ReadFile(r) => {
+            assert_eq!(husker_agent_proto::base64_decode(&r.data).unwrap(), b"defg");
+            assert_eq!(r.size, 4);
+            assert_eq!(r.total_size, Some(10));
+        }
+        other => panic!("expected ReadFile response, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -422,6 +537,8 @@ async fn read_nonexistent_file() {
 
     let request = AgentRequest::ReadFile(ReadFileRequest {
         path: "/tmp/nonexistent_file_12345_husker_test".into(),
+        offset: 0,
+        len: None,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -482,6 +599,8 @@ async fn read_file_refuses_symlink_target() {
 
     let request = AgentRequest::ReadFile(ReadFileRequest {
         path: link.to_string_lossy().into_owned(),
+        offset: 0,
+        len: None,
     });
     write_message(&mut stream, &request).await.unwrap();
 
@@ -834,7 +953,11 @@ async fn normal_requests_still_work_with_shell_protocol() {
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
     assert!(matches!(response, AgentResponse::WriteFile(_)));
 
-    let request = AgentRequest::ReadFile(ReadFileRequest { path: file_path });
+    let request = AgentRequest::ReadFile(ReadFileRequest {
+        path: file_path,
+        offset: 0,
+        len: None,
+    });
     write_message(&mut stream, &request).await.unwrap();
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
     match response {

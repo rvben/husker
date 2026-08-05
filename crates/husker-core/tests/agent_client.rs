@@ -392,6 +392,7 @@ async fn read_file_invalid_base64_maps_to_agent_error() {
             &AgentResponse::ReadFile(ReadFileResponse {
                 data: "%%%".into(),
                 size: 3,
+                total_size: Some(3),
             }),
         )
         .await

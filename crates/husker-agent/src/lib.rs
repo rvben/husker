@@ -23,7 +23,7 @@ use husker_agent_proto::{
     ReconfigureNetworkResponse, ShellDataResponse, ShellExitResponse, ShellStartRequest,
     WriteFileResponse, base64_decode, base64_encode, read_message, write_message,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
 /// Handle a single connection, processing requests until the stream closes.
@@ -647,26 +647,55 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                 .open(&req.path)
                 .await;
             match open {
-                Ok(file) => {
+                Ok(mut file) => {
+                    // Reported whatever slice is returned, so a chunking host
+                    // knows when it has the whole file. Taken before the read
+                    // so it describes the same file the bytes come from.
+                    let total_size = match file.metadata().await {
+                        Ok(m) => m.len(),
+                        Err(e) => {
+                            return AgentResponse::Error(ErrorResponse {
+                                message: format!("read failed: {e}"),
+                            });
+                        }
+                    };
                     let max = max_read_bytes();
-                    let mut limited = file.take(max + 1);
+                    // A request for more than the ceiling is clamped rather
+                    // than refused: the host discovers the real size from
+                    // total_size and comes back for the rest. Only an
+                    // unranged read of an oversized file still errors, since
+                    // such a caller has no way to ask for the remainder.
+                    let want = req.len.unwrap_or(max).min(max);
+                    if req.offset > 0
+                        && let Err(e) = file.seek(std::io::SeekFrom::Start(req.offset)).await
+                    {
+                        return AgentResponse::Error(ErrorResponse {
+                            message: format!("read failed: seeking to {}: {e}", req.offset),
+                        });
+                    }
+                    // One byte past the allowance distinguishes "filled the
+                    // window" from "hit the ceiling" for the unranged case.
+                    let mut limited = file.take(want + 1);
                     let mut data = Vec::new();
                     match limited.read_to_end(&mut data).await {
                         Ok(_) => {
-                            if data.len() as u64 > max {
-                                AgentResponse::Error(ErrorResponse {
-                                    message: format!(
-                                        "read failed: file exceeds max read size of {max} bytes"
-                                    ),
-                                })
-                            } else {
-                                let size = data.len() as u64;
-                                let encoded = base64_encode(&data);
-                                AgentResponse::ReadFile(ReadFileResponse {
-                                    data: encoded,
-                                    size,
-                                })
+                            if data.len() as u64 > want {
+                                if req.len.is_none() {
+                                    return AgentResponse::Error(ErrorResponse {
+                                        message: format!(
+                                            "read failed: file exceeds max read size of {max} bytes"
+                                        ),
+                                    });
+                                }
+                                data.truncate(want as usize);
                             }
+                            let size = data.len() as u64;
+                            let encoded = base64_encode(&data);
+                            AgentResponse::ReadFile(ReadFileResponse {
+                                data: encoded,
+                                size,
+                                total_size: Some(total_size),
+                            })
                         }
                         Err(e) => AgentResponse::Error(ErrorResponse {
                             message: format!("read failed: {e}"),
