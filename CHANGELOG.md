@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.42](https://github.com/rvben/husker/compare/v0.4.41...v0.4.42) - 2026-08-05
+
+### Fixed
+
+- **images**: publish rootfs images on every release, not only monthly ([0e89ae7](https://github.com/rvben/husker/commit/0e89ae7ea801295e988982580aee5aadf57e57d4))
+- **oci**: accept the oci:// scheme husker reports in an image's source_path ([667ae3b](https://github.com/rvben/husker/commit/667ae3b98a4e167ac45072ef2c551082fa5f2a42))
+- **cli**: refuse host-local commands run against a remote context ([593c0ef](https://github.com/rvben/husker/commit/593c0efb196be36fe99b364db9f3e457ee6da91a))
+
 ## [0.4.41](https://github.com/rvben/husker/compare/v0.4.40...v0.4.41) - 2026-08-05
 
 ### Added
