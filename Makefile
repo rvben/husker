@@ -108,13 +108,22 @@ fmt:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Clippy the macOS/no-linux-net configuration, which CI checks with
-# RUSTFLAGS=-D warnings. The pass above builds with default features, so a
-# function reachable only from a `linux-net`-gated caller looks used there and
-# is dead code here. Without this, `make lint` goes green on a tree that fails
-# four CI jobs.
+# Clippy the macOS/no-linux-net configuration, which CI checks on its macOS
+# runners with RUSTFLAGS=-D warnings. The pass above builds with default
+# features, so a function reachable only from a `linux-net`-gated caller looks
+# used there and is dead code here. Without this, `make lint` goes green on a
+# tree that fails four CI jobs.
+#
+# Darwin only: --no-default-features on Linux drops linux-net without enabling
+# the macOS VZ backend in its place, leaving a configuration husker neither
+# supports nor ships. The skip is printed rather than silent so a green lint on
+# Linux is not read as having covered this.
 clippy-macos:
+ifeq ($(shell uname -s),Darwin)
 	cargo clippy --workspace --no-default-features --all-targets -- -D warnings
+else
+	@echo "clippy-macos: SKIPPED on $(shell uname -s) (macOS-only configuration; CI covers it on its macOS runners)"
+endif
 
 # Type check without building
 check:
