@@ -148,19 +148,77 @@ pub async fn resolve_download_base(config_url: &str) -> Result<String> {
         .await
         .with_context(|| format!("parsing JSON from {api_url}"))?;
 
-    let tag = releases
-        .into_iter()
-        .map(|r| r.tag_name)
-        .filter(|t| t.starts_with(IMAGES_TAG_PREFIX))
-        .max()
-        .ok_or_else(|| {
-            anyhow!(
-                "no '{IMAGES_TAG_PREFIX}*' release found at https://github.com/{repo_path} — \
-                 the first default images release may not be published yet"
-            )
-        })?;
+    let tag = select_images_tag(releases.into_iter().map(|r| r.tag_name)).ok_or_else(|| {
+        anyhow!(
+            "no '{IMAGES_TAG_PREFIX}*' release found at https://github.com/{repo_path} — \
+             the first default images release may not be published yet"
+        )
+    })?;
 
     Ok(format!(
         "https://github.com/{repo_path}/releases/download/{tag}"
     ))
+}
+
+/// Pick the newest images release from a set of repository tags.
+///
+/// Newest is decided lexicographically, which is only correct because the tag
+/// carries a UTC timestamp in a fixed-width, big-endian format
+/// (`images-YYYY-MM-DDThhmmssZ`). The workflow that mints these tags must keep
+/// that property: any tag whose first differing character can sort above a later
+/// one - a version number, a run id, an unpadded field - would pin every host to
+/// the wrong release, silently and permanently.
+fn select_images_tag(tags: impl Iterator<Item = String>) -> Option<String> {
+    tags.filter(|t| t.starts_with(IMAGES_TAG_PREFIX)).max()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_images_tag;
+
+    fn newest(tags: &[&str]) -> Option<String> {
+        select_images_tag(tags.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn newest_images_tag_wins_across_both_tag_formats() {
+        // Date-only tags predate the timestamped ones and must keep sorting
+        // correctly against them: a date-only tag is a prefix of a timestamped
+        // tag from the same day, so the timestamped one is newer.
+        assert_eq!(
+            newest(&[
+                "images-2026-08-01",
+                "images-2026-08-05T151200Z",
+                "images-2026-07-01",
+            ]),
+            Some("images-2026-08-05T151200Z".to_string())
+        );
+        // A later date beats an earlier timestamped one.
+        assert_eq!(
+            newest(&["images-2026-08-05T151200Z", "images-2026-09-01"]),
+            Some("images-2026-09-01".to_string())
+        );
+        // Two runs on the same day are ordered by time, not by arrival.
+        assert_eq!(
+            newest(&["images-2026-08-05T235900Z", "images-2026-08-05T010000Z"]),
+            Some("images-2026-08-05T235900Z".to_string())
+        );
+    }
+
+    #[test]
+    fn version_tags_are_never_mistaken_for_images_releases() {
+        // The repo's own `v*` releases share the tag list. They must be filtered
+        // out, and - the reason the images tag is NOT version-stamped - a tag like
+        // `images-v0.4.42` would sort above every date, pinning hosts to it
+        // forever, so this asserts no such tag can be produced by the filter.
+        assert_eq!(
+            newest(&["v0.4.41", "v0.4.42", "images-2026-08-01"]),
+            Some("images-2026-08-01".to_string())
+        );
+        assert!(
+            "images-v0.4.42" > "images-2026-09-01",
+            "the trap this avoids"
+        );
+        assert_eq!(newest(&["v0.4.41", "nightly"]), None);
+    }
 }

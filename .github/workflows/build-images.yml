@@ -8,12 +8,26 @@ on:
         required: false
         default: true
         type: boolean
+  release:
+    # Republish on every husker release. The rootfs bakes in the guest agent, so
+    # a monthly-only cadence let a released daemon pair with an agent up to a
+    # month older than itself: protocol 3 landed 2026-08-05 while the newest
+    # published image was images-2026-08-01, so every `husker image pull` in
+    # between silently got a protocol 2 agent and lost the features gated on it.
+    types: [published]
   schedule:
-    # Rebuild monthly so Alpine + kernel fixes land in the default image.
+    # Rebuild monthly so Alpine + kernel fixes land in the default image even
+    # when there has been no husker release.
     - cron: '0 7 1 * *'
 
 permissions:
   contents: write
+
+# Serialise: a release-triggered run and the monthly cron can otherwise overlap
+# and race to publish, and both write to the same tag namespace.
+concurrency:
+  group: build-images
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -90,7 +104,13 @@ jobs:
           cp "$HOME/.local/share/husker/kernels/$INITRAMFS_SRC" "stage/initramfs-${{ matrix.arch }}.gz"
           cp "$HOME/.local/share/husker/images/alpine-${{ matrix.arch }}.ext4" \
              "stage/rootfs-${{ matrix.arch }}.ext4"
-          ( cd stage && sha256sum kernel-* initramfs-* rootfs-* > "SHA256SUMS-${{ matrix.arch }}" )
+          # Publish the agent that went into the rootfs. `husker doctor` reports
+          # the daemon's embedded agent as "sha256 <first 8 hex>, protocol N", so
+          # shipping the same binary makes image-vs-daemon drift checkable by
+          # comparing that line against this asset instead of guessing from dates.
+          cp "target/${{ matrix.musl-target }}/agent/husker-agent" \
+             "stage/husker-agent-${{ matrix.arch }}"
+          ( cd stage && sha256sum kernel-* initramfs-* rootfs-* husker-agent-* > "SHA256SUMS-${{ matrix.arch }}" )
 
       - uses: actions/upload-artifact@v7
         with:
@@ -114,17 +134,39 @@ jobs:
           cp artifacts/images-*/kernel-* release/
           cp artifacts/images-*/initramfs-* release/
           cp artifacts/images-*/rootfs-* release/
+          cp artifacts/images-*/husker-agent-* release/
           count=$(find artifacts/images-* -name 'SHA256SUMS-*' -maxdepth 1 | wc -l)
           [ "$count" -eq 2 ] || { echo "Expected 2 SHA256SUMS files, got $count" >&2; exit 1; }
           cat artifacts/images-*/SHA256SUMS-* > release/SHA256SUMS
           ls -lh release/
 
+      # `husker image pull` picks the images release by LEXICOGRAPHIC max over
+      # `images-*` tags, so the tag must sort chronologically. A UTC timestamp
+      # does, and unlike a bare date it cannot collide when a release-triggered
+      # run and the monthly cron land on the same day. It also sorts after the
+      # older date-only tags, which are a prefix of it.
       - name: Compute tag
         id: tag
-        run: echo "tag=images-$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+        run: echo "tag=images-$(date -u +%Y-%m-%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
-      # On schedule: inputs.dry_run is null, so this evaluates to true and we publish.
-      # On workflow_dispatch: honours the dry_run input (default true).
+      # Name the agent this rootfs carries, so an image can be matched to a
+      # daemon without downloading and mounting it.
+      - name: Describe the baked agent
+        id: agent
+        run: |
+          proto=$(grep -oE 'PROTOCOL_VERSION: u32 = [0-9]+' \
+            crates/husker-agent-proto/src/lib.rs | grep -oE '[0-9]+$')
+          [ -n "$proto" ] || { echo "could not read PROTOCOL_VERSION" >&2; exit 1; }
+          echo "protocol=$proto" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha256<<EOF"
+            grep 'husker-agent-' release/SHA256SUMS
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      # On schedule and on release: inputs.dry_run is null, so this evaluates to
+      # true and we publish. On workflow_dispatch: honours the dry_run input
+      # (default true).
       - name: Create release
         if: ${{ inputs.dry_run != true }}
         uses: softprops/action-gh-release@v3
@@ -136,10 +178,22 @@ jobs:
             modules-free build from kernel.org source (all virtio drivers built in);
             the rootfs is Alpine 3.21 minirootfs. Verify downloads against SHA256SUMS.
 
+            Built from `${{ github.sha }}`, triggered by `${{ github.event_name }}`.
+
+            The rootfs bakes in guest agent protocol **${{ steps.agent.outputs.protocol }}**.
+            A daemon reports its own embedded agent via `husker doctor`; when the
+            protocol shown there is higher than this one, the features gated on it
+            are unavailable in VMs booted from this rootfs.
+
+            ```
+            ${{ steps.agent.outputs.sha256 }}
+            ```
+
             File naming:
               kernel-<arch>            (uncompressed Linux Image / vmlinux, no modules)
               initramfs-<arch>.gz      (gzipped cpio, only needed by legacy modular kernels)
               rootfs-<arch>.ext4       (Alpine + husker-agent baked in)
+              husker-agent-<arch>      (the exact agent baked into that rootfs)
           files: release/*
 
       # Only runs on workflow_dispatch with dry_run=true (default).
