@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -94,7 +94,7 @@ test-unit:
 	cargo nextest run --workspace --lib 2>/dev/null || cargo test --workspace --lib
 
 # Lint
-lint: fmt-check clippy
+lint: fmt-check clippy clippy-macos
 
 # Check formatting
 fmt-check:
@@ -107,6 +107,14 @@ fmt:
 # Clippy
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# Clippy the macOS/no-linux-net configuration, which CI checks with
+# RUSTFLAGS=-D warnings. The pass above builds with default features, so a
+# function reachable only from a `linux-net`-gated caller looks used there and
+# is dead code here. Without this, `make lint` goes green on a tree that fails
+# four CI jobs.
+clippy-macos:
+	cargo clippy --workspace --no-default-features --all-targets -- -D warnings
 
 # Type check without building
 check:
