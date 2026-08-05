@@ -394,6 +394,20 @@ post-release:
 	echo "==> waiting for the $$v release artifacts"; \
 	tarry http "$$url" --timeout 20m
 	vership update-local
+# vership updates registry-managed copies. husker is installed from a path
+# (cargo install --path, to embed the guest agent), so there is no registry
+# copy and vership correctly reports changed:false with an empty install list.
+# Reading that no-op as "local install updated" leaves a stale binary behind,
+# so check the installed version against the tag and build from source when it
+# does not match. An absent binary is reported as absent, not as a version.
+	@want=$$(git describe --tags --abbrev=0 | sed 's/^v//'); \
+	have=$$(husker --version 2>/dev/null | awk '{print $$2}'); \
+	if [ "$$have" != "$$want" ]; then \
+		echo "==> local install is $${have:-absent}, expected $$want; building from source"; \
+		$(MAKE) install; \
+	else \
+		echo "==> local install already at $$want"; \
+	fi
 	@if [ -n "$(POST_RELEASE)" ]; then \
 		echo "==> post-release: $(POST_RELEASE)"; \
 		$(POST_RELEASE); \
