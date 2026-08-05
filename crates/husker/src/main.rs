@@ -2743,7 +2743,7 @@ async fn run(cli: Cli) -> Result<()> {
                         state_dir: config.effective_state_dir(),
                     };
                     let storage_volume = config.storage_volume;
-                    let embedded_agent_present = husker::agent_embedded();
+                    let embedded_agent = husker::EMBEDDED_AGENT;
                     // Resolve "auto" the same way the daemon does so the probe
                     // checks the interface NAT would actually pin.
                     #[cfg(feature = "linux-net")]
@@ -2755,7 +2755,7 @@ async fn run(cli: Cli) -> Result<()> {
                         let input = husker_core::DiagnosticsInput {
                             storage: &storage,
                             storage_volume,
-                            embedded_agent_present,
+                            embedded_agent,
                             host_interface: host_interface.as_deref(),
                             resource_limits_requested: config.resource_limits,
                         };

@@ -1163,7 +1163,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             let input = DiagnosticsInput {
                 storage: &self.storage,
                 storage_volume: self.storage_volume,
-                embedded_agent_present: !self.embedded_agent.is_empty(),
+                embedded_agent: self.embedded_agent,
                 host_interface: self.host_interface(),
                 resource_limits_requested: self.resource_limits(),
             };
@@ -1835,14 +1835,30 @@ pub struct DiagnosticsInput<'a> {
     pub storage: &'a husker_storage::StorageConfig,
     /// Whether the data dir is a mounted reflink storage volume (config flag).
     pub storage_volume: bool,
-    /// Whether this binary carries an embedded guest agent. Cloud-image VMs need
-    /// it at create time; a missing agent is a silent footgun until then.
-    pub embedded_agent_present: bool,
+    /// The embedded guest agent's bytes. Cloud-image VMs need it at create time;
+    /// a missing agent is a silent footgun until then.
+    ///
+    /// The bytes rather than a `present` flag, so the check can report *which*
+    /// agent this binary carries. Two husker binaries reporting the same
+    /// `--version` can embed different agents, and the resulting protocol
+    /// mismatch surfaces much later as an unrelated-looking guest error.
+    pub embedded_agent: &'a [u8],
     /// Configured host uplink interface for guest NAT egress (Linux). `None` when
     /// unknown, e.g. the macOS backend, which NATs internally via VZ.
     pub host_interface: Option<&'a str>,
     /// Whether the daemon is configured with resource_limits; gates the cgroup readiness check.
     pub resource_limits_requested: bool,
+}
+
+/// First 8 hex characters of the sha256 of `bytes`.
+///
+/// Long enough to distinguish the agents actually in circulation (five distinct
+/// ones across two hosts on 2026-08-05) while staying readable in a `doctor`
+/// line. It identifies a build; it is not a security boundary.
+fn short_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Build the host diagnostics report. Pure host inspection (no backend state),
@@ -1961,18 +1977,27 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
     }
 
     // embedded guest agent (cloud-image VMs fail at create without it).
+    //
+    // Identify the agent, do not just assert one exists. An image carries the
+    // agent of whichever daemon imported it, so "this host is up to date" is a
+    // claim about agent bytes, not about `husker --version`, and only a
+    // reported identity makes it checkable from outside.
     checks.push(CheckResult {
         name: "embedded agent".into(),
-        status: if input.embedded_agent_present {
-            CheckStatus::Ok
-        } else {
+        status: if input.embedded_agent.is_empty() {
             CheckStatus::Warn
-        },
-        message: if input.embedded_agent_present {
-            "guest agent embedded in this binary".into()
         } else {
+            CheckStatus::Ok
+        },
+        message: if input.embedded_agent.is_empty() {
             "no embedded agent: cloud-image VMs will fail at create (rebuild with HUSKER_EMBED_AGENT_BIN)"
                 .into()
+        } else {
+            format!(
+                "guest agent embedded in this binary (sha256 {}, protocol {})",
+                short_sha256(input.embedded_agent),
+                husker_agent_proto::PROTOCOL_VERSION,
+            )
         },
     });
 
@@ -5886,7 +5911,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let input = DiagnosticsInput {
             storage: &storage,
             storage_volume: false,
-            embedded_agent_present: true,
+            embedded_agent: b"test-agent",
             host_interface: None,
             resource_limits_requested: false,
         };
@@ -5928,7 +5953,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let input = DiagnosticsInput {
             storage: &storage,
             storage_volume: true,
-            embedded_agent_present: true,
+            embedded_agent: b"test-agent",
             host_interface: None,
             resource_limits_requested: false,
         };
@@ -5952,7 +5977,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let input = DiagnosticsInput {
             storage: &storage,
             storage_volume: false,
-            embedded_agent_present: false,
+            embedded_agent: b"",
             host_interface: None,
             resource_limits_requested: false,
         };
@@ -5980,7 +6005,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let input = DiagnosticsInput {
             storage: &storage,
             storage_volume: false,
-            embedded_agent_present: true,
+            embedded_agent: b"test-agent",
             host_interface: None,
             resource_limits_requested: false,
         };
@@ -6001,6 +6026,50 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     }
 
     #[test]
+    fn embedded_agent_check_identifies_which_agent_is_embedded() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let message_for = |agent: &'static [u8]| {
+            let input = DiagnosticsInput {
+                storage: &storage,
+                storage_volume: false,
+                embedded_agent: agent,
+                host_interface: None,
+                resource_limits_requested: false,
+            };
+            build_diagnostics(&input)
+                .checks
+                .into_iter()
+                .find(|c| c.name == "embedded agent")
+                .expect("embedded agent check present")
+                .message
+        };
+
+        // Two different agents must be distinguishable from the message alone.
+        // Reporting only "an agent is embedded" is what let two binaries with
+        // the same --version carry different agents unnoticed.
+        let one = message_for(b"agent-one");
+        let two = message_for(b"agent-two");
+        assert_ne!(one, two, "the message must identify WHICH agent: {one}");
+
+        // sha256("agent-one") starts with these 8 hex chars, so the message
+        // carries the real digest rather than any stable-but-arbitrary token.
+        let expected = short_sha256(b"agent-one");
+        assert_eq!(expected.len(), 8);
+        assert!(one.contains(&expected), "{one} should contain {expected}");
+        assert!(
+            one.contains(&format!(
+                "protocol {}",
+                husker_agent_proto::PROTOCOL_VERSION
+            )),
+            "{one} should name the protocol version the daemon speaks"
+        );
+    }
+
+    #[test]
     fn build_diagnostics_checks_state_dir_when_split_from_data_dir() {
         let data = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -6011,7 +6080,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let input = DiagnosticsInput {
             storage: &storage,
             storage_volume: false,
-            embedded_agent_present: true,
+            embedded_agent: b"test-agent",
             host_interface: None,
             resource_limits_requested: false,
         };
@@ -6035,7 +6104,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let input = DiagnosticsInput {
             storage: &storage,
             storage_volume: false,
-            embedded_agent_present: true,
+            embedded_agent: b"test-agent",
             host_interface: None,
             resource_limits_requested: true,
         };
