@@ -14,12 +14,14 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 mod cli;
 mod config;
 mod daemon;
+mod guest_file;
 mod job;
 mod schema;
 
 use crate::cli::*;
 use crate::config::*;
 use crate::daemon::*;
+use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::*;
 
 fn resolve_format(fmt: OutputFormat) -> OutputFormat {
@@ -569,6 +571,7 @@ fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
 /// machine-readable `kind` (the daemon's stable error identifier, matching the
 /// clispec error envelope), the process exit code to return, and an optional
 /// actionable hint. `String`/`&str` convert in as a generic error.
+#[derive(Debug, Clone)]
 pub(crate) struct ApiFailure {
     pub(crate) message: String,
     pub(crate) kind: Option<String>,
@@ -2042,24 +2045,34 @@ async fn run(cli: Cli) -> Result<()> {
             };
 
             match result {
-                Ok(result) => {
-                    let exit_code = result["exit_code"].as_i64().unwrap_or(1);
+                Ok(outcome) => {
+                    let exec = &outcome.exec;
+                    let exit_code = exec["exit_code"].as_i64().unwrap_or(1);
+                    // Outputs that were asked for and did not arrive fail the
+                    // job. Decided before printing so the JSON status agrees
+                    // with the exit code rather than reporting "ok" beside an
+                    // error envelope.
+                    let retrieval_failure =
+                        outcome.retrieval.as_ref().and_then(job::Retrieval::failure);
                     if output == OutputFormat::Json {
-                        print_output(
-                            output,
-                            &serde_json::json!({
-                                "status": "ok",
-                                "action": "job",
-                                "vm": name,
-                                "exit_code": exit_code,
-                                "stdout": result["stdout"],
-                                "stderr": result["stderr"],
-                            }),
-                            "",
-                        );
+                        let mut payload = serde_json::json!({
+                            "status": if retrieval_failure.is_some() { "error" } else { "ok" },
+                            "action": "job",
+                            "vm": name,
+                            "exit_code": exit_code,
+                            "stdout": exec["stdout"],
+                            "stderr": exec["stderr"],
+                        });
+                        // Only when the job asked for outputs: absent means
+                        // none were requested, which an empty list would blur
+                        // into "requested and none came back".
+                        if let Some(retrieval) = &outcome.retrieval {
+                            payload["retrieval"] = retrieval.to_json();
+                        }
+                        print_output(output, &payload, "");
                     } else {
-                        print!("{}", result["stdout"].as_str().unwrap_or(""));
-                        eprint!("{}", result["stderr"].as_str().unwrap_or(""));
+                        print!("{}", exec["stdout"].as_str().unwrap_or(""));
+                        eprint!("{}", exec["stderr"].as_str().unwrap_or(""));
                     }
                     if keep {
                         if output == OutputFormat::Text {
@@ -2085,8 +2098,21 @@ async fn run(cli: Cli) -> Result<()> {
                              `husker image import-oci`)."
                         );
                     }
+                    // A command that failed keeps its own exit code: replacing
+                    // it with a retrieval failure would hide the reason the
+                    // outputs were never written. The retrieval failure is
+                    // still said out loud, because it is a second thing the
+                    // user needs to know.
                     if exit_code != 0 {
+                        if let Some(failure) = &retrieval_failure
+                            && output == OutputFormat::Text
+                        {
+                            eprintln!("[job] note: {}", failure.message);
+                        }
                         std::process::exit(exit_code.clamp(1, 255) as i32);
+                    }
+                    if let Some(failure) = retrieval_failure {
+                        exit_with_error(output, failure);
                     }
                     Ok(())
                 }
@@ -2222,40 +2248,37 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 (CpPath::Vm { name, path }, CpPath::Local(local)) => {
+                    // Reads in chunks when the file is larger than one response
+                    // can carry, so the size of an artifact is not a reason it
+                    // cannot be copied out.
                     let client = reqwest::Client::new();
-                    let resp = api_request(
-                        with_api_auth(
-                            client.post(format!("{api_url}/v1/vms/{name}/files/read")),
-                            api_token.as_deref(),
-                        )
-                        .json(&serde_json::json!({ "path": path })),
+                    let data = match read_guest_file(
+                        &client,
+                        &api_url,
+                        api_token.as_deref(),
+                        &name,
+                        &path,
                     )
-                    .await?;
-
-                    if resp.status().is_success() {
-                        let result: serde_json::Value = resp.json().await?;
-                        let b64 = result["data"].as_str().unwrap_or("");
-                        let data = husker_agent_proto::base64_decode(b64)
-                            .map_err(|e| anyhow::anyhow!("invalid base64 from server: {e}"))?;
-                        std::fs::write(&local, &data)
-                            .with_context(|| format!("writing {}", local.display()))?;
-                        print_output(
-                            output,
-                            &serde_json::json!({
-                                "status": "ok",
-                                "action": "cp",
-                                "direction": "from_vm",
-                                "vm": name,
-                                "path": path,
-                                "bytes": data.len(),
-                                "destination": local,
-                            }),
-                            format!("{} bytes copied from {name}:{path}", data.len()),
-                        );
-                    } else {
-                        let msg = api_error(resp, &format!("VM '{name}'")).await;
-                        exit_with_error(output, msg);
-                    }
+                    .await?
+                    {
+                        GuestFile::Read(data) => data,
+                        GuestFile::Failed(failure) => exit_with_error(output, failure),
+                    };
+                    std::fs::write(&local, &data)
+                        .with_context(|| format!("writing {}", local.display()))?;
+                    print_output(
+                        output,
+                        &serde_json::json!({
+                            "status": "ok",
+                            "action": "cp",
+                            "direction": "from_vm",
+                            "vm": name,
+                            "path": path,
+                            "bytes": data.len(),
+                            "destination": local,
+                        }),
+                        format!("{} bytes copied from {name}:{path}", data.len()),
+                    );
                 }
                 (CpPath::Local(_), CpPath::Local(_)) => {
                     anyhow::bail!(
@@ -5434,6 +5457,16 @@ pub(crate) const SYNC_ARCHIVE_GUEST_PATH: &str = "/tmp/.husker-sync.tgz";
 pub(crate) const SYNC_WORKDIR: &str = "/work";
 /// Guest path the retrieval archive (`--out`/`--write-back`) is built at.
 pub(crate) const SYNC_OUTPUT_GUEST_PATH: &str = "/tmp/.husker-out.tgz";
+/// Guest path the retrieval manifest is written to: one line per requested
+/// pattern that matched nothing, as its 1-based position in the request. The
+/// file is created before any matching happens and truncated first, so the host
+/// can tell "every pattern matched" (present and empty) from "the wrapper never
+/// got this far" (absent) - two facts an absent archive alone conflates, and the
+/// conflation is why an unretrievable artifact used to be reported as one the
+/// command never produced. Positions rather than the patterns themselves because
+/// a position is always digits: no quoting, no separator that a path could
+/// contain.
+pub(crate) const SYNC_MANIFEST_GUEST_PATH: &str = "/tmp/.husker-out.manifest";
 
 /// Collect the set of files to sync into a `--sync-cwd` sandbox, relative to `dir`.
 ///
@@ -5532,11 +5565,18 @@ fn shell_single_quote(s: &str) -> String {
 /// guest-side via unquoted word expansion - pathname expansion only, never
 /// shell re-parsing - so they match files the command created. busybox-safe:
 /// no arrays, no `tar -T`/`--null`.
+///
+/// Alongside the archive the guest writes `manifest_path`, listing the 1-based
+/// position of every pattern that matched nothing. Which patterns went unmatched
+/// is knowable only on the guest, where the expansion happens, and without it the
+/// host can only observe that the archive is missing - true both when nothing
+/// matched and when everything matched but the archive could not be transferred.
 pub(crate) fn wrap_sync_command(
     archive_guest_path: &str,
     workdir: &str,
     command: &[String],
     output_path: &str,
+    manifest_path: &str,
     retrieve_paths: &[PathBuf],
 ) -> (String, Vec<String>) {
     let setup = format!(
@@ -5552,7 +5592,8 @@ pub(crate) fn wrap_sync_command(
         // expansion (globbing) but never shell re-parsing; a pattern with no
         // matches stays literal and is dropped by the `-e` test. Matches
         // accumulate in the positional parameters (the user command has
-        // already run, so `$@` is free to reuse).
+        // already run, so `$@` is free to reuse), while `__i` counts patterns
+        // and `__n` records whether the current one matched anything.
         let quoted = retrieve_paths
             .iter()
             .map(|p| shell_single_quote(&format!("./{}", p.to_string_lossy())))
@@ -5560,9 +5601,11 @@ pub(crate) fn wrap_sync_command(
             .join(" ");
         format!(
             "{setup}set +e; \"$@\"; __rc=$?; \
-             set --; \
-             for __p in {quoted}; do for __m in $__p; do \
-             [ -e \"$__m\" ] && set -- \"$@\" \"$__m\"; done; done; \
+             set --; __i=0; : > {manifest_path}; \
+             for __p in {quoted}; do __i=$((__i+1)); __n=0; \
+             for __m in $__p; do \
+             if [ -e \"$__m\" ]; then set -- \"$@\" \"$__m\"; __n=1; fi; done; \
+             if [ $__n -eq 0 ]; then printf '%s\\n' \"$__i\" >> {manifest_path}; fi; done; \
              if [ $# -gt 0 ]; then tar -czf {output_path} \"$@\" 2>/dev/null || true; fi; \
              exit $__rc"
         )
@@ -6126,6 +6169,7 @@ mod tests {
             "/work",
             &["cargo".to_string(), "test".to_string()],
             "/tmp/.husker-out.tgz",
+            "/tmp/.husker-out.manifest",
             &[],
         );
         assert_eq!(cmd, "sh");
@@ -6153,13 +6197,15 @@ mod tests {
     /// Runs the generated retrieval script through a real `sh`: globs must
     /// expand against files the command CREATED (they did not exist at sync
     /// time), non-matching patterns must be dropped rather than passed to tar
-    /// as literals, and the command's exit code must survive.
+    /// as literals, the manifest must name exactly the pattern that matched
+    /// nothing, and the command's exit code must survive.
     #[test]
     fn wrap_sync_command_expands_globs_guest_side() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("work");
         let archive = tmp.path().join("sync.tgz");
         let out = tmp.path().join("out.tgz");
+        let manifest = tmp.path().join("out.manifest");
 
         // Minimal sync archive (one seed file) for the setup step to extract.
         let gz = flate2::write::GzEncoder::new(
@@ -6185,6 +6231,7 @@ mod tests {
                 "mkdir -p results && touch results/a.log results/b.log && exit 3".to_string(),
             ],
             out.to_str().unwrap(),
+            manifest.to_str().unwrap(),
             &[PathBuf::from("results/*"), PathBuf::from("nope/*")],
         );
         let status = std::process::Command::new(cmd)
@@ -6214,16 +6261,29 @@ mod tests {
             vec!["results/a.log".to_string(), "results/b.log".to_string()],
             "glob matched exactly the created files; 'nope/*' was dropped"
         );
+
+        // Dropping a pattern silently is what made an unretrievable artifact
+        // indistinguishable from one the command never wrote. The manifest
+        // names the second pattern, and only the second: a manifest that
+        // listed both (or neither) would let the host misreport which.
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "2\n",
+            "manifest names only the pattern that matched nothing, by position"
+        );
     }
 
-    /// A retrieval where no pattern matches anything must not create the
-    /// output archive at all (the CLI then warns "nothing matched --out").
+    /// A retrieval where no pattern matches anything must not create the output
+    /// archive, and must say so in the manifest. The manifest is the difference
+    /// between "the guest produced nothing" and "the archive did not come back":
+    /// without it the host sees only a missing archive and cannot tell which.
     #[test]
-    fn wrap_sync_command_no_matches_produces_no_archive() {
+    fn wrap_sync_command_no_matches_produces_no_archive_but_a_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("work");
         let archive = tmp.path().join("sync.tgz");
         let out = tmp.path().join("out.tgz");
+        let manifest = tmp.path().join("out.manifest");
 
         let gz = flate2::write::GzEncoder::new(
             std::fs::File::create(&archive).unwrap(),
@@ -6244,6 +6304,7 @@ mod tests {
             workdir.to_str().unwrap(),
             &["true".to_string()],
             out.to_str().unwrap(),
+            manifest.to_str().unwrap(),
             &[PathBuf::from("missing/*")],
         );
         let status = std::process::Command::new(cmd)
@@ -6251,9 +6312,68 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(0));
-        assert!(
-            !out.exists(),
-            "no output archive when nothing matched (host warns instead)"
+        assert!(!out.exists(), "no output archive when nothing matched");
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "1\n",
+            "the manifest accounts for the pattern that matched nothing"
+        );
+    }
+
+    /// The manifest exists and is empty when every pattern matched, so its
+    /// presence proves the wrapper ran to completion and its emptiness proves
+    /// nothing went unmatched. An absent manifest means neither, which is why
+    /// it is truncated up front rather than only written when there is
+    /// something to say.
+    #[test]
+    fn wrap_sync_command_writes_an_empty_manifest_when_everything_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("work");
+        let archive = tmp.path().join("sync.tgz");
+        let out = tmp.path().join("out.tgz");
+        let manifest = tmp.path().join("out.manifest");
+
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "seed.txt", std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        // Pre-fill the manifest so a wrapper that appended without truncating
+        // would leave the stale line behind and fail this test.
+        std::fs::write(&manifest, "9\n").unwrap();
+
+        let (cmd, args) = wrap_sync_command(
+            archive.to_str().unwrap(),
+            workdir.to_str().unwrap(),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "touch made.txt".to_string(),
+            ],
+            out.to_str().unwrap(),
+            manifest.to_str().unwrap(),
+            &[PathBuf::from("made.txt")],
+        );
+        let status = std::process::Command::new(cmd)
+            .args(&args)
+            .env("COPYFILE_DISABLE", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(out.exists(), "the matched path is archived");
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "",
+            "an empty manifest means every pattern matched"
         );
     }
 
@@ -6264,6 +6384,7 @@ mod tests {
             "/work",
             &["cargo".to_string(), "build".to_string()],
             "/tmp/.husker-out.tgz",
+            "/tmp/.husker-out.manifest",
             &[PathBuf::from("target/release/app"), PathBuf::from("src")],
         );
         let script = &args[1];
