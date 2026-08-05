@@ -8,13 +8,20 @@ on:
         required: false
         default: true
         type: boolean
-  release:
+  workflow_run:
     # Republish on every husker release. The rootfs bakes in the guest agent, so
     # a monthly-only cadence let a released daemon pair with an agent up to a
     # month older than itself: protocol 3 landed 2026-08-05 while the newest
     # published image was images-2026-08-01, so every `husker image pull` in
     # between silently got a protocol 2 agent and lost the features gated on it.
-    types: [published]
+    #
+    # This keys off the Release workflow finishing rather than `release:
+    # published`, because that event never arrives: the release is created by
+    # softprops/action-gh-release authenticated with GITHUB_TOKEN, and GitHub
+    # does not start workflow runs from events a GITHUB_TOKEN created. A
+    # `release:` trigger here is silently inert, which is how it went unnoticed.
+    workflows: [Release]
+    types: [completed]
   schedule:
     # Rebuild monthly so Alpine + kernel fixes land in the default image even
     # when there has been no husker release.
@@ -32,6 +39,11 @@ concurrency:
 jobs:
   build:
     name: Build ${{ matrix.arch }} image
+    # A failed or cancelled Release must not publish images. The other triggers
+    # carry no workflow_run context, so they are unaffected.
+    if: >-
+      github.event_name != 'workflow_run'
+      || github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +58,13 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      # On workflow_run the default ref is the default branch, which can already
+      # have moved past the release. Build from the commit the Release ran on so
+      # the baked agent is exactly the one that daemon release ships. Empty on
+      # every other trigger, where the default ref is already correct.
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install build dependencies
         run: |
@@ -122,7 +140,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # On workflow_run the default ref is the default branch, which can already
+      # have moved past the release. Build from the commit the Release ran on so
+      # the baked agent is exactly the one that daemon release ships. Empty on
+      # every other trigger, where the default ref is already correct.
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -178,7 +202,8 @@ jobs:
             modules-free build from kernel.org source (all virtio drivers built in);
             the rootfs is Alpine 3.21 minirootfs. Verify downloads against SHA256SUMS.
 
-            Built from `${{ github.sha }}`, triggered by `${{ github.event_name }}`.
+            Built from `${{ github.event.workflow_run.head_sha || github.sha }}`,
+            triggered by `${{ github.event_name }}`.
 
             The rootfs bakes in guest agent protocol **${{ steps.agent.outputs.protocol }}**.
             A daemon reports its own embedded agent via `husker doctor`; when the
