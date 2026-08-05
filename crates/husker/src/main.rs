@@ -5594,6 +5594,11 @@ pub(crate) fn wrap_sync_command(
         // accumulate in the positional parameters (the user command has
         // already run, so `$@` is free to reuse), while `__i` counts patterns
         // and `__n` records whether the current one matched anything.
+        //
+        // `IFS` is emptied for that expansion, which disables field splitting
+        // and leaves only globbing. Otherwise a pattern containing a space
+        // ("build output/*.tgz") would be split into two words before it was
+        // expanded, and both would fail to match a file that exists.
         let quoted = retrieve_paths
             .iter()
             .map(|p| shell_single_quote(&format!("./{}", p.to_string_lossy())))
@@ -5601,11 +5606,12 @@ pub(crate) fn wrap_sync_command(
             .join(" ");
         format!(
             "{setup}set +e; \"$@\"; __rc=$?; \
-             set --; __i=0; : > {manifest_path}; \
+             set --; __i=0; : > {manifest_path}; __oifs=$IFS; IFS=; \
              for __p in {quoted}; do __i=$((__i+1)); __n=0; \
              for __m in $__p; do \
              if [ -e \"$__m\" ]; then set -- \"$@\" \"$__m\"; __n=1; fi; done; \
              if [ $__n -eq 0 ]; then printf '%s\\n' \"$__i\" >> {manifest_path}; fi; done; \
+             IFS=$__oifs; \
              if [ $# -gt 0 ]; then tar -czf {output_path} \"$@\" 2>/dev/null || true; fi; \
              exit $__rc"
         )
@@ -6270,6 +6276,77 @@ mod tests {
             std::fs::read_to_string(&manifest).unwrap(),
             "2\n",
             "manifest names only the pattern that matched nothing, by position"
+        );
+    }
+
+    /// A directory name with a space in it is an ordinary thing to build into,
+    /// and the pattern naming it is one pattern. Splitting it on the space
+    /// before globbing makes both halves match nothing, which now reports a
+    /// file that exists as an output the command never wrote, and fails the job
+    /// for it.
+    #[test]
+    fn wrap_sync_command_matches_a_pattern_containing_a_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("work");
+        let archive = tmp.path().join("sync.tgz");
+        let out = tmp.path().join("out.tgz");
+        let manifest = tmp.path().join("out.manifest");
+
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "seed.txt", std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let (cmd, args) = wrap_sync_command(
+            archive.to_str().unwrap(),
+            workdir.to_str().unwrap(),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p 'build output' && touch 'build output/app.tgz'".to_string(),
+            ],
+            out.to_str().unwrap(),
+            manifest.to_str().unwrap(),
+            &[PathBuf::from("build output/*.tgz")],
+        );
+        let status = std::process::Command::new(cmd)
+            .args(&args)
+            .env("COPYFILE_DISABLE", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+
+        // Asserted before the archive is opened: a split pattern matches
+        // nothing, and the manifest says which pattern that was, while a
+        // missing archive only says something went unretrieved.
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "",
+            "a pattern that matched must not be reported as unmatched"
+        );
+
+        let gz = flate2::read::GzDecoder::new(std::fs::File::open(&out).unwrap());
+        let names: Vec<String> = tar::Archive::new(gz)
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path().unwrap().to_string_lossy().into_owned();
+                p.trim_start_matches("./").to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["build output/app.tgz".to_string()],
+            "the space belongs to the pattern, not between two patterns"
         );
     }
 
