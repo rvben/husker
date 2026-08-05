@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.41](https://github.com/rvben/husker/compare/v0.4.40...v0.4.41) - 2026-08-05
+
+### Added
+
+- **doctor**: report the sha256 and protocol of the embedded guest agent ([7ba562d](https://github.com/rvben/husker/commit/7ba562d45902b202edaeb99db8c4c3d8fc9397f5))
+- **vm**: refresh the guest agent in each VM's rootfs clone at create ([9997e92](https://github.com/rvben/husker/commit/9997e922a01c07e9225d01eba7443645bdab7fc6))
+
+### Fixed
+
+- **proxy**: drain queued connections the reactor has not observed ([2ef3a54](https://github.com/rvben/husker/commit/2ef3a549ef69956d406add973d9716736f2fbff0))
+
 ## [0.4.40](https://github.com/rvben/husker/compare/v0.4.39...v0.4.40) - 2026-08-05
 
 ### Added
