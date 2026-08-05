@@ -280,18 +280,102 @@ impl<D: GuestDialer> ResumeListenerHandle for PortProxy<D> {
     }
 }
 
-/// Poll `listener` once with a no-op waker: `Ok(Some(_))` if a connection was
-/// already queued, `Ok(None)` if the backlog is empty right now. Used by
-/// `PortProxy::drain_and_close` to drain synchronously without an executor
-/// (tokio's `TcpListener` has no `try_accept`, only `poll_accept`).
+/// Take one connection off `listener`'s backlog without blocking:
+/// `Ok(Some(_))` if one was queued, `Ok(None)` if the backlog is empty right
+/// now. Used by `PortProxy::drain_and_close` to drain synchronously without an
+/// executor.
+///
+/// This asks the kernel directly rather than going through tokio's
+/// `poll_accept`, which answers from the readiness the reactor has observed so
+/// far and returns `Pending` - without issuing `accept(2)` - when the
+/// listener's event has not been processed yet. On a busy host that is the
+/// common case at teardown, so a readiness-based probe reports an empty backlog
+/// while connections are queued in it; the drain then closes the listener and
+/// the kernel resets exactly the connections this path exists to rescue.
 #[cfg(feature = "linux-net")]
 fn try_accept_now(listener: &TcpListener) -> io::Result<Option<(TcpStream, SocketAddr)>> {
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    match listener.poll_accept(&mut cx) {
-        std::task::Poll::Ready(Ok(pair)) => Ok(Some(pair)),
-        std::task::Poll::Ready(Err(e)) => Err(e),
-        std::task::Poll::Pending => Ok(None),
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let raw = loop {
+        // SAFETY: `listener` owns a valid listening descriptor for the duration
+        // of the call.
+        let fd = unsafe { accept_raw(listener.as_raw_fd()) };
+        if fd >= 0 {
+            break fd;
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Interrupted before a connection was dequeued: nothing was lost.
+            Some(libc::EINTR) => continue,
+            // This pending connection died between the client's connect and our
+            // accept. It is gone either way, so move on to the next one.
+            Some(libc::ECONNABORTED) => continue,
+            // Tokio's listeners are always non-blocking, so this is the empty
+            // backlog rather than a would-block on a blocking socket.
+            _ if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            _ => return Err(err),
+        }
+    };
+
+    // SAFETY: `accept_raw` returned a fresh descriptor that nothing else owns,
+    // so the stream below takes sole ownership and closes it exactly once -
+    // including on the `?` paths that follow.
+    let stream = unsafe { std::net::TcpStream::from_raw_fd(raw) };
+    set_cloexec(&stream)?;
+    // An accepted socket does not inherit O_NONBLOCK from its listener, and
+    // tokio requires a non-blocking one. On Linux `accept4` already set it;
+    // repeating that here is a no-op and keeps the other platforms correct.
+    stream.set_nonblocking(true)?;
+    let peer = stream.peer_addr()?;
+    Ok(Some((TcpStream::from_std(stream)?, peer)))
+}
+
+/// `accept(2)` on `listener`, returning the new descriptor or a negative value
+/// with `errno` set.
+///
+/// Linux asks for the close-on-exec and non-blocking flags in the syscall
+/// itself. Setting close-on-exec afterwards instead would leave a window in
+/// which a concurrently spawned process inherits the client socket, and the
+/// processes this daemon spawns are the long-lived VMMs: an inherited socket
+/// would hold the connection open long after the relay that owns it is gone.
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+unsafe fn accept_raw(listener: std::os::fd::RawFd) -> std::os::fd::RawFd {
+    // SAFETY: the caller guarantees `listener` is a valid listening descriptor,
+    // and null addr/len ask the kernel not to write a peer address (it is read
+    // from the accepted socket instead).
+    unsafe {
+        libc::accept4(
+            listener,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
     }
+}
+
+/// Non-Linux fallback: no `accept4`, so the flags are applied to the accepted
+/// descriptor by the caller.
+#[cfg(all(feature = "linux-net", not(target_os = "linux")))]
+unsafe fn accept_raw(listener: std::os::fd::RawFd) -> std::os::fd::RawFd {
+    // SAFETY: as above.
+    unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) }
+}
+
+/// Mark `stream` close-on-exec. A no-op on Linux, where `accept4` already did
+/// it atomically; on the other platforms this is the only opportunity.
+#[cfg(feature = "linux-net")]
+fn set_cloexec(stream: &std::net::TcpStream) -> io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `stream` owns a valid descriptor for the duration of the call.
+        if unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let _ = stream;
+    Ok(())
 }
 
 #[cfg(not(feature = "linux-net"))]
@@ -550,6 +634,81 @@ mod tests {
         assert!(*sessions.lock().get(&vm).unwrap_or(&0) >= 1);
     }
 
+    /// The drain probe must see a connection sitting in the kernel backlog even
+    /// when tokio's reactor has never observed the listener as readable - the
+    /// state a busy host produces at teardown, and the one `drain_and_close`
+    /// exists to handle.
+    ///
+    /// The setup makes both halves of that precondition exact rather than
+    /// likely. The connection is queued before tokio ever sees the listener:
+    /// the `std` connect and the blocking sleep both run on the current-thread
+    /// runtime's only thread without an `.await`, so the handshake completes
+    /// (the accept queue is filled on the client's final ACK, which lands after
+    /// `connect` returns) while the I/O driver cannot run. Registration then
+    /// starts with no readiness recorded, so a probe answering from tokio's
+    /// cached readiness reports an empty backlog while a connection is in it.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn try_accept_now_sees_a_connection_the_reactor_has_not_noticed() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let listener = TcpListener::from_std(std_listener).unwrap();
+        let accepted = try_accept_now(&listener).expect("probe must not error");
+        assert!(
+            accepted.is_some(),
+            "probe missed a connection that is queued in the kernel backlog"
+        );
+        drop(client);
+    }
+
+    /// A drained client socket must not survive into the processes this daemon
+    /// spawns. The daemon launches long-lived VMMs, and an inherited socket
+    /// holds the connection open after the relay that owns it has closed, so
+    /// the client never sees the peer go away and the descriptor leaks for as
+    /// long as that VM runs. `accept(2)` does not set close-on-exec, so this is
+    /// not automatic.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn try_accept_now_returns_a_close_on_exec_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let (stream, _) = try_accept_now(&listener)
+            .expect("probe must not error")
+            .expect("a connection is queued");
+        // SAFETY: `stream` owns a valid descriptor for the duration of the call.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed: {}", io::Error::last_os_error());
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "accepted descriptor must be close-on-exec, got flags {flags:#x}"
+        );
+        drop(client);
+    }
+
+    /// Negative control for the probe: with nothing queued it must report
+    /// "none" rather than erroring or blocking, so `drain_and_close` stops
+    /// draining instead of spinning to its cap.
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn try_accept_now_reports_none_on_an_idle_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert!(
+            try_accept_now(&listener)
+                .expect("probe must not error")
+                .is_none()
+        );
+    }
+
     #[cfg(feature = "linux-net")]
     #[tokio::test]
     async fn drain_and_close_relays_pending_connection_then_frees_port() {
@@ -569,11 +728,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Connect, then close the forward immediately: whichever of the
-        // background accept loop or drain_and_close's own try_accept picks
-        // this connection up, it must still be relayed correctly.
-        let mut client = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+        // Connect without yielding to the runtime: on the current-thread test
+        // runtime the accept loop cannot run, so at the drain below this
+        // connection is still sitting in the kernel backlog and only
+        // `drain_and_close`'s own probe can rescue it. The sleep is what makes
+        // that precondition exact - `connect` returns on the SYN-ACK, and the
+        // listener's accept queue is filled by the final ACK that follows - and
+        // it blocks the runtime thread, so it does not weaken the guarantee.
+        let client = std::net::TcpStream::connect(("127.0.0.1", host_port)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
         proxy.drain_and_close(vm);
+
+        client.set_nonblocking(true).unwrap();
+        let mut client = TcpStream::from_std(client).unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.unwrap();
