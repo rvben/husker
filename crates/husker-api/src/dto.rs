@@ -306,6 +306,12 @@ pub struct ReadFileResponse {
     /// non-zero `offset` fails with 501 against that agent rather than
     /// returning bytes from the wrong part of the file.
     pub total_size: Option<u64>,
+    /// The file's modification time in nanoseconds since the Unix epoch. A
+    /// client chunking a large read compares it across responses to notice a
+    /// file replaced mid-transfer by contents of the same length, which
+    /// comparing `total_size` alone cannot see. Null when the guest agent or
+    /// its filesystem does not report one: unknown, not "unchanged".
+    pub modified_nanos: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

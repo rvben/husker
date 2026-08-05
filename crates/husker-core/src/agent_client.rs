@@ -69,6 +69,11 @@ pub struct RangedRead {
     /// agent that predates ranged reads; that is "unknown", not zero, and a
     /// caller must not treat it as a complete transfer.
     pub total_size: Option<u64>,
+    /// The file's modification time in nanoseconds since the Unix epoch, which
+    /// a chunking caller compares across requests to notice a file replaced
+    /// mid-transfer by contents of the same length. `None` when the agent or
+    /// the guest filesystem does not report one: unknown, not "unchanged".
+    pub modified_nanos: Option<u64>,
 }
 
 /// Factory for creating agent connections.
@@ -345,6 +350,7 @@ where
                 Ok(RangedRead {
                     data,
                     total_size: r.total_size,
+                    modified_nanos: r.modified_nanos,
                 })
             }
             AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),

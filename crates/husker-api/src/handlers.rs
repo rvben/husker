@@ -1472,6 +1472,7 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
         data: husker_agent_proto::base64_encode(&data),
         size,
         total_size: read.total_size,
+        modified_nanos: read.modified_nanos,
     }))
 }
 

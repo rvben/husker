@@ -77,10 +77,13 @@ pub(crate) async fn read_guest_file(
     path: &str,
 ) -> Result<GuestFile> {
     let mut buf: Vec<u8> = Vec::new();
-    // The file size the first response reported, re-checked against every later
-    // one: a file rewritten underneath a multi-request transfer would otherwise
-    // be reassembled from two different versions of itself.
-    let mut expected_total: Option<u64> = None;
+    // What the first response said about the file, re-checked against every
+    // later one: a file rewritten underneath a multi-request transfer would
+    // otherwise be reassembled from two different versions of itself. Size
+    // alone would miss a replacement of the same length, so the modification
+    // time is carried too, and the outer Option is "no response seen yet" so an
+    // absent time is never read as an unchanged one.
+    let mut expected: Option<(u64, Option<u64>)> = None;
 
     loop {
         let offset = buf.len() as u64;
@@ -125,6 +128,7 @@ pub(crate) async fn read_guest_file(
         // Absent rather than zero when the agent predates ranged reads. Reading
         // it as a size would make every such file look empty.
         let total = body["total_size"].as_u64();
+        let modified = body["modified_nanos"].as_u64();
         buf.extend_from_slice(&chunk);
 
         let Some(total) = total else {
@@ -134,20 +138,36 @@ pub(crate) async fn read_guest_file(
             return Ok(GuestFile::Read(buf));
         };
 
-        match expected_total {
-            None => expected_total = Some(total),
-            Some(first) if first != total => {
-                return Ok(GuestFile::Failed(
-                    format!(
-                        "reading {path} from VM '{vm}': the file changed while it was being \
-                         transferred ({first} bytes when the transfer started, {total} now). \
-                         The copy would have been assembled from two different versions of the \
-                         file, so none of it was kept."
+        match expected {
+            None => expected = Some((total, modified)),
+            Some((first_total, first_modified)) => {
+                // Named separately because the two say different things to
+                // whoever reads the error: a size change is a file still being
+                // written, a time change at the same size is a file replaced.
+                let changed = if first_total != total {
+                    Some(format!(
+                        "it was {first_total} bytes when the transfer started and is {total} now"
+                    ))
+                } else if first_modified != modified {
+                    Some(
+                        "its contents were replaced by the same number of bytes, which its \
+                         modification time records even though its size did not change"
+                            .to_string(),
                     )
-                    .into(),
-                ));
+                } else {
+                    None
+                };
+                if let Some(detail) = changed {
+                    return Ok(GuestFile::Failed(
+                        format!(
+                            "reading {path} from VM '{vm}': the file changed while it was being \
+                             transferred ({detail}). The copy would have been assembled from two \
+                             different versions of the file, so none of it was kept."
+                        )
+                        .into(),
+                    ));
+                }
             }
-            Some(_) => {}
         }
 
         if buf.len() as u64 >= total {
@@ -383,6 +403,65 @@ mod tests {
                 "got: {}",
                 f.message
             ),
+        }
+        server.abort();
+    }
+
+    /// The size check alone cannot see a file whose replacement happens to be
+    /// the same length, and that is the case that corrupts silently: every
+    /// chunk is a valid read, the total matches, and the reassembled file is
+    /// half of one version and half of another. The modification time is what
+    /// makes the replacement visible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_replaced_by_one_of_the_same_size_fails_rather_than_mixing_versions() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_route = calls.clone();
+        let chunk = GUEST_READ_CHUNK_BYTES as usize;
+        let app = Router::new().route(
+            "/v1/vms/{name}/files/read",
+            post(move || {
+                let calls = calls_route.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    // Same size throughout; only the contents and the
+                    // modification time differ from the second response on.
+                    let (byte, modified) = if n == 0 {
+                        (b'a', 1_700_000_000_000_000_000u64)
+                    } else {
+                        (b'b', 1_700_000_009_000_000_000u64)
+                    };
+                    Json(serde_json::json!({
+                        "data": husker_agent_proto::base64_encode(&vec![byte; chunk]),
+                        "size": chunk,
+                        "total_size": chunk * 3,
+                        "modified_nanos": modified,
+                    }))
+                }
+            }),
+        );
+        let (api_url, server) = serve_stub(app).await;
+
+        let client = reqwest::Client::new();
+        let got = read_guest_file(&client, &api_url, None, "vm-x", "/replaced.bin")
+            .await
+            .unwrap();
+
+        match got {
+            GuestFile::Read(_) => {
+                panic!("a file replaced mid-transfer must not be reported as read")
+            }
+            GuestFile::Failed(f) => {
+                assert!(
+                    f.message.contains("changed while it was being transferred"),
+                    "got: {}",
+                    f.message
+                );
+                assert!(
+                    f.message.contains("its size did not change"),
+                    "the reason must name what changed, not just that something did: {}",
+                    f.message
+                );
+            }
         }
         server.abort();
     }

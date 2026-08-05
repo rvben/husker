@@ -181,6 +181,14 @@ pub struct ReadFileResponse {
     /// never be defaulted to zero.
     #[serde(default)]
     pub total_size: Option<u64>,
+    /// The file's modification time as nanoseconds since the Unix epoch, taken
+    /// from the same `stat` as `total_size`. A chunking host compares it across
+    /// requests to catch a file replaced mid-transfer whose new contents happen
+    /// to be the same length, which comparing sizes alone cannot see. `None`
+    /// when the agent predates the field or the filesystem reports no
+    /// modification time: unknown, never "unchanged".
+    #[serde(default)]
+    pub modified_nanos: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -649,10 +649,18 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
             match open {
                 Ok(mut file) => {
                     // Reported whatever slice is returned, so a chunking host
-                    // knows when it has the whole file. Taken before the read
-                    // so it describes the same file the bytes come from.
-                    let total_size = match file.metadata().await {
-                        Ok(m) => m.len(),
+                    // knows when it has the whole file and can tell whether the
+                    // file changed between its requests. Taken before the read
+                    // so both describe the same file the bytes come from.
+                    let (total_size, modified_nanos) = match file.metadata().await {
+                        Ok(m) => {
+                            let modified = m
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+                            (m.len(), modified)
+                        }
                         Err(e) => {
                             return AgentResponse::Error(ErrorResponse {
                                 message: format!("read failed: {e}"),
@@ -701,6 +709,7 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
                                 data: encoded,
                                 size,
                                 total_size: Some(total_size),
+                                modified_nanos,
                             })
                         }
                         Err(e) => AgentResponse::Error(ErrorResponse {

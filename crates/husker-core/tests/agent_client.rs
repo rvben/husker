@@ -393,6 +393,7 @@ async fn read_file_invalid_base64_maps_to_agent_error() {
                 data: "%%%".into(),
                 size: 3,
                 total_size: Some(3),
+                modified_nanos: Some(1_700_000_000_000_000_000),
             }),
         )
         .await
@@ -422,6 +423,7 @@ async fn a_legacy_agent_answering_a_ranged_read_from_the_start_is_an_error() {
                 data: husker_agent_proto::base64_encode(b"the start of the file"),
                 size: 21,
                 total_size: None,
+                modified_nanos: None,
             }),
         )
         .await
@@ -460,6 +462,7 @@ async fn a_legacy_agent_answering_from_offset_zero_is_accepted_as_the_whole_file
                 data: husker_agent_proto::base64_encode(b"the whole file"),
                 size: 14,
                 total_size: None,
+                modified_nanos: None,
             }),
         )
         .await

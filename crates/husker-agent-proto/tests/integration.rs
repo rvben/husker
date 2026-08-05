@@ -124,6 +124,7 @@ async fn large_message_roundtrip() {
             data: large_data_clone,
             size: 64 * 1024,
             total_size: Some(64 * 1024),
+            modified_nanos: Some(1_700_000_000_000_000_000),
         });
         write_message(&mut client, &response).await.unwrap();
     });
