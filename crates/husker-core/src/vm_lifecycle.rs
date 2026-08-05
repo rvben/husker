@@ -385,6 +385,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             )
         };
 
+        // Cloud VMs are not ext4 and get a current agent from their cloud-init
+        // seed on every boot, so they need nothing here.
+        if !is_cloud {
+            crate::refresh_cloned_agent(&req.name, &disk_path, self.embedded_agent).await?;
+        }
+
         // resolv.conf injection loop-mounts the ext4 rootfs; skip it for qcow2 cloud
         // images, which are not ext4. Cloud images configure DNS via cloud-init at boot.
         if !is_cloud && !self.dns_servers.is_empty() {
@@ -802,7 +808,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         if let Some(size) = req.disk_size {
             husker_storage::grow_rootfs_ext4(&vm_rootfs, size).await?;
         }
+        // Registered before the agent refresh so a refresh that cannot be
+        // verified takes the half-written clone down with it.
         resources.vm_dir = Some(vm_dir);
+        crate::refresh_cloned_agent(&req.name, &vm_rootfs, self.embedded_agent).await?;
 
         // Resolve the named volume to its image path. The exclusivity check runs
         // here, right before the VmRecord insert; there is a small TOCTOU window

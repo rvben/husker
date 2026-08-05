@@ -334,6 +334,263 @@ pub async fn grow_rootfs_ext4(path: &Path, new_size_bytes: u64) -> Result<(), St
     Ok(())
 }
 
+/// Absolute path of the husker guest agent inside a rootfs image. `import-oci`
+/// writes the agent here and points `/sbin/init` at it, and the baseline rootfs
+/// ships it at the same path.
+pub const GUEST_AGENT_PATH: &str = "/usr/local/bin/husker-agent";
+
+/// Outcome of [`refresh_guest_agent`]. The non-error outcomes are deliberately
+/// distinct: an image that never carried an agent, an image whose agent already
+/// matches, and a refresh that could not be attempted are three different
+/// facts, and collapsing them would report a skipped refresh as a successful one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRefresh {
+    /// The image already carries these exact agent bytes.
+    UpToDate,
+    /// The image carried a different build and now carries this one.
+    Replaced,
+    /// Nothing at [`GUEST_AGENT_PATH`], so husker did not put an agent in this
+    /// image. Left untouched.
+    Absent,
+    /// The refresh could not be attempted. The image is untouched; the string
+    /// says why.
+    Skipped(String),
+}
+
+/// Build the `debugfs` command script that replaces the guest agent.
+///
+/// `write` allocates a fresh inode, so the old file is unlinked first and the
+/// mode and ownership are restored explicitly afterwards: the new inode lands
+/// at 0664 owned by the calling user, which leaves the guest unable to exec its
+/// own init.
+fn agent_replace_script(source: &Path) -> String {
+    format!(
+        "rm {path}\n\
+         write {src} {path}\n\
+         set_inode_field {path} mode 0100755\n\
+         set_inode_field {path} uid 0\n\
+         set_inode_field {path} gid 0\n",
+        path = GUEST_AGENT_PATH,
+        src = source.display(),
+    )
+}
+
+/// Run a `debugfs` command script against `image`. `Err` means debugfs could
+/// not be run at all; a successful return says nothing about whether the
+/// commands inside the script worked, because debugfs exits 0 either way.
+async fn run_debugfs(
+    image: &Path,
+    script_path: &Path,
+    writable: bool,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("debugfs");
+    if writable {
+        cmd.arg("-w");
+    }
+    cmd.arg("-f").arg(script_path).arg(image).output().await
+}
+
+/// Replace the husker guest agent inside an ext4 rootfs image with `agent`.
+///
+/// The agent is written into a rootfs once, at import time, so upgrading the
+/// daemon leaves every already-imported image carrying the agent it was
+/// imported with - and a VM booted from it speaks that older protocol. Running
+/// this against the per-VM clone at create time heals those VMs without
+/// mutating the catalog image they were cloned from.
+///
+/// Uses `debugfs` from e2fsprogs (the package that already provides the
+/// `mkfs.ext4` used at import and the `resize2fs` used by [`grow_rootfs_ext4`])
+/// rather than a loop mount, so it needs no mount namespace and never feeds
+/// image-controlled metadata to the host kernel's ext4 parser.
+///
+/// `debugfs` exits 0 even when a command inside it fails - a `dump` of a
+/// missing path and a successful one both return 0 - so every outcome here is
+/// established by reading the file back and comparing bytes, never by exit
+/// status.
+pub async fn refresh_guest_agent(image: &Path, agent: &[u8]) -> Result<AgentRefresh, StorageError> {
+    if agent.is_empty() {
+        return Err(StorageError::CommandFailed(
+            "refusing to write an empty guest agent into a rootfs image".into(),
+        ));
+    }
+
+    // Work beside the image: same filesystem, and a path husker controls.
+    let work = image.with_extension("agent-refresh");
+    // debugfs splits its command scripts on whitespace and offers no quoting,
+    // so a path with a space in it cannot be expressed in one.
+    if work.to_string_lossy().chars().any(char::is_whitespace) {
+        return Ok(AgentRefresh::Skipped(format!(
+            "{} contains whitespace, which a debugfs command script cannot express",
+            work.display()
+        )));
+    }
+    let _ = tokio::fs::remove_dir_all(&work).await;
+    tokio::fs::create_dir_all(&work).await?;
+
+    let result = refresh_in_work_dir(image, agent, &work).await;
+    let _ = tokio::fs::remove_dir_all(&work).await;
+    result
+}
+
+async fn refresh_in_work_dir(
+    image: &Path,
+    agent: &[u8],
+    work: &Path,
+) -> Result<AgentRefresh, StorageError> {
+    let dump_script = work.join("dump.debugfs");
+    let current = work.join("current");
+    // One invocation reads both the content and the metadata: the agent is only
+    // up to date if its bytes match *and* the inode is still one the guest can
+    // exec as its init.
+    tokio::fs::write(
+        &dump_script,
+        format!(
+            "dump {GUEST_AGENT_PATH} {}\nstat {GUEST_AGENT_PATH}\n",
+            current.display()
+        ),
+    )
+    .await?;
+
+    let dumped = match run_debugfs(image, &dump_script, false).await {
+        Ok(out) => out,
+        Err(e) => {
+            return Ok(AgentRefresh::Skipped(format!(
+                "debugfs not runnable ({e}); refreshing a rootfs image's guest agent needs e2fsprogs"
+            )));
+        }
+    };
+
+    let in_image = match tokio::fs::read(&current).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // No dump file: either the path is absent from the image, or
+            // debugfs could not read the image at all. Those demand opposite
+            // responses, so confirm the image is readable before concluding
+            // the agent is simply not there.
+            let probe_script = work.join("probe.debugfs");
+            tokio::fs::write(&probe_script, "show_super_stats -h\n").await?;
+            let readable = run_debugfs(image, &probe_script, false)
+                .await
+                .map(|o| o.stdout.windows(6).any(|w| w == b"Inode "))
+                .unwrap_or(false);
+            if readable {
+                return Ok(AgentRefresh::Absent);
+            }
+            return Ok(AgentRefresh::Skipped(format!(
+                "debugfs could not read {}: {}",
+                image.display(),
+                String::from_utf8_lossy(&dumped.stderr).trim()
+            )));
+        }
+    };
+
+    // Matching bytes on an inode the guest cannot exec is not "up to date": a
+    // rootfs built by hand can carry the current agent at 0644 or owned by a
+    // non-root user, and reporting that as nothing-to-do would hand the VM an
+    // agent it cannot start. Fall through to the replace path, which reinstates
+    // the mode and ownership along with the bytes.
+    let stat = String::from_utf8_lossy(&dumped.stdout);
+    if in_image == agent && agent_inode_is_bootable(&stat).is_ok() {
+        return Ok(AgentRefresh::UpToDate);
+    }
+
+    let source = work.join("husker-agent");
+    tokio::fs::write(&source, agent).await?;
+    let write_script = work.join("write.debugfs");
+    tokio::fs::write(&write_script, agent_replace_script(&source)).await?;
+    let written = run_debugfs(image, &write_script, true).await.map_err(|e| {
+        StorageError::CommandFailed(format!(
+            "debugfs not runnable ({e}); refreshing a rootfs image's guest agent needs e2fsprogs"
+        ))
+    })?;
+
+    // The only trustworthy signals: the bytes read back out of the image, and
+    // the inode's own metadata. Content alone is not enough - a `write` that
+    // lands while `set_inode_field` does not leaves the right bytes at a
+    // non-executable, non-root inode, which the guest cannot exec as its init.
+    let verify_script = work.join("verify.debugfs");
+    let readback = work.join("readback");
+    tokio::fs::write(
+        &verify_script,
+        format!(
+            "dump {GUEST_AGENT_PATH} {}\nstat {GUEST_AGENT_PATH}\n",
+            readback.display()
+        ),
+    )
+    .await?;
+    let verified = run_debugfs(image, &verify_script, false)
+        .await
+        .map_err(|e| {
+            StorageError::CommandFailed(format!("debugfs not runnable while verifying ({e})"))
+        })?;
+    let stderr = String::from_utf8_lossy(&written.stderr);
+    let stderr = stderr.trim();
+
+    match tokio::fs::read(&readback).await {
+        Ok(bytes) if bytes == agent => {}
+        Ok(bytes) => {
+            return Err(StorageError::CommandFailed(format!(
+                "guest-agent refresh of {} left {} bytes at {GUEST_AGENT_PATH}, expected {}: {stderr}",
+                image.display(),
+                bytes.len(),
+                agent.len(),
+            )));
+        }
+        Err(e) => {
+            return Err(StorageError::CommandFailed(format!(
+                "guest-agent refresh of {} left nothing readable at {GUEST_AGENT_PATH} ({e}): {stderr}",
+                image.display(),
+            )));
+        }
+    }
+
+    let stat = String::from_utf8_lossy(&verified.stdout);
+    if let Err(problem) = agent_inode_is_bootable(&stat) {
+        return Err(StorageError::CommandFailed(format!(
+            "guest-agent refresh of {} wrote the right bytes but {problem}, so the guest could \
+             not exec {GUEST_AGENT_PATH}: {stderr}",
+            image.display(),
+        )));
+    }
+    Ok(AgentRefresh::Replaced)
+}
+
+/// Check a `debugfs stat` report for the mode and ownership the guest needs to
+/// exec the agent as its init: 0755, root-owned.
+///
+/// Parses positionally rather than by substring, so a stat that does not carry
+/// these fields at all is an error rather than a silent pass. `Err` describes
+/// what is wrong, phrased to complete "... but {problem}".
+fn agent_inode_is_bootable(stat: &str) -> Result<(), String> {
+    // `Inode: 428   Type: regular    Mode:  0755   Flags: 0x80000`
+    // `User:     0   Group:     0   Project:     0   Size: 1514352`
+    let field = |name: &str| -> Option<String> {
+        let mut tokens = stat.split_whitespace();
+        while let Some(t) = tokens.next() {
+            if t == name {
+                return tokens.next().map(str::to_owned);
+            }
+        }
+        None
+    };
+
+    match field("Mode:").as_deref() {
+        Some("0755") => {}
+        Some(other) => return Err(format!("left it at mode {other} rather than 0755")),
+        None => return Err("debugfs reported no mode for it".to_string()),
+    }
+    for (name, owner) in [("User:", "uid"), ("Group:", "gid")] {
+        match field(name).as_deref() {
+            Some("0") => {}
+            Some(other) => {
+                return Err(format!("left it owned by {owner} {other} rather than root"));
+            }
+            None => return Err(format!("debugfs reported no {owner} for it")),
+        }
+    }
+    Ok(())
+}
+
 /// Virtual size of a qcow2 image in bytes, via `qemu-img info`.
 ///
 /// Returns the number of bytes the guest OS sees as the disk's capacity,
@@ -638,6 +895,90 @@ mod tests {
     fn validate_kernel_missing_file() {
         let result = validate_kernel(Path::new("/nonexistent/vmlinux"));
         assert!(matches!(result, Err(StorageError::KernelNotFound(_))));
+    }
+
+    /// `write` allocates a new inode, so an agent replaced without restoring
+    /// the mode is not executable and the guest cannot boot into it. The order
+    /// matters too: the fields can only be set once the file exists.
+    #[test]
+    fn agent_replace_script_unlinks_then_restores_mode_and_ownership() {
+        let script = agent_replace_script(Path::new("/var/lib/husker/vms/a/x/husker-agent"));
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "rm /usr/local/bin/husker-agent",
+                "write /var/lib/husker/vms/a/x/husker-agent /usr/local/bin/husker-agent",
+                "set_inode_field /usr/local/bin/husker-agent mode 0100755",
+                "set_inode_field /usr/local/bin/husker-agent uid 0",
+                "set_inode_field /usr/local/bin/husker-agent gid 0",
+            ]
+        );
+    }
+
+    /// Verbatim `debugfs -R "stat /usr/local/bin/husker-agent"` output, taken
+    /// from a real husker rootfs image (e2fsprogs 1.47.0). `mode` is the only
+    /// substitution, so these tests read the format the tool actually emits
+    /// rather than one assumed here.
+    fn stat_fixture(mode: &str, uid: &str, gid: &str) -> String {
+        format!(
+            "Inode: 428   Type: regular    Mode:  {mode}   Flags: 0x80000\n\
+             Generation: 0    Version: 0x00000000:00000000\n\
+             User:     {uid}   Group:     {gid}   Project:     0   Size: 1514352\n\
+             File ACL: 0\n\
+             Links: 1   Blockcount: 2960\n"
+        )
+    }
+
+    #[test]
+    fn agent_inode_is_bootable_accepts_a_root_owned_executable() {
+        assert_eq!(
+            agent_inode_is_bootable(&stat_fixture("0755", "0", "0")),
+            Ok(())
+        );
+    }
+
+    /// The failure this guards is the quiet one: `write` succeeds, a
+    /// `set_inode_field` does not, and the bytes read back match perfectly
+    /// while the guest still cannot exec its own init. 0664 is what debugfs
+    /// leaves behind when the mode is never restored.
+    #[test]
+    fn agent_inode_is_bootable_rejects_a_non_executable_mode() {
+        let err = agent_inode_is_bootable(&stat_fixture("0664", "0", "0")).unwrap_err();
+        assert!(err.contains("mode 0664"), "unexpected problem: {err}");
+    }
+
+    #[test]
+    fn agent_inode_is_bootable_rejects_a_non_root_owner() {
+        let err = agent_inode_is_bootable(&stat_fixture("0755", "1000", "0")).unwrap_err();
+        assert!(err.contains("uid 1000"), "unexpected problem: {err}");
+        let err = agent_inode_is_bootable(&stat_fixture("0755", "0", "1000")).unwrap_err();
+        assert!(err.contains("gid 1000"), "unexpected problem: {err}");
+    }
+
+    /// A stat that carries no mode at all must not read as "mode is fine". A
+    /// debugfs that failed to find the inode prints an error, not a stat, and
+    /// absent metadata is not passing metadata.
+    #[test]
+    fn agent_inode_is_bootable_rejects_output_with_no_fields() {
+        let err =
+            agent_inode_is_bootable("/usr/local/bin/husker-agent: File not found by ext2_lookup\n")
+                .unwrap_err();
+        assert!(err.contains("no mode"), "unexpected problem: {err}");
+    }
+
+    /// An empty embedded agent means this build has no agent to install, not
+    /// that the image should be given a zero-byte one: writing that would
+    /// replace a working agent with an unbootable file.
+    #[tokio::test]
+    async fn refresh_guest_agent_refuses_an_empty_agent() {
+        let err = refresh_guest_agent(Path::new("/nonexistent/rootfs.ext4"), b"")
+            .await
+            .expect_err("an empty agent must be refused");
+        assert!(
+            err.to_string().contains("empty guest agent"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -1585,6 +1585,44 @@ fn seed_error_to_core(e: husker_cloudinit::CloudInitError) -> CoreError {
     }
 }
 
+/// Bring the guest agent in a freshly cloned rootfs up to this daemon's build.
+///
+/// The agent is written into a rootfs once, at import time, so an image
+/// imported by an older daemon still carries that older agent and every VM
+/// booted from it speaks its protocol - a mismatch that surfaces only later,
+/// as an unsupported operation inside the guest. Refreshing the VM's private
+/// clone (never the catalog image it was cloned from) makes upgrading the
+/// daemon upgrade the agent too.
+///
+/// Only for ext4 rootfs images: cloud VMs get a current agent from their
+/// cloud-init seed on every boot.
+async fn refresh_cloned_agent(
+    vm_name: &str,
+    rootfs: &std::path::Path,
+    agent: &[u8],
+) -> Result<(), CoreError> {
+    if agent.is_empty() {
+        return Ok(());
+    }
+    match husker_storage::refresh_guest_agent(rootfs, agent).await? {
+        husker_storage::AgentRefresh::Replaced => {
+            info!(vm = %vm_name, "refreshed the guest agent in the VM's rootfs clone");
+        }
+        husker_storage::AgentRefresh::Skipped(reason) => {
+            warn!(
+                vm = %vm_name, %reason,
+                "could not refresh the guest agent; this VM keeps the agent its image was \
+                 imported with, which may be older than this daemon"
+            );
+        }
+        husker_storage::AgentRefresh::Absent => {
+            debug!(vm = %vm_name, "image carries no husker agent; leaving it untouched");
+        }
+        husker_storage::AgentRefresh::UpToDate => {}
+    }
+    Ok(())
+}
+
 /// Mount a rootfs image via loop, write `/etc/resolv.conf`, and unmount.
 #[cfg(feature = "linux-net")]
 async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Result<(), CoreError> {
