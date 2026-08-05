@@ -187,6 +187,31 @@ fn is_local_target(api_url: &str, via_ssh_tunnel: bool) -> bool {
     is_local_api(api_url) && !via_ssh_tunnel
 }
 
+/// Commands that act on THIS machine's filesystem rather than on the daemon, and
+/// so cannot honour `--context`/`--api-url`. Returns the refusal message when the
+/// command is host-local, `None` when it is safe against any target.
+///
+/// Without this, a host-local command run against a remote context reports success
+/// while having written to the local machine, which is indistinguishable from
+/// having done the remote work. Refusing is the only honest answer: the flag is
+/// unsupported here, not silently ignored.
+fn host_local_refusal(command: &Commands) -> Option<String> {
+    match command {
+        Commands::Setup {
+            action: SetupAction::Storage { .. },
+        } => Some("setup storage runs on the daemon host; ssh to it and run there".to_string()),
+        Commands::Image {
+            action: ImageAction::Pull { .. },
+        } => Some(format!(
+            "image pull downloads into THIS machine's husker data dir and cannot target a remote \
+             context; ssh to the daemon host and run it there (destinations: {}, {})",
+            load_config(None).default_kernel.display(),
+            husker::default_rootfs_path().display(),
+        )),
+        _ => None,
+    }
+}
+
 /// Map a diagnostics report to a process exit code: 1 on any hard failure,
 /// 0 otherwise (warnings are reported but do not fail).
 fn doctor_exit_code(report: &husker_core::DiagnosticsReport) -> i32 {
@@ -1149,21 +1174,12 @@ async fn run(cli: Cli) -> Result<()> {
     let api_url =
         resolve_effective_api_url(api_url.as_deref(), context.as_deref(), &load_contexts())?;
 
-    // `setup storage` is a host-local operation (it inspects and would migrate
-    // THIS machine's data dir). Refuse a remote/ssh context up front, before we
-    // open a tunnel or probe the local host, so the error is clean and no local
-    // dirs are touched.
-    if matches!(
-        &command,
-        Commands::Setup {
-            action: SetupAction::Storage { .. }
-        }
-    ) && (api_url.starts_with("ssh://") || !is_local_api(&api_url))
-    {
-        exit_with_error(
-            output,
-            "setup storage runs on the daemon host; ssh to it and run there".to_string(),
-        );
+    // Host-local operations read and write THIS machine's data dir. Refuse a
+    // remote/ssh context up front, before we open a tunnel or touch any local
+    // path, so the error is clean and nothing is written to the wrong host.
+    let targets_remote_host = api_url.starts_with("ssh://") || !is_local_api(&api_url);
+    if targets_remote_host && let Some(msg) = host_local_refusal(&command) {
+        exit_with_error(output, msg);
     }
 
     // ssh:// transport: open an SSH local-forward tunnel to a remote daemon and
@@ -8162,6 +8178,49 @@ default_auto_resume = false
         match cli.command {
             Commands::Exec { timeout, .. } => assert_eq!(timeout, Some(600)),
             _ => panic!("expected Exec"),
+        }
+    }
+
+    /// Parse a command line and report whether it is refused against a remote target.
+    fn refusal_for(argv: &[&str]) -> Option<String> {
+        let cli = Cli::try_parse_from(argv).expect("argv parses");
+        host_local_refusal(&cli.command)
+    }
+
+    #[test]
+    fn host_local_commands_are_refused_against_a_remote_target() {
+        // `image pull` writes the kernel/initramfs/rootfs into the LOCAL data dir
+        // with no daemon call at all, so a remote context could only ever produce a
+        // successful-looking no-op against the host the user meant to update.
+        let pull = refusal_for(&["husker", "image", "pull"]).expect("image pull is host-local");
+        assert!(
+            pull.contains("cannot target a remote context"),
+            "the refusal must say the context is unsupported, not merely unusual: {pull}"
+        );
+        assert!(
+            pull.contains("ssh to the daemon host"),
+            "the refusal must name the way to actually do it: {pull}"
+        );
+        assert!(
+            refusal_for(&["husker", "setup", "storage"]).is_some(),
+            "setup storage inspects this machine's data dir and stays host-local"
+        );
+    }
+
+    #[test]
+    fn daemon_commands_are_not_refused_against_a_remote_target() {
+        // The negative control: these are the whole point of --context, so a guard
+        // that refused them would be worse than the bug it replaces.
+        for argv in [
+            vec!["husker", "image", "list"],
+            vec!["husker", "image", "import-oci", "python:3.12-alpine"],
+            vec!["husker", "list"],
+            vec!["husker", "exec", "vm1", "--", "true"],
+        ] {
+            assert!(
+                refusal_for(&argv).is_none(),
+                "{argv:?} talks to the daemon and must work against any context"
+            );
         }
     }
 
