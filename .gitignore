@@ -12,3 +12,5 @@ vmlinux
 uv.lock
 # Agent worktree/session scratch
 .claire/
+# Untracked local Makefile overrides (POST_RELEASE rollout hook, etc.)
+Makefile.local

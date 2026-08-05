@@ -1,9 +1,18 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill chaos-tests nightly-quality lint fmt fmt-check clippy check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
 # Alpine Linux version used by build-initramfs.
 ALPINE_VERSION ?= 3.21
+
+# Optional, untracked local overrides. Kept out of git so a checkout can carry
+# machine-specific settings without touching the repo.
+-include Makefile.local
+
+# Command run by post-release once the artifacts are published and the local
+# install is updated, e.g. to roll the new version out to your own hosts. Empty
+# by default, so a plain clone releases exactly as before; set it in Makefile.local.
+POST_RELEASE ?=
 
 all: lint test
 
@@ -355,3 +364,37 @@ check-deps:
 # Install development dependencies
 setup:
 	cargo install cargo-nextest cargo-audit cargo-deny upd
+
+# ---------------------------------------------------------------------------
+# Release
+# ---------------------------------------------------------------------------
+#
+# vership bumps the version, writes the changelog, tags and pushes; the release
+# workflow then builds and uploads the artifacts. post-release waits for those
+# artifacts to actually exist before doing anything that consumes them, because
+# the tag is published several minutes before the assets finish uploading.
+
+release-patch:
+	vership bump patch
+	$(MAKE) post-release
+
+release-minor:
+	vership bump minor
+	$(MAKE) post-release
+
+release-major:
+	vership bump major
+	$(MAKE) post-release
+
+# Wait for the published artifacts, update the local install, then run the
+# optional rollout hook. Safe to re-run: every step is idempotent.
+post-release:
+	@v=$$(git describe --tags --abbrev=0); \
+	url="https://github.com/rvben/husker/releases/download/$$v/husker-$$v-x86_64-unknown-linux-gnu.tar.gz"; \
+	echo "==> waiting for the $$v release artifacts"; \
+	tarry http "$$url" --timeout 20m
+	vership update-local
+	@if [ -n "$(POST_RELEASE)" ]; then \
+		echo "==> post-release: $(POST_RELEASE)"; \
+		$(POST_RELEASE); \
+	fi
