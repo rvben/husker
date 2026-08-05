@@ -8205,6 +8205,19 @@ default_auto_resume = false
             refusal_for(&["husker", "setup", "storage"]).is_some(),
             "setup storage inspects this machine's data dir and stays host-local"
         );
+
+        // `image` carries the visible aliases `images` and `img`, and the
+        // not-found hint in build_vm_request_body tells users to run
+        // `husker images pull` specifically. A guard that only caught the
+        // canonical spelling would leave the spelling husker itself suggests
+        // writing to the wrong host.
+        for alias in ["image", "images", "img"] {
+            assert_eq!(
+                refusal_for(&["husker", alias, "pull"]),
+                Some(pull.clone()),
+                "`husker {alias} pull` must be refused exactly like `image pull`"
+            );
+        }
     }
 
     #[test]
