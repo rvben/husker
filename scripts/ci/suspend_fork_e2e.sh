@@ -72,15 +72,8 @@ ROOTFS="${HUSKER_E2E_ROOTFS:-}"
 INITRD="${HUSKER_E2E_INITRD:-}"
 if [[ -z "${KERNEL}" || -z "${ROOTFS}" || -z "${INITRD}" ]]; then
   log "resolving the latest images-* release"
-  # Authenticate the GitHub API call when a token is present (CI sets GITHUB_TOKEN)
-  # to dodge the 60/hr unauthenticated rate limit.
-  gh_auth=()
-  [[ -n "${GITHUB_TOKEN:-}" ]] && gh_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-  TAG="$(curl -fsSL "${gh_auth[@]}" 'https://api.github.com/repos/rvben/husker/releases?per_page=100' \
-         | grep -oE 'images-[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)"
-  [[ -n "${TAG}" ]] || { echo "could not find an images-* release" >&2; exit 1; }
-  log "using images from ${TAG}"
-  url="https://github.com/rvben/husker/releases/download/${TAG}"
+  url="$(bash "$(dirname "${BASH_SOURCE[0]}")/resolve-images-tag.sh" --url)"
+  log "using images from ${url##*/}"
   [[ -n "${KERNEL}" ]] || { KERNEL="${WORK}/kernel"; curl -fsSL "${url}/kernel-x86_64" -o "${KERNEL}"; }
   [[ -n "${ROOTFS}" ]] || { ROOTFS="${WORK}/rootfs.ext4"; curl -fsSL "${url}/rootfs-x86_64.ext4" -o "${ROOTFS}"; }
   [[ -n "${INITRD}" ]] || { INITRD="${WORK}/initramfs.gz"; curl -fsSL "${url}/initramfs-x86_64.gz" -o "${INITRD}"; }

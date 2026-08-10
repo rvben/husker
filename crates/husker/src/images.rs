@@ -221,4 +221,67 @@ mod tests {
         );
         assert_eq!(newest(&["v0.4.41", "nightly"]), None);
     }
+
+    /// Every fixture above, as a table the shell parity test replays.
+    const TAG_FIXTURES: &[&[&str]] = &[
+        &[
+            "images-2026-08-01",
+            "images-2026-08-05T151200Z",
+            "images-2026-07-01",
+        ],
+        &["images-2026-08-05T151200Z", "images-2026-09-01"],
+        &["images-2026-08-05T235900Z", "images-2026-08-05T010000Z"],
+        &["v0.4.41", "v0.4.42", "images-2026-08-01"],
+        &["v0.4.41", "nightly"],
+    ];
+
+    /// Run `scripts/ci/resolve-images-tag.sh` over a tag list. `None` when it
+    /// exits non-zero, mirroring `select_images_tag` returning `None`.
+    fn shell_newest(tags: &[&str]) -> Option<String> {
+        use std::io::Write;
+        use std::path::Path;
+        use std::process::{Command, Stdio};
+
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/ci/resolve-images-tag.sh");
+        let mut child = Command::new("bash")
+            .arg(&script)
+            .args(["--tags-file", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawning {}: {e}", script.display()));
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(tags.join("\n").as_bytes())
+            .expect("writing tags to the resolver");
+        let out = child.wait_with_output().expect("running the resolver");
+
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// CI resolves the images tag in shell, because it needs the tag before a
+    /// husker binary exists to ask. That duplication is only safe while it is
+    /// enforced, so pin the two implementations to the same answers.
+    ///
+    /// This is the test that was missing on 2026-08-05, when the tag format
+    /// grew a timestamp (`images-2026-08-05` -> `images-2026-08-05T200756Z`):
+    /// this function was updated with the fixtures above, five shell copies
+    /// kept a regex that truncated the tag back to the date, and every nightly
+    /// e2e downloaded a 404 for four days.
+    #[test]
+    fn shell_resolver_matches_rust() {
+        for tags in TAG_FIXTURES {
+            assert_eq!(
+                shell_newest(tags),
+                newest(tags),
+                "scripts/ci/resolve-images-tag.sh disagrees with select_images_tag on {tags:?}"
+            );
+        }
+    }
 }

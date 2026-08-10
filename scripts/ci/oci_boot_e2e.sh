@@ -65,16 +65,10 @@ trap cleanup EXIT
 KERNEL="${HUSKER_E2E_KERNEL:-}"
 if [[ -z "${KERNEL}" ]]; then
   log "resolving the latest images-* release kernel"
-  # Authenticate the GitHub API call when a token is present (CI sets GITHUB_TOKEN)
-  # to dodge the 60/hr unauthenticated rate limit.
-  gh_auth=()
-  [[ -n "${GITHUB_TOKEN:-}" ]] && gh_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-  TAG="$(curl -fsSL "${gh_auth[@]}" 'https://api.github.com/repos/rvben/husker/releases?per_page=100' \
-         | grep -oE 'images-[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)"
-  [[ -n "${TAG}" ]] || { echo "could not find an images-* release" >&2; exit 1; }
+  url="$(bash "$(dirname "${BASH_SOURCE[0]}")/resolve-images-tag.sh" --url)"
   KERNEL="${WORK}/kernel"
-  curl -fsSL "https://github.com/rvben/husker/releases/download/${TAG}/kernel-x86_64" -o "${KERNEL}"
-  log "using kernel from ${TAG}"
+  curl -fsSL "${url}/kernel-x86_64" -o "${KERNEL}"
+  log "using kernel from ${url##*/}"
 fi
 
 # 2. Build the x86_64-musl agent and the daemon embedding it.
