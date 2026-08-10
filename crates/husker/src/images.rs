@@ -13,6 +13,11 @@ const GITHUB_API_USER_AGENT: &str = concat!("husker/", env!("CARGO_PKG_VERSION")
 /// channel used by `pip install husker` binaries.
 const IMAGES_TAG_PREFIX: &str = "images-";
 
+/// How many pages of the releases listing to walk while looking for the images
+/// channel. Bounds the cost of the search; in practice page 1 always carries an
+/// images release, because every `v*` release triggers an image build.
+const MAX_RELEASE_PAGES: u32 = 10;
+
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
     pub url: String,
@@ -131,24 +136,45 @@ pub async fn resolve_download_base(config_url: &str) -> Result<String> {
             )
         })?;
 
-    let api_url = format!("https://api.github.com/repos/{repo_path}/releases?per_page=100");
     let client = reqwest::Client::builder()
         .user_agent(GITHUB_API_USER_AGENT)
         .build()
         .context("building http client")?;
-    let releases: Vec<GithubRelease> = client
-        .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("GET {api_url}"))?
-        .error_for_status()
-        .with_context(|| format!("GET {api_url}"))?
-        .json()
-        .await
-        .with_context(|| format!("parsing JSON from {api_url}"))?;
 
-    let tag = select_images_tag(releases.into_iter().map(|r| r.tag_name)).ok_or_else(|| {
+    // Walk the release pages newest-first until one carries an images-* tag.
+    // Reading only the first page would silently resolve a STALE release once
+    // 100 newer releases pile up after the last image build - and a stale tag
+    // downloads successfully, so nothing downstream could ever flag it.
+    let mut tags: Vec<String> = Vec::new();
+    for page in 1..=MAX_RELEASE_PAGES {
+        let api_url =
+            format!("https://api.github.com/repos/{repo_path}/releases?per_page=100&page={page}");
+        let releases: Vec<GithubRelease> = client
+            .get(&api_url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .with_context(|| format!("GET {api_url}"))?
+            .error_for_status()
+            .with_context(|| format!("GET {api_url}"))?
+            .json()
+            .await
+            .with_context(|| format!("parsing JSON from {api_url}"))?;
+
+        // An empty page means the release list is exhausted.
+        if releases.is_empty() {
+            break;
+        }
+        let found_images = releases
+            .iter()
+            .any(|r| r.tag_name.starts_with(IMAGES_TAG_PREFIX));
+        tags.extend(releases.into_iter().map(|r| r.tag_name));
+        if found_images {
+            break;
+        }
+    }
+
+    let tag = select_images_tag(tags.into_iter()).ok_or_else(|| {
         anyhow!(
             "no '{IMAGES_TAG_PREFIX}*' release found at https://github.com/{repo_path} — \
              the first default images release may not be published yet"
