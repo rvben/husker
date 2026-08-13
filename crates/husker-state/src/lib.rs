@@ -726,6 +726,28 @@ impl StateStore {
         Ok(())
     }
 
+    /// Atomically update the lifecycle state and the VMM process that owns it.
+    ///
+    /// Snapshot suspend destroys the old process and restore starts a new one;
+    /// persisting only the state would leave clients and crash recovery pointing
+    /// at the pre-suspend PID.
+    pub fn update_vm_runtime(
+        &self,
+        id: Uuid,
+        state: &str,
+        pid: Option<u32>,
+    ) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE vms SET state = ?1, pid = ?2, updated_at = ?3 WHERE id = ?4",
+            params![state, pid, Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        if updated == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Clear a VM's host network fields (`tap_device`, `host_ip`, `guest_ip`)
     /// after its leaked resources have been reclaimed, keeping the (stopped)
     /// record. The record no longer references a freed TAP/IP, so a later
@@ -2174,6 +2196,25 @@ mod tests {
         store.update_vm_state(rec.id, "stopped").unwrap();
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.state, "stopped");
+    }
+
+    #[test]
+    fn update_runtime_replaces_state_and_pid_atomically() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("runtime-test");
+        store.insert_vm(&rec).unwrap();
+
+        store.update_vm_runtime(rec.id, "suspended", None).unwrap();
+        let suspended = store.get_vm(rec.id).unwrap();
+        assert_eq!(suspended.state, "suspended");
+        assert_eq!(suspended.pid, None);
+
+        store
+            .update_vm_runtime(rec.id, "running", Some(5678))
+            .unwrap();
+        let resumed = store.get_vm(rec.id).unwrap();
+        assert_eq!(resumed.state, "running");
+        assert_eq!(resumed.pid, Some(5678));
     }
 
     #[test]

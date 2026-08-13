@@ -2987,21 +2987,33 @@ mod tests {
     #[tokio::test]
     async fn suspend_stamps_suspended_at_and_resume_clears_it_and_resets_timers() {
         let core = test_core().await;
-        let rec = sample_vm_record("c1");
+        let mut rec = sample_vm_record("c1");
+        rec.pid = Some(4321);
         core.state.insert_vm(&rec).unwrap();
         core.mark_network_active(rec.id); // simulate old activity, pre-suspend
 
         core.suspend_vm("c1").await.unwrap();
-        assert_eq!(core.get_vm("c1").unwrap().state, "suspended");
-        assert!(core.get_vm("c1").unwrap().suspended_at.is_some());
+        let suspended = core.get_vm("c1").unwrap();
+        assert_eq!(suspended.state, "suspended");
+        assert_eq!(
+            suspended.pid, None,
+            "suspend must clear the PID of the destroyed VMM process"
+        );
+        assert!(suspended.suspended_at.is_some());
 
         let transitioned = core.resume_vm("c1").await.unwrap();
         assert!(
             transitioned,
             "resume from a genuinely suspended VM must report a real transition"
         );
-        assert_eq!(core.get_vm("c1").unwrap().state, "running");
-        assert!(core.get_vm("c1").unwrap().suspended_at.is_none());
+        let resumed = core.get_vm("c1").unwrap();
+        assert_eq!(resumed.state, "running");
+        assert_eq!(
+            resumed.pid,
+            Some(1),
+            "resume must persist the PID returned by the replacement VMM process"
+        );
+        assert!(resumed.suspended_at.is_none());
         // Both idle timers reset: network_last_active is now recent (< 5s),
         // even though `mark_network_active` above staged it as old pre-suspend.
         let recent = core

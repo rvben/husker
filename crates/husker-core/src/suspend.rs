@@ -124,7 +124,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // public `destroy_vm`, which also takes `vm_name_lock` and would deadlock
         // re-entering it here.
         self.vmm.destroy_vm(record.id).await?;
-        self.state.update_vm_state(record.id, "suspended")?;
+        self.state.update_vm_runtime(record.id, "suspended", None)?;
 
         // Stamp the reap anchor before the network transition, so a crash mid
         // transition still leaves a suspended VM whose TTL clock is running.
@@ -339,8 +339,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             mem_size_mib: record.mem_size_mib,
             vsock_cid: record.vsock_cid,
         };
-        self.vmm.restore_vm(&paths, target).await?;
-        self.state.update_vm_state(record.id, "running")?;
+        let restored = self.vmm.restore_vm(&paths, target).await?;
+        self.state
+            .update_vm_runtime(record.id, "running", restored.pid)?;
 
         let _ = tokio::fs::remove_dir_all(&slot).await;
         Ok(())
