@@ -774,6 +774,10 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks:
         parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-volume locks span asynchronous VM preparation and catalog deletion,
+    /// closing the gap that cannot safely be covered by a SQLite transaction.
+    volume_locks:
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-service reconcile locks; serialize concurrent reconciles of the same service.
     reconcile_locks:
         parking_lot::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
@@ -998,6 +1002,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             profiles: std::collections::HashMap::new(),
             runtime_dir,
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             control_plane_last_active: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
@@ -1041,6 +1046,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             profiles: std::collections::HashMap::new(),
             runtime_dir,
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             control_plane_last_active: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
@@ -1244,6 +1250,13 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.vm_name_locks.lock();
+        map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn volume_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.volume_locks.lock();
         map.entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()

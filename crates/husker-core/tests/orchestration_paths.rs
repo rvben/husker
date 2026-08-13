@@ -33,6 +33,7 @@ struct MockInner {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     stop_failures: Mutex<HashSet<Uuid>>,
     stop_calls: Mutex<Vec<Uuid>>,
+    create_gate: Mutex<Option<Arc<CreateGate>>>,
     #[cfg(not(feature = "linux-net"))]
     destroy_gate: Mutex<Option<Arc<DestroyGate>>>,
     pause_gate: Mutex<Option<Arc<PauseGate>>>,
@@ -40,6 +41,12 @@ struct MockInner {
     // Only needed by the kernel_args_composition tests (not(linux-net) builds).
     #[cfg(not(feature = "linux-net"))]
     last_config: Mutex<Option<VmConfig>>,
+}
+
+#[derive(Default)]
+struct CreateGate {
+    entered: Notify,
+    release: Notify,
 }
 
 #[cfg(not(feature = "linux-net"))]
@@ -69,6 +76,7 @@ impl MockVmm {
                 vms: Mutex::new(HashMap::new()),
                 stop_failures: Mutex::new(HashSet::new()),
                 stop_calls: Mutex::new(Vec::new()),
+                create_gate: Mutex::new(None),
                 #[cfg(not(feature = "linux-net"))]
                 destroy_gate: Mutex::new(None),
                 pause_gate: Mutex::new(None),
@@ -100,6 +108,13 @@ impl MockVmm {
 
     async fn stop_call_count(&self) -> usize {
         self.inner.stop_calls.lock().await.len()
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    async fn block_next_create(&self) -> Arc<CreateGate> {
+        let gate = Arc::new(CreateGate::default());
+        *self.inner.create_gate.lock().await = Some(Arc::clone(&gate));
+        gate
     }
 
     #[cfg(not(feature = "linux-net"))]
@@ -142,6 +157,10 @@ impl VmmBackend for MockVmm {
         // linux-net builds capture nothing; consume config to avoid an unused-variable warning.
         #[cfg(feature = "linux-net")]
         let _ = config;
+        if let Some(gate) = self.inner.create_gate.lock().await.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         self.upsert_vm(info.clone()).await;
         Ok(CreatedVm::new(info, self.creation_backend))
     }
@@ -2390,6 +2409,130 @@ async fn concurrent_create_same_name_one_winner() {
     );
     // Exactly one VM persisted.
     assert_eq!(core.list_vms().unwrap().len(), 1);
+}
+
+#[cfg(not(feature = "linux-net"))]
+fn volume_create_request(
+    name: &str,
+    volume: &str,
+    kernel: &Path,
+    rootfs: &Path,
+) -> CreateVmRequest {
+    CreateVmRequest {
+        name: name.into(),
+        kernel_path: Some(kernel.to_path_buf()),
+        rootfs_path: Some(rootfs.to_path_buf()),
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        volume: Some(volume.into()),
+        ..Default::default()
+    }
+}
+
+#[cfg(not(feature = "linux-net"))]
+fn volume_race_core(
+    tmp: &tempfile::TempDir,
+    mock: MockVmm,
+) -> (Arc<HuskerCore<MockVmm>>, PathBuf, PathBuf, PathBuf) {
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let kernel = tmp.path().join("vmlinux");
+    let mut kernel_bytes = vec![0u8; 64];
+    kernel_bytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, kernel_bytes).unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"rootfs").unwrap();
+    let volume_path = tmp.path().join("exclusive.img");
+    std::fs::write(&volume_path, b"volume").unwrap();
+    let state = StateStore::open_memory().unwrap();
+    state
+        .insert_volume(&husker_state::VolumeRecord {
+            id: Uuid::new_v4(),
+            name: "exclusive".into(),
+            file_path: volume_path.to_string_lossy().into_owned(),
+            size_bytes: 6,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+    (
+        build_core(mock, state, &data_dir, &runtime_dir),
+        kernel,
+        rootfs,
+        volume_path,
+    )
+}
+
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn concurrent_creates_cannot_share_a_writable_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (core, kernel, rootfs, _) = volume_race_core(&tmp, MockVmm::new());
+    let first = {
+        let core = Arc::clone(&core);
+        let request = volume_create_request("volume-a", "exclusive", &kernel, &rootfs);
+        tokio::spawn(async move { core.create_vm(request).await })
+    };
+    let second = {
+        let core = Arc::clone(&core);
+        let request = volume_create_request("volume-b", "exclusive", &kernel, &rootfs);
+        tokio::spawn(async move { core.create_vm(request).await })
+    };
+    let results = [first.await.unwrap(), second.await.unwrap()];
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(CoreError::VolumeAttached { .. })))
+            .count(),
+        1
+    );
+    let winner = results
+        .iter()
+        .find_map(|result| result.as_ref().ok())
+        .unwrap();
+    assert_eq!(
+        core.get_vm(&winner.name).unwrap().volume.as_deref(),
+        Some("exclusive")
+    );
+}
+
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test(flavor = "current_thread")]
+async fn volume_delete_waits_for_inflight_attachment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockVmm::new();
+    let gate = mock.block_next_create().await;
+    let (core, kernel, rootfs, volume_path) = volume_race_core(&tmp, mock);
+    let create = {
+        let core = Arc::clone(&core);
+        let request = volume_create_request("attaching", "exclusive", &kernel, &rootfs);
+        tokio::spawn(async move { core.create_vm(request).await })
+    };
+    gate.entered.notified().await;
+
+    let mut delete = {
+        let core = Arc::clone(&core);
+        tokio::spawn(async move { core.delete_volume("exclusive").await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut delete)
+            .await
+            .is_err(),
+        "delete must wait while the attachment owns the volume mutation boundary"
+    );
+
+    gate.release.notify_one();
+    create.await.unwrap().unwrap();
+    let error = delete.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, CoreError::VolumeAttached { ref volume, ref vm }
+            if volume == "exclusive" && vm == "attaching"),
+        "got {error:?}"
+    );
+    assert!(volume_path.exists(), "a refused delete must keep the image");
 }
 
 #[cfg(not(feature = "linux-net"))]

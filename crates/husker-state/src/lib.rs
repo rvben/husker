@@ -64,6 +64,8 @@ pub enum StateError {
     VolumeNotFoundByName(String),
     #[error("volume already exists: {0}")]
     VolumeAlreadyExists(String),
+    #[error("volume '{volume}' is attached to VM '{vm}'")]
+    VolumeAttached { volume: String, vm: String },
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
     #[error("host-resource lease not found: {0}")]
@@ -314,9 +316,10 @@ const BASELINE_SCHEMA_VERSION: u32 = 1;
 /// exactly once, in its own transaction, when `user_version` is below its
 /// number. Append-only: never edit, reorder, or renumber a migration that has
 /// shipped; keep the numbers strictly ascending and greater than the baseline.
-const MIGRATIONS: &[(u32, &str)] = &[(
-    2,
-    "CREATE TABLE host_resource_leases (
+const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        2,
+        "CREATE TABLE host_resource_leases (
             id TEXT PRIMARY KEY,
             vm_name TEXT NOT NULL UNIQUE,
             vsock_cid INTEGER NOT NULL UNIQUE,
@@ -324,7 +327,51 @@ const MIGRATIONS: &[(u32, &str)] = &[(
             guest_ip TEXT,
             created_at TEXT NOT NULL
         );",
-)];
+    ),
+    (
+        3,
+        "UPDATE vms
+             SET volume = NULL
+             WHERE volume IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM volumes WHERE name = vms.volume);
+
+         UPDATE vms
+             SET volume = NULL
+             WHERE volume IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM vms AS keeper
+                   WHERE keeper.volume = vms.volume
+                     AND (keeper.created_at < vms.created_at
+                          OR (keeper.created_at = vms.created_at AND keeper.id < vms.id))
+               );
+
+         CREATE UNIQUE INDEX idx_vms_volume
+             ON vms(volume) WHERE volume IS NOT NULL;
+
+         CREATE TRIGGER vms_volume_must_exist_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.volume IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM volumes WHERE name = NEW.volume)
+         BEGIN
+             SELECT RAISE(ABORT, 'attached volume does not exist');
+         END;
+
+         CREATE TRIGGER vms_volume_must_exist_on_update
+         BEFORE UPDATE OF volume ON vms
+         WHEN NEW.volume IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM volumes WHERE name = NEW.volume)
+         BEGIN
+             SELECT RAISE(ABORT, 'attached volume does not exist');
+         END;
+
+         CREATE TRIGGER attached_volume_cannot_be_deleted
+         BEFORE DELETE ON volumes
+         WHEN EXISTS (SELECT 1 FROM vms WHERE volume = OLD.name)
+         BEGIN
+             SELECT RAISE(ABORT, 'volume is attached');
+         END;",
+    ),
+];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
 /// database that predates versioning, then apply every migration newer than the
@@ -364,7 +411,31 @@ fn apply_migrations(
 }
 
 fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> {
-    conn.execute(
+    if let Some(volume) = record.volume.as_deref() {
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM volumes WHERE name = ?1)",
+            params![volume],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StateError::VolumeNotFoundByName(volume.to_string()));
+        }
+        if let Some(vm) = conn
+            .query_row(
+                "SELECT name FROM vms WHERE volume = ?1 LIMIT 1",
+                params![volume],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(StateError::VolumeAttached {
+                volume: volume.to_string(),
+                vm,
+            });
+        }
+    }
+
+    let insert_result = conn.execute(
         "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
                           tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
                           created_at, updated_at, userdata, userdata_status, userdata_env,
@@ -404,16 +475,38 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.auto_resume as i64,
             record.forked_from.map(|u| u.to_string()),
         ],
-    )
-    .map_err(|e| match &e {
-        rusqlite::Error::SqliteFailure(err, Some(msg))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation
-                && msg.contains("vms.name") =>
-        {
-            StateError::VmAlreadyExists(record.name.clone())
+    );
+    if let Err(error) = insert_result {
+        match &error {
+            rusqlite::Error::SqliteFailure(err, Some(message))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && message.contains("vms.name") =>
+            {
+                return Err(StateError::VmAlreadyExists(record.name.clone()));
+            }
+            rusqlite::Error::SqliteFailure(err, Some(message))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && message.contains("vms.volume") =>
+            {
+                let volume = record.volume.clone().unwrap_or_default();
+                let vm = conn.query_row(
+                    "SELECT name FROM vms WHERE volume = ?1 LIMIT 1",
+                    params![&volume],
+                    |row| row.get::<_, String>(0),
+                )?;
+                return Err(StateError::VolumeAttached { volume, vm });
+            }
+            rusqlite::Error::SqliteFailure(err, Some(message))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && message.contains("attached volume does not exist") =>
+            {
+                return Err(StateError::VolumeNotFoundByName(
+                    record.volume.clone().unwrap_or_default(),
+                ));
+            }
+            _ => return Err(StateError::Database(error)),
         }
-        _ => StateError::Database(e),
-    })?;
+    }
     Ok(())
 }
 
@@ -1961,6 +2054,46 @@ impl StateStore {
             return Err(StateError::VolumeNotFound(id));
         }
         Ok(())
+    }
+
+    /// Atomically remove an unattached volume from the catalog and return the
+    /// deleted record. The immediate transaction serializes the holder check
+    /// with deletion, while schema triggers prevent callers from bypassing it.
+    pub fn delete_unattached_volume_by_name(&self, name: &str) -> Result<VolumeRecord, StateError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let record = tx
+            .query_row(
+                "SELECT id, name, file_path, size_bytes, created_at
+                 FROM volumes WHERE name = ?1",
+                params![name],
+                row_to_volume_record,
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StateError::VolumeNotFoundByName(name.to_string())
+                }
+                other => StateError::Database(other),
+            })?;
+        if let Some(vm) = tx
+            .query_row(
+                "SELECT name FROM vms WHERE volume = ?1 LIMIT 1",
+                params![name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(StateError::VolumeAttached {
+                volume: name.to_string(),
+                vm,
+            });
+        }
+        tx.execute(
+            "DELETE FROM volumes WHERE id = ?1",
+            params![record.id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(record)
     }
 
     /// Find the first VM that currently has the named volume attached.
@@ -3799,6 +3932,7 @@ mod tests {
     #[test]
     fn find_vm_by_volume_returns_attached_vm() {
         let store = StateStore::open_memory().unwrap();
+        store.insert_volume(&make_volume("mydata", 512)).unwrap();
 
         let mut vm = make_record("vm-with-vol");
         vm.volume = Some("mydata".into());
@@ -3826,12 +3960,163 @@ mod tests {
     #[test]
     fn vm_volume_field_roundtrips() {
         let store = StateStore::open_memory().unwrap();
+        store
+            .insert_volume(&make_volume("persistent-data", 512))
+            .unwrap();
         let mut vm = make_record("vol-vm");
         vm.volume = Some("persistent-data".into());
         store.insert_vm(&vm).unwrap();
 
         let fetched = store.get_vm_by_name("vol-vm").unwrap();
         assert_eq!(fetched.volume.as_deref(), Some("persistent-data"));
+    }
+
+    #[test]
+    fn vm_cannot_attach_a_missing_volume() {
+        let store = StateStore::open_memory().unwrap();
+        let mut vm = make_record("missing-volume-vm");
+        vm.volume = Some("missing".into());
+
+        let error = store.insert_vm(&vm).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::VolumeNotFoundByName(ref name) if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn two_vms_cannot_attach_the_same_volume() {
+        let store = StateStore::open_memory().unwrap();
+        store.insert_volume(&make_volume("exclusive", 512)).unwrap();
+        let mut first = make_record("first-holder");
+        first.volume = Some("exclusive".into());
+        store.insert_vm(&first).unwrap();
+        let mut second = make_record("second-holder");
+        second.volume = Some("exclusive".into());
+
+        let error = store.insert_vm(&second).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::VolumeAttached { ref volume, ref vm }
+                if volume == "exclusive" && vm == "first-holder"
+        ));
+    }
+
+    #[test]
+    fn concurrent_vm_inserts_have_exactly_one_volume_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let setup = StateStore::open(&path).unwrap();
+        setup.insert_volume(&make_volume("contended", 512)).unwrap();
+        drop(setup);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let spawn = |name: &'static str| {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = StateStore::open(&path).unwrap();
+                let mut vm = make_record(name);
+                vm.volume = Some("contended".into());
+                barrier.wait();
+                store.insert_vm(&vm)
+            })
+        };
+        let first = spawn("concurrent-a");
+        let second = spawn("concurrent-b");
+        let results = [first.join().unwrap(), second.join().unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(StateError::VolumeAttached { .. })))
+                .count(),
+            1
+        );
+        let store = StateStore::open(&path).unwrap();
+        let holder = store.find_vm_by_volume("contended").unwrap().unwrap();
+        assert!(holder.name == "concurrent-a" || holder.name == "concurrent-b");
+    }
+
+    #[test]
+    fn deleting_an_attached_volume_is_atomic_and_non_destructive() {
+        let store = StateStore::open_memory().unwrap();
+        let volume = make_volume("in-use", 512);
+        store.insert_volume(&volume).unwrap();
+        let mut vm = make_record("holder");
+        vm.volume = Some(volume.name.clone());
+        store.insert_vm(&vm).unwrap();
+
+        let error = store
+            .delete_unattached_volume_by_name(&volume.name)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::VolumeAttached { ref volume, ref vm }
+                if volume == "in-use" && vm == "holder"
+        ));
+        assert!(
+            store.delete_volume(volume.id).is_err(),
+            "the schema guard must also reject callers that bypass the atomic helper"
+        );
+        assert_eq!(store.get_volume_by_name("in-use").unwrap().id, volume.id);
+    }
+
+    #[test]
+    fn concurrent_attach_and_delete_never_leave_a_dangling_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let setup = StateStore::open(&path).unwrap();
+        setup.insert_volume(&make_volume("raced", 512)).unwrap();
+        drop(setup);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let attach = {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = StateStore::open(&path).unwrap();
+                let mut vm = make_record("raced-holder");
+                vm.volume = Some("raced".into());
+                barrier.wait();
+                store.insert_vm(&vm)
+            })
+        };
+        let delete = {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = StateStore::open(&path).unwrap();
+                barrier.wait();
+                store.delete_unattached_volume_by_name("raced")
+            })
+        };
+        let attach_result = attach.join().unwrap();
+        let delete_result = delete.join().unwrap();
+        let store = StateStore::open(&path).unwrap();
+
+        match (attach_result, delete_result) {
+            (Ok(()), Err(StateError::VolumeAttached { volume, vm })) => {
+                assert_eq!(volume, "raced");
+                assert_eq!(vm, "raced-holder");
+                assert!(store.get_volume_by_name("raced").is_ok());
+                assert!(store.find_vm_by_volume("raced").unwrap().is_some());
+            }
+            (Err(StateError::VolumeNotFoundByName(volume)), Ok(deleted)) => {
+                assert_eq!(volume, "raced");
+                assert_eq!(deleted.name, "raced");
+                assert!(matches!(
+                    store.get_volume_by_name("raced"),
+                    Err(StateError::VolumeNotFoundByName(_))
+                ));
+                assert!(store.find_vm_by_volume("raced").unwrap().is_none());
+            }
+            other => panic!("unexpected attach/delete outcome: {other:?}"),
+        }
     }
 
     #[test]
@@ -4059,6 +4344,52 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version as u32, MIGRATIONS.last().unwrap().0);
+    }
+
+    #[test]
+    fn volume_invariant_migration_repairs_legacy_dangling_and_duplicate_attachments() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE volumes (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+             CREATE TABLE vms (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 volume TEXT,
+                 created_at TEXT NOT NULL
+             );
+             INSERT INTO volumes (id, name) VALUES ('volume-id', 'shared');
+             INSERT INTO vms (id, name, volume, created_at) VALUES
+                 ('a', 'keeper', 'shared', '2024-01-01T00:00:00Z'),
+                 ('b', 'duplicate', 'shared', '2024-01-02T00:00:00Z'),
+                 ('c', 'dangling', 'missing', '2024-01-03T00:00:00Z');
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+
+        apply_migrations(&conn, BASELINE_SCHEMA_VERSION, MIGRATIONS).unwrap();
+
+        let attachments = conn
+            .prepare("SELECT name, volume FROM vms ORDER BY name")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            attachments,
+            vec![
+                ("dangling".into(), None),
+                ("duplicate".into(), None),
+                ("keeper".into(), Some("shared".into())),
+            ]
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
     }
 
     #[test]

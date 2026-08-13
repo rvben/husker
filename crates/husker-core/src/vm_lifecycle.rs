@@ -65,6 +65,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         info!(name = %req.name, "creating VM");
 
         let _name_guard = self.vm_name_lock(&req.name).lock_owned().await;
+        let _volume_guard = if let Some(volume) = req.volume.as_deref() {
+            Some(self.volume_lock(volume).lock_owned().await)
+        } else {
+            None
+        };
 
         // If a stopped VM with this name exists, replace it automatically when
         // the caller allows it. Running or paused VMs must be explicitly
@@ -279,20 +284,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         // still cleaned up on failure.
         resources.vm_dir = Some(vm_dir.clone());
 
-        // Resolve the named volume before disk setup so the cloud-init seed can
-        // reflect the correct mount_volume value in a single pass. The
-        // exclusivity check (find_vm_by_volume) runs here right before the
-        // VmRecord insert; there is a small TOCTOU window between this check
-        // and the insert, but at homelab scale that race is acceptable.
+        // The outer per-volume guard spans this resolution through the final
+        // VM insert, so no competing create or delete can invalidate it while
+        // asynchronous disk and VMM preparation runs.
         let volume_attachment = self.resolve_volume_attachment(&req.volume)?;
-        if let Some((ref vol_name, _)) = volume_attachment
-            && let Some(holder) = self.state.find_vm_by_volume(vol_name)?
-        {
-            return Err(CoreError::InvalidArgument(format!(
-                "volume '{vol_name}' is already attached to VM '{}'",
-                holder.name
-            )));
-        }
         let mount_volume = volume_attachment.is_some();
 
         // Choose the boot disk + mode. A cloud image boots via UEFI/OVMF from a cloned
@@ -568,10 +563,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         self.state
             .commit_vm_from_host_resource_lease(&record, lease.id)
-            .map_err(|e| match e {
-                husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
-                other => CoreError::State(other),
-            })?;
+            .map_err(map_vm_insert_error)?;
 
         Ok(record)
     }
@@ -797,10 +789,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 forked_from: None,
             };
 
-            self.state.insert_vm(&record).map_err(|e| match e {
-                husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
-                other => CoreError::State(other),
-            })?;
+            self.state.insert_vm(&record).map_err(map_vm_insert_error)?;
 
             return Ok(record);
         }
@@ -825,19 +814,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         resources.vm_dir = Some(vm_dir);
         crate::refresh_cloned_agent(&req.name, &vm_rootfs, self.embedded_agent).await?;
 
-        // Resolve the named volume to its image path. The exclusivity check runs
-        // here, right before the VmRecord insert; there is a small TOCTOU window
-        // between this check and the insert, but at homelab scale that race is
-        // acceptable.
+        // The outer per-volume guard spans this resolution through the final
+        // VM insert, including all asynchronous preparation below.
         let volume_attachment = self.resolve_volume_attachment(&req.volume)?;
-        if let Some((ref vol_name, _)) = volume_attachment
-            && let Some(holder) = self.state.find_vm_by_volume(vol_name)?
-        {
-            return Err(CoreError::InvalidArgument(format!(
-                "volume '{vol_name}' is already attached to VM '{}'",
-                holder.name
-            )));
-        }
 
         // Resolve initrd: prefer explicit path, then daemon default (if it exists on
         // the daemon host), then the conventional data-dir location as a last resort.
@@ -918,10 +897,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             forked_from: None,
         };
 
-        self.state.insert_vm(&record).map_err(|e| match e {
-            husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
-            other => CoreError::State(other),
-        })?;
+        self.state.insert_vm(&record).map_err(map_vm_insert_error)?;
 
         Ok(record)
     }
@@ -1254,6 +1230,17 @@ impl<B: VmmBackend> HuskerCore<B> {
             husker_state::StateError::VmNotFoundByName(_) => CoreError::VmNotFound(name.into()),
             other => CoreError::State(other),
         })
+    }
+}
+
+fn map_vm_insert_error(error: husker_state::StateError) -> CoreError {
+    match error {
+        husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
+        husker_state::StateError::VolumeAttached { volume, vm } => {
+            CoreError::VolumeAttached { volume, vm }
+        }
+        husker_state::StateError::VolumeNotFoundByName(name) => CoreError::VolumeNotFound(name),
+        other => CoreError::State(other),
     }
 }
 
