@@ -37,6 +37,13 @@ shutdown behavior.
 - On Linux, shutdown immediately releases the TAP, IP, and forwarding state of
   terminal VMs after drain. The normal grace period for inspecting a recently
   stopped VM remains unchanged during ordinary daemon operation.
+- Suspended VMs preserve their TAP and network identity across shutdown. On
+  startup, the runtime reattaches every preserved TAP to the newly created host
+  bridge before it restores forwarding listeners or serves health/API traffic.
+  Failure to reattach is a startup failure, not a degraded green daemon.
+- Snapshot suspend clears the destroyed VMM's PID from state; snapshot restore
+  atomically persists `running` with the replacement VMM PID returned by the
+  backend.
 - Linux cgroup initialization happens before bridge creation. After a bridge is
   created, every later result flows through both NAT cleanup and bridge deletion.
   A runtime error remains primary; otherwise a cleanup failure is returned.
@@ -49,9 +56,11 @@ shutdown behavior.
 - Shutdown ordering and failure precedence are testable through the runtime
   interface without installing operating-system signal handlers.
 - A privileged Linux drill exercises a post-network API bind failure, empty
-  SIGTERM, and a live-Firecracker SIGTERM. It asserts worker/drain/cleanup
-  ordering, VMM exit, persisted stopped state across restart, and the absence of
-  leaked TAP, bridge, nftables, and metrics resources. The live-VM scenario is
-  mandatory on the nightly self-hosted KVM runner.
+  SIGTERM, a live-Firecracker SIGTERM, and suspend -> daemon restart -> first
+  forwarded connection. It asserts worker/drain/cleanup ordering, VMM exit,
+  persisted stopped state, suspended-TAP reattachment, replacement-PID
+  persistence, end-to-end echo after auto-resume, and the absence of leaked TAP,
+  bridge, nftables, and metrics resources. The live-VM scenarios are mandatory
+  on the nightly self-hosted KVM runner.
 - Platform networking remains explicit and consistent with ADR-0001 and
   ADR-0005.
