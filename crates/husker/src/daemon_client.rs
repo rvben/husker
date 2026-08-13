@@ -9,7 +9,14 @@
 use std::fmt;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
+
+use husker_api::{
+    AddPortForwardRequest, ErrorResponse, ExecRequest, ExecResponse, GuestInfoResponse,
+    PortForwardResponse, ProfilesResponse, ReadFileRequest, ReadFileResponse, ReadyResponse,
+    VmResponse, WriteFileRequest, WriteFileResponse,
+};
 
 use crate::schema::exit_code;
 
@@ -96,6 +103,27 @@ pub(crate) struct DaemonClient {
     api_token: Option<String>,
 }
 
+/// A guest-file read either carries a contract-checked slice or the daemon's
+/// structured refusal. The payload-size distinction is retained because it
+/// selects the one useful compatibility diagnostic the CLI can perform.
+#[derive(Debug)]
+pub(crate) enum FileReadOutcome {
+    Read(ReadFileResponse),
+    Failed {
+        failure: ApiFailure,
+        payload_too_large: bool,
+    },
+}
+
+/// Result of the backward-compatible profiles probe. Only an absent endpoint
+/// or an unreachable older daemon counts as unavailable; a malformed success
+/// response is contract drift and remains an error.
+#[derive(Debug)]
+pub(crate) enum ProfilesOutcome {
+    Available(ProfilesResponse),
+    Unavailable,
+}
+
 impl DaemonClient {
     pub(crate) fn new(base_url: impl Into<String>, api_token: Option<String>) -> Self {
         Self {
@@ -131,6 +159,150 @@ impl DaemonClient {
 
     pub(crate) fn delete(&self, path: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::DELETE, path)
+    }
+
+    /// Fetch one VM through the daemon's shared wire contract.
+    ///
+    /// The route, subject used for daemon failures, and response DTO belong to
+    /// this operation. Callers receive a VM, not a transport response they have
+    /// to interpret independently.
+    pub(crate) async fn vm(&self, name: &str) -> Result<VmResponse> {
+        self.execute_json(self.get(format!("/v1/vms/{name}")), &format!("VM '{name}'"))
+            .await
+    }
+
+    /// Execute a command in a VM and require the daemon's complete exec result.
+    pub(crate) async fn exec(&self, name: &str, request: &ExecRequest) -> Result<ExecResponse> {
+        self.execute_json(
+            self.post(format!("/v1/vms/{name}/exec")).json(request),
+            &format!("VM '{name}'"),
+        )
+        .await
+    }
+
+    /// Read one byte range from a guest file through the shared API contract.
+    pub(crate) async fn read_file(
+        &self,
+        name: &str,
+        path: &str,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<FileReadOutcome> {
+        let request = ReadFileRequest {
+            path: path.to_string(),
+            offset,
+            len,
+        };
+        let subject = format!("VM '{name}'");
+        let response = self
+            .send(
+                self.post(format!("/v1/vms/{name}/files/read"))
+                    .json(&request),
+            )
+            .await?;
+        if !response.status().is_success() {
+            let payload_too_large = response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE;
+            return Ok(FileReadOutcome::Failed {
+                failure: self.error(response, &subject).await,
+                payload_too_large,
+            });
+        }
+        let body: ReadFileResponse = self.decode_json(response, &subject).await?;
+        let decoded_size = husker_agent_proto::base64_decode(&body.data)
+            .map_err(|error| anyhow::anyhow!("{subject} returned invalid base64: {error}"))?
+            .len() as u64;
+        anyhow::ensure!(
+            body.size == decoded_size,
+            "{subject} file response reports {} bytes but contains {decoded_size}",
+            body.size
+        );
+        Ok(FileReadOutcome::Read(body))
+    }
+
+    /// Fetch the readiness state without allowing a missing `ready` field to
+    /// become a false value.
+    pub(crate) async fn ready(&self, name: &str) -> Result<ReadyResponse> {
+        self.execute_json(
+            self.get(format!("/v1/vms/{name}/ready")),
+            &format!("VM '{name}'"),
+        )
+        .await
+    }
+
+    /// Fetch the guest-agent feature contract for one VM.
+    pub(crate) async fn guest_info(&self, name: &str) -> Result<GuestInfoResponse> {
+        self.execute_json(
+            self.get(format!("/v1/vms/{name}/guest-info")),
+            &format!("VM '{name}'"),
+        )
+        .await
+    }
+
+    /// Write one guest-file chunk and require the daemon to report the number
+    /// of bytes accepted.
+    pub(crate) async fn write_file(
+        &self,
+        name: &str,
+        request: &WriteFileRequest,
+    ) -> Result<WriteFileResponse> {
+        let expected = husker_agent_proto::base64_decode(&request.data)
+            .map_err(|error| {
+                anyhow::anyhow!("file-write request contained invalid base64: {error}")
+            })?
+            .len() as u64;
+        let response: WriteFileResponse = self
+            .execute_json(
+                self.post(format!("/v1/vms/{name}/files/write"))
+                    .json(request),
+                &format!("VM '{name}'"),
+            )
+            .await?;
+        anyhow::ensure!(
+            response.bytes_written == expected,
+            "VM '{name}' reported writing {} of {expected} bytes to {}",
+            response.bytes_written,
+            request.path
+        );
+        Ok(response)
+    }
+
+    /// Add a host-to-guest port mapping and return the daemon's effective bind.
+    /// A requested host port of zero is intentionally not a usable fallback:
+    /// only the daemon knows which port it actually bound.
+    pub(crate) async fn add_port_forward(
+        &self,
+        name: &str,
+        host_port: u16,
+        guest_port: u16,
+        bind_addr: Option<&str>,
+    ) -> Result<PortForwardResponse> {
+        let request = AddPortForwardRequest {
+            host_port,
+            guest_port,
+            bind_addr: bind_addr.map(str::to_string),
+        };
+        self.execute_json(
+            self.post(format!("/v1/vms/{name}/ports")).json(&request),
+            &format!("VM '{name}'"),
+        )
+        .await
+    }
+
+    pub(crate) async fn profiles(&self) -> Result<ProfilesOutcome> {
+        let response = match self.try_send(self.get("/v1/profiles")).await {
+            Ok(response) => response,
+            Err(_) => return Ok(ProfilesOutcome::Unavailable),
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(ProfilesOutcome::Unavailable);
+        }
+        if !response.status().is_success() {
+            return Err(self.error(response, "listing daemon profiles").await.into());
+        }
+        Ok(ProfilesOutcome::Available(
+            self.decode_json(response, "listing daemon profiles")
+                .await?,
+        ))
     }
 
     fn request(&self, method: reqwest::Method, path: impl AsRef<str>) -> reqwest::RequestBuilder {
@@ -181,19 +353,15 @@ impl DaemonClient {
         let mut hint = None;
         let message = match response.text().await {
             Ok(body) if !body.is_empty() => {
-                match serde_json::from_str::<serde_json::Value>(&body) {
-                    Ok(json) => {
-                        kind = json["kind"].as_str().map(String::from);
-                        if let Some(message) = json["message"].as_str() {
-                            hint = json["hint"].as_str().map(String::from);
-                            message.to_string()
-                        } else if let Some(message) = json["error"].as_str() {
-                            message.to_string()
-                        } else {
-                            body
-                        }
+                if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
+                    kind = Some(error.kind);
+                    hint = error.hint;
+                    error.message
+                } else {
+                    match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(json) => json["error"].as_str().map(String::from).unwrap_or(body),
+                        Err(_) => body,
                     }
-                    Err(_) => body,
                 }
             }
             _ => match status.as_u16() {
@@ -208,6 +376,30 @@ impl DaemonClient {
             exit_code,
             hint,
         }
+    }
+
+    /// Complete an operation whose success response is part of the daemon's
+    /// JSON contract. Keeping status handling and strict DTO decoding together
+    /// prevents each command from inventing its own fallback semantics.
+    async fn execute_json<T>(&self, request: reqwest::RequestBuilder, subject: &str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let response = self.send(request).await?;
+        if !response.status().is_success() {
+            return Err(self.error(response, subject).await.into());
+        }
+        self.decode_json(response, subject).await
+    }
+
+    async fn decode_json<T>(&self, response: reqwest::Response, subject: &str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("daemon returned an invalid response for {subject}"))
     }
 
     fn url(&self, path: &str) -> String {
@@ -229,6 +421,7 @@ fn normalize_base_url(mut base_url: String) -> String {
 #[cfg(test)]
 mod tests {
     use axum::Json;
+    use axum::extract::Json as ExtractJson;
     use axum::http::StatusCode;
     use axum::routing::get;
     use serde_json::json;
@@ -403,6 +596,199 @@ mod tests {
             client.error(failure, "creating VM").await.message,
             "creating VM: 500 Internal Server Error"
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn vm_read_owns_its_route_and_decodes_the_shared_contract() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo",
+            get(|| async {
+                Json(json!({
+                    "id": "vm-1",
+                    "name": "demo",
+                    "state": "running",
+                    "pid": 42,
+                    "vcpu_count": 2,
+                    "mem_size_mib": 512,
+                    "vsock_cid": 7,
+                    "host_ip": "172.16.0.1",
+                    "guest_ip": "172.16.0.2",
+                    "created_at": "2026-08-13T00:00:00Z",
+                    "updated_at": "2026-08-13T00:00:01Z",
+                    "userdata_status": null,
+                    "vmm": "firecracker",
+                    "boot_mode": "direct",
+                    "rootfs_path": "/images/rootfs.ext4",
+                    "kernel_path": "/images/vmlinux",
+                    "volume": null,
+                    "network": "nat",
+                    "idle_timeout_secs": null,
+                    "suspend_ttl_secs": null,
+                    "auto_resume": null,
+                    "suspended_at": null
+                }))
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let vm = client.vm("demo").await.unwrap();
+
+        assert_eq!(vm.name, "demo");
+        assert_eq!(vm.boot_mode, "direct");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn vm_read_rejects_a_response_that_drifted_from_the_shared_contract() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo",
+            get(|| async { Json(json!({ "id": "vm-1", "name": "demo" })) }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let error = client.vm("demo").await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("invalid response for VM 'demo'"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn file_read_sends_the_shared_request_and_requires_the_shared_response() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/files/read",
+            axum::routing::post(
+                |ExtractJson(request): ExtractJson<serde_json::Value>| async move {
+                    assert_eq!(request["path"], "/tmp/result");
+                    assert_eq!(request["offset"], 12);
+                    assert_eq!(request["len"], 64);
+                    Json(json!({
+                        "data": "aGVsbG8=",
+                        "size": 5,
+                        "total_size": 17,
+                        "modified_nanos": 99
+                    }))
+                },
+            ),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let file = client
+            .read_file("demo", "/tmp/result", 12, Some(64))
+            .await
+            .unwrap();
+
+        let FileReadOutcome::Read(file) = file else {
+            panic!("expected a file slice");
+        };
+        assert_eq!(file.size, 5);
+        assert_eq!(file.total_size, Some(17));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn file_read_rejects_a_size_that_disagrees_with_its_data() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/files/read",
+            axum::routing::post(|| async {
+                Json(json!({
+                    "data": "aGVsbG8=",
+                    "size": 4,
+                    "total_size": 5,
+                    "modified_nanos": 99
+                }))
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let error = client
+            .read_file("demo", "/tmp/result", 0, None)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("reports 4 bytes but contains 5"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_a_success_response_without_an_exit_code() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/exec",
+            axum::routing::post(|| async { Json(json!({ "stdout": "ok", "stderr": "" })) }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let request = husker_api::ExecRequest {
+            command: "true".into(),
+            args: Vec::new(),
+            working_dir: None,
+            env: std::collections::HashMap::new(),
+            secret_env: std::collections::HashMap::new(),
+            connect_timeout_secs: None,
+            timeout_secs: None,
+        };
+
+        let error = client.exec("demo", &request).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("invalid response for VM 'demo'"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_a_partial_success() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/files/write",
+            axum::routing::post(|| async { Json(json!({ "bytes_written": 2 })) }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let request = WriteFileRequest {
+            path: "/tmp/result".into(),
+            data: husker_agent_proto::base64_encode(b"hello"),
+            mode: None,
+            append: false,
+        };
+
+        let error = client.write_file("demo", &request).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("reported writing 2 of 5 bytes"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn port_forward_add_rejects_an_incomplete_success_payload() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/ports",
+            axum::routing::post(|| async { Json(json!({ "host_port": 49152 })) }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let error = client
+            .add_port_forward("demo", 0, 8080, Some("127.0.0.1"))
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("invalid response for VM 'demo'"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn profiles_probe_does_not_disguise_a_malformed_success_as_unavailable() {
+        let app = axum::Router::new().route(
+            "/v1/profiles",
+            get(|| async { Json(json!({ "profiles": "not-an-object" })) }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let error = client.profiles().await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("invalid response for listing daemon profiles"));
         task.abort();
     }
 }

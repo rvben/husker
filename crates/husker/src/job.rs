@@ -10,6 +10,7 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use husker_api::{ExecRequest, ExecResponse, WriteFileRequest};
 
 use crate::cli::OutputFormat;
 use crate::cli_contract::structured_output;
@@ -170,7 +171,7 @@ pub(crate) struct JobRequest<'a> {
     pub out: &'a [PathBuf],
     pub command: &'a [String],
     pub env: &'a [String],
-    pub secret_env: &'a serde_json::Map<String, serde_json::Value>,
+    pub secret_env: &'a HashMap<String, String>,
 }
 
 /// The only process decision exposed by the Job module. `main.rs` applies it;
@@ -182,25 +183,11 @@ pub(crate) enum JobTermination {
     Failure(ApiFailure),
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct JobExecution {
-    #[serde(default = "default_job_exit_code")]
-    exit_code: i64,
-    #[serde(default)]
-    stdout: String,
-    #[serde(default)]
-    stderr: String,
-}
-
-fn default_job_exit_code() -> i64 {
-    1
-}
-
 /// Internal result of command execution, before keep/destroy and process-exit
 /// policy are applied.
 #[derive(Debug)]
 struct JobOutcome {
-    exec: JobExecution,
+    exec: ExecResponse,
     /// The outcome of `--out`/`--write-back`, or `None` when the job requested
     /// no outputs. `None` and an empty [`Retrieval`] are different: nothing was
     /// asked for, versus nothing came back.
@@ -328,26 +315,11 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
     }
 
     // 2. Boot-mode-aware readiness wait (mirrors Commands::Wait logic).
-    let info_path = format!("/v1/vms/{name}");
-    let resp = daemon.send(daemon.get(&info_path)).await?;
-    if !resp.status().is_success() {
-        return Err(daemon.error(resp, &format!("VM '{name}'")).await.into());
-    }
-    let vm: serde_json::Value = resp.json().await?;
-    let boot_mode = vm
-        .get("boot_mode")
-        .and_then(|b| b.as_str())
-        .unwrap_or("direct");
-    let ready_path = format!("/v1/vms/{name}/ready");
-    let deadline = std::time::Instant::now() + husker_core::default_ready_timeout(boot_mode);
+    let vm = daemon.vm(name).await?;
+    let deadline = std::time::Instant::now() + husker_core::default_ready_timeout(&vm.boot_mode);
     let mut backoff = std::time::Duration::from_millis(200);
     loop {
-        let resp = daemon.send(daemon.get(&ready_path)).await?;
-        if !resp.status().is_success() {
-            return Err(daemon.error(resp, &format!("VM '{name}'")).await.into());
-        }
-        let rdy: serde_json::Value = resp.json().await?;
-        if rdy.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
+        if daemon.ready(name).await?.ready {
             break;
         }
         if std::time::Instant::now() + backoff >= deadline {
@@ -374,22 +346,17 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
         }
         let archive = build_sync_archive(&cwd)?;
         let encoded = husker_agent_proto::base64_encode(&archive);
-        let write_resp = daemon
-            .send(
-                daemon
-                    .post(format!("/v1/vms/{name}/files/write"))
-                    .json(&serde_json::json!({
-                        "path": SYNC_ARCHIVE_GUEST_PATH,
-                        "data": encoded,
-                    })),
+        daemon
+            .write_file(
+                name,
+                &WriteFileRequest {
+                    path: SYNC_ARCHIVE_GUEST_PATH.to_string(),
+                    data: encoded,
+                    mode: None,
+                    append: false,
+                },
             )
             .await?;
-        if !write_resp.status().is_success() {
-            return Err(daemon
-                .error(write_resp, &format!("VM '{name}'"))
-                .await
-                .into());
-        }
         // --write-back returns the synced files as the command left them
         // (modifications only; new build artifacts are never pulled back).
         if req.write_back {
@@ -420,22 +387,20 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
         eprintln!("[job] running command");
     }
     let env_map = parse_env_map(req.env);
-    let mut exec_body = serde_json::json!({
-        "command": exec_command,
-        "args": exec_args,
-        "env": env_map,
-        "timeout_secs": req.timeout,
-    });
-    if !req.secret_env.is_empty() {
-        exec_body["secret_env"] = serde_json::Value::Object(req.secret_env.clone());
-    }
-    let resp = daemon
-        .send(daemon.post(format!("/v1/vms/{name}/exec")).json(&exec_body))
+    let exec = daemon
+        .exec(
+            name,
+            &ExecRequest {
+                command: exec_command,
+                args: exec_args,
+                working_dir: None,
+                env: env_map,
+                secret_env: req.secret_env.clone(),
+                connect_timeout_secs: None,
+                timeout_secs: Some(req.timeout),
+            },
+        )
         .await?;
-    if !resp.status().is_success() {
-        return Err(daemon.error(resp, &format!("VM '{name}'")).await.into());
-    }
-    let exec = resp.json().await?;
 
     // 3.5 Pull requested results back to the host (--out / --write-back).
     let mut retrieval = None;
@@ -457,7 +422,7 @@ async fn finish_job(req: &JobRequest<'_>, outcome: JobOutcome) -> JobTermination
         {
             eprintln!("[job] note: {}", failure.message);
         }
-        JobTermination::Exit(exit_code.clamp(1, 255) as i32)
+        JobTermination::Exit(exit_code.clamp(1, 255))
     } else if let Some(failure) = retrieval_failure.as_ref() {
         JobTermination::Failure(failure.clone())
     } else {
@@ -765,8 +730,39 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    fn running_vm_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "vm-job-x",
+            "name": "job-x",
+            "state": "running",
+            "pid": 42,
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+            "vsock_cid": 7,
+            "host_ip": null,
+            "guest_ip": null,
+            "created_at": "2026-08-13T00:00:00Z",
+            "updated_at": "2026-08-13T00:00:00Z",
+            "userdata_status": null,
+            "vmm": "firecracker",
+            "boot_mode": "direct",
+            "rootfs_path": "/images/rootfs.ext4",
+            "kernel_path": "/images/vmlinux",
+            "volume": null,
+            "network": "nat",
+            "idle_timeout_secs": null,
+            "suspend_ttl_secs": null,
+            "auto_resume": null,
+            "suspended_at": null,
+        })
+    }
+
+    fn ready_response() -> serde_json::Value {
+        serde_json::json!({ "vm": "job-x", "ready": true })
+    }
+
     fn lifecycle_stub(
-        exec_exit_code: i64,
+        exec_exit_code: i32,
         delete_status: StatusCode,
         deletes: Arc<AtomicUsize>,
     ) -> Router {
@@ -777,19 +773,17 @@ mod tests {
             )
             .route(
                 "/v1/vms/{name}",
-                get(|| async { Json(serde_json::json!({"boot_mode": "direct"})) }).delete(
-                    move || {
-                        let deletes = deletes.clone();
-                        async move {
-                            deletes.fetch_add(1, Ordering::SeqCst);
-                            delete_status
-                        }
-                    },
-                ),
+                get(|| async { Json(running_vm_response()) }).delete(move || {
+                    let deletes = deletes.clone();
+                    async move {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        delete_status
+                    }
+                }),
             )
             .route(
                 "/v1/vms/{name}/ready",
-                get(|| async { Json(serde_json::json!({"ready": true})) }),
+                get(|| async { Json(ready_response()) }),
             )
             .route(
                 "/v1/vms/{name}/exec",
@@ -807,7 +801,7 @@ mod tests {
         daemon: &'a DaemonClient,
         body: &'a serde_json::Value,
         command: &'a [String],
-        secret_env: &'a serde_json::Map<String, serde_json::Value>,
+        secret_env: &'a HashMap<String, String>,
     ) -> JobRequest<'a> {
         JobRequest {
             daemon,
@@ -832,7 +826,7 @@ mod tests {
         let client = DaemonClient::new("http://example.invalid", None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = Vec::new();
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
         let mut request = base_request(&client, &body, &command, &secret_env);
         request.sync_cwd = true;
 
@@ -844,7 +838,7 @@ mod tests {
     #[test]
     fn nonzero_command_is_rendered_as_error_status() {
         let outcome = JobOutcome {
-            exec: JobExecution {
+            exec: ExecResponse {
                 exit_code: 7,
                 stdout: "output".into(),
                 stderr: "failure".into(),
@@ -861,7 +855,7 @@ mod tests {
     #[test]
     fn lifecycle_failure_is_rendered_as_error_status() {
         let outcome = JobOutcome {
-            exec: JobExecution {
+            exec: ExecResponse {
                 exit_code: 0,
                 stdout: String::new(),
                 stderr: String::new(),
@@ -893,19 +887,17 @@ mod tests {
             )
             .route(
                 "/v1/vms/{name}",
-                get(|| async { Json(serde_json::json!({"boot_mode": "direct"})) }).delete(
-                    move || {
-                        let deletes = deletes_route.clone();
-                        async move {
-                            deletes.fetch_add(1, Ordering::SeqCst);
-                            StatusCode::NO_CONTENT
-                        }
-                    },
-                ),
+                get(|| async { Json(running_vm_response()) }).delete(move || {
+                    let deletes = deletes_route.clone();
+                    async move {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
             )
             .route(
                 "/v1/vms/{name}/ready",
-                get(|| async { Json(serde_json::json!({"ready": true})) }),
+                get(|| async { Json(ready_response()) }),
             )
             .route(
                 "/v1/vms/{name}/exec",
@@ -926,7 +918,7 @@ mod tests {
         let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["echo".to_string(), "hello".to_string()];
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
         let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
 
         assert!(matches!(termination, JobTermination::Exit(7)));
@@ -981,7 +973,7 @@ mod tests {
         let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["true".to_string()];
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
         let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
 
         let JobTermination::Failure(failure) = termination else {
@@ -1013,7 +1005,7 @@ mod tests {
         let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["true".to_string()];
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
 
         let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
 
@@ -1038,7 +1030,7 @@ mod tests {
         let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["false".to_string()];
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
 
         let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
 
@@ -1055,7 +1047,7 @@ mod tests {
         let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["true".to_string()];
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
         let mut request = base_request(&client, &body, &command, &secret_env);
         request.keep = true;
 
@@ -1074,7 +1066,7 @@ mod tests {
         let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["true".to_string()];
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
 
         let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
 
@@ -1096,19 +1088,17 @@ mod tests {
             )
             .route(
                 "/v1/vms/{name}",
-                get(|| async { Json(serde_json::json!({"boot_mode": "direct"})) }).delete(
-                    move || {
-                        let deletes = deletes_route.clone();
-                        async move {
-                            deletes.fetch_add(1, Ordering::SeqCst);
-                            StatusCode::NO_CONTENT
-                        }
-                    },
-                ),
+                get(|| async { Json(running_vm_response()) }).delete(move || {
+                    let deletes = deletes_route.clone();
+                    async move {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
             )
             .route(
                 "/v1/vms/{name}/ready",
-                get(|| async { Json(serde_json::json!({"ready": true})) }),
+                get(|| async { Json(ready_response()) }),
             )
             .route(
                 "/v1/vms/{name}/exec",
@@ -1124,7 +1114,7 @@ mod tests {
         let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["sleep".to_string(), "forever".to_string()];
-        let secret_env = serde_json::Map::new();
+        let secret_env = HashMap::new();
         let request = base_request(&client, &body, &command, &secret_env);
 
         let termination = run_job_with_interrupt(request, exec_started.notified()).await;

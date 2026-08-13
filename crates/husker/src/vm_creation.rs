@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::OutputFormat;
 use crate::config::{Config, Profile, ProfileOrigin, merge_profiles};
-use crate::daemon_client::DaemonClient;
+use crate::daemon_client::{DaemonClient, ProfilesOutcome};
 
 /// The VM options supplied by a command before profile resolution.
 #[derive(Debug, Default)]
@@ -515,36 +515,9 @@ pub(crate) fn daemon_to_profile(profile: husker_core::DaemonProfile) -> Profile 
 pub(crate) async fn fetch_daemon_profiles(
     daemon: &DaemonClient,
 ) -> Result<Option<HashMap<String, Profile>>> {
-    let response = match daemon.try_send(daemon.get("/v1/profiles")).await {
-        Ok(response) => response,
-        Err(_) => return Ok(None),
-    };
-    let status = response.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if status == reqwest::StatusCode::UNAUTHORIZED
-        || status == reqwest::StatusCode::FORBIDDEN
-        || status.is_server_error()
-    {
-        anyhow::bail!(
-            "daemon rejected profiles request: {status} - check your api_token and daemon configuration"
-        );
-    }
-    anyhow::ensure!(
-        status.is_success(),
-        "unexpected response from daemon profiles endpoint: {status}"
-    );
-    let Ok(body) = response.json::<serde_json::Value>().await else {
-        return Ok(None);
-    };
-    let Some(profiles) = body.get("profiles") else {
-        return Ok(None);
-    };
-    let Ok(profiles) =
-        serde_json::from_value::<HashMap<String, husker_core::DaemonProfile>>(profiles.clone())
-    else {
-        return Ok(None);
+    let profiles = match daemon.profiles().await? {
+        ProfilesOutcome::Available(response) => response.profiles,
+        ProfilesOutcome::Unavailable => return Ok(None),
     };
     Ok(Some(
         profiles

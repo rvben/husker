@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use husker_api::{ExecRequest, WriteFileRequest};
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite;
@@ -262,13 +263,11 @@ fn parse_secret_ref(spec: &str) -> anyhow::Result<(String, String)> {
 /// Build the `secret_env` request map (env-var name -> stored secret name) from
 /// repeated `--secret` flags. The daemon resolves each name to its value; the
 /// CLI never sees plaintext.
-fn build_secret_env(
-    specs: &[String],
-) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
-    let mut map = serde_json::Map::new();
+fn build_secret_env(specs: &[String]) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
     for spec in specs {
         let (env_var, name) = parse_secret_ref(spec)?;
-        map.insert(env_var, serde_json::Value::String(name));
+        map.insert(env_var, name);
     }
     Ok(map)
 }
@@ -342,17 +341,10 @@ async fn wait_for_vm_ready(
     name: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<bool> {
-    let ready_path = format!("/v1/vms/{name}/ready");
     let deadline = std::time::Instant::now() + timeout;
     let mut backoff = std::time::Duration::from_millis(200);
     loop {
-        let resp = daemon.send(daemon.get(&ready_path)).await?;
-        if !resp.status().is_success() {
-            let msg = daemon.error(resp, &format!("VM '{name}'")).await;
-            anyhow::bail!("{}", msg.message);
-        }
-        let rdy: serde_json::Value = resp.json().await?;
-        if rdy.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
+        if daemon.ready(name).await?.ready {
             return Ok(true);
         }
         if std::time::Instant::now() + backoff >= deadline {
@@ -370,21 +362,18 @@ async fn write_guest_file(
     path: &str,
     data: &[u8],
 ) -> anyhow::Result<()> {
-    let body = serde_json::json!({
-        "path": path,
-        "data": husker_agent_proto::base64_encode(data),
-    });
-    let resp = daemon
-        .send(
-            daemon
-                .post(format!("/v1/vms/{name}/files/write"))
-                .json(&body),
+    daemon
+        .write_file(
+            name,
+            &WriteFileRequest {
+                path: path.to_string(),
+                data: husker_agent_proto::base64_encode(data),
+                mode: None,
+                append: false,
+            },
         )
-        .await?;
-    if !resp.status().is_success() {
-        let msg = daemon.error(resp, &format!("VM '{name}'")).await;
-        anyhow::bail!("writing {path}: {}", msg.message);
-    }
+        .await
+        .with_context(|| format!("writing {path}"))?;
     Ok(())
 }
 
@@ -395,19 +384,11 @@ async fn read_guest_file_or_empty(
     name: &str,
     path: &str,
 ) -> anyhow::Result<String> {
-    let resp = daemon
-        .send(
-            daemon
-                .post(format!("/v1/vms/{name}/files/read"))
-                .json(&serde_json::json!({ "path": path })),
-        )
-        .await?;
-    if !resp.status().is_success() {
-        return Ok(String::new());
-    }
-    let result: serde_json::Value = resp.json().await?;
-    let b64 = result["data"].as_str().unwrap_or("");
-    let bytes = husker_agent_proto::base64_decode(b64)
+    let result = match daemon.read_file(name, path, 0, None).await? {
+        crate::daemon_client::FileReadOutcome::Read(result) => result,
+        crate::daemon_client::FileReadOutcome::Failed { .. } => return Ok(String::new()),
+    };
+    let bytes = husker_agent_proto::base64_decode(&result.data)
         .map_err(|e| anyhow::anyhow!("invalid base64 from server: {e}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -1045,14 +1026,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Info { name } => {
             let client = target.daemon().clone();
-            let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
-
-            if !resp.status().is_success() {
-                let msg = client.error(resp, &format!("VM '{name}'")).await;
-                exit_with_error(output, msg);
-            }
-
-            let vm: serde_json::Value = resp.json().await?;
+            let vm = client.vm(&name).await?;
             if output == OutputFormat::Json {
                 print_output(
                     output,
@@ -1064,35 +1038,32 @@ async fn run(cli: Cli) -> Result<()> {
                     "",
                 );
             } else {
-                let s = |key: &str| vm[key].as_str().unwrap_or("-").to_string();
-                println!("Name:      {}", s("name"));
-                println!("State:     {}", s("state"));
-                println!("vCPUs:     {}", vm["vcpu_count"]);
-                println!("Memory:    {} MiB", vm["mem_size_mib"]);
-                println!("Backend:   {}", s("vmm"));
-                println!("Boot:      {}", s("boot_mode"));
-                println!("Network:   {}", s("network"));
-                let kernel = vm["kernel_path"].as_str().unwrap_or("");
-                if !kernel.is_empty() {
-                    println!("Kernel:    {kernel}");
+                println!("Name:      {}", vm.name);
+                println!("State:     {}", vm.state);
+                println!("vCPUs:     {}", vm.vcpu_count);
+                println!("Memory:    {} MiB", vm.mem_size_mib);
+                println!("Backend:   {}", vm.vmm);
+                println!("Boot:      {}", vm.boot_mode);
+                println!("Network:   {}", vm.network);
+                if !vm.kernel_path.is_empty() {
+                    println!("Kernel:    {}", vm.kernel_path);
                 }
-                let rootfs = vm["rootfs_path"].as_str().unwrap_or("");
-                if !rootfs.is_empty() {
-                    println!("Rootfs:    {rootfs}");
+                if !vm.rootfs_path.is_empty() {
+                    println!("Rootfs:    {}", vm.rootfs_path);
                 }
-                if let Some(ip) = vm["guest_ip"].as_str() {
+                if let Some(ip) = &vm.guest_ip {
                     println!("Guest IP:  {ip}");
                 }
-                if let Some(ip) = vm["host_ip"].as_str() {
+                if let Some(ip) = &vm.host_ip {
                     println!("Host IP:   {ip}");
                 }
-                if let Some(status) = vm["userdata_status"].as_str() {
+                if let Some(status) = &vm.userdata_status {
                     println!("Userdata:  {status}");
                 }
-                if let Some(vol) = vm["volume"].as_str() {
+                if let Some(vol) = &vm.volume {
                     println!("Volume:    {vol}");
                 }
-                println!("ID:        {}", s("id"));
+                println!("ID:        {}", vm.id);
             }
             Ok(())
         }
@@ -1298,42 +1269,23 @@ async fn run(cli: Cli) -> Result<()> {
             let env = merge_env(&env_file, env)?;
             let secret_env = build_secret_env(&secret)?;
 
-            let mut body = serde_json::json!({
-                "command": cmd,
-                "args": args,
-            });
-            if let Some(ref wd) = workdir {
-                body["working_dir"] = serde_json::json!(wd);
-            }
-            let env_map: serde_json::Map<String, serde_json::Value> = env
+            let env_map = env
                 .iter()
                 .filter_map(|s| s.split_once('='))
-                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            if !env_map.is_empty() {
-                body["env"] = serde_json::Value::Object(env_map);
-            }
-            if !secret_env.is_empty() {
-                body["secret_env"] = serde_json::Value::Object(secret_env);
-            }
-            if let Some(secs) = connect_timeout {
-                body["connect_timeout_secs"] = serde_json::json!(secs);
-            }
-            if let Some(secs) = timeout {
-                body["timeout_secs"] = serde_json::json!(secs);
-            }
+            let request = ExecRequest {
+                command: cmd.clone(),
+                args: args.to_vec(),
+                working_dir: workdir,
+                env: env_map,
+                secret_env,
+                connect_timeout_secs: connect_timeout,
+                timeout_secs: timeout,
+            };
 
             let client = target.daemon().clone();
-            let resp = client
-                .send(client.post(format!("/v1/vms/{name}/exec")).json(&body))
-                .await?;
-
-            if !resp.status().is_success() {
-                let msg = client.error(resp, &format!("VM '{name}'")).await;
-                exit_with_error(output, msg);
-            }
-
-            let result: serde_json::Value = resp.json().await?;
+            let result = client.exec(&name, &request).await?;
             if output == OutputFormat::Json {
                 print_output(
                     output,
@@ -1346,8 +1298,8 @@ async fn run(cli: Cli) -> Result<()> {
                     "",
                 );
             } else {
-                let stdout = result["stdout"].as_str().unwrap_or("");
-                let stderr = result["stderr"].as_str().unwrap_or("");
+                let stdout = &result.stdout;
+                let stderr = &result.stderr;
                 if !stdout.is_empty() {
                     print!("{stdout}");
                 }
@@ -1355,7 +1307,7 @@ async fn run(cli: Cli) -> Result<()> {
                     eprint!("{stderr}");
                 }
             }
-            let exit_code = result["exit_code"].as_i64().unwrap_or(1) as i32;
+            let exit_code = result.exit_code;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -1490,17 +1442,8 @@ async fn run(cli: Cli) -> Result<()> {
                         // on every write, which would silently corrupt the
                         // destination to only the final chunk while cp still
                         // reported success.
-                        let resp = client
-                            .send(client.get(format!("/v1/vms/{name}/guest-info")))
-                            .await?;
-                        if !resp.status().is_success() {
-                            let msg = client.error(resp, &format!("VM '{name}'")).await;
-                            exit_with_error(output, msg);
-                        }
-                        let info: serde_json::Value = resp.json().await?;
-                        let guest_protocol_version =
-                            info["protocol_version"].as_u64().unwrap_or(0) as u32;
-                        if let Err(msg) = check_append_capable(guest_protocol_version) {
+                        let info = client.guest_info(&name).await?;
+                        if let Err(msg) = check_append_capable(info.protocol_version) {
                             exit_with_error(output, msg);
                         }
 
@@ -1510,29 +1453,18 @@ async fn run(cli: Cli) -> Result<()> {
                             .enumerate()
                         {
                             let chunk = &data[start..end];
-                            let mut body = serde_json::json!({
-                                "path": path,
-                                "data": husker_agent_proto::base64_encode(chunk),
-                                "append": i > 0,
-                            });
-                            if let Some(m) = mode {
-                                body["mode"] = serde_json::json!(m);
-                            }
-
-                            let resp = client
-                                .send(
-                                    client
-                                        .post(format!("/v1/vms/{name}/files/write"))
-                                        .json(&body),
+                            let result = client
+                                .write_file(
+                                    &name,
+                                    &WriteFileRequest {
+                                        path: path.clone(),
+                                        data: husker_agent_proto::base64_encode(chunk),
+                                        mode,
+                                        append: i > 0,
+                                    },
                                 )
                                 .await?;
-
-                            if !resp.status().is_success() {
-                                let msg = client.error(resp, &format!("VM '{name}'")).await;
-                                exit_with_error(output, msg);
-                            }
-                            let result: serde_json::Value = resp.json().await?;
-                            bytes_copied += result["bytes_written"].as_u64().unwrap_or(0);
+                            bytes_copied += result.bytes_written;
                         }
 
                         print_output(
@@ -1550,41 +1482,30 @@ async fn run(cli: Cli) -> Result<()> {
                     } else {
                         let encoded = husker_agent_proto::base64_encode(&data);
 
-                        let mut body = serde_json::json!({
-                            "path": path,
-                            "data": encoded,
-                        });
-                        if let Some(m) = mode {
-                            body["mode"] = serde_json::json!(m);
-                        }
-
-                        let resp = client
-                            .send(
-                                client
-                                    .post(format!("/v1/vms/{name}/files/write"))
-                                    .json(&body),
+                        let result = client
+                            .write_file(
+                                &name,
+                                &WriteFileRequest {
+                                    path: path.clone(),
+                                    data: encoded,
+                                    mode,
+                                    append: false,
+                                },
                             )
                             .await?;
-
-                        if resp.status().is_success() {
-                            let result: serde_json::Value = resp.json().await?;
-                            let bytes = result["bytes_written"].as_u64().unwrap_or(0);
-                            print_output(
-                                output,
-                                &serde_json::json!({
-                                    "status": "ok",
-                                    "action": "cp",
-                                    "direction": "to_vm",
-                                    "vm": name,
-                                    "path": path,
-                                    "bytes": bytes,
-                                }),
-                                format!("{bytes} bytes copied to {name}:{path}"),
-                            );
-                        } else {
-                            let msg = client.error(resp, &format!("VM '{name}'")).await;
-                            exit_with_error(output, msg);
-                        }
+                        let bytes = result.bytes_written;
+                        print_output(
+                            output,
+                            &serde_json::json!({
+                                "status": "ok",
+                                "action": "cp",
+                                "direction": "to_vm",
+                                "vm": name,
+                                "path": path,
+                                "bytes": bytes,
+                            }),
+                            format!("{bytes} bytes copied to {name}:{path}"),
+                        );
                     }
                 }
                 (CpPath::Vm { name, path }, CpPath::Local(local)) => {
@@ -1732,31 +1653,14 @@ async fn run(cli: Cli) -> Result<()> {
                 None => {
                     // Boot-mode-aware default: UEFI/EFI cloud VMs boot much slower
                     // than direct-kernel microVMs.
-                    let info_url = format!("/v1/vms/{name}");
-                    let resp = client.send(client.get(&info_url)).await?;
-                    if !resp.status().is_success() {
-                        let msg = client.error(resp, &format!("VM '{name}'")).await;
-                        exit_with_error(output, msg);
-                    }
-                    let vm: serde_json::Value = resp.json().await?;
-                    let boot_mode = vm
-                        .get("boot_mode")
-                        .and_then(|b| b.as_str())
-                        .unwrap_or("direct");
-                    husker_core::default_ready_timeout(boot_mode)
+                    let vm = client.vm(&name).await?;
+                    husker_core::default_ready_timeout(&vm.boot_mode)
                 }
             };
-            let url = format!("/v1/vms/{name}/ready");
             let deadline = std::time::Instant::now() + timeout;
             let mut backoff = std::time::Duration::from_millis(200);
             loop {
-                let resp = client.send(client.get(&url)).await?;
-                if !resp.status().is_success() {
-                    let msg = client.error(resp, &format!("VM '{name}'")).await;
-                    exit_with_error(output, msg);
-                }
-                let body: serde_json::Value = resp.json().await?;
-                if body.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
+                if client.ready(&name).await?.ready {
                     print_output(
                         output,
                         &serde_json::json!({"status":"ok","action":"wait","vm":name,"ready":true}),
@@ -2217,47 +2121,27 @@ async fn port_forward(
             guest_port,
             bind,
         } => {
-            let mut payload = serde_json::json!({
-                "host_port": host_port,
-                "guest_port": guest_port,
-            });
-            if let Some(bind) = &bind {
-                payload["bind_addr"] = serde_json::json!(bind);
-            }
-            let resp = client
-                .send(client.post(format!("/v1/vms/{name}/ports")).json(&payload))
+            let pf = client
+                .add_port_forward(&name, host_port, guest_port, bind.as_deref())
                 .await?;
-            if resp.status().is_success() {
-                // Read the effective values from the response: the bound host
-                // port (the daemon may pick one when 0 is requested) and the
-                // effective bind address.
-                let pf: serde_json::Value =
-                    resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
-                let bound = pf
-                    .get("host_port")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(host_port as u64);
-                let bind = pf.get("bind_addr").and_then(|v| v.as_str());
-                let target = match bind {
-                    Some(b) => format!("{b}:{bound}"),
-                    None => bound.to_string(),
-                };
-                print_output(
-                    output,
-                    &serde_json::json!({
-                        "status": "ok",
-                        "action": "port-forward-add",
-                        "vm": name,
-                        "host_port": bound,
-                        "guest_port": guest_port,
-                        "bind_addr": bind,
-                    }),
-                    format!("Port forward added: {target} -> {name}:{guest_port}"),
-                );
-            } else {
-                let msg = client.error(resp, &format!("VM '{name}'")).await;
-                exit_with_error(output, msg);
-            }
+            let bound = pf.host_port;
+            let effective_bind = pf.bind_addr.as_deref();
+            let target = match effective_bind {
+                Some(b) => format!("{b}:{bound}"),
+                None => bound.to_string(),
+            };
+            print_output(
+                output,
+                &serde_json::json!({
+                    "status": "ok",
+                    "action": "port-forward-add",
+                    "vm": name,
+                    "host_port": bound,
+                    "guest_port": guest_port,
+                    "bind_addr": effective_bind,
+                }),
+                format!("Port forward added: {target} -> {name}:{guest_port}"),
+            );
         }
         PortForwardAction::Remove { host_port } => {
             let resp = client
@@ -3718,15 +3602,8 @@ async fn run_shell(
     output: OutputFormat,
 ) -> Result<()> {
     let client = target.daemon();
-    let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
-
-    if !resp.status().is_success() {
-        let err = client.error(resp, &format!("VM '{name}'")).await;
-        exit_with_error(output, err);
-    }
-
-    let vm: serde_json::Value = resp.json().await?;
-    let vm_id = vm["id"].as_str().context("missing VM id")?;
+    let vm = client.vm(&name).await?;
+    let vm_id = &vm.id;
 
     let config = load_config(config_path.as_deref());
     let runtime_dir = config.effective_state_dir().join("run");
@@ -3790,13 +3667,8 @@ async fn run_shell_ws(
 ) -> Result<()> {
     // Pre-check: verify VM is running before opening the WebSocket.
     let client = target.daemon();
-    let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
-    if !resp.status().is_success() {
-        let err = client.error(resp, &format!("VM '{name}'")).await;
-        exit_with_error(output, err);
-    }
-    let vm: serde_json::Value = resp.json().await?;
-    let state = vm["state"].as_str().unwrap_or("unknown");
+    let vm = client.vm(name).await?;
+    let state = vm.state.as_str();
     if state != "running" {
         let mut message = format!("VM '{name}' is {state}, expected running");
         if state == "stopped" {

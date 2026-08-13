@@ -241,7 +241,7 @@ pub struct ImportOciRequest {
 
 // ── Exec Types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ExecRequest {
     pub command: String,
     #[serde(default)]
@@ -265,7 +265,7 @@ pub struct ExecRequest {
     pub timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ExecResponse {
     pub exit_code: i32,
     pub stdout: String,
@@ -274,7 +274,7 @@ pub struct ExecResponse {
 
 // ── File Types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReadFileRequest {
     pub path: String,
     /// Byte offset to begin reading at. A client pulling a file larger than
@@ -290,7 +290,7 @@ pub struct ReadFileRequest {
     pub len: Option<u64>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReadFileResponse {
     pub data: String,
     /// Bytes carried by this response, which for a ranged request is the
@@ -314,7 +314,7 @@ pub struct ReadFileResponse {
     pub modified_nanos: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct WriteFileRequest {
     pub path: String,
     /// Base64-encoded file data.
@@ -329,14 +329,14 @@ pub struct WriteFileRequest {
     pub append: bool,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct WriteFileResponse {
     pub bytes_written: u64,
 }
 
 // ── Port Forward Types ────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddPortForwardRequest {
     pub host_port: u16,
     pub guest_port: u16,
@@ -345,7 +345,7 @@ pub struct AddPortForwardRequest {
     pub bind_addr: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PortForwardResponse {
     pub host_port: u16,
     pub guest_port: u16,

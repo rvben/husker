@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 
-use crate::daemon_client::{ApiFailure, DaemonClient};
+use crate::daemon_client::{ApiFailure, DaemonClient, FileReadOutcome};
 
 /// Bytes requested per `files/read` request. The daemon rejects a response
 /// larger than `ApiPolicy::max_file_read_bytes` (1 MiB by default) and does not
@@ -85,35 +85,29 @@ pub(crate) async fn read_guest_file(
 
     loop {
         let offset = buf.len() as u64;
-        let resp = daemon
-            .send(
-                daemon
-                    .post(format!("/v1/vms/{vm}/files/read"))
-                    .json(&serde_json::json!({
-                        "path": path,
-                        "offset": offset,
-                        "len": GUEST_READ_CHUNK_BYTES,
-                    })),
-            )
-            .await?;
+        let body = match daemon
+            .read_file(vm, path, offset, Some(GUEST_READ_CHUNK_BYTES))
+            .await?
+        {
+            FileReadOutcome::Read(body) => body,
+            FileReadOutcome::Failed {
+                failure,
+                payload_too_large,
+            } => {
+                // A bounded request that came back "too large" means the range was
+                // not applied. Ask the guest which of the two reasons it is, so the
+                // user is told to rebuild a stale image or to raise a policy that
+                // sits below one chunk, rather than being left to guess.
+                let failure = if payload_too_large && buf.is_empty() {
+                    explain_oversized_read(daemon, vm, failure).await?
+                } else {
+                    failure
+                };
+                return Ok(GuestFile::Failed(failure));
+            }
+        };
 
-        if !resp.status().is_success() {
-            let too_large = resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE;
-            let failure = daemon.error(resp, &format!("VM '{vm}'")).await;
-            // A bounded request that came back "too large" means the range was
-            // not applied. Ask the guest which of the two reasons it is, so the
-            // user is told to rebuild a stale image or to raise a policy that
-            // sits below one chunk, rather than being left to guess.
-            let failure = if too_large && buf.is_empty() {
-                explain_oversized_read(daemon, vm, failure).await?
-            } else {
-                failure
-            };
-            return Ok(GuestFile::Failed(failure));
-        }
-
-        let body: serde_json::Value = resp.json().await?;
-        let chunk = match husker_agent_proto::base64_decode(body["data"].as_str().unwrap_or("")) {
+        let chunk = match husker_agent_proto::base64_decode(&body.data) {
             Ok(bytes) => bytes,
             Err(e) => {
                 return Ok(GuestFile::Failed(
@@ -124,8 +118,8 @@ pub(crate) async fn read_guest_file(
         };
         // Absent rather than zero when the agent predates ranged reads. Reading
         // it as a size would make every such file look empty.
-        let total = body["total_size"].as_u64();
-        let modified = body["modified_nanos"].as_u64();
+        let total = body.total_size;
+        let modified = body.modified_nanos;
         buf.extend_from_slice(&chunk);
 
         let Some(total) = total else {
@@ -195,14 +189,12 @@ async fn explain_oversized_read(
     vm: &str,
     failure: ApiFailure,
 ) -> Result<ApiFailure> {
-    let resp = daemon
-        .send(daemon.get(format!("/v1/vms/{vm}/guest-info")))
-        .await?;
-    if !resp.status().is_success() {
-        return Ok(failure);
-    }
-    let info: serde_json::Value = resp.json().await?;
-    let version = info["protocol_version"].as_u64().unwrap_or(0) as u32;
+    let info = match daemon.guest_info(vm).await {
+        Ok(info) => info,
+        Err(error) if error.downcast_ref::<ApiFailure>().is_some() => return Ok(failure),
+        Err(error) => return Err(error),
+    };
+    let version = info.protocol_version;
     Ok(match check_ranged_read_capable(version) {
         Err(message) => ApiFailure { message, ..failure },
         Ok(()) => ApiFailure {
@@ -499,7 +491,12 @@ mod tests {
             )
             .route(
                 "/v1/vms/{name}/guest-info",
-                get(|| async { Json(serde_json::json!({ "protocol_version": 2 })) }),
+                get(|| async {
+                    Json(serde_json::json!({
+                        "ipv4": [],
+                        "protocol_version": 2,
+                    }))
+                }),
             );
         let (api_url, server) = serve_stub(app).await;
 
@@ -536,6 +533,7 @@ mod tests {
                 "/v1/vms/{name}/guest-info",
                 get(|| async {
                     Json(serde_json::json!({
+                        "ipv4": [],
                         "protocol_version": husker_agent_proto::PROTOCOL_VERSION,
                     }))
                 }),
