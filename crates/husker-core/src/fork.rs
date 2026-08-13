@@ -39,10 +39,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         let _fork_guard = self.vm_name_lock(fork_name).lock_owned().await;
 
         let source = self.lookup_vm(source_name)?;
-        if source.state != "suspended" {
+        if source.state != VmLifecycleState::Suspended {
             return Err(CoreError::InvalidState {
                 name: source_name.into(),
-                actual: source.state,
+                actual: source.state.to_string(),
                 expected: "suspended".into(),
             });
         }
@@ -195,7 +195,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let record = VmRecord {
             id: fork_id,
             name: fork_name.into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: info.pid,
             vcpu_count: source.vcpu_count,
             mem_size_mib: source.mem_size_mib,

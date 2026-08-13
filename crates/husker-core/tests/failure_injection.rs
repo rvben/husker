@@ -468,7 +468,7 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
     let record = husker_state::VmRecord {
         id,
         name: name.into(),
-        state: state.into(),
+        state: state.parse().expect("test fixture uses a known VM state"),
         pid: Some(9999),
         vcpu_count: 1,
         mem_size_mib: 128,

@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 pub use husker_state::{
     HostGroupRecord, ImageRecord, PoolRecord, SecretRecord, ServiceRecord, SnapshotRecord,
-    VmRecord, VolumeRecord,
+    VmLifecycleState, VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 
@@ -502,8 +502,14 @@ fn validate_service_instance_names(name: &str, desired_instances: u32) -> Result
 /// True if `candidate` is a better survivor than `current` for the same ordinal:
 /// prefer `running`, then oldest `created_at`, then lowest `id`.
 fn better_survivor(candidate: &VmRecord, current: &VmRecord) -> bool {
-    let rank = |s: &str| if s == "running" { 0 } else { 1 };
-    match rank(&candidate.state).cmp(&rank(&current.state)) {
+    let rank = |state: VmLifecycleState| {
+        if state == VmLifecycleState::Running {
+            0
+        } else {
+            1
+        }
+    };
+    match rank(candidate.state).cmp(&rank(current.state)) {
         std::cmp::Ordering::Less => true,
         std::cmp::Ordering::Greater => false,
         std::cmp::Ordering::Equal => match candidate.created_at.cmp(&current.created_at) {
@@ -511,6 +517,20 @@ fn better_survivor(candidate: &VmRecord, current: &VmRecord) -> bool {
             std::cmp::Ordering::Greater => false,
             std::cmp::Ordering::Equal => candidate.id < current.id,
         },
+    }
+}
+
+/// Translate the live backend vocabulary into the durable lifecycle vocabulary.
+///
+/// Keep this exhaustive: if a backend gains a new live state, core must decide
+/// explicitly how (or whether) that state is safe to persist.
+fn durable_lifecycle_state(state: VmState) -> VmLifecycleState {
+    match state {
+        VmState::Creating => VmLifecycleState::Creating,
+        VmState::Running => VmLifecycleState::Running,
+        VmState::Paused => VmLifecycleState::Paused,
+        VmState::Stopped => VmLifecycleState::Stopped,
+        VmState::Failed => VmLifecycleState::Failed,
     }
 }
 
@@ -717,7 +737,7 @@ pub fn reap_orphaned_vmms(state: &husker_state::StateStore) -> usize {
     };
     let mut reaped = 0;
     for vm in vms {
-        if vm.state != "running" && vm.state != "paused" {
+        if !vm.state.is_live() {
             continue;
         }
         let Some(pid) = vm.pid else { continue };
@@ -2215,12 +2235,12 @@ pub fn evaluate_policy(
         return PolicyAction::None;
     }
 
-    match record.state.as_str() {
-        "running" => match idle_for {
+    match record.state {
+        VmLifecycleState::Running => match idle_for {
             Some(d) if d.as_secs() >= idle_timeout => PolicyAction::Suspend,
             _ => PolicyAction::None,
         },
-        "suspended" => {
+        VmLifecycleState::Suspended => {
             let ttl = record.suspend_ttl_secs.unwrap_or(0);
             if ttl == 0 {
                 return PolicyAction::None;
@@ -2564,7 +2584,7 @@ mod tests {
         VmRecord {
             id: Uuid::new_v4(),
             name: name.into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: None,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -2610,7 +2630,7 @@ mod tests {
     #[cfg(feature = "linux-net")]
     fn abandoned_crashed_vm(name: &str) -> VmRecord {
         let mut rec = sample_vm_record(name);
-        rec.state = "stopped".into();
+        rec.state = VmLifecycleState::Stopped;
         rec.tap_device = Some(format!("tap-{name}"));
         rec.host_ip = Some("172.20.0.1".into());
         rec.guest_ip = Some("172.20.0.2".into());
@@ -2706,7 +2726,7 @@ mod tests {
         host_port: u16,
     ) -> VmRecord {
         let mut rec = sample_vm_record(name);
-        rec.state = "suspended".into();
+        rec.state = VmLifecycleState::Suspended;
         rec.auto_resume = true;
         rec.tap_device = Some(format!("tap-{name}"));
         rec.guest_ip = Some("172.20.0.5".into());
@@ -2899,7 +2919,7 @@ mod tests {
     async fn agent_connect_resumes_suspended_auto_resume_vm() {
         let (core, tmp) = resume_mock_core(false).await;
         let mut rec = sample_vm_record("aw");
-        rec.state = "suspended".into();
+        rec.state = VmLifecycleState::Suspended;
         rec.vmm = "firecracker".into();
         rec.auto_resume = true;
         core.state.insert_vm(&rec).unwrap();
@@ -2933,7 +2953,7 @@ mod tests {
     async fn agent_connect_on_suspended_no_auto_resume_errors() {
         let core = test_core().await;
         let mut rec = sample_vm_record("na");
-        rec.state = "suspended".into();
+        rec.state = VmLifecycleState::Suspended;
         rec.auto_resume = false;
         core.state.insert_vm(&rec).unwrap();
         // `AgentConnection` does not implement `Debug` (it wraps a live
@@ -2969,8 +2989,8 @@ mod tests {
 
         let reconcile = core.reconcile_port_forwards_from_state().await;
         // `skipped_suspended` is the load-bearing assertion: it can only be 1
-        // if the `if vm.state == "suspended" { .. continue }` guard actually
-        // ran. `restored == 0` alone is not enough to prove the guard exists
+        // if the `if vm.state == VmLifecycleState::Suspended { .. continue }`
+        // guard actually ran. `restored == 0` alone is not enough to prove it
         // (the only staged VM here is suspended, so `restored` would also be
         // 0 if the guard were deleted and the VM instead fell through to a
         // failing/no-op `add_port_forward`), so both are asserted together.
@@ -3055,7 +3075,7 @@ mod tests {
     async fn resume_from_paused_does_not_touch_suspend_lifecycle_state() {
         let core = test_core().await;
         let mut rec = sample_vm_record("p1");
-        rec.state = "paused".into();
+        rec.state = VmLifecycleState::Paused;
         // A real `pause_vm` never sets `suspended_at` (only `suspend_vm_locked`
         // does). Force it here anyway: if the arm-gating regresses and the
         // "suspended" cleanup runs for "paused" too, this field flipping to
@@ -3309,7 +3329,7 @@ mod tests {
         core.state.ensure_cid_base(1000).unwrap();
 
         let mut src = sample_vm_record("src");
-        src.state = "suspended".into();
+        src.state = VmLifecycleState::Suspended;
         src.vmm = "firecracker".into();
         core.state.insert_vm(&src).unwrap();
 
@@ -4422,7 +4442,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let vm = husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: "vm-with-vol".into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: None,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -5025,7 +5045,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let vm = husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: "bridged-vm".into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: None,
             vcpu_count: 1,
             mem_size_mib: 512,
@@ -5173,7 +5193,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: None,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -5211,7 +5231,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         let mut vm = running_nat_vm("pf-stopped");
-        vm.state = "stopped".into();
+        vm.state = VmLifecycleState::Stopped;
         state.insert_vm(&vm).unwrap();
         let core = make_vz_core(state, tmp.path());
         let err = core
@@ -6088,7 +6108,7 @@ mod idle_policy_tests {
         VmRecord {
             id: Uuid::new_v4(),
             name: name.into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: None,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -6121,7 +6141,7 @@ mod idle_policy_tests {
 
     fn running(idle_timeout: Option<u64>) -> VmRecord {
         let mut r = sample_vm_record("v");
-        r.state = "running".into();
+        r.state = VmLifecycleState::Running;
         r.vmm = "firecracker".into();
         r.idle_timeout_secs = idle_timeout;
         r
@@ -6212,7 +6232,7 @@ mod idle_policy_tests {
     #[test]
     fn suspended_past_ttl_reaps_when_eligible() {
         let mut r = running(Some(60));
-        r.state = "suspended".into();
+        r.state = VmLifecycleState::Suspended;
         r.suspend_ttl_secs = Some(100);
         r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(101));
         assert!(matches!(
@@ -6225,7 +6245,7 @@ mod idle_policy_tests {
     fn suspended_with_live_fork_or_volume_or_null_ts_not_reaped() {
         let base = || {
             let mut r = running(Some(60));
-            r.state = "suspended".into();
+            r.state = VmLifecycleState::Suspended;
             r.suspend_ttl_secs = Some(100);
             r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(101));
             r
@@ -6264,7 +6284,7 @@ mod idle_policy_tests {
         // `suspend_ttl_secs` varies, isolating the "never reap" guard.
         let base = || {
             let mut r = running(Some(60));
-            r.state = "suspended".into();
+            r.state = VmLifecycleState::Suspended;
             r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(999));
             r
         };

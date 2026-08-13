@@ -58,7 +58,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// through. Map entries are populated only by explicit activity events
     /// (`note_activity`, `mark_network_active`, `seed_activity`).
     fn idle_for(&self, record: &VmRecord) -> Option<std::time::Duration> {
-        if record.state != "running" || self.active_session_count(record.id) > 0 {
+        if record.state != VmLifecycleState::Running || self.active_session_count(record.id) > 0 {
             return None;
         }
         // Fallback when a signal has no in-memory entry (never seen since the

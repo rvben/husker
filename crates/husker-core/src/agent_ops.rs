@@ -21,7 +21,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         name: &str,
     ) -> Result<AgentConnection<B::VsockStream>, CoreError> {
         let record = self.lookup_vm(name)?;
-        if record.state == "suspended" {
+        if record.state == VmLifecycleState::Suspended {
             if record.auto_resume {
                 if self.resume_vm(name).await? {
                     self.idle_metrics
@@ -31,7 +31,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
-                    actual: record.state,
+                    actual: record.state.to_string(),
                     expected: "running".into(),
                 });
             }
@@ -39,10 +39,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Re-read after a possible resume: the state (and, on Linux, the
         // vsock CID) may have changed.
         let record = self.lookup_vm(name)?;
-        if record.state != "running" {
+        if record.state != VmLifecycleState::Running {
             return Err(CoreError::InvalidState {
                 name: name.into(),
-                actual: record.state,
+                actual: record.state.to_string(),
                 expected: "running".into(),
             });
         }

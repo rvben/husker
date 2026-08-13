@@ -280,7 +280,7 @@ fn vm_record(
     VmRecord {
         id,
         name: name.to_string(),
-        state: state.to_string(),
+        state: state.parse().expect("test fixture uses a known VM state"),
         pid: Some(9999),
         vcpu_count: 1,
         mem_size_mib: 128,

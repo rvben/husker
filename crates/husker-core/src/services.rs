@@ -312,7 +312,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Ordinals 0..desired-1: ensure each is a single running instance.
         for ordinal in 0..svc.desired_instances {
             match by_ordinal.get(&ordinal) {
-                Some(vm) if vm.state == "running" => {}
+                Some(vm) if vm.state == VmLifecycleState::Running => {}
                 Some(vm) => {
                     let vm = vm.clone();
                     if self.destroy_instance(&vm, &mut outcome).await {

@@ -12,10 +12,10 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "VM '{name}' was created without --balloon"
             )));
         }
-        if record.state != "running" {
+        if record.state != VmLifecycleState::Running {
             return Err(CoreError::InvalidState {
                 name: name.into(),
-                actual: record.state,
+                actual: record.state.to_string(),
                 expected: "running".into(),
             });
         }

@@ -12,7 +12,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// the guest IP is DHCP-assigned and not known at creation time. On Linux,
     /// boot_mode is always "direct" or "uefi", so this function is a no-op.
     pub(crate) async fn discover_guest_ip(&self, vm: &mut VmRecord) {
-        if vm.guest_ip.is_some() || vm.state != "running" || vm.boot_mode != "efi" {
+        if vm.guest_ip.is_some() || vm.state != VmLifecycleState::Running || vm.boot_mode != "efi" {
             return;
         }
 
@@ -93,7 +93,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// `VZVirtualMachine.state()` on the VM's dispatch queue so guest-initiated
     /// shutdown (poweroff, kernel panic) is also detected on macOS.
     pub async fn refresh_vm_liveness(&self, vm: &VmRecord) -> VmRecord {
-        if vm.state != "running" && vm.state != "paused" {
+        if !vm.state.is_live() {
             return vm.clone();
         }
         let alive = match self.vmm.vm_info(vm.id).await {
@@ -110,7 +110,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             warn!(name = %vm.name, error = %e, "failed to persist stopped state");
         }
         let mut updated = vm.clone();
-        updated.state = "stopped".to_string();
+        updated.state = VmLifecycleState::Stopped;
         updated.pid = None;
         updated
     }
@@ -246,10 +246,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     ) -> Result<husker_state::PortForwardRecord, CoreError> {
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
-        if record.state != "running" {
+        if record.state != VmLifecycleState::Running {
             return Err(CoreError::InvalidState {
                 name: name.into(),
-                actual: record.state,
+                actual: record.state.to_string(),
                 expected: "running".into(),
             });
         }
@@ -362,7 +362,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let mut reattached = 0usize;
 
         for vm in vms {
-            if vm.state != "suspended" {
+            if vm.state != VmLifecycleState::Suspended {
                 continue;
             }
 
@@ -420,7 +420,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let mut restored = 0usize;
         let mut skipped_suspended = 0usize;
         for vm in vms {
-            if vm.state == "suspended" {
+            if vm.state == VmLifecycleState::Suspended {
                 // A suspended VM has no live guest; DNAT would blackhole traffic to a
                 // dead IP and bypass the resume listener. Skip; listeners are
                 // re-installed separately by `reinstall_resume_listeners`.
@@ -505,7 +505,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         };
         for vm in vms {
-            if vm.state != "suspended" || !vm.auto_resume {
+            if vm.state != VmLifecycleState::Suspended || !vm.auto_resume {
                 continue;
             }
             let forwards = self

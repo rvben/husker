@@ -75,9 +75,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // the caller allows it. Running or paused VMs must be explicitly
         // destroyed first.
         if let Ok(existing) = self.state.get_vm_by_name(&req.name) {
-            if replace_existing_stopped
-                && (existing.state == "stopped" || existing.state == "failed")
-            {
+            if replace_existing_stopped && existing.state.is_terminal() {
                 info!(name = %req.name, "replacing stopped VM");
                 self.destroy_vm_locked(&existing).await?;
             } else {
@@ -522,7 +520,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let record = VmRecord {
             id: info.id,
             name: req.name,
-            state: info.state.to_string(),
+            state: durable_lifecycle_state(info.state),
             pid: info.pid,
             vcpu_count: info.vcpu_count,
             mem_size_mib: info.mem_size_mib,
@@ -735,7 +733,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             let record = VmRecord {
                 id: info.id,
                 name: req.name,
-                state: info.state.to_string(),
+                state: durable_lifecycle_state(info.state),
                 pid: info.pid,
                 vcpu_count: info.vcpu_count,
                 mem_size_mib: info.mem_size_mib,
@@ -847,7 +845,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let record = VmRecord {
             id: info.id,
             name: req.name,
-            state: info.state.to_string(),
+            state: durable_lifecycle_state(info.state),
             pid: info.pid,
             vcpu_count: info.vcpu_count,
             mem_size_mib: info.mem_size_mib,
@@ -952,13 +950,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         let _stop_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         self.ensure_vm_is_not_pool_template(&record)?;
-        match record.state.as_str() {
-            "running" | "paused" => {}
-            "stopped" => {
+        match record.state {
+            VmLifecycleState::Running | VmLifecycleState::Paused => {}
+            VmLifecycleState::Stopped => {
                 debug!(%name, "VM already stopped; stop is a no-op");
                 return Ok(());
             }
-            "suspended" => {
+            VmLifecycleState::Suspended => {
                 // The process is already gone; discard the slot and mark stopped.
                 let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(record.id)).await;
                 self.state.mark_vm_stopped(record.id)?;
@@ -967,7 +965,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             _ => {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
-                    actual: record.state,
+                    actual: record.state.to_string(),
                     expected: "running or paused".into(),
                 });
             }
@@ -992,22 +990,23 @@ impl<B: VmmBackend> HuskerCore<B> {
         let _pause_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         self.ensure_vm_is_not_pool_template(&record)?;
-        match record.state.as_str() {
-            "running" => {}
-            "paused" => {
+        match record.state {
+            VmLifecycleState::Running => {}
+            VmLifecycleState::Paused => {
                 debug!(%name, "VM already paused; pause is a no-op");
                 return Ok(());
             }
             _ => {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
-                    actual: record.state,
+                    actual: record.state.to_string(),
                     expected: "running".into(),
                 });
             }
         }
         self.vmm.pause_vm(record.id).await?;
-        self.state.update_vm_state(record.id, "paused")?;
+        self.state
+            .update_vm_state(record.id, VmLifecycleState::Paused)?;
         Ok(())
     }
 

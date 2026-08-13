@@ -17,6 +17,8 @@
 // is intentionally absent there rather than silenced with `allow(dead_code)`.
 #[cfg(any(feature = "linux-net", test))]
 use chrono::{DateTime, Duration, Utc};
+#[cfg(test)]
+use husker_state::VmLifecycleState;
 #[cfg(any(feature = "linux-net", test))]
 use husker_state::VmRecord;
 
@@ -30,7 +32,7 @@ use husker_state::VmRecord;
 /// stamps `updated_at` on the stop and nothing mutates a stopped VM afterward.
 #[cfg(any(feature = "linux-net", test))]
 pub(crate) fn is_reclaimable_leak(vm: &VmRecord, now: DateTime<Utc>, grace: Duration) -> bool {
-    let terminal = vm.state == "stopped" || vm.state == "failed";
+    let terminal = vm.state.is_terminal();
     let standalone = vm.service_id.is_none();
     let not_suspended = vm.suspended_at.is_none();
     let holds_resources = vm.tap_device.is_some() || vm.guest_ip.is_some() || vm.host_ip.is_some();
@@ -45,8 +47,8 @@ pub(crate) fn is_reclaimable_leak(vm: &VmRecord, now: DateTime<Utc>, grace: Dura
 /// network identity is part of the durable suspend slot contract.
 #[cfg(any(feature = "linux-net", test))]
 pub(crate) fn is_shutdown_reclaimable(vm: &VmRecord) -> bool {
-    let terminal = vm.state == "stopped" || vm.state == "failed";
-    let not_suspended = vm.state != "suspended" && vm.suspended_at.is_none();
+    let terminal = vm.state.is_terminal();
+    let not_suspended = vm.suspended_at.is_none();
     let holds_resources = vm.tap_device.is_some() || vm.guest_ip.is_some() || vm.host_ip.is_some();
     terminal && not_suspended && holds_resources
 }
@@ -169,7 +171,7 @@ mod tests {
         VmRecord {
             id: Uuid::new_v4(),
             name: "vm".into(),
-            state: "stopped".into(),
+            state: VmLifecycleState::Stopped,
             pid: None,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -217,7 +219,7 @@ mod tests {
     #[test]
     fn failed_state_is_also_reclaimable() {
         let mut vm = stopped_long_ago();
-        vm.state = "failed".into();
+        vm.state = VmLifecycleState::Failed;
         assert!(is_reclaimable_leak(&vm, Utc::now(), GRACE));
     }
 
@@ -225,7 +227,7 @@ mod tests {
     fn running_or_paused_vm_is_never_reclaimed() {
         for state in ["running", "paused", "creating", "suspended"] {
             let mut vm = stopped_long_ago();
-            vm.state = state.into();
+            vm.state = state.parse().expect("test fixture uses a known VM state");
             assert!(
                 !is_reclaimable_leak(&vm, Utc::now(), GRACE),
                 "state {state} must not be reclaimed"
@@ -266,7 +268,7 @@ mod tests {
     fn shutdown_does_not_reclaim_running_or_suspended_vm_resources() {
         for state in ["running", "paused", "suspended"] {
             let mut vm = base_vm();
-            vm.state = state.into();
+            vm.state = state.parse().expect("test fixture uses a known VM state");
             if state == "suspended" {
                 vm.suspended_at = Some(Utc::now());
             }

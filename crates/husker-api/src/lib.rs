@@ -36,7 +36,7 @@ use axum::http::StatusCode;
 #[cfg(test)]
 use errors::{map_agent_connect_error, map_error};
 #[cfg(test)]
-use husker_core::{CoreError, VmRecord};
+use husker_core::{CoreError, VmLifecycleState, VmRecord};
 #[cfg(test)]
 use router::{is_protected_route, is_rate_limited_route};
 #[cfg(test)]
@@ -437,7 +437,7 @@ mod tests {
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
                 name: "vm-running".into(),
-                state: "running".into(),
+                state: VmLifecycleState::Running,
                 pid: Some(1),
                 vcpu_count: 1,
                 mem_size_mib: 128,
@@ -473,7 +473,7 @@ mod tests {
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
                 name: "vm-stopped".into(),
-                state: "stopped".into(),
+                state: VmLifecycleState::Stopped,
                 pid: None,
                 vcpu_count: 1,
                 mem_size_mib: 128,
@@ -812,7 +812,7 @@ mod tests {
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
                 name: "snap-vm".into(),
-                state: "stopped".into(),
+                state: VmLifecycleState::Stopped,
                 pid: Some(1234),
                 vcpu_count: 1,
                 mem_size_mib: 128,
@@ -1156,7 +1156,7 @@ mod tests {
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
                 name: "existing".into(),
-                state: "running".into(),
+                state: VmLifecycleState::Running,
                 pid: Some(1),
                 vcpu_count: 1,
                 mem_size_mib: 128,
@@ -1276,7 +1276,7 @@ mod tests {
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
                 name: "logvm".into(),
-                state: "running".into(),
+                state: VmLifecycleState::Running,
                 pid: Some(1234),
                 vcpu_count: 1,
                 mem_size_mib: 128,
@@ -1409,7 +1409,7 @@ mod tests {
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
                 name: "no-balloon-vm".into(),
-                state: "running".into(),
+                state: VmLifecycleState::Running,
                 pid: Some(42),
                 vcpu_count: 1,
                 mem_size_mib: 256,
@@ -1647,7 +1647,7 @@ mod tests {
         VmRecord {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: None,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -2472,7 +2472,7 @@ mod tests {
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
                 name: "holder-vm".into(),
-                state: "running".into(),
+                state: VmLifecycleState::Running,
                 pid: Some(42),
                 vcpu_count: 1,
                 mem_size_mib: 128,

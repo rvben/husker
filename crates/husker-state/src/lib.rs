@@ -91,12 +91,115 @@ pub enum StateError {
     },
 }
 
+/// The durable lifecycle states a VM record may occupy.
+///
+/// This is deliberately distinct from `husker_vmm::VmState`: VMM state
+/// describes a live backend process, while this type also carries durable
+/// orchestration states such as `creating`, `suspending`, and `suspended`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VmLifecycleState {
+    Creating,
+    Running,
+    Paused,
+    Stopped,
+    Failed,
+    Suspending,
+    Suspended,
+}
+
+impl VmLifecycleState {
+    pub const ALL: [Self; 7] = [
+        Self::Creating,
+        Self::Running,
+        Self::Paused,
+        Self::Stopped,
+        Self::Failed,
+        Self::Suspending,
+        Self::Suspended,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Suspending => "suspending",
+            Self::Suspended => "suspended",
+        }
+    }
+
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Paused)
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
+}
+
+impl std::fmt::Display for VmLifecycleState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown VM lifecycle state '{0}'")]
+pub struct InvalidVmLifecycleState(String);
+
+impl std::str::FromStr for VmLifecycleState {
+    type Err = InvalidVmLifecycleState;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "creating" => Ok(Self::Creating),
+            "running" => Ok(Self::Running),
+            "paused" => Ok(Self::Paused),
+            "stopped" => Ok(Self::Stopped),
+            "failed" => Ok(Self::Failed),
+            "suspending" => Ok(Self::Suspending),
+            "suspended" => Ok(Self::Suspended),
+            other => Err(InvalidVmLifecycleState(other.to_string())),
+        }
+    }
+}
+
+impl PartialEq<str> for VmLifecycleState {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for VmLifecycleState {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl rusqlite::types::ToSql for VmLifecycleState {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+impl rusqlite::types::FromSql for VmLifecycleState {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let text = value.as_str()?;
+        text.parse().map_err(|error: InvalidVmLifecycleState| {
+            rusqlite::types::FromSqlError::Other(Box::new(error))
+        })
+    }
+}
+
 /// Persistent VM record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmRecord {
     pub id: Uuid,
     pub name: String,
-    pub state: String,
+    pub state: VmLifecycleState,
     pub pid: Option<u32>,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
@@ -431,6 +534,28 @@ const MIGRATIONS: &[(u32, &str)] = &[
          WHEN EXISTS (SELECT 1 FROM pools WHERE template_vm_id = OLD.id)
          BEGIN
              SELECT RAISE(ABORT, 'pool template cannot be deleted');
+         END;",
+    ),
+    (
+        5,
+        "CREATE TRIGGER vm_state_must_be_known_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.state NOT IN (
+             'creating', 'running', 'paused', 'stopped', 'failed',
+             'suspending', 'suspended'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM lifecycle state');
+         END;
+
+         CREATE TRIGGER vm_state_must_be_known_on_update
+         BEFORE UPDATE OF state ON vms
+         WHEN NEW.state NOT IN (
+             'creating', 'running', 'paused', 'stopped', 'failed',
+             'suspending', 'suspended'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM lifecycle state');
          END;",
     ),
 ];
@@ -898,7 +1023,7 @@ impl StateStore {
     }
 
     /// Update a VM's state.
-    pub fn update_vm_state(&self, id: Uuid, state: &str) -> Result<(), StateError> {
+    pub fn update_vm_state(&self, id: Uuid, state: VmLifecycleState) -> Result<(), StateError> {
         let conn = self.lock()?;
         let updated = conn.execute(
             "UPDATE vms SET state = ?1, updated_at = ?2 WHERE id = ?3",
@@ -918,7 +1043,7 @@ impl StateStore {
     pub fn update_vm_runtime(
         &self,
         id: Uuid,
-        state: &str,
+        state: VmLifecycleState,
         pid: Option<u32>,
     ) -> Result<(), StateError> {
         let conn = self.lock()?;
@@ -2543,6 +2668,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vm_lifecycle_state_has_a_stable_round_trip_for_every_value() {
+        for state in VmLifecycleState::ALL {
+            let wire_value = state.as_str();
+            assert_eq!(wire_value.parse::<VmLifecycleState>().unwrap(), state);
+            assert_eq!(state.to_string(), wire_value);
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{wire_value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<VmLifecycleState>(&format!("\"{wire_value}\"")).unwrap(),
+                state
+            );
+        }
+
+        assert!("RUNNING".parse::<VmLifecycleState>().is_err());
+        assert!("unknown".parse::<VmLifecycleState>().is_err());
+    }
+
+    #[test]
+    fn vm_lifecycle_state_classification_is_explicit() {
+        assert!(VmLifecycleState::Running.is_live());
+        assert!(VmLifecycleState::Paused.is_live());
+        assert!(!VmLifecycleState::Creating.is_live());
+        assert!(!VmLifecycleState::Suspending.is_live());
+        assert!(!VmLifecycleState::Suspended.is_live());
+
+        assert!(VmLifecycleState::Stopped.is_terminal());
+        assert!(VmLifecycleState::Failed.is_terminal());
+        assert!(!VmLifecycleState::Running.is_terminal());
+    }
+
+    #[test]
     fn add_column_ignores_duplicate_but_propagates_real_errors() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (id TEXT);").unwrap();
@@ -2559,7 +2717,7 @@ mod tests {
         VmRecord {
             id: Uuid::new_v4(),
             name: name.into(),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: Some(1234),
             vcpu_count: 2,
             mem_size_mib: 256,
@@ -2728,7 +2886,7 @@ mod tests {
     fn clear_vm_network_resources_nulls_fields_and_keeps_record() {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("crashed-vm");
-        rec.state = "stopped".into();
+        rec.state = VmLifecycleState::Stopped;
         rec.tap_device = Some("tap-crashed".into());
         rec.host_ip = Some("192.0.2.1".into());
         rec.guest_ip = Some("192.0.2.2".into());
@@ -2779,7 +2937,9 @@ mod tests {
         let rec = make_record("state-test");
         store.insert_vm(&rec).unwrap();
 
-        store.update_vm_state(rec.id, "stopped").unwrap();
+        store
+            .update_vm_state(rec.id, VmLifecycleState::Stopped)
+            .unwrap();
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.state, "stopped");
     }
@@ -2790,13 +2950,15 @@ mod tests {
         let rec = make_record("runtime-test");
         store.insert_vm(&rec).unwrap();
 
-        store.update_vm_runtime(rec.id, "suspended", None).unwrap();
+        store
+            .update_vm_runtime(rec.id, VmLifecycleState::Suspended, None)
+            .unwrap();
         let suspended = store.get_vm(rec.id).unwrap();
         assert_eq!(suspended.state, "suspended");
         assert_eq!(suspended.pid, None);
 
         store
-            .update_vm_runtime(rec.id, "running", Some(5678))
+            .update_vm_runtime(rec.id, VmLifecycleState::Running, Some(5678))
             .unwrap();
         let resumed = store.get_vm(rec.id).unwrap();
         assert_eq!(resumed.state, "running");
@@ -2807,7 +2969,7 @@ mod tests {
     fn mark_vm_stopped_retires_runtime_and_suspend_identity() {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("retired-runtime");
-        rec.state = "suspended".into();
+        rec.state = VmLifecycleState::Suspended;
         rec.pid = Some(4242);
         rec.suspended_at = Some(Utc::now());
         store.insert_vm(&rec).unwrap();
@@ -2900,11 +3062,11 @@ mod tests {
         store.insert_vm(&src).unwrap();
         let mut child = make_record("child");
         child.forked_from = Some(src.id);
-        child.state = "running".into();
+        child.state = VmLifecycleState::Running;
         store.insert_vm(&child).unwrap();
         let mut dead = make_record("dead");
         dead.forked_from = Some(src.id);
-        dead.state = "stopped".into();
+        dead.state = VmLifecycleState::Stopped;
         store.insert_vm(&dead).unwrap();
         assert_eq!(store.count_live_forks_of(src.id).unwrap(), 1);
     }
@@ -3137,7 +3299,7 @@ mod tests {
     #[test]
     fn update_state_nonexistent_vm() {
         let store = StateStore::open_memory().unwrap();
-        let result = store.update_vm_state(Uuid::new_v4(), "stopped");
+        let result = store.update_vm_state(Uuid::new_v4(), VmLifecycleState::Stopped);
         assert!(matches!(result, Err(StateError::VmNotFound(_))));
     }
 
@@ -3156,7 +3318,9 @@ mod tests {
 
         let before = store.get_vm(rec.id).unwrap().updated_at;
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.update_vm_state(rec.id, "stopped").unwrap();
+        store
+            .update_vm_state(rec.id, VmLifecycleState::Stopped)
+            .unwrap();
         let after = store.get_vm(rec.id).unwrap().updated_at;
 
         assert!(after >= before);
@@ -3347,19 +3511,19 @@ mod tests {
         // make_record defaults to "running" state
 
         let mut creating = make_record("vm-creating");
-        creating.state = "creating".into();
+        creating.state = VmLifecycleState::Creating;
         store.insert_vm(&creating).unwrap();
 
         let mut paused = make_record("vm-paused");
-        paused.state = "paused".into();
+        paused.state = VmLifecycleState::Paused;
         store.insert_vm(&paused).unwrap();
 
         let mut stopped = make_record("vm-stopped");
-        stopped.state = "stopped".into();
+        stopped.state = VmLifecycleState::Stopped;
         store.insert_vm(&stopped).unwrap();
 
         let mut failed = make_record("vm-failed");
-        failed.state = "failed".into();
+        failed.state = VmLifecycleState::Failed;
         store.insert_vm(&failed).unwrap();
 
         let count = store.mark_stale_vms_stopped().unwrap();
@@ -3380,7 +3544,7 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
 
         let mut stopped = make_record("vm-stopped");
-        stopped.state = "stopped".into();
+        stopped.state = VmLifecycleState::Stopped;
         store.insert_vm(&stopped).unwrap();
 
         let count = store.mark_stale_vms_stopped().unwrap();
@@ -3400,7 +3564,7 @@ mod tests {
             "suspended",
         ] {
             let mut vm = make_record(&format!("vm-{state}"));
-            vm.state = state.into();
+            vm.state = state.parse().expect("test fixture uses a known VM state");
             vm.pid = Some(4242);
             store.insert_vm(&vm).unwrap();
         }
@@ -3424,7 +3588,7 @@ mod tests {
         store.insert_vm(&running).unwrap();
 
         let mut suspended = make_record("vm-susp");
-        suspended.state = "suspended".into();
+        suspended.state = VmLifecycleState::Suspended;
         store.insert_vm(&suspended).unwrap();
 
         let marked = store.mark_stale_vms_stopped().unwrap();
@@ -4360,7 +4524,7 @@ mod tests {
         let template = Uuid::new_v4();
         let mut template_record = make_record("web-template");
         template_record.id = template;
-        template_record.state = "suspended".into();
+        template_record.state = VmLifecycleState::Suspended;
         template_record.pid = None;
         store.insert_vm(&template_record).unwrap();
         let rec = PoolRecord {
@@ -4441,7 +4605,7 @@ mod tests {
     fn pool_template_cannot_be_reused_or_retired_directly() {
         let store = StateStore::open_memory().unwrap();
         let mut template = make_record("template");
-        template.state = "suspended".into();
+        template.state = VmLifecycleState::Suspended;
         template.pid = None;
         store.insert_vm(&template).unwrap();
         let now = Utc::now();
@@ -4480,7 +4644,7 @@ mod tests {
     fn retiring_a_pool_template_atomically_removes_both_and_releases_its_cid() {
         let store = StateStore::open_memory().unwrap();
         let mut template = make_record("template");
-        template.state = "suspended".into();
+        template.state = VmLifecycleState::Suspended;
         template.pid = None;
         store.insert_vm(&template).unwrap();
         let now = Utc::now();
@@ -4657,6 +4821,50 @@ mod tests {
     }
 
     #[test]
+    fn database_rejects_unknown_vm_lifecycle_states() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("guarded-state");
+        store.insert_vm(&record).unwrap();
+
+        let error = store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE vms SET state = 'teleporting' WHERE id = ?1",
+                params![record.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown VM lifecycle state"));
+        assert_eq!(
+            store.get_vm(record.id).unwrap().state,
+            VmLifecycleState::Running
+        );
+    }
+
+    #[test]
+    fn row_decoder_surfaces_corrupt_vm_lifecycle_state() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("corrupt-state");
+        store.insert_vm(&record).unwrap();
+
+        // Simulate a database corrupted outside Husker by removing the guard.
+        // The typed row boundary must still reject the value instead of passing
+        // an unknown state into lifecycle policy.
+        let conn = store.lock().unwrap();
+        conn.execute_batch("DROP TRIGGER vm_state_must_be_known_on_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE vms SET state = 'teleporting' WHERE id = ?1",
+            params![record.id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store.get_vm(record.id).unwrap_err();
+        assert!(error.to_string().contains("unknown VM lifecycle state"));
+    }
+
+    #[test]
     fn volume_invariant_migration_repairs_legacy_dangling_and_duplicate_attachments() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -4755,7 +4963,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            4
+            MIGRATIONS.last().unwrap().0
         );
     }
 

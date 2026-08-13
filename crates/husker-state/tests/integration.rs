@@ -1,5 +1,5 @@
 use chrono::Utc;
-use husker_state::{PortForwardRecord, StateStore, VmRecord};
+use husker_state::{PortForwardRecord, StateStore, VmLifecycleState, VmRecord};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -7,7 +7,7 @@ fn make_record(name: &str) -> VmRecord {
     VmRecord {
         id: Uuid::new_v4(),
         name: name.into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1234),
         vcpu_count: 2,
         mem_size_mib: 256,

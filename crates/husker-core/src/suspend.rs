@@ -26,16 +26,16 @@ impl<B: VmmBackend> HuskerCore<B> {
         // this same lock on the source name.
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
-        match record.state.as_str() {
-            "running" | "paused" => {}
-            "suspended" => {
+        match record.state {
+            VmLifecycleState::Running | VmLifecycleState::Paused => {}
+            VmLifecycleState::Suspended => {
                 debug!(%name, "VM already suspended; suspend is a no-op");
                 return Ok(());
             }
             _ => {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
-                    actual: record.state,
+                    actual: record.state.to_string(),
                     expected: "running or paused".into(),
                 });
             }
@@ -67,8 +67,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             ))));
         }
 
-        let paused_by_us = record.state == "running";
-        let original_state = record.state.clone();
+        let paused_by_us = record.state == VmLifecycleState::Running;
+        let original_state = record.state;
 
         // Persist the transient "suspending" state up front, BEFORE pausing or
         // capturing anything. A crash anywhere in the capture window then leaves a
@@ -76,7 +76,8 @@ impl<B: VmmBackend> HuskerCore<B> {
         // on-disk slot (a complete slot -> "suspended", an incomplete one ->
         // "stopped"), instead of a "running"/"paused" row that startup downgrades
         // to "stopped" even though a complete, resumable slot exists on disk.
-        self.state.update_vm_state(record.id, "suspending")?;
+        self.state
+            .update_vm_state(record.id, VmLifecycleState::Suspending)?;
 
         let slot = self.suspend_slot_dir(record.id);
         let paths = SnapshotPaths::in_dir(&slot);
@@ -114,7 +115,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             if paused_by_us {
                 let _ = self.vmm.resume_vm(record.id).await;
             }
-            let _ = self.state.update_vm_state(record.id, &original_state);
+            let _ = self.state.update_vm_state(record.id, original_state);
             return Err(e);
         }
 
@@ -124,7 +125,8 @@ impl<B: VmmBackend> HuskerCore<B> {
         // public `destroy_vm`, which also takes `vm_name_lock` and would deadlock
         // re-entering it here.
         self.vmm.destroy_vm(record.id).await?;
-        self.state.update_vm_runtime(record.id, "suspended", None)?;
+        self.state
+            .update_vm_runtime(record.id, VmLifecycleState::Suspended, None)?;
 
         // Stamp the reap anchor before the network transition, so a crash mid
         // transition still leaves a suspended VM whose TTL clock is running.
@@ -249,7 +251,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub async fn reconcile_suspended_vms(&self) -> Result<usize, CoreError> {
         let mut reconciled = 0;
         for vm in self.state.list_vms()? {
-            if vm.state != "suspending" {
+            if vm.state != VmLifecycleState::Suspending {
                 continue;
             }
             // A hard crash between the snapshot write and destroy_vm can leave the
@@ -270,7 +272,8 @@ impl<B: VmmBackend> HuskerCore<B> {
                 && tokio::fs::try_exists(&paths.memory).await.unwrap_or(false)
                 && tokio::fs::try_exists(&paths.vmstate).await.unwrap_or(false);
             let recovered_to = if slot_complete {
-                self.state.update_vm_runtime(vm.id, "suspended", None)?;
+                self.state
+                    .update_vm_runtime(vm.id, VmLifecycleState::Suspended, None)?;
                 "suspended"
             } else {
                 let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(vm.id)).await;
@@ -344,7 +347,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         };
         let restored = self.vmm.restore_vm(&paths, target).await?;
         self.state
-            .update_vm_runtime(record.id, "running", restored.pid)?;
+            .update_vm_runtime(record.id, VmLifecycleState::Running, restored.pid)?;
 
         let _ = tokio::fs::remove_dir_all(&slot).await;
         Ok(())
@@ -380,23 +383,24 @@ impl<B: VmmBackend> HuskerCore<B> {
         // networking, so its resume must not either, and it is not part of
         // the idle-suspend lifecycle (no `suspended_at` to clear, no idle
         // timers to reset).
-        let restoring_from_suspend = record.state == "suspended";
-        match record.state.as_str() {
-            "paused" => {
+        let restoring_from_suspend = record.state == VmLifecycleState::Suspended;
+        match record.state {
+            VmLifecycleState::Paused => {
                 self.vmm.resume_vm(record.id).await?;
-                self.state.update_vm_state(record.id, "running")?;
+                self.state
+                    .update_vm_state(record.id, VmLifecycleState::Running)?;
             }
-            "suspended" => {
+            VmLifecycleState::Suspended => {
                 self.restore_from_suspend(&record).await?;
             }
-            "running" => {
+            VmLifecycleState::Running => {
                 debug!(%name, "VM already running; resume is a no-op");
                 return Ok(false);
             }
             _ => {
                 return Err(CoreError::InvalidState {
                     name: name.into(),
-                    actual: record.state,
+                    actual: record.state.to_string(),
                     expected: "paused or suspended".into(),
                 });
             }

@@ -18,6 +18,7 @@ use tower::ServiceExt;
 
 use husker_api::{VmResponse, metrics_router, router};
 use husker_core::HuskerCore;
+use husker_state::VmLifecycleState;
 
 fn make_core(
     state: husker_state::StateStore,
@@ -100,7 +101,9 @@ async fn health_counts_vms_correctly() {
         let record = husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: format!("health-vm-{i}"),
-            state: (*vm_state).into(),
+            state: vm_state
+                .parse()
+                .expect("test fixture uses a known VM state"),
             pid: Some(1000 + i as u32),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -397,7 +400,7 @@ async fn snapshot_endpoints_roundtrip() {
         .insert_vm(&husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: "snap-vm".into(),
-            state: "stopped".into(),
+            state: VmLifecycleState::Stopped,
             pid: Some(1234),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -925,7 +928,7 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: vm_name.into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1234),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -1087,7 +1090,7 @@ async fn vm_response_json_structure() {
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "shape-test".into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(999),
         vcpu_count: 2,
         mem_size_mib: 256,
@@ -1181,7 +1184,7 @@ async fn list_vms_returns_all_records() {
         let record = husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: format!("vm-{i}"),
-            state: "running".into(),
+            state: VmLifecycleState::Running,
             pid: Some(1000 + i),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -1422,7 +1425,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "pf-test".into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1000),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -1485,7 +1488,7 @@ async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "pf-ok".into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1000),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -1548,7 +1551,7 @@ async fn vm_response_with_null_optional_fields() {
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "null-fields".into(),
-        state: "creating".into(),
+        state: VmLifecycleState::Creating,
         pid: None,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -1630,7 +1633,7 @@ async fn logs_returns_serial_output() {
     let record = husker_state::VmRecord {
         id: vm_id,
         name: "log-test".into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1000),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -1696,7 +1699,7 @@ async fn logs_tail_returns_last_n_lines() {
     let record = husker_state::VmRecord {
         id: vm_id,
         name: "tail-test".into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1000),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -1762,7 +1765,7 @@ async fn logs_no_serial_file_returns_404() {
     let record = husker_state::VmRecord {
         id: vm_id,
         name: "no-log-test".into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1000),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -1830,7 +1833,7 @@ fn logs_test_core(
     let record = husker_state::VmRecord {
         id: vm_id,
         name: vm_name.into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1000),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -2079,7 +2082,7 @@ async fn logs_large_file_is_truncated() {
     let record = husker_state::VmRecord {
         id: vm_id,
         name: "big-log".into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(1000),
         vcpu_count: 1,
         mem_size_mib: 128,

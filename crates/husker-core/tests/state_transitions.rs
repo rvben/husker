@@ -137,7 +137,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
     let record = husker_state::VmRecord {
         id,
         name: name.into(),
-        state: state.into(),
+        state: state.parse().expect("test fixture uses a known VM state"),
         pid: Some(9999),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -460,7 +460,7 @@ async fn lifecycle_property_randomized_transitions() {
         }
 
         let actual = core.get_vm("prop-vm").unwrap().state;
-        assert_eq!(actual, expected);
+        assert_eq!(actual.to_string(), expected);
     }
 }
 

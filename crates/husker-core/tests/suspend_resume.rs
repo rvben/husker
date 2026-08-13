@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use husker_core::{CoreError, CreatePoolRequest, HuskerCore};
+use husker_core::{CoreError, CreatePoolRequest, HuskerCore, VmLifecycleState};
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
     VmmError,
@@ -211,7 +211,7 @@ fn core_with_running_vm_backend(
     let record = husker_state::VmRecord {
         id,
         name: name.into(),
-        state: "running".into(),
+        state: VmLifecycleState::Running,
         pid: Some(9999),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -294,7 +294,7 @@ fn core_store_with_vm(
     let record = husker_state::VmRecord {
         id,
         name: name.into(),
-        state: state.into(),
+        state: state.parse().expect("test fixture uses a known VM state"),
         pid: Some(4242),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -351,7 +351,7 @@ fn vm_state(core: &HuskerCore<SharedRecordingVmm>, id: Uuid) -> String {
         .unwrap()
         .into_iter()
         .find(|v| v.id == id)
-        .map(|v| v.state)
+        .map(|v| v.state.to_string())
         .unwrap_or_else(|| "<missing>".into())
 }
 
@@ -683,7 +683,7 @@ fn core_with_named_pool_template(
     let template = husker_state::VmRecord {
         id: template_id,
         name: template_name.into(),
-        state: "suspended".into(),
+        state: VmLifecycleState::Suspended,
         pid: None,
         vcpu_count: 1,
         mem_size_mib: 512,

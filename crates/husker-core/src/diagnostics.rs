@@ -55,7 +55,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let mut count = 0;
         for vm in vms {
-            if vm.state != "running" && vm.state != "paused" {
+            if !vm.state.is_live() {
                 continue;
             }
             info!(name = %vm.name, state = %vm.state, "draining VM");

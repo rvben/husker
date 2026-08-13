@@ -18,7 +18,7 @@ use husker_core::{
     CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest, DiagnosticsReport,
     ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
     ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
-    ServiceRecord, ShellEvent, SnapshotRecord, VmRecord, VolumeRecord,
+    ServiceRecord, ShellEvent, SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
 };
 use husker_vmm::VmmBackend;
 
@@ -149,7 +149,10 @@ pub(crate) async fn health<B: VmmBackend + 'static>(
     let (total, running, state_db_ok) = match core.list_vms() {
         Ok(vms) => {
             let total = vms.len() as u64;
-            let running = vms.iter().filter(|v| v.state == "running").count() as u64;
+            let running = vms
+                .iter()
+                .filter(|v| v.state == VmLifecycleState::Running)
+                .count() as u64;
             (total, running, true)
         }
         Err(_) => (0, 0, false),
@@ -565,7 +568,7 @@ pub(crate) async fn get_service<B: VmmBackend + 'static>(
             v.service_ordinal.map(|ord| ServiceInstance {
                 name: v.name,
                 ordinal: ord,
-                state: v.state,
+                state: v.state.to_string(),
             })
         })
         .collect();
@@ -2296,7 +2299,11 @@ fn service_to_response<B: VmmBackend + 'static>(
 ) -> ServiceResponse {
     let current_instances = core
         .list_vms_for_service(r.id)
-        .map(|vs| vs.iter().filter(|v| v.state == "running").count() as u32)
+        .map(|vs| {
+            vs.iter()
+                .filter(|v| v.state == VmLifecycleState::Running)
+                .count() as u32
+        })
         .unwrap_or(0);
     ServiceResponse {
         id: r.id.to_string(),
@@ -2360,7 +2367,7 @@ pub(crate) fn record_to_response(r: VmRecord) -> VmResponse {
     VmResponse {
         id: r.id.to_string(),
         name: r.name,
-        state: r.state,
+        state: r.state.to_string(),
         pid: r.pid,
         vcpu_count: r.vcpu_count,
         mem_size_mib: r.mem_size_mib,

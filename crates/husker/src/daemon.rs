@@ -298,7 +298,7 @@ async fn reconcile_host_resources(
     let mut socks = 0usize;
     for vm in &vms {
         // Suspended VMs keep their TAP/sockets/rootfs for resume; leave them.
-        if vm.state == "suspended" {
+        if vm.state == husker_core::VmLifecycleState::Suspended {
             continue;
         }
         #[cfg(feature = "linux-net")]

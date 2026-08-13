@@ -8,10 +8,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     ) -> Result<SnapshotRecord, CoreError> {
         validate_resource_name("snapshot", &req.name)?;
         let vm = self.lookup_vm(&req.vm)?;
-        if vm.state != "stopped" {
+        if vm.state != VmLifecycleState::Stopped {
             return Err(CoreError::InvalidState {
                 name: vm.name,
-                actual: vm.state,
+                actual: vm.state.to_string(),
                 expected: "stopped".into(),
             });
         }

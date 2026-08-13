@@ -124,7 +124,7 @@ fn make_vm_record(
     VmRecord {
         id,
         name: name.into(),
-        state: state.into(),
+        state: state.parse().expect("test fixture uses a known VM state"),
         pid: if state == "running" { Some(9999) } else { None },
         vcpu_count: 1,
         mem_size_mib: 128,
