@@ -83,6 +83,8 @@ Primary file:
 
 ### 5. Eliminate parallel CLI schema policy — Worth exploring
 
+Status: implemented after daemon target resolution.
+
 Clap definitions, hand-maintained schema annotations, emitted JSON, and output
 documentation form parallel sources of truth. The schema currently declares
 every output field as a string even when the emitted value is numeric or
@@ -113,9 +115,11 @@ Primary file:
 
 ## Recommended order
 
-The first four recommendations are complete: daemon adapter, complete Job
-lifecycle, VM creation planning, and daemon target resolution. The strongest
-next improvement is eliminating parallel CLI schema policy.
+The first five recommendations are complete: daemon adapter, complete Job
+lifecycle, VM creation planning, daemon target resolution, and CLI contract
+policy. The strongest remaining candidate is daemon runtime assembly, although
+it remains speculative and should be pressure-tested against the platform ADRs
+before implementation.
 
 ## Implementation note
 
@@ -151,3 +155,14 @@ quietly reconstruct clients with different authentication or timeout policy.
 Local-only commands return before daemon resolution, host-local operations
 reject remote targets before opening a tunnel, and an SSH tunnel's loopback
 endpoint can no longer make the remote daemon appear local.
+
+The new CLI contract module provides the test surface for mutation policy,
+structured-output fields and types, and the finite stable error vocabulary. An
+exhaustive registry beside the Clap definitions gives the policy locality: a
+missing, duplicate, or stale command contract now fails the deletion test.
+Clispec argument types and defaults are derived from Clap's actual parsers, and
+JSON payloads are validated through the registry before rendering. List fields
+follow clispec v0.2 item semantics, documentation examples are executable
+contract samples, unsupported structured modes fail cleanly, and unknown
+daemon-specific error kinds normalize at the CLI seam. ADR-0007 records the
+compatibility policy.
