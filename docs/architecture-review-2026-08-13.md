@@ -219,3 +219,12 @@ and attempts both NAT and bridge teardown after every later outcome, preserving
 the original runtime error over secondary cleanup failures. Runtime-ordering,
 stuck-worker, error-precedence, and resume-listener tests make the interface the
 test surface. ADR-0008 records the lifecycle and platform ownership policy.
+
+The operational pressure-test now has a repeatable privileged Linux drill. It
+induces an API bind failure after bridge/NAT initialization and separately sends
+SIGTERM to a healthy daemon, then asserts the observable worker-stop, drain,
+nftables-removal, and bridge-deletion order plus the absence of leaked network
+and metrics resources. The drill passed on x86_64 Linux with CAP_NET_ADMIN on
+2026-08-13 and runs nightly in the isolated self-hosted E2E workflow. That host
+did not expose KVM, so the manual run did not claim a real-VM drain; the nightly
+workflow remains the KVM-backed integration boundary.

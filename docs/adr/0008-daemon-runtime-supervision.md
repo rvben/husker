@@ -42,5 +42,9 @@ shutdown behavior.
 - Suspended VMs cannot auto-resume through a forwarded connection during drain.
 - Shutdown ordering and failure precedence are testable through the runtime
   interface without installing operating-system signal handlers.
+- A privileged Linux drill exercises both a post-network API bind failure and
+  SIGTERM, asserting worker/drain/cleanup ordering and the absence of leaked
+  bridge, nftables, and metrics resources. It runs nightly on the isolated
+  self-hosted E2E runner.
 - Platform networking remains explicit and consistent with ADR-0001 and
   ADR-0005.
