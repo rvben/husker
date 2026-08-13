@@ -225,6 +225,12 @@ induces an API bind failure after bridge/NAT initialization and separately sends
 SIGTERM to a healthy daemon, then asserts the observable worker-stop, drain,
 nftables-removal, and bridge-deletion order plus the absence of leaked network
 and metrics resources. The drill passed on x86_64 Linux with CAP_NET_ADMIN on
-2026-08-13 and runs nightly in the isolated self-hosted E2E workflow. That host
-did not expose KVM, so the manual run did not claim a real-VM drain; the nightly
-workflow remains the KVM-backed integration boundary.
+2026-08-13 and runs nightly in the isolated self-hosted E2E workflow. A second
+run on the dedicated KVM host booted a real Firecracker VM and exposed one last
+contract gap: `stop_vm` returned after accepting Ctrl-Alt-Del, before the VMM
+released its TAP. Firecracker stop now waits five seconds for guest exit, then
+force-kills and reaps the process; Linux shutdown immediately releases the
+drained VM's retained TAP/IP/forwarding state before deleting its bridge. The
+rerun proved VMM and TAP removal, persisted `stopped` state across a daemon
+restart, no VM resurrection, complete host-network cleanup, and no impact to
+the co-located production daemon or VM.

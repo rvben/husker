@@ -31,6 +31,12 @@ shutdown behavior.
 - After serving ends for either success or failure, the runtime stops workers,
   closes auto-resume ingress without servicing queued connections, and drains
   running or paused VMs. It then returns the original serving result.
+- A Firecracker stop is complete only after the VMM process exits. The backend
+  waits up to five seconds after `SendCtrlAltDel`, then force-kills and reaps the
+  process so host resources are no longer held when cleanup begins.
+- On Linux, shutdown immediately releases the TAP, IP, and forwarding state of
+  terminal VMs after drain. The normal grace period for inspecting a recently
+  stopped VM remains unchanged during ordinary daemon operation.
 - Linux cgroup initialization happens before bridge creation. After a bridge is
   created, every later result flows through both NAT cleanup and bridge deletion.
   A runtime error remains primary; otherwise a cleanup failure is returned.
@@ -42,9 +48,10 @@ shutdown behavior.
 - Suspended VMs cannot auto-resume through a forwarded connection during drain.
 - Shutdown ordering and failure precedence are testable through the runtime
   interface without installing operating-system signal handlers.
-- A privileged Linux drill exercises both a post-network API bind failure and
-  SIGTERM, asserting worker/drain/cleanup ordering and the absence of leaked
-  bridge, nftables, and metrics resources. It runs nightly on the isolated
-  self-hosted E2E runner.
+- A privileged Linux drill exercises a post-network API bind failure, empty
+  SIGTERM, and a live-Firecracker SIGTERM. It asserts worker/drain/cleanup
+  ordering, VMM exit, persisted stopped state across restart, and the absence of
+  leaked TAP, bridge, nftables, and metrics resources. The live-VM scenario is
+  mandatory on the nightly self-hosted KVM runner.
 - Platform networking remains explicit and consistent with ADR-0001 and
   ADR-0005.
