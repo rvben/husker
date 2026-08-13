@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 mod cli;
+mod cli_contract;
 mod config;
 mod daemon;
 mod daemon_client;
@@ -21,6 +22,9 @@ mod schema;
 mod vm_creation;
 
 use crate::cli::*;
+#[cfg(test)]
+use crate::cli_contract::command_contract;
+use crate::cli_contract::{normalize_error_kind, structured_output};
 use crate::config::*;
 use crate::daemon::*;
 use crate::daemon_client::{ApiFailure, DaemonClient, DaemonUnreachable};
@@ -93,10 +97,12 @@ fn doctor_exit_code(report: &husker_core::DiagnosticsReport) -> i32 {
 }
 
 /// Render a diagnostics report as `[ok/warn/FAIL] name: message` lines (text)
-/// or a JSON array (JSON format).
+/// or the diagnostics JSON object (JSON format).
 fn render_diagnostics(report: &husker_core::DiagnosticsReport, format: OutputFormat) {
     if format == OutputFormat::Json {
-        println!("{}", serde_json::to_string_pretty(report).unwrap());
+        let report =
+            structured_output("doctor", report).expect("doctor output must match its CLI contract");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return;
     }
     for c in &report.checks {
@@ -386,6 +392,7 @@ fn resolve_api_token(cli_api_token: Option<String>, config_path: Option<&Path>) 
     cli_api_token.or_else(|| load_config(config_path).api_token)
 }
 
+#[cfg(test)]
 fn render_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<str>) -> String {
     if resolve_format(format) == OutputFormat::Json {
         serde_json::to_string_pretty(value).expect("json serialization should succeed")
@@ -394,30 +401,45 @@ fn render_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef
     }
 }
 
-fn exit_code_to_kind(exit_code: i32) -> &'static str {
-    match exit_code {
-        exit_code::NOT_FOUND => "not_found",
-        exit_code::CONFLICT => "conflict",
-        exit_code::DENIED => "permission_denied",
-        exit_code::DAEMON_UNREACHABLE => "daemon_unreachable",
-        exit_code::CONFIRMATION_REQUIRED => "confirmation_required",
-        _ => "error",
+fn print_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<str>) {
+    if resolve_format(format) == OutputFormat::Json {
+        let value = serde_json::to_value(value).expect("JSON output must serialize");
+        let path = command_path_for_output(&value)
+            .expect("structured output must identify one CLI command contract");
+        let value = structured_output(path, &value).expect("structured output must match clispec");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("JSON output must serialize")
+        );
+    } else {
+        println!("{}", text.as_ref());
     }
 }
 
-fn print_output<T: Serialize>(format: OutputFormat, value: &T, text: impl AsRef<str>) {
-    println!("{}", render_output(format, value, text));
+fn command_path_for_output(value: &serde_json::Value) -> Option<&'static str> {
+    if let Some(action) = value.get("action").and_then(serde_json::Value::as_str) {
+        return COMMAND_CONTRACTS
+            .iter()
+            .find(|contract| contract.path.replace(' ', "-") == action)
+            .map(|contract| contract.path);
+    }
+    if value.get("items").is_some() {
+        Some("list")
+    } else if value.get("contexts").is_some() {
+        Some("context list")
+    } else if value.get("current").is_some() {
+        Some("context show")
+    } else {
+        None
+    }
 }
 
 fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
     let err = error.into();
-    let kind = err
-        .kind
-        .as_deref()
-        .unwrap_or_else(|| exit_code_to_kind(err.exit_code));
+    let kind = normalize_error_kind(err.kind.as_deref(), err.exit_code);
     // The structured error envelope is always written to stderr as the last line.
     // Human-readable text mode also puts errors on stderr (no stdout pollution).
-    let structured = render_error_envelope(kind, &err.message, err.hint.as_deref());
+    let structured = render_error_envelope(kind.name(), &err.message, err.hint.as_deref());
     if resolve_format(format) == OutputFormat::Json {
         eprintln!("{structured}");
     } else {
@@ -679,6 +701,23 @@ async fn run(cli: Cli) -> Result<()> {
         return context_command(action, output);
     }
 
+    if output == OutputFormat::Json
+        && matches!(
+            &command,
+            Commands::Daemon { .. }
+                | Commands::Shell { .. }
+                | Commands::Setup {
+                    action: SetupAction::Storage { .. }
+                }
+                | Commands::Completions { .. }
+        )
+    {
+        exit_with_error(
+            output,
+            "this command does not support --output json; use text output",
+        );
+    }
+
     // These commands are entirely local and must not resolve a saved context,
     // validate a remote URL, or establish an SSH tunnel.
     if let Commands::Config { action } = command {
@@ -695,9 +734,10 @@ async fn run(cli: Cli) -> Result<()> {
         };
     }
     if matches!(command, Commands::Schema) {
+        let schema = structured_output("schema", &build_cli_schema())?;
         println!(
             "{}",
-            serde_json::to_string_pretty(&build_cli_schema()).expect("schema serializes")
+            serde_json::to_string_pretty(&schema).expect("schema serializes")
         );
         return Ok(());
     }
@@ -3294,7 +3334,7 @@ async fn image_command(
                 .await
                 .context("resolving images release URL")?;
             if base_url != configured {
-                println!("Resolved {configured} -> {base_url}");
+                eprintln!("Resolved {configured} -> {base_url}");
             }
             let manifest = husker::images::fetch_manifest(&base_url)
                 .await
@@ -3320,21 +3360,21 @@ async fn image_command(
             // (re)download all of them from this manifest so the set stays matched.
             let all_present = targets.iter().all(|(_, dest)| dest.exists());
             if all_present && !force {
-                println!("All default images already present (pass --force to re-download).");
+                eprintln!("All default images already present (pass --force to re-download).");
             } else {
                 for (asset, dest) in &targets {
                     let sha = manifest.get(asset).ok_or_else(|| {
                         anyhow::anyhow!("{asset} missing from manifest at {base_url}")
                     })?;
                     let url = format!("{}/{}", base_url.trim_end_matches('/'), asset);
-                    println!("Downloading {url} -> {}", dest.display());
+                    eprintln!("Downloading {url} -> {}", dest.display());
                     husker::images::fetch_and_verify(husker::images::DownloadSpec {
                         url,
                         expected_sha256: sha.clone(),
                         dest: dest.clone(),
                     })
                     .await?;
-                    println!("Verified {}", dest.display());
+                    eprintln!("Verified {}", dest.display());
                 }
             }
 
@@ -5834,7 +5874,7 @@ mod tests {
             .as_array()
             .expect("commands must be an array");
         let balloon =
-            find_leaf_command(cmds, "balloon").expect("balloon command must exist in schema");
+            find_command_path(cmds, "balloon").expect("balloon command must exist in schema");
         assert!(balloon.is_object());
         assert_eq!(balloon["mutating"], true, "balloon is a mutating command");
         let fields = balloon["output_fields"].as_array().unwrap();
@@ -6124,14 +6164,15 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(&rendered).expect("envelope must be valid JSON");
     }
 
-    /// Find a command by its canonical full path.
-    fn find_leaf_command<'a>(
+    /// Find a command by its canonical full path so repeated leaf names such as
+    /// `list`, `get`, and `delete` cannot make semantic tests ambiguous.
+    fn find_command_path<'a>(
         commands: &'a [serde_json::Value],
-        name: &str,
+        path: &str,
     ) -> Option<&'a serde_json::Value> {
         commands
             .iter()
-            .find(|command| command.get("name").and_then(|value| value.as_str()) == Some(name))
+            .find(|command| command.get("name").and_then(|name| name.as_str()) == Some(path))
     }
 
     #[test]
@@ -6157,9 +6198,9 @@ mod tests {
         assert!(!cmds.is_empty());
 
         // Leaf commands are derived from clap.
-        let run_cmd = find_leaf_command(cmds, "run").expect("run command must exist");
+        let run_cmd = find_command_path(cmds, "run").expect("run command must exist");
         assert!(run_cmd.is_object());
-        let schema_cmd = find_leaf_command(cmds, "schema").expect("schema command must exist");
+        let schema_cmd = find_command_path(cmds, "schema").expect("schema command must exist");
         assert!(schema_cmd.is_object());
 
         assert!(
@@ -6167,13 +6208,13 @@ mod tests {
                 .all(|command| command.get("subcommands").is_none())
         );
         let pull_cmd =
-            find_leaf_command(cmds, "image pull").expect("image pull command must exist");
+            find_command_path(cmds, "image pull").expect("image pull command must exist");
         assert!(pull_cmd.is_object());
 
         // Mutating annotations: writes are mutating, getters/lists are not.
         assert_eq!(run_cmd["mutating"], true);
         assert_eq!(pull_cmd["mutating"], true);
-        let list_cmd = find_leaf_command(cmds, "list").expect("list command must exist");
+        let list_cmd = find_command_path(cmds, "list").expect("list command must exist");
         assert_eq!(list_cmd["mutating"], false);
         assert_eq!(schema_cmd["mutating"], false);
 
@@ -6184,7 +6225,7 @@ mod tests {
         // Nested commands inherit their parent's arguments: `port-forward add`
         // requires the parent VM `name` as well as its own ports.
         let pf_add =
-            find_leaf_command(cmds, "port-forward add").expect("port-forward add must exist");
+            find_command_path(cmds, "port-forward add").expect("port-forward add must exist");
         let pf_args = pf_add["args"].as_array().unwrap();
         assert!(pf_args.iter().any(|a| a["name"] == "name"));
         assert!(pf_args.iter().any(|a| a["name"] == "host_port"));
@@ -6220,7 +6261,7 @@ mod tests {
             .as_array()
             .expect("commands must be an array");
 
-        let vol_get = find_leaf_command(cmds, "volume get").expect("volume get leaf must exist");
+        let vol_get = find_command_path(cmds, "volume get").expect("volume get leaf must exist");
         assert!(vol_get.is_object());
         assert_eq!(vol_get["mutating"], false);
         let fields = vol_get["output_fields"].as_array().unwrap();
@@ -6237,7 +6278,7 @@ mod tests {
             .expect("commands must be an array");
         // suspend must be present as a leaf command
         let suspend =
-            find_leaf_command(cmds, "suspend").expect("suspend command must exist in schema");
+            find_command_path(cmds, "suspend").expect("suspend command must exist in schema");
         assert!(suspend.is_object());
         // suspend is a state-changing operation and must be marked mutating
         assert_eq!(suspend["mutating"], true, "suspend must be mutating");
@@ -7586,11 +7627,11 @@ default_auto_resume = false
         );
     }
 
-    // ── schema_command_annotations: profile list ─────────────────────────
+    // ── command contract: profile list ───────────────────────────────────
 
     #[test]
-    fn schema_annotation_profile_list_is_non_mutating() {
-        let (mutating, _fields) = schema_command_annotations("profile list");
+    fn command_contract_profile_list_is_non_mutating() {
+        let mutating = command_contract("profile list").unwrap().mutating;
         assert!(
             !mutating,
             "profile list is a read-only introspection command and must not be marked mutating"
@@ -7598,18 +7639,18 @@ default_auto_resume = false
     }
 
     #[test]
-    fn schema_annotation_profile_list_has_output_fields() {
-        let (_mutating, fields) = schema_command_annotations("profile list");
+    fn command_contract_profile_list_has_output_fields() {
+        let fields = command_contract("profile list").unwrap().clispec_fields();
         assert!(
-            fields.contains(&"status"),
+            fields.iter().any(|field| field.name == "status"),
             "profile list output must include 'status'"
         );
         assert!(
-            fields.contains(&"action"),
+            fields.iter().any(|field| field.name == "action"),
             "profile list output must include 'action'"
         );
         assert!(
-            fields.contains(&"profiles"),
+            fields.iter().any(|field| field.name == "profiles"),
             "profile list output must include 'profiles'"
         );
     }
@@ -7667,12 +7708,11 @@ default_auto_resume = false
     }
 
     #[test]
-    fn setup_storage_in_schema_is_read_only() {
-        // build_cli_schema derives from clap; the annotation marks setup storage read-only.
-        let (mutating, _fields) = schema_command_annotations("setup storage");
+    fn setup_storage_in_schema_is_mutating() {
+        let mutating = command_contract("setup storage").unwrap().mutating;
         assert!(
-            !mutating,
-            "setup storage only prints/writes files; must be read-only"
+            mutating,
+            "setup storage can write scripts with --out and cannot be auto-approved as read-only"
         );
     }
 }

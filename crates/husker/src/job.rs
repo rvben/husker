@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::cli::OutputFormat;
+use crate::cli_contract::structured_output;
 use crate::daemon_client::{ApiFailure, DaemonClient};
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::exit_code;
@@ -514,7 +515,11 @@ fn render_outcome(
     lifecycle_failed: bool,
 ) {
     if req.output == OutputFormat::Json {
-        let payload = outcome_json(req.name, outcome, retrieval_failure, lifecycle_failed);
+        let payload = structured_output(
+            "job",
+            &outcome_json(req.name, outcome, retrieval_failure, lifecycle_failed),
+        )
+        .expect("job output must match its CLI contract");
         println!(
             "{}",
             serde_json::to_string_pretty(&payload).expect("job output must serialize")

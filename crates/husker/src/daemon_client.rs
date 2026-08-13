@@ -178,16 +178,15 @@ impl DaemonClient {
             _ => exit_code::GENERAL,
         };
         let mut kind = None;
+        let mut hint = None;
         let message = match response.text().await {
             Ok(body) if !body.is_empty() => {
                 match serde_json::from_str::<serde_json::Value>(&body) {
                     Ok(json) => {
                         kind = json["kind"].as_str().map(String::from);
                         if let Some(message) = json["message"].as_str() {
-                            match json["hint"].as_str() {
-                                Some(hint) => format!("{message} (hint: {hint})"),
-                                None => message.to_string(),
-                            }
+                            hint = json["hint"].as_str().map(String::from);
+                            message.to_string()
                         } else if let Some(message) = json["error"].as_str() {
                             message.to_string()
                         } else {
@@ -207,7 +206,7 @@ impl DaemonClient {
             message,
             kind,
             exit_code,
-            hint: None,
+            hint,
         }
     }
 
@@ -324,7 +323,8 @@ mod tests {
 
         assert_eq!(failure.kind.as_deref(), Some("vm_conflict"));
         assert_eq!(failure.exit_code, exit_code::CONFLICT);
-        assert_eq!(failure.message, "VM is busy (hint: stop it first)");
+        assert_eq!(failure.message, "VM is busy");
+        assert_eq!(failure.hint.as_deref(), Some("stop it first"));
         task.abort();
     }
 

@@ -8,6 +8,40 @@ use assert_cmd::Command;
 /// is fully self-contained.
 const CLISPEC_V03_SCHEMA: &str = include_str!("fixtures/clispec-v0.3.json");
 
+fn schema_document() -> serde_json::Value {
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .arg("schema")
+        .output()
+        .expect("husker schema should run");
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).expect("husker schema should emit JSON")
+}
+
+fn command_at_path<'a>(document: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+    let mut commands = document["commands"].as_array().expect("commands array");
+    let mut command = None;
+    for name in path.split(' ') {
+        command = commands
+            .iter()
+            .find(|command| command["name"].as_str() == Some(name));
+        let found = command.unwrap_or_else(|| panic!("missing command path '{path}'"));
+        if let Some(subcommands) = found.get("subcommands").and_then(|value| value.as_array()) {
+            commands = subcommands;
+        }
+    }
+    command.expect("path contains at least one command")
+}
+
+fn named_entry<'a>(entries: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    entries
+        .as_array()
+        .expect("metadata array")
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("missing metadata entry '{name}'"))
+}
+
 #[test]
 fn schema_command_produces_valid_json() {
     let output = Command::cargo_bin("husker")
@@ -195,5 +229,86 @@ fn schema_global_args_is_array() {
             arg.get("type").and_then(|t| t.as_str()).is_some(),
             "global arg '{name}' should have a type"
         );
+    }
+}
+
+#[test]
+fn schema_uses_semantic_output_types_and_full_command_paths() {
+    let document = schema_document();
+
+    let run = command_at_path(&document, "run");
+    assert_eq!(named_entry(&run["output_fields"], "vm")["type"], "object");
+    assert_eq!(
+        named_entry(&run["output_fields"], "userdata_queued")["type"],
+        "boolean"
+    );
+
+    let balloon = command_at_path(&document, "balloon");
+    assert_eq!(
+        named_entry(&balloon["output_fields"], "amount_mib")["type"],
+        "integer"
+    );
+
+    let list = command_at_path(&document, "list");
+    assert_eq!(
+        named_entry(&list["output_fields"], "vcpu_count")["type"],
+        "integer"
+    );
+    assert_eq!(
+        named_entry(&list["output_fields"], "auto_resume")["type"],
+        "boolean|null"
+    );
+
+    let port_forward_add = command_at_path(&document, "port-forward add");
+    assert_eq!(
+        named_entry(&port_forward_add["output_fields"], "host_port")["type"],
+        "integer"
+    );
+    assert!(port_forward_add["mutating"].as_bool().unwrap());
+
+    let setup_storage = command_at_path(&document, "setup storage");
+    assert_eq!(setup_storage["mutating"], true);
+}
+
+#[test]
+fn schema_derives_argument_types_and_defaults_from_clap() {
+    let document = schema_document();
+    let run = command_at_path(&document, "run");
+    assert_eq!(named_entry(&run["args"], "rootfs")["type"], "path");
+    assert_eq!(
+        named_entry(&run["args"], "--idle-timeout")["type"],
+        "integer"
+    );
+    assert_eq!(named_entry(&run["args"], "--env-file")["type"], "path[]");
+
+    let list = command_at_path(&document, "list");
+    let limit = named_entry(&list["args"], "--limit");
+    assert_eq!(limit["type"], "integer");
+    assert_eq!(limit["default"], 100);
+}
+
+#[test]
+fn schema_advertises_every_stable_cli_error_kind() {
+    let document = schema_document();
+    let kinds: std::collections::BTreeSet<&str> = document["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|error| error["kind"].as_str())
+        .collect();
+
+    for kind in [
+        "error",
+        "not_found",
+        "invalid_usage",
+        "conflict",
+        "permission_denied",
+        "daemon_unreachable",
+        "confirmation_required",
+        "out_matched_nothing",
+        "job_cleanup_failed",
+        "vm_not_running",
+    ] {
+        assert!(kinds.contains(kind), "missing error kind '{kind}'");
     }
 }

@@ -15,14 +15,15 @@
 
 - Default text output is human-oriented and may improve wording.
 - `--output json` is contract-oriented:
-  - top-level `status` field is stable
+  - `husker schema` is the canonical machine-readable command contract
   - command payload keys are additive-only within a major release
-  - error JSON always includes `status=error` and `error`
+  - documented field types are stable within a major release
+  - error JSON always uses `{ "error": { "kind", "message", "hint"? } }`
 
 ## Error contract
 
 - API error schema uses:
-  - `code`
+  - `kind`
   - `message`
   - optional `hint`
   - optional `details`

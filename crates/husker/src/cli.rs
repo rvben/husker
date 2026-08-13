@@ -1033,3 +1033,448 @@ pub(crate) enum SecretAction {
         yes: bool,
     },
 }
+
+// Semantic command metadata lives beside the clap definitions. Adding or
+// removing a clap leaf without updating this registry fails the contract
+// coverage test in `schema.rs`; there is deliberately no default policy.
+use crate::cli_contract::{CommandContract, FieldContract as F, JsonType as T};
+
+const VM_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+];
+const NAMED_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("name", T::String),
+];
+const RUN_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::Object),
+    F::required("userdata_queued", T::Boolean),
+];
+const VM_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("state", T::String),
+    F::optional("pid", T::NullableInteger),
+    F::required("vcpu_count", T::Integer),
+    F::required("mem_size_mib", T::Integer),
+    F::required("vsock_cid", T::Integer),
+    F::optional("host_ip", T::NullableString),
+    F::optional("guest_ip", T::NullableString),
+    F::required("created_at", T::String),
+    F::required("updated_at", T::String),
+    F::optional("userdata_status", T::NullableString),
+    F::required("vmm", T::String),
+    F::required("boot_mode", T::String),
+    F::required("rootfs_path", T::String),
+    F::required("kernel_path", T::String),
+    F::optional("volume", T::NullableString),
+    F::required("network", T::String),
+    F::optional("idle_timeout_secs", T::NullableInteger),
+    F::optional("suspend_ttl_secs", T::NullableInteger),
+    F::optional("auto_resume", T::NullableBoolean),
+    F::optional("suspended_at", T::NullableString),
+];
+const VM_LIST: &[F] = &[
+    F::required("items", T::Array),
+    F::required("total", T::Integer),
+    F::required("limit", T::Integer),
+    F::required("offset", T::Integer),
+    F::required("daemon_reachable", T::Boolean),
+];
+const INFO_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::Object),
+];
+const FORK_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("source", T::String),
+    F::required("vm", T::String),
+    F::required("guest_ip", T::NullableString),
+];
+const BALLOON_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("amount_mib", T::Integer),
+];
+const EXEC_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("result", T::Object),
+];
+const JOB_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("exit_code", T::Integer),
+    F::required("stdout", T::String),
+    F::required("stderr", T::String),
+    F::optional("retrieval", T::Object),
+];
+const CP_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("direction", T::String),
+    F::required("vm", T::String),
+    F::required("path", T::String),
+    F::required("bytes", T::Integer),
+    F::optional("destination", T::String),
+];
+const LOGS_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("follow", T::Boolean),
+    F::required("tail", T::NullableInteger),
+    F::required("logs", T::String),
+];
+const WAIT_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("ready", T::Boolean),
+];
+const VERSION_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("client_version", T::String),
+    F::required("daemon", T::NullableObject),
+];
+const PROFILE_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("profiles", T::Object),
+];
+const CONTEXT_ITEM: &[F] = &[
+    F::required("name", T::String),
+    F::required("api_url", T::String),
+    F::required("current", T::Boolean),
+];
+const CONTEXT_LIST: &[F] = &[F::required("contexts", T::Array)];
+const CONTEXT_ADD: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("name", T::String),
+    F::required("api_url", T::String),
+];
+const CONTEXT_SHOW: &[F] = &[
+    F::required("current", T::NullableString),
+    F::optional("api_url", T::String),
+];
+const DOCTOR_OUTPUT: &[F] = &[F::required("checks", T::Array)];
+const PF_ADD: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("host_port", T::Integer),
+    F::required("guest_port", T::Integer),
+    F::required("bind_addr", T::NullableString),
+];
+const PF_REMOVE: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("host_port", T::Integer),
+];
+const PF_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("forwards", T::Array),
+];
+const PF_ITEM: &[F] = &[
+    F::required("host_port", T::Integer),
+    F::required("guest_port", T::Integer),
+    F::required("protocol", T::String),
+    F::required("bind_addr", T::NullableString),
+    F::required("created_at", T::String),
+];
+const HOST_GROUP_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("host_group", T::Object),
+];
+const HOST_GROUP_DELETE: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("host_group", T::String),
+];
+const HOST_GROUP_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("host_groups", T::Array),
+];
+const HOST_GROUP_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("description", T::NullableString),
+    F::required("created_at", T::String),
+    F::required("updated_at", T::String),
+];
+const SERVICE_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("service", T::Object),
+    F::optional("outcome", T::Object),
+];
+const SERVICE_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("services", T::Array),
+];
+const SERVICE_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("host_group_id", T::NullableString),
+    F::required("desired_instances", T::Integer),
+    F::required("current_instances", T::Integer),
+    F::required("image", T::NullableString),
+    F::required("rootfs_path", T::String),
+    F::required("kernel_path", T::String),
+    F::required("created_at", T::String),
+    F::required("updated_at", T::String),
+    F::optional("cloud_image", T::NullableString),
+    F::optional("disk_size", T::NullableInteger),
+    F::required("balloon", T::Boolean),
+    F::optional("volume", T::NullableString),
+];
+const SERVICE_DELETE: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("name", T::String),
+    F::required("outcome", T::Object),
+];
+const POOL_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("pool", T::Object),
+];
+const POOL_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("pools", T::Array),
+];
+const POOL_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("template_vm_id", T::String),
+    F::required("rootfs_path", T::String),
+    F::required("kernel_path", T::String),
+    F::optional("initrd_path", T::NullableString),
+    F::optional("vcpu_count", T::NullableInteger),
+    F::optional("mem_size_mib", T::NullableInteger),
+    F::required("created_at", T::String),
+    F::required("updated_at", T::String),
+];
+const POOL_CHECKOUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::Object),
+];
+const SNAPSHOT_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("snapshot", T::Object),
+];
+const SNAPSHOT_DELETE: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("snapshot", T::String),
+];
+const SNAPSHOT_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("snapshots", T::Array),
+];
+const SNAPSHOT_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("source_vm_name", T::String),
+    F::required("file_path", T::String),
+    F::required("created_at", T::String),
+];
+const SNAPSHOT_RESTORE: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("snapshot", T::String),
+    F::required("vm", T::Object),
+];
+const IMAGE_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("image", T::Object),
+];
+const IMAGE_DELETE: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("image", T::String),
+];
+const IMAGE_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("images", T::Array),
+];
+const IMAGE_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("source_path", T::String),
+    F::required("file_path", T::String),
+    F::required("format", T::String),
+    F::required("kind", T::String),
+    F::required("size_bytes", T::Integer),
+    F::required("created_at", T::String),
+];
+const IMAGE_EXPORT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("image", T::String),
+    F::required("export", T::Object),
+];
+const IMAGE_PULL: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("kernel", T::String),
+    F::required("rootfs", T::String),
+    F::required("initrd", T::NullableString),
+];
+const VOLUME_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("volume", T::Object),
+];
+const VOLUME_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("volumes", T::Array),
+];
+const VOLUME_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("file_path", T::String),
+    F::required("size_bytes", T::Integer),
+    F::required("created_at", T::String),
+];
+const SECRET_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("secret", T::Object),
+];
+const SECRET_DELETE: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("secret", T::String),
+];
+const SECRET_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("secrets", T::Array),
+];
+const SECRET_ITEM: &[F] = &[
+    F::required("id", T::String),
+    F::required("name", T::String),
+    F::required("created_at", T::String),
+    F::required("updated_at", T::String),
+];
+
+pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
+    CommandContract::unsupported("daemon", true),
+    CommandContract::object("run", true, RUN_OUTPUT),
+    CommandContract::list("list", false, VM_LIST, "items", VM_ITEM),
+    CommandContract::object("info", false, INFO_OUTPUT),
+    CommandContract::object("stop", true, VM_ACTION),
+    CommandContract::object("pause", true, VM_ACTION),
+    CommandContract::object("resume", true, VM_ACTION),
+    CommandContract::object("suspend", true, VM_ACTION),
+    CommandContract::object("fork", true, FORK_OUTPUT),
+    CommandContract::object("destroy", true, VM_ACTION),
+    CommandContract::object("balloon", true, BALLOON_OUTPUT),
+    CommandContract::object("exec", true, EXEC_OUTPUT),
+    CommandContract::object("job", true, JOB_OUTPUT),
+    CommandContract::object("cp", true, CP_OUTPUT),
+    CommandContract::object("port-forward add", true, PF_ADD),
+    CommandContract::object("port-forward remove", true, PF_REMOVE),
+    CommandContract::list("port-forward list", false, PF_LIST, "forwards", PF_ITEM),
+    CommandContract::object("host-group create", true, HOST_GROUP_ACTION),
+    CommandContract::list(
+        "host-group list",
+        false,
+        HOST_GROUP_LIST,
+        "host_groups",
+        HOST_GROUP_ITEM,
+    ),
+    CommandContract::object("host-group get", false, HOST_GROUP_ACTION),
+    CommandContract::object("host-group delete", true, HOST_GROUP_DELETE),
+    CommandContract::object("service create", true, SERVICE_ACTION),
+    CommandContract::list(
+        "service list",
+        false,
+        SERVICE_LIST,
+        "services",
+        SERVICE_ITEM,
+    ),
+    CommandContract::object("service get", false, SERVICE_ACTION),
+    CommandContract::object("service scale", true, SERVICE_ACTION),
+    CommandContract::object("service delete", true, SERVICE_DELETE),
+    CommandContract::object("pool create", true, POOL_ACTION),
+    CommandContract::list("pool list", false, POOL_LIST, "pools", POOL_ITEM),
+    CommandContract::object("pool get", false, POOL_ACTION),
+    CommandContract::object("pool checkout", true, POOL_CHECKOUT),
+    CommandContract::object("pool delete", true, NAMED_ACTION),
+    CommandContract::object("snapshot create", true, SNAPSHOT_ACTION),
+    CommandContract::list(
+        "snapshot list",
+        false,
+        SNAPSHOT_LIST,
+        "snapshots",
+        SNAPSHOT_ITEM,
+    ),
+    CommandContract::object("snapshot get", false, SNAPSHOT_ACTION),
+    CommandContract::object("snapshot restore", true, SNAPSHOT_RESTORE),
+    CommandContract::object("snapshot delete", true, SNAPSHOT_DELETE),
+    CommandContract::object("image import", true, IMAGE_ACTION),
+    CommandContract::object("image import-oci", true, IMAGE_ACTION),
+    CommandContract::list("image list", false, IMAGE_LIST, "images", IMAGE_ITEM),
+    CommandContract::object("image get", false, IMAGE_ACTION),
+    CommandContract::object("image export", true, IMAGE_EXPORT),
+    CommandContract::object("image delete", true, IMAGE_DELETE),
+    CommandContract::object("image pull", true, IMAGE_PULL),
+    CommandContract::object("volume create", true, VOLUME_ACTION),
+    CommandContract::list("volume list", false, VOLUME_LIST, "volumes", VOLUME_ITEM),
+    CommandContract::object("volume get", false, VOLUME_ACTION),
+    CommandContract::object("volume delete", true, NAMED_ACTION),
+    CommandContract::object("secret create", true, SECRET_ACTION),
+    CommandContract::list("secret list", false, SECRET_LIST, "secrets", SECRET_ITEM),
+    CommandContract::object("secret get", false, SECRET_ACTION),
+    CommandContract::object("secret reveal", false, SECRET_ACTION),
+    CommandContract::object("secret rotate", true, SECRET_ACTION),
+    CommandContract::object("secret delete", true, SECRET_DELETE),
+    CommandContract::unsupported("shell", true),
+    CommandContract::object("logs", false, LOGS_OUTPUT),
+    CommandContract::object("wait", false, WAIT_OUTPUT),
+    CommandContract::object("version", false, VERSION_OUTPUT),
+    CommandContract::unsupported("config check", false),
+    CommandContract::object("profile list", false, PROFILE_LIST),
+    CommandContract::object("context add", true, CONTEXT_ADD),
+    CommandContract::list(
+        "context list",
+        false,
+        CONTEXT_LIST,
+        "contexts",
+        CONTEXT_ITEM,
+    ),
+    CommandContract::object("context use", true, NAMED_ACTION),
+    CommandContract::object("context remove", true, NAMED_ACTION),
+    CommandContract::object("context show", false, CONTEXT_SHOW),
+    CommandContract::self_describing("schema", false),
+    CommandContract::unsupported("setup storage", true),
+    CommandContract::object("doctor", false, DOCTOR_OUTPUT),
+    CommandContract::unsupported("completions", false),
+];

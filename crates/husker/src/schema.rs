@@ -1,4 +1,10 @@
-use crate::cli::Cli;
+use std::any::TypeId;
+use std::path::PathBuf;
+
+use anyhow::Result;
+
+use crate::cli::{COMMAND_CONTRACTS, Cli};
+use crate::cli_contract::{CliErrorKind, command_contract};
 
 /// Extract a clean error message from an API error response.
 ///
@@ -36,6 +42,7 @@ pub(crate) fn render_error_envelope(kind: &str, message: &str, hint: Option<&str
 /// `global_args` is an array, `commands` is an array, `errors` is an array.
 pub(crate) fn build_cli_schema() -> serde_json::Value {
     use clap::CommandFactory;
+    validate_contract_registry().expect("clap commands and CLI contracts must match");
     let root = Cli::command();
     let mut commands: Vec<serde_json::Value> = Vec::new();
     for sub in root.get_subcommands() {
@@ -65,50 +72,12 @@ pub(crate) fn build_cli_schema() -> serde_json::Value {
         "description": root.get_about().map(|s| s.to_string()).unwrap_or_default(),
         "global_args": schema_global_args(&root),
         "commands": commands,
-        "errors": [
-            {
-                "kind": "error",
-                "exit_code": 1,
-                "retryable": false,
-                "description": "General client or server error"
-            },
-            {
-                "kind": "not_found",
-                "exit_code": 2,
-                "retryable": false,
-                "description": "VM, image, snapshot, volume, or secret not found"
-            },
-            {
-                "kind": "invalid_usage",
-                "exit_code": 2,
-                "retryable": false,
-                "description": "Invalid command-line usage (unknown flag, missing or invalid argument). Shares exit code 2 with not_found; the error `kind` field disambiguates the two."
-            },
-            {
-                "kind": "conflict",
-                "exit_code": 3,
-                "retryable": false,
-                "description": "Resource already exists or is in an incompatible state"
-            },
-            {
-                "kind": "permission_denied",
-                "exit_code": 4,
-                "retryable": false,
-                "description": "Authentication or authorization failure"
-            },
-            {
-                "kind": "daemon_unreachable",
-                "exit_code": 5,
-                "retryable": true,
-                "description": "Cannot connect to the husker daemon"
-            },
-            {
-                "kind": "confirmation_required",
-                "exit_code": 6,
-                "retryable": false,
-                "description": "Destructive command attempted without confirmation; re-run with --yes"
-            }
-        ],
+        "errors": CliErrorKind::ALL.map(|kind| serde_json::json!({
+            "kind": kind.name(),
+            "exit_code": kind.exit_code(),
+            "retryable": kind.retryable(),
+            "description": kind.description(),
+        })),
         "output": {"tty": "text", "piped": "json"}
     });
     enrich_v0_3(&mut schema);
@@ -123,31 +92,44 @@ fn clap_arg_to_schema(a: &clap::Arg) -> serde_json::Value {
     } else {
         id.to_string()
     };
-    let type_str = match a.get_action() {
-        clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count => "boolean",
-        clap::ArgAction::Append => "string[]",
-        _ => {
-            // Heuristic: detect integer args by looking at default values or
-            // known numeric arg names.
-            if matches!(
-                id,
-                "limit"
-                    | "offset"
-                    | "amount_mib"
-                    | "cpus"
-                    | "memory"
-                    | "desired_instances"
-                    | "timeout"
-                    | "tail"
-                    | "host_port"
-                    | "guest_port"
-                    | "vcpus"
-            ) {
-                "integer"
-            } else {
-                "string"
-            }
+    let scalar_type = if matches!(
+        a.get_action(),
+        clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count
+    ) {
+        "boolean"
+    } else {
+        let type_id = a.get_value_parser().type_id();
+        if type_id == TypeId::of::<PathBuf>() {
+            "path"
+        } else if [
+            TypeId::of::<u8>(),
+            TypeId::of::<u16>(),
+            TypeId::of::<u32>(),
+            TypeId::of::<u64>(),
+            TypeId::of::<usize>(),
+            TypeId::of::<i8>(),
+            TypeId::of::<i16>(),
+            TypeId::of::<i32>(),
+            TypeId::of::<i64>(),
+            TypeId::of::<isize>(),
+        ]
+        .into_iter()
+        .any(|candidate| type_id == candidate)
+        {
+            "integer"
+        } else if [TypeId::of::<f32>(), TypeId::of::<f64>()]
+            .into_iter()
+            .any(|candidate| type_id == candidate)
+        {
+            "number"
+        } else {
+            "string"
         }
+    };
+    let type_str = if matches!(a.get_action(), clap::ArgAction::Append) {
+        format!("{scalar_type}[]")
+    } else {
+        scalar_type.to_string()
     };
     let mut o = serde_json::Map::new();
     o.insert("name".into(), serde_json::Value::from(flag_name));
@@ -161,6 +143,35 @@ fn clap_arg_to_schema(a: &clap::Arg) -> serde_json::Value {
             "description".into(),
             serde_json::Value::from(help.to_string()),
         );
+    }
+    let defaults: Vec<serde_json::Value> = a
+        .get_default_values()
+        .iter()
+        .map(|value| {
+            let value = value.to_string_lossy();
+            match scalar_type {
+                "integer" => value
+                    .parse::<i64>()
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|_| serde_json::Value::from(value.into_owned())),
+                "number" => value
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or_else(|| serde_json::Value::from(value.into_owned())),
+                "boolean" => value
+                    .parse::<bool>()
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|_| serde_json::Value::from(value.into_owned())),
+                _ => serde_json::Value::from(value.into_owned()),
+            }
+        })
+        .collect();
+    if defaults.len() == 1 {
+        o.insert("default".into(), defaults[0].clone());
+    } else if !defaults.is_empty() {
+        o.insert("default".into(), serde_json::json!(defaults));
     }
     if let Some(vals) = a.get_possible_values().first() {
         let _ = vals; // ensure no dead-code warning; enum population below
@@ -224,16 +235,27 @@ fn collect_schema_command_inner(
         let mut args = parent_args.to_vec();
         args.extend(own_args);
 
-        let (mutating, output_field_names) = schema_command_annotations(&full_path);
-        let output_fields: Vec<serde_json::Value> = output_field_names
+        let contract = command_contract(&full_path)
+            .unwrap_or_else(|| panic!("missing CLI contract for clap leaf '{full_path}'"));
+        let output_fields: Vec<serde_json::Value> = contract
+            .clispec_fields()
             .iter()
-            .map(|f| serde_json::json!({"name": f, "type": "string"}))
+            .map(|field| {
+                let mut value = serde_json::json!({
+                    "name": field.name,
+                    "type": field.kind.name(),
+                });
+                if !field.required {
+                    value["description"] = serde_json::Value::from("Optional field");
+                }
+                value
+            })
             .collect();
 
         out.push(serde_json::json!({
             "name": full_path,
             "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
-            "mutating": mutating,
+            "mutating": contract.mutating,
             "args": args,
             "output_fields": output_fields,
         }));
@@ -343,107 +365,50 @@ fn schema_global_args(root: &clap::Command) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Manual annotations clap cannot derive: whether a command mutates state, and
-/// the fields its JSON output emits. Read-only commands are listed explicitly;
-/// everything else is treated as mutating. `output_fields` are provided for the
-/// core commands and left empty for the rest.
-pub(crate) fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>) {
-    let read_only = matches!(
-        path,
-        "list"
-            | "info"
-            | "logs"
-            | "wait"
-            | "version"
-            | "schema"
-            | "capabilities"
-            | "config check"
-            | "port-forward list"
-            | "host-group list"
-            | "host-group get"
-            | "service list"
-            | "service get"
-            | "pool list"
-            | "pool get"
-            | "snapshot list"
-            | "snapshot get"
-            | "image list"
-            | "image get"
-            | "volume list"
-            | "volume get"
-            | "secret list"
-            | "secret get"
-            | "secret reveal"
-            | "context list"
-            | "context show"
-            | "profile list"
-            | "doctor"
-            | "completions"
-            | "setup storage"
+/// Verify the deletion-test invariant for semantic command metadata: every
+/// clap leaf has exactly one contract, and no stale contract survives after a
+/// command is removed or renamed.
+pub(crate) fn validate_contract_registry() -> Result<()> {
+    use clap::CommandFactory;
+    use std::collections::BTreeSet;
+
+    fn collect(command: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| subcommand.get_name() != "help")
+        {
+            let path = if prefix.is_empty() {
+                subcommand.get_name().to_string()
+            } else {
+                format!("{prefix} {}", subcommand.get_name())
+            };
+            if subcommand
+                .get_subcommands()
+                .any(|child| child.get_name() != "help")
+            {
+                collect(subcommand, &path, paths);
+            } else {
+                paths.push(path);
+            }
+        }
+    }
+
+    let mut clap_paths = Vec::new();
+    collect(&Cli::command(), "", &mut clap_paths);
+    let clap_paths: BTreeSet<String> = clap_paths.into_iter().collect();
+    let contract_paths: BTreeSet<String> = COMMAND_CONTRACTS
+        .iter()
+        .map(|contract| contract.path.to_string())
+        .collect();
+    anyhow::ensure!(
+        contract_paths.len() == COMMAND_CONTRACTS.len(),
+        "CLI contract registry contains duplicate command paths"
     );
-    let output_fields: Vec<&'static str> = match path {
-        "balloon" => vec!["status", "action", "vm", "amount_mib"],
-        "run" => vec!["status", "action", "vm", "userdata_queued"],
-        "job" => vec!["status", "action", "vm", "exit_code", "stdout", "stderr"],
-        "list" => vec![
-            "name",
-            "state",
-            "vcpu_count",
-            "mem_size_mib",
-            "guest_ip",
-            "vmm",
-            "idle_timeout_secs",
-            "suspend_ttl_secs",
-            "auto_resume",
-            "suspended_at",
-        ],
-        "info" => vec![
-            "name",
-            "state",
-            "vcpu_count",
-            "mem_size_mib",
-            "guest_ip",
-            "host_ip",
-            "userdata_status",
-            "volume",
-            "id",
-            "vmm",
-            "boot_mode",
-            "kernel_path",
-            "rootfs_path",
-            "network",
-            "idle_timeout_secs",
-            "suspend_ttl_secs",
-            "auto_resume",
-            "suspended_at",
-        ],
-        "wait" => vec!["status", "action", "vm", "ready"],
-        "fork" => vec!["status", "action", "source", "vm", "guest_ip"],
-        "stop" | "pause" | "resume" | "suspend" | "destroy" => vec!["status", "action", "vm"],
-        // The exec envelope nests the guest result under `result`
-        // (`{status, action, vm, result:{exit_code, stdout, stderr}}`), so declare
-        // the actual top-level fields rather than the inner ones.
-        "exec" => vec!["status", "action", "vm", "result"],
-        "version" => vec!["client_version", "server_version"],
-        "service create" | "service scale" => vec!["status", "action", "service", "outcome"],
-        "service delete" => vec!["status", "action", "name", "outcome"],
-        "service get" => vec!["status", "action", "service", "instances"],
-        "service list" => vec!["status", "action", "services"],
-        "pool create" | "pool get" => vec!["status", "action", "pool"],
-        "pool list" => vec!["status", "action", "pools"],
-        "pool checkout" => vec!["status", "action", "vm"],
-        "pool delete" => vec!["status", "action", "name"],
-        "volume create" | "volume get" => vec!["status", "action", "volume"],
-        "volume delete" => vec!["status", "action", "name"],
-        "volume list" => vec!["status", "action", "volumes"],
-        "context list" => vec!["contexts"],
-        "context show" => vec!["current", "api_url"],
-        "context add" => vec!["status", "action", "name", "api_url"],
-        "context use" | "context remove" => vec!["status", "action", "name"],
-        "profile list" => vec!["status", "action", "profiles"],
-        "doctor" => vec!["name", "status", "message"],
-        "setup storage" => vec!["status", "script_path", "unit_path"],
-        _ => vec![],
-    };
-    (!read_only, output_fields)
+    let missing: Vec<_> = clap_paths.difference(&contract_paths).cloned().collect();
+    let stale: Vec<_> = contract_paths.difference(&clap_paths).cloned().collect();
+    anyhow::ensure!(
+        missing.is_empty() && stale.is_empty(),
+        "CLI contract registry drift (missing: {missing:?}; stale: {stale:?})"
+    );
+    Ok(())
 }
