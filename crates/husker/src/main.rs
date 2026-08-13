@@ -1171,6 +1171,35 @@ async fn run(cli: Cli) -> Result<()> {
     // downstream branches can compare directly without re-calling resolve_format.
     let output = resolve_format(raw_output);
 
+    if matches!(&command, Commands::Schema) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&build_cli_schema()).expect("schema serializes")
+        );
+        return Ok(());
+    }
+    if matches!(&command, Commands::Capabilities) {
+        let capabilities = serde_json::json!({
+            "name": "husker",
+            "version": env!("CARGO_PKG_VERSION"),
+            "clispec": "0.3",
+            "output": ["text", "json"],
+            "features": ["schema", "pagination", "field selection", "offline introspection"]
+        });
+        if output == OutputFormat::Json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&capabilities).expect("capabilities serialize")
+            );
+        } else {
+            println!(
+                "husker {} - clispec 0.3; text/json output, pagination, field selection",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        return Ok(());
+    }
+
     // Context management is local-only; handle it before resolving a daemon URL.
     if let Commands::Context { action } = command {
         return context_command(action, output);
@@ -2815,12 +2844,9 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Context { .. } => {
             unreachable!("Context is handled before daemon-target resolution in run()")
         }
-        Commands::Schema => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&build_cli_schema()).expect("schema serializes")
-            );
-            Ok(())
+        Commands::Schema => unreachable!("schema handled before target resolution"),
+        Commands::Capabilities => {
+            unreachable!("capabilities handled before target resolution")
         }
         Commands::Completions { shell } => {
             use clap::CommandFactory;
@@ -7368,24 +7394,14 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(&rendered).expect("envelope must be valid JSON");
     }
 
-    /// Helper: find a leaf command by name in the schema commands array.
-    /// Groups have a "subcommands" key; leaves have "mutating".
+    /// Find a command by its canonical full path.
     fn find_leaf_command<'a>(
         commands: &'a [serde_json::Value],
         name: &str,
     ) -> Option<&'a serde_json::Value> {
-        for cmd in commands {
-            if let Some(subs) = cmd.get("subcommands") {
-                if let Some(subs) = subs.as_array()
-                    && let Some(found) = find_leaf_command(subs, name)
-                {
-                    return Some(found);
-                }
-            } else if cmd.get("name").and_then(|n| n.as_str()) == Some(name) {
-                return Some(cmd);
-            }
-        }
-        None
+        commands
+            .iter()
+            .find(|command| command.get("name").and_then(|value| value.as_str()) == Some(name))
     }
 
     #[test]
@@ -7394,7 +7410,7 @@ mod tests {
         assert_eq!(schema["name"], "husker");
         assert!(schema["version"].as_str().is_some());
 
-        // v0.2: errors is an array; find the not_found entry.
+        // Errors are an array; find the not_found entry.
         let errors = schema["errors"]
             .as_array()
             .expect("errors must be an array");
@@ -7404,25 +7420,24 @@ mod tests {
             .expect("not_found error entry must exist");
         assert_eq!(not_found["exit_code"], 2);
 
-        // v0.2: commands is an array.
+        // Commands are a flat array of canonical paths.
         let cmds = schema["commands"]
             .as_array()
             .expect("commands must be an array");
         assert!(!cmds.is_empty());
 
-        // Leaf commands and nested subcommands are derived from clap.
+        // Leaf commands are derived from clap.
         let run_cmd = find_leaf_command(cmds, "run").expect("run command must exist");
         assert!(run_cmd.is_object());
         let schema_cmd = find_leaf_command(cmds, "schema").expect("schema command must exist");
         assert!(schema_cmd.is_object());
 
-        // Groups appear with subcommands; "image" is a group, "pull" is its leaf.
-        let image_group = cmds.iter().find(|c| {
-            c.get("name").and_then(|n| n.as_str()) == Some("image")
-                && c.get("subcommands").is_some()
-        });
-        assert!(image_group.is_some(), "image group must be in commands");
-        let pull_cmd = find_leaf_command(cmds, "pull").expect("image pull command must exist");
+        assert!(
+            cmds.iter()
+                .all(|command| command.get("subcommands").is_none())
+        );
+        let pull_cmd =
+            find_leaf_command(cmds, "image pull").expect("image pull command must exist");
         assert!(pull_cmd.is_object());
 
         // Mutating annotations: writes are mutating, getters/lists are not.
@@ -7438,7 +7453,8 @@ mod tests {
 
         // Nested commands inherit their parent's arguments: `port-forward add`
         // requires the parent VM `name` as well as its own ports.
-        let pf_add = find_leaf_command(cmds, "add").expect("port-forward add must exist");
+        let pf_add =
+            find_leaf_command(cmds, "port-forward add").expect("port-forward add must exist");
         let pf_args = pf_add["args"].as_array().unwrap();
         assert!(pf_args.iter().any(|a| a["name"] == "name"));
         assert!(pf_args.iter().any(|a| a["name"] == "host_port"));
@@ -7474,18 +7490,7 @@ mod tests {
             .as_array()
             .expect("commands must be an array");
 
-        // Find the volume group, then look for "get" within it.
-        let volume_group = cmds
-            .iter()
-            .find(|c| {
-                c.get("name").and_then(|n| n.as_str()) == Some("volume")
-                    && c.get("subcommands").is_some()
-            })
-            .expect("volume group must exist");
-        let vol_subs = volume_group["subcommands"]
-            .as_array()
-            .expect("volume must have subcommands");
-        let vol_get = find_leaf_command(vol_subs, "get").expect("volume get leaf must exist");
+        let vol_get = find_leaf_command(cmds, "volume get").expect("volume get leaf must exist");
         assert!(vol_get.is_object());
         assert_eq!(vol_get["mutating"], false);
         let fields = vol_get["output_fields"].as_array().unwrap();

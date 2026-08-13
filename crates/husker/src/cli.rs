@@ -587,6 +587,9 @@ pub(crate) enum Commands {
     /// fields, exit codes) for agent introspection
     Schema,
 
+    /// Describe offline-safe CLI capabilities
+    Capabilities,
+
     /// Generate a one-time migration to a reflink-capable storage volume
     Setup {
         #[command(subcommand)]

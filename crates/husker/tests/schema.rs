@@ -1,12 +1,12 @@
-//! Tests that `husker schema` output validates against the bundled clispec v0.2
+//! Tests that `husker schema` output validates against the bundled clispec v0.3
 //! JSON Schema fixture. This catches schema shape regressions without network
 //! access and without running a daemon.
 
 use assert_cmd::Command;
 
-/// The vendored clispec v0.2 JSON Schema, embedded at compile time so the test
+/// The vendored clispec v0.3 JSON Schema, embedded at compile time so the test
 /// is fully self-contained.
-const CLISPEC_V02_SCHEMA: &str = include_str!("fixtures/clispec-v0.2.json");
+const CLISPEC_V03_SCHEMA: &str = include_str!("fixtures/clispec-v0.3.json");
 
 #[test]
 fn schema_command_produces_valid_json() {
@@ -28,9 +28,9 @@ fn schema_command_produces_valid_json() {
 }
 
 #[test]
-fn schema_validates_against_clispec_v02() {
+fn schema_validates_against_clispec_v03() {
     let schema_doc: serde_json::Value =
-        serde_json::from_str(CLISPEC_V02_SCHEMA).expect("bundled schema should be valid JSON");
+        serde_json::from_str(CLISPEC_V03_SCHEMA).expect("bundled schema should be valid JSON");
 
     let output = Command::cargo_bin("husker")
         .unwrap()
@@ -44,7 +44,7 @@ fn schema_validates_against_clispec_v02() {
         serde_json::from_str(&stdout).expect("husker schema should emit valid JSON");
 
     let validator = jsonschema::validator_for(&schema_doc)
-        .expect("bundled clispec v0.2 schema should be a valid JSON Schema");
+        .expect("bundled clispec v0.3 schema should be a valid JSON Schema");
 
     let errors: Vec<String> = validator
         .iter_errors(&instance)
@@ -53,7 +53,7 @@ fn schema_validates_against_clispec_v02() {
 
     assert!(
         errors.is_empty(),
-        "husker schema output should validate against clispec v0.2:\n{}",
+        "husker schema output should validate against clispec v0.3:\n{}",
         errors.join("\n")
     );
 }
@@ -71,8 +71,8 @@ fn schema_has_required_clispec_version() {
 
     assert_eq!(
         doc.get("clispec").and_then(|v| v.as_str()),
-        Some("0.2"),
-        "schema should declare clispec version 0.2"
+        Some("0.3"),
+        "schema should declare clispec version 0.3"
     );
 }
 
@@ -94,21 +94,18 @@ fn schema_commands_are_array_with_mutating_markers() {
 
     assert!(!commands.is_empty(), "commands array should not be empty");
 
-    // Every leaf command (those without subcommands) must have a mutating marker.
-    fn check_leaf_commands(commands: &[serde_json::Value]) {
-        for cmd in commands {
-            let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-            if let Some(subs) = cmd.get("subcommands").and_then(|s| s.as_array()) {
-                check_leaf_commands(subs);
-            } else {
-                assert!(
-                    cmd.get("mutating").is_some(),
-                    "leaf command '{name}' should have a mutating marker"
-                );
-            }
-        }
+    for command in commands {
+        let name = command.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        assert!(
+            command.get("mutating").is_some(),
+            "command '{name}' should have a mutating marker"
+        );
+        assert!(
+            command.get("effects").is_some(),
+            "command '{name}' should declare effects"
+        );
+        assert!(command.get("subcommands").is_none());
     }
-    check_leaf_commands(commands);
 }
 
 #[test]

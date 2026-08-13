@@ -16,7 +16,7 @@ pub(crate) mod exit_code {
     pub const CONFIRMATION_REQUIRED: i32 = 6;
 }
 
-/// Emit a clispec v0.2 structured error envelope as a single JSON line.
+/// Emit a clispec structured error envelope as a single JSON line.
 /// The kind is derived from the ApiFailure code when available; falls back to
 /// a generic kind derived from the exit code.
 pub(crate) fn render_error_envelope(kind: &str, message: &str, hint: Option<&str>) -> String {
@@ -32,7 +32,7 @@ pub(crate) fn render_error_envelope(kind: &str, message: &str, hint: Option<&str
 }
 
 /// Build the machine-readable CLI contract emitted by `husker schema`.
-/// Conforms to The CLI Spec v0.2 (https://clispec.dev/schema/v0.2.json):
+/// Conforms to The CLI Spec v0.3 (https://clispec.dev/schema/v0.3.json):
 /// `global_args` is an array, `commands` is an array, `errors` is an array.
 pub(crate) fn build_cli_schema() -> serde_json::Value {
     use clap::CommandFactory;
@@ -57,8 +57,9 @@ pub(crate) fn build_cli_schema() -> serde_json::Value {
         };
         priority(a).cmp(&priority(b))
     });
-    serde_json::json!({
-        "clispec": "0.2",
+    let mut schema = serde_json::json!({
+        "$schema": "https://clispec.dev/schema/v0.3.json",
+        "clispec": "0.3",
         "name": "husker",
         "version": env!("CARGO_PKG_VERSION"),
         "description": root.get_about().map(|s| s.to_string()).unwrap_or_default(),
@@ -107,8 +108,11 @@ pub(crate) fn build_cli_schema() -> serde_json::Value {
                 "retryable": false,
                 "description": "Destructive command attempted without confirmation; re-run with --yes"
             }
-        ]
-    })
+        ],
+        "output": {"tty": "text", "piped": "json"}
+    });
+    enrich_v0_3(&mut schema);
+    schema
 }
 
 /// Build a clap arg into the clispec `arg` shape.
@@ -227,7 +231,7 @@ fn collect_schema_command_inner(
             .collect();
 
         out.push(serde_json::json!({
-            "name": name,
+            "name": full_path,
             "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
             "mutating": mutating,
             "args": args,
@@ -238,20 +242,97 @@ fn collect_schema_command_inner(
         let mut child_args = parent_args.to_vec();
         child_args.extend(own_args);
 
-        let mut subcommands: Vec<serde_json::Value> = Vec::new();
         for sub in subs {
-            collect_schema_command_inner(sub, &child_args, &full_path, &mut subcommands);
+            collect_schema_command_inner(sub, &child_args, &full_path, out);
         }
-        out.push(serde_json::json!({
-            "name": name,
-            "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
-            "subcommands": subcommands,
-        }));
+    }
+}
+
+fn enrich_v0_3(schema: &mut serde_json::Value) {
+    let Some(commands) = schema["commands"].as_array_mut() else {
+        return;
+    };
+    for command in commands {
+        let Some(object) = command.as_object_mut() else {
+            continue;
+        };
+        let name = object["name"].as_str().unwrap_or_default().to_string();
+        let mutating = object["mutating"].as_bool().unwrap_or(false);
+        let non_idempotent = name == "run"
+            || name == "fork"
+            || name.ends_with(" create")
+            || name.ends_with(" import")
+            || name.ends_with(" import-oci")
+            || name.ends_with(" pull")
+            || name.ends_with(" checkout");
+        object.insert(
+            "effects".into(),
+            serde_json::json!(if !mutating {
+                "read_only"
+            } else if non_idempotent {
+                "non_idempotent"
+            } else {
+                "idempotent"
+            }),
+        );
+
+        if matches!(
+            name.as_str(),
+            "daemon" | "shell" | "config check" | "setup storage" | "completions"
+        ) {
+            object.insert("output_kind".into(), serde_json::json!("opaque"));
+            object.insert("media_type".into(), serde_json::json!("text/plain"));
+            object.remove("output_fields");
+            continue;
+        }
+
+        object.insert("cardinality".into(), serde_json::json!("bounded"));
+        if name == "list" {
+            object.insert("cardinality".into(), serde_json::json!("unbounded"));
+            object.insert(
+                "pagination".into(),
+                serde_json::json!({
+                    "style": "offset",
+                    "limit_arg": "--limit",
+                    "offset_arg": "--offset"
+                }),
+            );
+            object.insert("fields_arg".into(), serde_json::json!("--fields"));
+        }
+        if name == "schema" {
+            object.insert("cardinality".into(), serde_json::json!("single"));
+            object.insert(
+                "stdout_schema".into(),
+                serde_json::json!({"$ref": "https://clispec.dev/schema/v0.3.json"}),
+            );
+        }
+        if name == "capabilities" {
+            object.insert("cardinality".into(), serde_json::json!("single"));
+            object.insert(
+                "example".into(),
+                serde_json::json!({"args": ["capabilities"]}),
+            );
+        }
+        if object
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|args| args.iter().any(|arg| arg["name"] == "--yes"))
+        {
+            object.insert("confirmation_bypass_arg".into(), serde_json::json!("--yes"));
+        }
+        if object
+            .get("output_fields")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+            && !object.contains_key("stdout_schema")
+        {
+            object.insert("stdout_schema".into(), serde_json::json!({}));
+        }
     }
 }
 
 /// Global args accepted by every command, derived from the root command.
-/// Returns a v0.2-compliant array of arg objects.
+/// Returns a clispec-compliant array of arg objects.
 fn schema_global_args(root: &clap::Command) -> Vec<serde_json::Value> {
     root.get_arguments()
         .filter(|a| {
@@ -275,6 +356,7 @@ pub(crate) fn schema_command_annotations(path: &str) -> (bool, Vec<&'static str>
             | "wait"
             | "version"
             | "schema"
+            | "capabilities"
             | "config check"
             | "port-forward list"
             | "host-group list"
