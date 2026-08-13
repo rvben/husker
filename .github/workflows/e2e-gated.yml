@@ -33,6 +33,18 @@ jobs:
             HUSKER_RUN_NET_E2E=1 \
             make test-net-e2e-gated
 
+      # Exercise daemon-owned worker shutdown and host-network cleanup after
+      # both an API bind failure and SIGTERM. The drill owns a distinct bridge,
+      # nftables table, data directory, and high ports.
+      - name: Daemon shutdown lifecycle drill
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            HUSKER_RUN_LINUX_SHUTDOWN_DRILL=1 \
+            make test-linux-shutdown-drill-gated
+
       # Resolve kernel + rootfs + initrd from the latest images-* release for the
       # general daemon e2e, which boots real Firecracker VMs.
       - name: Fetch guest images

@@ -848,6 +848,11 @@ impl RuntimeWorkers {
     }
 
     async fn stop_with_grace(&mut self, grace: std::time::Duration) {
+        tracing::info!(
+            cooperative = self.cooperative.len(),
+            abortable = self.abortable.len(),
+            "stopping daemon background workers"
+        );
         self.shutdown.send_replace(true);
         let deadline = tokio::time::Instant::now() + grace;
         for mut worker in self.cooperative.drain(..) {
@@ -866,6 +871,7 @@ impl RuntimeWorkers {
         for worker in self.abortable.drain(..) {
             report_worker_exit(worker.await, "background endpoint");
         }
+        tracing::info!("daemon background workers stopped");
     }
 }
 
