@@ -27,9 +27,42 @@ pub enum StorageError {
     VolumeImage(String),
     #[error("qemu-img error: {0}")]
     QemuImg(String),
+    #[error(
+        "requested disk size {requested} bytes is smaller than the source disk ({current} bytes); shrinking is not supported"
+    )]
+    DiskTooSmall { requested: u64, current: u64 },
 }
 
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Everything needed to turn a catalog rootfs into a bootable private VM disk.
+#[derive(Debug, Clone, Copy)]
+pub struct RootDiskRequest<'a> {
+    pub source: &'a Path,
+    pub destination: &'a Path,
+    pub size_bytes: Option<u64>,
+    /// Empty when this daemon build has no embedded agent. In that case the
+    /// cloned image is left unchanged.
+    pub guest_agent: &'a [u8],
+}
+
+/// The representation required by the VMM that will attach a cloud disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudDiskFormat {
+    /// Keep the source image in qcow2 form (QEMU-backed Linux hosts).
+    Qcow2,
+    /// Materialize a sparse raw disk (Apple Virtualization.framework).
+    Raw,
+}
+
+/// Everything needed to materialize a private cloud-image disk.
+#[derive(Debug, Clone, Copy)]
+pub struct CloudDiskRequest<'a> {
+    pub source: &'a Path,
+    pub destination: &'a Path,
+    pub size_bytes: Option<u64>,
+    pub format: CloudDiskFormat,
+}
 
 /// Abstraction for storage backends used to prepare VM root disks.
 pub trait StorageDriver: Send + Sync {
@@ -40,6 +73,110 @@ pub trait StorageDriver: Send + Sync {
         source: &'a Path,
         dest: &'a Path,
     ) -> StorageFuture<'a, Result<(), StorageError>>;
+
+    /// Materialize a complete direct-kernel root disk. The boundary owns the
+    /// order of cloning, offline growth, and guest-agent refresh so callers
+    /// cannot accidentally boot a half-prepared artifact.
+    fn prepare_root_disk<'a>(
+        &'a self,
+        request: RootDiskRequest<'a>,
+    ) -> StorageFuture<'a, Result<Option<AgentRefresh>, StorageError>> {
+        Box::pin(async move {
+            self.clone_rootfs(request.source, request.destination)
+                .await?;
+            let prepared = async {
+                if let Some(size) = request.size_bytes {
+                    grow_rootfs_ext4(request.destination, size).await?;
+                }
+                if request.guest_agent.is_empty() {
+                    Ok(None)
+                } else {
+                    refresh_guest_agent(request.destination, request.guest_agent)
+                        .await
+                        .map(Some)
+                }
+            }
+            .await;
+            if prepared.is_err() {
+                let _ = tokio::fs::remove_file(request.destination).await;
+            }
+            prepared
+        })
+    }
+
+    /// Materialize a complete cloud-image disk in the representation expected
+    /// by its VMM. Validation and shrink rejection happen before creating the
+    /// destination; any later failure removes the partial artifact.
+    fn prepare_cloud_disk<'a>(
+        &'a self,
+        request: CloudDiskRequest<'a>,
+    ) -> StorageFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            validate_cloud_image(request.source)?;
+            if let Some(requested) = request.size_bytes {
+                let current = qcow2_virtual_size(request.source).await?;
+                if requested < current {
+                    return Err(StorageError::DiskTooSmall { requested, current });
+                }
+            }
+            if let Some(parent) = request.destination.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            if request.destination.exists() {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "destination disk already exists: {}",
+                        request.destination.display()
+                    ),
+                )));
+            }
+
+            let materialized = match request.format {
+                CloudDiskFormat::Qcow2 => {
+                    self.clone_rootfs(request.source, request.destination).await
+                }
+                CloudDiskFormat::Raw => {
+                    let source = request.source.to_owned();
+                    let destination = request.destination.to_owned();
+                    match tokio::task::spawn_blocking(move || {
+                        convert_qcow2_to_raw(&source, &destination)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(StorageError::QemuImg(format!(
+                            "spawn_blocking join error: {error}"
+                        ))),
+                    }
+                }
+            };
+            if let Err(error) = materialized {
+                // A concurrent creator may win after the existence check. Its
+                // AlreadyExists destination is not ours to remove.
+                let preserves_existing = matches!(
+                    &error,
+                    StorageError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists
+                );
+                if !preserves_existing {
+                    let _ = tokio::fs::remove_file(request.destination).await;
+                }
+                return Err(error);
+            }
+
+            let prepared = async {
+                if let Some(size) = request.size_bytes {
+                    resize_disk(request.destination, size).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if prepared.is_err() {
+                let _ = tokio::fs::remove_file(request.destination).await;
+            }
+            prepared
+        })
+    }
 }
 
 /// Default local storage driver backed by reflink-or-copy filesystem cloning.
@@ -277,10 +414,10 @@ pub async fn grow_rootfs_ext4(path: &Path, new_size_bytes: u64) -> Result<(), St
         .map_err(StorageError::Io)?
         .len();
     if new_size_bytes < current {
-        return Err(StorageError::CommandFailed(format!(
-            "disk_size {new_size_bytes} bytes is smaller than the rootfs image \
-             ({current} bytes); shrinking is not supported"
-        )));
+        return Err(StorageError::DiskTooSmall {
+            requested: new_size_bytes,
+            current,
+        });
     }
     if new_size_bytes == current {
         return Ok(());

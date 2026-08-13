@@ -375,12 +375,17 @@ impl<B: VmmBackend> HuskerCore<B> {
                 CoreError::InvalidArgument("rootfs_path is required for direct-kernel boot".into())
             })?;
             let vm_rootfs = vm_dir.join("rootfs.ext4");
-            self.storage_driver.clone_rootfs(rootfs, &vm_rootfs).await?;
-            // Plain rootfs images have no cloud-init to grow the filesystem on
-            // first boot, so an explicit disk_size is applied offline here.
-            if let Some(size) = req.disk_size {
-                husker_storage::grow_rootfs_ext4(&vm_rootfs, size).await?;
-            }
+            let agent_refresh = self
+                .storage_driver
+                .prepare_root_disk(husker_storage::RootDiskRequest {
+                    source: rootfs,
+                    destination: &vm_rootfs,
+                    size_bytes: req.disk_size,
+                    guest_agent: self.embedded_agent,
+                })
+                .await
+                .map_err(crate::storage_preparation_error)?;
+            crate::report_agent_refresh(&req.name, agent_refresh);
             (
                 vm_rootfs,
                 husker_vmm::BootMode::DirectKernel,
@@ -389,12 +394,6 @@ impl<B: VmmBackend> HuskerCore<B> {
                 None,
             )
         };
-
-        // Cloud VMs are not ext4 and get a current agent from their cloud-init
-        // seed on every boot, so they need nothing here.
-        if !is_cloud {
-            crate::refresh_cloned_agent(&req.name, &disk_path, self.embedded_agent).await?;
-        }
 
         // resolv.conf injection loop-mounts the ext4 rootfs; skip it for qcow2 cloud
         // images, which are not ext4. Cloud images configure DNS via cloud-init at boot.
@@ -661,18 +660,6 @@ impl<B: VmmBackend> HuskerCore<B> {
                 ));
             }
 
-            // Guard against shrinking: if the caller requests a disk_size smaller
-            // than the image's virtual size, reject before starting the conversion.
-            if let Some(size) = req.disk_size {
-                let virtual_size = husker_storage::qcow2_virtual_size(&image_path).await?;
-                if size < virtual_size {
-                    return Err(CoreError::InvalidArgument(format!(
-                        "--disk-size {size} is smaller than the image's virtual size \
-                         {virtual_size}"
-                    )));
-                }
-            }
-
             // Register the VM directory for rollback before creating any disk files,
             // so a partial conversion is cleaned up on failure.
             tokio::fs::create_dir_all(&vm_dir)
@@ -680,23 +667,16 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .map_err(|e| CoreError::Storage(husker_storage::StorageError::Io(e)))?;
             resources.vm_dir = Some(vm_dir.clone());
 
-            // Convert the source qcow2 to a raw disk image. Apple Virtualization.framework
-            // requires raw images; qemu-img convert is blocking (it reads GBs of data), so
-            // it runs on the blocking thread pool.
             let disk = vm_dir.join("disk.raw");
-            let src = image_path.clone();
-            let dst = disk.clone();
-            tokio::task::spawn_blocking(move || husker_storage::convert_qcow2_to_raw(&src, &dst))
+            self.storage_driver
+                .prepare_cloud_disk(husker_storage::CloudDiskRequest {
+                    source: &image_path,
+                    destination: &disk,
+                    size_bytes: req.disk_size,
+                    format: husker_storage::CloudDiskFormat::Raw,
+                })
                 .await
-                .map_err(|e| {
-                    CoreError::Storage(husker_storage::StorageError::QemuImg(format!(
-                        "spawn_blocking join error: {e}"
-                    )))
-                })??;
-
-            if let Some(size) = req.disk_size {
-                husker_storage::resize_disk(&disk, size).await?;
-            }
+                .map_err(crate::storage_preparation_error)?;
 
             // Build the NoCloud seed. VZ NAT assigns addresses via DHCP, so omit
             // network-config and let cloud-init's fallback DHCP client handle it.
@@ -803,16 +783,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             CoreError::InvalidArgument("rootfs_path is required for direct-kernel boot".into())
         })?;
         let vm_rootfs = vm_dir.join("rootfs.ext4");
-        self.storage_driver.clone_rootfs(rootfs, &vm_rootfs).await?;
-        // Plain rootfs images have no cloud-init to grow the filesystem on
-        // first boot, so an explicit disk_size is applied offline here.
-        if let Some(size) = req.disk_size {
-            husker_storage::grow_rootfs_ext4(&vm_rootfs, size).await?;
-        }
-        // Registered before the agent refresh so a refresh that cannot be
-        // verified takes the half-written clone down with it.
+        // Register ownership before disk preparation so outer rollback also
+        // removes any surrounding VM artifacts if preparation fails.
         resources.vm_dir = Some(vm_dir);
-        crate::refresh_cloned_agent(&req.name, &vm_rootfs, self.embedded_agent).await?;
+        let agent_refresh = self
+            .storage_driver
+            .prepare_root_disk(husker_storage::RootDiskRequest {
+                source: rootfs,
+                destination: &vm_rootfs,
+                size_bytes: req.disk_size,
+                guest_agent: self.embedded_agent,
+            })
+            .await
+            .map_err(crate::storage_preparation_error)?;
+        crate::report_agent_refresh(&req.name, agent_refresh);
 
         // The outer per-volume guard spans this resolution through the final
         // VM insert, including all asynchronous preparation below.

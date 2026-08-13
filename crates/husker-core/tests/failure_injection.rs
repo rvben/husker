@@ -194,6 +194,52 @@ impl husker_net::HostNetwork for TestHostNetwork {
     }
 }
 
+#[cfg(feature = "linux-net")]
+#[derive(Default)]
+struct PreparingStorage {
+    clone_calls: std::sync::atomic::AtomicUsize,
+    prepare_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "linux-net")]
+impl husker_storage::StorageDriver for PreparingStorage {
+    fn name(&self) -> &'static str {
+        "preparing-test"
+    }
+
+    fn clone_rootfs<'a>(
+        &'a self,
+        _source: &'a std::path::Path,
+        _destination: &'a std::path::Path,
+    ) -> husker_storage::StorageFuture<'a, Result<(), husker_storage::StorageError>> {
+        self.clone_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err(husker_storage::StorageError::CommandFailed(
+                "shallow clone path must not be used by VM creation".into(),
+            ))
+        })
+    }
+
+    fn prepare_root_disk<'a>(
+        &'a self,
+        request: husker_storage::RootDiskRequest<'a>,
+    ) -> husker_storage::StorageFuture<
+        'a,
+        Result<Option<husker_storage::AgentRefresh>, husker_storage::StorageError>,
+    > {
+        self.prepare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if let Some(parent) = request.destination.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(request.destination, b"prepared-disk").await?;
+            Ok(None)
+        })
+    }
+}
+
 struct FailingVmm {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     fail_ops: HashSet<&'static str>,
@@ -487,6 +533,44 @@ fn linux_create_request(
         mem_size_mib: Some(128),
         ..Default::default()
     }
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn create_uses_complete_disk_preparation_boundary() {
+    use std::sync::atomic::Ordering;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    let storage = Arc::new(PreparingStorage::default());
+    let core = Arc::new(
+        HuskerCore::new(
+            FailingVmm::new(&[]),
+            husker_state::StateStore::open_memory().unwrap(),
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            husker_storage::StorageConfig {
+                data_dir: tmp.path().to_path_buf(),
+                state_dir: tmp.path().to_path_buf(),
+            },
+            "husker0".into(),
+            vec![],
+            tmp.path().join("run"),
+        )
+        .with_host_network(network)
+        .with_storage_driver(storage.clone()),
+    );
+
+    core.create_vm(linux_create_request("prepared", &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    assert_eq!(storage.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.clone_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read(tmp.path().join("vms/prepared/rootfs.ext4")).unwrap(),
+        b"prepared-disk"
+    );
 }
 
 #[cfg(feature = "linux-net")]

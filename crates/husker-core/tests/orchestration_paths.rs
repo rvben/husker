@@ -2749,6 +2749,50 @@ async fn run_userdata_spawn_userdata_drives_to_completed() {
 mod kernel_args_composition {
     use super::*;
 
+    #[derive(Default)]
+    struct PreparingStorage {
+        clone_calls: std::sync::atomic::AtomicUsize,
+        prepare_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl husker_storage::StorageDriver for PreparingStorage {
+        fn name(&self) -> &'static str {
+            "preparing-test"
+        }
+
+        fn clone_rootfs<'a>(
+            &'a self,
+            _source: &'a Path,
+            _destination: &'a Path,
+        ) -> husker_storage::StorageFuture<'a, Result<(), husker_storage::StorageError>> {
+            self.clone_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Err(husker_storage::StorageError::CommandFailed(
+                    "shallow clone path must not be used by VM creation".into(),
+                ))
+            })
+        }
+
+        fn prepare_root_disk<'a>(
+            &'a self,
+            request: husker_storage::RootDiskRequest<'a>,
+        ) -> husker_storage::StorageFuture<
+            'a,
+            Result<Option<husker_storage::AgentRefresh>, husker_storage::StorageError>,
+        > {
+            self.prepare_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if let Some(parent) = request.destination.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(request.destination, b"prepared-disk").await?;
+                Ok(None)
+            })
+        }
+    }
+
     fn kernel_stub_bytes() -> Vec<u8> {
         // ARM64 Image magic at offset 56 so validate_kernel_format passes.
         let mut b = vec![0u8; 64];
@@ -2772,6 +2816,51 @@ mod kernel_args_composition {
             runtime_dir,
         ));
         (core, mock)
+    }
+
+    #[tokio::test]
+    async fn vm_creation_uses_complete_disk_preparation_boundary() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("vmlinux");
+        std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
+        let rootfs = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"catalog-rootfs").unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let storage = Arc::new(PreparingStorage::default());
+        let core = HuskerCore::new(
+            MockVmm::new(),
+            StateStore::open_memory().unwrap(),
+            StorageConfig {
+                data_dir: data_dir.clone(),
+                state_dir: data_dir.clone(),
+            },
+            runtime_dir,
+        )
+        .with_storage_driver(storage.clone());
+
+        core.create_vm(CreateVmRequest {
+            name: "prepared-at-boundary".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(storage.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.clone_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(data_dir.join("vms/prepared-at-boundary/rootfs.ext4")).unwrap(),
+            b"prepared-disk"
+        );
     }
 
     #[tokio::test]

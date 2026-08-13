@@ -1074,6 +1074,17 @@ impl<B: VmmBackend> HuskerCore<B> {
         self
     }
 
+    /// Override disk materialization. The injected boundary owns complete VM
+    /// disk preparation (clone, resize/conversion, and agent refresh), which
+    /// makes failure ordering testable without invoking host storage tools.
+    pub fn with_storage_driver(
+        mut self,
+        storage_driver: Arc<dyn husker_storage::StorageDriver>,
+    ) -> Self {
+        self.storage_driver = storage_driver;
+        self
+    }
+
     /// Set whether the data dir is a mounted reflink storage volume (config flag).
     /// Surfaced by diagnostics; does not change create/destroy behavior.
     pub fn with_storage_volume(mut self, storage_volume: bool) -> Self {
@@ -1552,14 +1563,28 @@ async fn prepare_cloud_disk(
             ovmf_vars_template.display()
         )));
     }
-    storage_driver.clone_rootfs(image, dest_disk).await?;
-    if let Some(size) = disk_size {
-        husker_storage::resize_disk(dest_disk, size).await?;
-    }
+    storage_driver
+        .prepare_cloud_disk(husker_storage::CloudDiskRequest {
+            source: image,
+            destination: dest_disk,
+            size_bytes: disk_size,
+            format: husker_storage::CloudDiskFormat::Qcow2,
+        })
+        .await
+        .map_err(storage_preparation_error)?;
     Ok(husker_vmm::BootMode::Uefi {
         ovmf_code: ovmf_code.to_path_buf(),
         ovmf_vars_template: ovmf_vars_template.to_path_buf(),
     })
+}
+
+fn storage_preparation_error(error: husker_storage::StorageError) -> CoreError {
+    match error {
+        husker_storage::StorageError::DiskTooSmall { .. } => {
+            CoreError::InvalidArgument(error.to_string())
+        }
+        other => CoreError::Storage(other),
+    }
 }
 
 /// Convert a seed-build failure into a core error. Invalid SSH keys are the
@@ -1574,7 +1599,7 @@ fn seed_error_to_core(e: husker_cloudinit::CloudInitError) -> CoreError {
     }
 }
 
-/// Bring the guest agent in a freshly cloned rootfs up to this daemon's build.
+/// Report how disk preparation handled the guest agent in a private rootfs.
 ///
 /// The agent is written into a rootfs once, at import time, so an image
 /// imported by an older daemon still carries that older agent and every VM
@@ -1583,33 +1608,26 @@ fn seed_error_to_core(e: husker_cloudinit::CloudInitError) -> CoreError {
 /// clone (never the catalog image it was cloned from) makes upgrading the
 /// daemon upgrade the agent too.
 ///
-/// Only for ext4 rootfs images: cloud VMs get a current agent from their
-/// cloud-init seed on every boot.
-async fn refresh_cloned_agent(
-    vm_name: &str,
-    rootfs: &std::path::Path,
-    agent: &[u8],
-) -> Result<(), CoreError> {
-    if agent.is_empty() {
-        return Ok(());
-    }
-    match husker_storage::refresh_guest_agent(rootfs, agent).await? {
-        husker_storage::AgentRefresh::Replaced => {
+/// Cloud VMs do not produce this outcome because their cloud-init seed carries
+/// the current agent on every boot.
+fn report_agent_refresh(vm_name: &str, refresh: Option<husker_storage::AgentRefresh>) {
+    match refresh {
+        None => {}
+        Some(husker_storage::AgentRefresh::Replaced) => {
             info!(vm = %vm_name, "refreshed the guest agent in the VM's rootfs clone");
         }
-        husker_storage::AgentRefresh::Skipped(reason) => {
+        Some(husker_storage::AgentRefresh::Skipped(reason)) => {
             warn!(
                 vm = %vm_name, %reason,
                 "could not refresh the guest agent; this VM keeps the agent its image was \
                  imported with, which may be older than this daemon"
             );
         }
-        husker_storage::AgentRefresh::Absent => {
+        Some(husker_storage::AgentRefresh::Absent) => {
             debug!(vm = %vm_name, "image carries no husker agent; leaving it untouched");
         }
-        husker_storage::AgentRefresh::UpToDate => {}
+        Some(husker_storage::AgentRefresh::UpToDate) => {}
     }
-    Ok(())
 }
 
 /// Mount a rootfs image via loop, write `/etc/resolv.conf`, and unmount.

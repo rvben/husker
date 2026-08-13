@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use husker_storage::{
-    LocalStorageDriver, StorageConfig, StorageDriver, StorageError, clone_rootfs,
-    default_storage_driver,
+    CloudDiskFormat, CloudDiskRequest, LocalStorageDriver, RootDiskRequest, StorageConfig,
+    StorageDriver, StorageError, clone_rootfs, default_storage_driver,
 };
 use tempfile::tempdir;
 
@@ -49,10 +49,13 @@ async fn grow_rootfs_ext4_refuses_shrink() {
     let err = husker_storage::grow_rootfs_ext4(&img, 1024)
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains("shrinking is not supported"),
-        "unexpected error: {err}"
-    );
+    assert!(matches!(
+        err,
+        StorageError::DiskTooSmall {
+            requested: 1024,
+            current: 1_048_576
+        }
+    ));
 }
 
 #[tokio::test]
@@ -448,4 +451,105 @@ async fn local_storage_driver_trait_clone_rootfs() {
     let driver = LocalStorageDriver;
     driver.clone_rootfs(&source, &dest).await.unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"driver content");
+}
+
+#[tokio::test]
+async fn root_disk_preparation_owns_clone_and_optional_steps() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.ext4");
+    let destination = dir.path().join("vm/rootfs.ext4");
+    std::fs::write(&source, b"rootfs").unwrap();
+
+    let refresh = LocalStorageDriver
+        .prepare_root_disk(RootDiskRequest {
+            source: &source,
+            destination: &destination,
+            size_bytes: None,
+            guest_agent: &[],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(refresh, None);
+    assert_eq!(std::fs::read(destination).unwrap(), b"rootfs");
+}
+
+#[tokio::test]
+async fn root_disk_preparation_removes_clone_when_resize_fails() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.ext4");
+    let destination = dir.path().join("vm/rootfs.ext4");
+    std::fs::write(&source, b"rootfs").unwrap();
+
+    let error = LocalStorageDriver
+        .prepare_root_disk(RootDiskRequest {
+            source: &source,
+            destination: &destination,
+            size_bytes: Some(1),
+            guest_agent: &[],
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StorageError::DiskTooSmall {
+            requested: 1,
+            current: 6
+        }
+    ));
+    assert!(
+        !destination.exists(),
+        "a failed preparation must not leave a bootable-looking disk"
+    );
+}
+
+#[tokio::test]
+async fn cloud_disk_preparation_validates_before_creating_destination() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("not-qcow2.img");
+    let destination = dir.path().join("vm/disk.qcow2");
+    std::fs::write(&source, b"not a cloud image").unwrap();
+
+    let error = LocalStorageDriver
+        .prepare_cloud_disk(CloudDiskRequest {
+            source: &source,
+            destination: &destination,
+            size_bytes: None,
+            format: CloudDiskFormat::Qcow2,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StorageError::InvalidCloudImage(_)));
+    assert!(!destination.exists());
+    assert!(!destination.parent().unwrap().exists());
+}
+
+#[tokio::test]
+async fn cloud_disk_preparation_never_overwrites_an_existing_destination() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.qcow2");
+    let destination = dir.path().join("disk.qcow2");
+    std::fs::write(&source, [0x51, 0x46, 0x49, 0xfb]).unwrap();
+    std::fs::write(&destination, b"owned by another operation").unwrap();
+
+    let error = LocalStorageDriver
+        .prepare_cloud_disk(CloudDiskRequest {
+            source: &source,
+            destination: &destination,
+            size_bytes: None,
+            format: CloudDiskFormat::Qcow2,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(
+        std::fs::read(destination).unwrap(),
+        b"owned by another operation"
+    );
 }
