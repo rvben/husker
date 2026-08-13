@@ -50,6 +50,30 @@ fn resolve_format(fmt: OutputFormat) -> OutputFormat {
     }
 }
 
+/// Commands without a finite JSON document keep text output when `auto` is
+/// redirected. This is essential for daemon/service scripts: redirecting logs
+/// must not silently turn `husker daemon` into an unsupported JSON invocation.
+/// An explicit `--output json` is preserved and rejected by command dispatch.
+fn resolve_command_format(format: OutputFormat, command: &Commands) -> OutputFormat {
+    if format == OutputFormat::Auto && command_requires_text_output(command) {
+        OutputFormat::Text
+    } else {
+        resolve_format(format)
+    }
+}
+
+fn command_requires_text_output(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Daemon { .. }
+            | Commands::Shell { .. }
+            | Commands::Logs { follow: true, .. }
+            | Commands::Config { .. }
+            | Commands::Setup { .. }
+            | Commands::Completions { .. }
+    )
+}
+
 /// Fetch a diagnostics report from the daemon's `GET /v1/diagnostics` endpoint.
 async fn fetch_diagnostics(
     daemon: &DaemonClient,
@@ -631,7 +655,7 @@ async fn main() {
             std::process::exit(e.exit_code());
         }
     };
-    let output = resolve_format(cli.output);
+    let output = resolve_command_format(cli.output, &cli.command);
     if let Err(e) = run(cli).await {
         // A connection failure carries the DaemonUnreachable marker; everything
         // else is a generic client error. API errors (not-found/conflict/denied)
@@ -663,9 +687,9 @@ async fn run(cli: Cli) -> Result<()> {
         output: raw_output,
         command,
     } = cli;
-    // Resolve Auto -> Json/Text once based on stdout TTY state, so all
-    // downstream branches can compare directly without re-calling resolve_format.
-    let output = resolve_format(raw_output);
+    // Resolve Auto once, taking commands with streaming/text-only output into
+    // account before downstream branches compare the selected format.
+    let output = resolve_command_format(raw_output, &command);
 
     if matches!(&command, Commands::Schema) {
         println!(
@@ -5570,6 +5594,51 @@ mod tests {
         let cli = Cli::try_parse_from(["husker", "--output", "json", "list"])
             .expect("cli should parse with json output");
         assert_eq!(cli.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn text_only_commands_keep_auto_text_when_redirected() {
+        for args in [
+            vec!["husker", "daemon"],
+            vec!["husker", "shell", "vm"],
+            vec!["husker", "logs", "vm", "--follow"],
+            vec!["husker", "config", "check"],
+            vec!["husker", "setup", "storage"],
+            vec!["husker", "completions", "bash"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("text-only command should parse");
+            assert_eq!(cli.output, OutputFormat::Auto);
+            assert_eq!(
+                resolve_command_format(cli.output, &cli.command),
+                OutputFormat::Text
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_json_is_preserved_for_a_text_only_command() {
+        let cli = Cli::try_parse_from(["husker", "--output", "json", "daemon"])
+            .expect("daemon should parse");
+        assert_eq!(
+            resolve_command_format(cli.output, &cli.command),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn finite_commands_still_use_tty_aware_auto_output() {
+        for args in [
+            vec!["husker", "list"],
+            vec!["husker", "logs", "vm"],
+            vec!["husker", "doctor"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("finite command should parse");
+            assert!(!command_requires_text_output(&cli.command));
+            assert_eq!(
+                resolve_command_format(cli.output, &cli.command),
+                resolve_format(OutputFormat::Auto)
+            );
+        }
     }
 
     #[test]
