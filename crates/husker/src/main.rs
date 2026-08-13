@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -14,6 +14,7 @@ mod cli;
 mod config;
 mod daemon;
 mod daemon_client;
+mod daemon_target;
 mod guest_file;
 mod job;
 mod schema;
@@ -23,6 +24,7 @@ use crate::cli::*;
 use crate::config::*;
 use crate::daemon::*;
 use crate::daemon_client::{ApiFailure, DaemonClient, DaemonUnreachable};
+use crate::daemon_target::*;
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::*;
 use crate::vm_creation::{
@@ -53,20 +55,6 @@ async fn fetch_diagnostics(
         .await?
         .error_for_status()?;
     Ok(resp.json().await?)
-}
-
-/// True when the API URL targets the local daemon, so a local probe is valid
-/// as a fallback when the daemon is not running.
-fn is_local_api(api_url: &str) -> bool {
-    api_url.contains("127.0.0.1") || api_url.contains("localhost") || api_url.contains("[::1]")
-}
-
-/// Whether the resolved target is genuinely the LOCAL host, not a remote daemon
-/// reached over an SSH tunnel. An `ssh://` context is rewritten to a
-/// `127.0.0.1:<port>` tunnel URL, so `is_local_api` alone would wrongly treat a
-/// remote host as local; the tunnel flag disambiguates.
-fn is_local_target(api_url: &str, via_ssh_tunnel: bool) -> bool {
-    is_local_api(api_url) && !via_ssh_tunnel
 }
 
 /// Commands that act on THIS machine's filesystem rather than on the daemon, and
@@ -691,48 +679,70 @@ async fn run(cli: Cli) -> Result<()> {
         return context_command(action, output);
     }
 
-    // Resolve the daemon target: explicit --api-url/HUSKER_API_URL, else the
-    // selected/current saved context, else the local default.
-    let api_url =
-        resolve_effective_api_url(api_url.as_deref(), context.as_deref(), &load_contexts())?;
+    // These commands are entirely local and must not resolve a saved context,
+    // validate a remote URL, or establish an SSH tunnel.
+    if let Commands::Config { action } = command {
+        return match action {
+            ConfigAction::Check => {
+                if output == OutputFormat::Json {
+                    exit_with_error(
+                        output,
+                        "`husker config check` does not yet support --output json",
+                    );
+                }
+                check_config(config_path.as_deref())
+            }
+        };
+    }
+    if matches!(command, Commands::Schema) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&build_cli_schema()).expect("schema serializes")
+        );
+        return Ok(());
+    }
+    if let Commands::Completions { shell } = command {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let name = cli.get_name().to_string();
+        clap_complete::generate(shell, &mut cli, name, &mut std::io::stdout());
+        return Ok(());
+    }
+
+    // Starting the daemon is host-local and does not consume a client target.
+    if let Commands::Daemon {
+        listen,
+        allow_remote,
+    } = command
+    {
+        let mut config = load_config_strict(config_path.as_deref())?;
+        if let Some(token) = cli_api_token {
+            config.api_token = Some(token);
+        }
+        validate_daemon_bind(listen, allow_remote, config.api_token.is_some())?;
+        return start_daemon(config, listen).await;
+    }
+
+    let resolved_target =
+        ResolvedDaemonTarget::resolve(api_url.as_deref(), context.as_deref(), &load_contexts())?;
 
     // Host-local operations read and write THIS machine's data dir. Refuse a
     // remote/ssh context up front, before we open a tunnel or touch any local
     // path, so the error is clean and nothing is written to the wrong host.
-    let targets_remote_host = api_url.starts_with("ssh://") || !is_local_api(&api_url);
-    if targets_remote_host && let Some(msg) = host_local_refusal(&command) {
+    if !resolved_target.is_local()
+        && let Some(msg) = host_local_refusal(&command)
+    {
         exit_with_error(output, msg);
     }
 
-    // ssh:// transport: open an SSH local-forward tunnel to a remote daemon and
-    // rewrite api_url to the local end. The guard keeps the ssh process alive for
-    // the whole command and tears it down on return. `husker daemon` starts a
-    // local server and never tunnels, even if the current context is ssh://.
-    let _ssh_tunnel: Option<SshTunnel>;
-    let api_url = if api_url.starts_with("ssh://") && !matches!(command, Commands::Daemon { .. }) {
-        let tunnel = SshTunnel::establish(&api_url).await?;
-        let local = tunnel.local_url();
-        _ssh_tunnel = Some(tunnel);
-        local
-    } else {
-        _ssh_tunnel = None;
-        api_url
-    };
-    // Remote-over-ssh: the tunnel URL is localhost, so `is_local_api` would
-    // misclassify it. This flag lets `is_local_target` treat it as remote.
-    let via_ssh_tunnel = _ssh_tunnel.is_some();
+    let target = resolved_target
+        .connect(resolve_api_token(
+            cli_api_token.clone(),
+            config_path.as_deref(),
+        ))
+        .await?;
     match command {
-        Commands::Daemon {
-            listen,
-            allow_remote,
-        } => {
-            let mut config = load_config_strict(config_path.as_deref())?;
-            if let Some(token) = cli_api_token.clone() {
-                config.api_token = Some(token);
-            }
-            validate_daemon_bind(listen, allow_remote, config.api_token.is_some())?;
-            start_daemon(config, listen).await
-        }
+        Commands::Daemon { .. } => unreachable!("daemon handled before target connection"),
         Commands::Run {
             rootfs,
             name,
@@ -761,7 +771,6 @@ async fn run(cli: Cli) -> Result<()> {
             profile,
         } => {
             let config = load_config(config_path.as_deref());
-            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
 
             let name =
                 name.unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
@@ -774,7 +783,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|s| parse_add_host(s))
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let userdata_queued = userdata.is_some();
             let mut extra_pool_conflicts = Vec::new();
             if !dns.is_empty() {
@@ -813,7 +822,7 @@ async fn run(cli: Cli) -> Result<()> {
                     userdata,
                     extra_pool_conflicts,
                 },
-                is_local_target(&api_url, via_ssh_tunnel),
+                target.is_local(),
             )
             .await
             {
@@ -890,8 +899,7 @@ async fn run(cli: Cli) -> Result<()> {
             offset,
             fields,
         } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let mut url = format!("/v1/vms?limit={limit}&offset={offset}");
             if let Some(ref f) = fields {
                 url.push_str(&format!("&fields={}", f));
@@ -972,8 +980,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Info { name } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
 
             if !resp.status().is_success() {
@@ -1026,8 +1033,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Stop { name } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let resp = client
                 .send(client.post(format!("/v1/vms/{name}/stop")))
                 .await?;
@@ -1052,8 +1058,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Pause { name } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let resp = client
                 .send(client.post(format!("/v1/vms/{name}/pause")))
                 .await?;
@@ -1079,8 +1084,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Resume { name } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let resp = client
                 .send(client.post(format!("/v1/vms/{name}/resume")))
                 .await?;
@@ -1109,9 +1113,8 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Suspend { name } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            preflight_capability(&api_url, api_token.as_deref(), "snapshot").await?;
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
+            preflight_capability(&client, "snapshot").await?;
             let resp = client
                 .send(client.post(format!("/v1/vms/{name}/suspend")))
                 .await?;
@@ -1137,9 +1140,8 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Fork { source, fork_name } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            preflight_capability(&api_url, api_token.as_deref(), "fork").await?;
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
+            preflight_capability(&client, "fork").await?;
             let resp = client
                 .send(
                     client
@@ -1173,8 +1175,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Destroy { name, yes } => {
             require_confirmation(&format!("Destroy VM '{name}'?"), yes, output);
 
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let resp = client
                 .send(client.delete(format!("/v1/vms/{name}")))
                 .await?;
@@ -1196,8 +1197,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Balloon { name, amount_mib } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let body = serde_json::json!({ "amount_mib": amount_mib });
             let resp = client
                 .send(client.put(format!("/v1/vms/{name}/balloon")).json(&body))
@@ -1230,7 +1230,6 @@ async fn run(cli: Cli) -> Result<()> {
             timeout,
             command,
         } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let (cmd, args) = command.split_first().context("command required after --")?;
             let env = merge_env(&env_file, env)?;
             let secret_env = build_secret_env(&secret)?;
@@ -1260,7 +1259,7 @@ async fn run(cli: Cli) -> Result<()> {
                 body["timeout_secs"] = serde_json::json!(secs);
             }
 
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let resp = client
                 .send(client.post(format!("/v1/vms/{name}/exec")).json(&body))
                 .await?;
@@ -1332,7 +1331,6 @@ async fn run(cli: Cli) -> Result<()> {
             command,
         } => {
             let config = load_config(config_path.as_deref());
-            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
             let name =
                 name.unwrap_or_else(|| format!("job-{}", &uuid::Uuid::new_v4().to_string()[..8]));
             let env = merge_env(&env_file, env)?;
@@ -1344,7 +1342,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|s| parse_add_host(s))
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let plan = match plan_vm_creation(
                 &client,
                 &config,
@@ -1375,7 +1373,7 @@ async fn run(cli: Cli) -> Result<()> {
                     userdata: None,
                     extra_pool_conflicts: Vec::new(),
                 },
-                is_local_target(&api_url, via_ssh_tunnel),
+                target.is_local(),
             )
             .await
             {
@@ -1410,7 +1408,6 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Cp { source, dest, mode } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             let src = parse_cp_path(&source);
             let dst = parse_cp_path(&dest);
 
@@ -1418,7 +1415,7 @@ async fn run(cli: Cli) -> Result<()> {
                 (CpPath::Local(local), CpPath::Vm { name, path }) => {
                     let data = std::fs::read(&local)
                         .with_context(|| format!("reading {}", local.display()))?;
-                    let client = DaemonClient::new(&api_url, api_token.clone());
+                    let client = target.daemon().clone();
 
                     if data.len() > CP_CHUNK_BYTES {
                         // Large file: send it as a sequence of append-mode
@@ -1530,7 +1527,7 @@ async fn run(cli: Cli) -> Result<()> {
                     // Reads in chunks when the file is larger than one response
                     // can carry, so the size of an artifact is not a reason it
                     // cannot be copied out.
-                    let client = DaemonClient::new(&api_url, api_token.clone());
+                    let client = target.daemon().clone();
                     let data = match read_guest_file(&client, &name, &path).await? {
                         GuestFile::Read(data) => data,
                         GuestFile::Failed(failure) => exit_with_error(output, failure),
@@ -1563,39 +1560,21 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::PortForward { name, action } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            port_forward(api_url, api_token, name, action, output).await
+            port_forward(target.daemon(), name, action, output).await
         }
-        Commands::HostGroup { action } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            host_group_command(api_url, api_token, action, output).await
-        }
+        Commands::HostGroup { action } => host_group_command(target.daemon(), action, output).await,
         Commands::Pool { action } => {
             let config = load_config(config_path.as_deref());
-            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
-            pool_command(api_url, api_token, action, output, config).await
+            pool_command(target.daemon(), action, output, config).await
         }
         Commands::Service { action } => {
             let config = load_config(config_path.as_deref());
-            let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
-            service_command(api_url, api_token, action, output, config).await
+            service_command(target.daemon(), action, output, config).await
         }
-        Commands::Snapshot { action } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            snapshot_command(api_url, api_token, action, output).await
-        }
-        Commands::Image { action } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            image_command(api_url, api_token, action, output).await
-        }
-        Commands::Volume { action } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            volume_command(api_url, api_token, action, output).await
-        }
-        Commands::Secret { action } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            secret_command(api_url, api_token, action, output).await
-        }
+        Commands::Snapshot { action } => snapshot_command(target.daemon(), action, output).await,
+        Commands::Image { action } => image_command(target.daemon(), action, output).await,
+        Commands::Volume { action } => volume_command(target.daemon(), action, output).await,
+        Commands::Secret { action } => secret_command(target.daemon(), action, output).await,
         Commands::Logs {
             name,
             follow,
@@ -1603,7 +1582,6 @@ async fn run(cli: Cli) -> Result<()> {
             userdata,
             source,
         } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             // Effective source: explicit --source wins; else --userdata maps to
             // "userdata"; else serial. Warn if both --source and --userdata given.
             if source.is_some() && userdata {
@@ -1632,7 +1610,7 @@ async fn run(cli: Cli) -> Result<()> {
                 url.push_str(&params.join("&"));
             }
 
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let resp = client.send(client.get(&url)).await?;
 
             if !resp.status().is_success() {
@@ -1684,8 +1662,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Wait { name, timeout } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = DaemonClient::new(&api_url, api_token.clone());
+            let client = target.daemon().clone();
             let timeout = match timeout {
                 Some(t) => std::time::Duration::from_secs(t),
                 None => {
@@ -1735,25 +1712,12 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Shell { name, command } => {
-            let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            run_shell(
-                api_url,
-                config_path,
-                name,
-                command,
-                api_token.as_deref(),
-                output,
-            )
-            .await
+            run_shell(&target, config_path, name, command, output).await
         }
         Commands::Version => {
             let mut daemon_info: Option<serde_json::Value> = None;
 
-            let client = DaemonClient::with_timeout(
-                &api_url,
-                resolve_api_token(cli_api_token.clone(), config_path.as_deref()),
-                std::time::Duration::from_secs(2),
-            )?;
+            let client = target.client_with_timeout(std::time::Duration::from_secs(2))?;
             if let Ok(resp) = client.try_send(client.get("/v1/health")).await
                 && resp.status().is_success()
                 && let Ok(health) = resp.json::<serde_json::Value>().await
@@ -1792,26 +1756,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Commands::Config { action } => match action {
-            ConfigAction::Check => {
-                if output == OutputFormat::Json {
-                    exit_with_error(
-                        output,
-                        "`husker config check` does not yet support --output json",
-                    );
-                }
-                check_config(config_path.as_deref())
-            }
-        },
+        Commands::Config { .. } => unreachable!("config handled before target resolution"),
         Commands::Profile { action } => match action {
             ProfileAction::List => {
                 let config = load_config(config_path.as_deref());
-                let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
-                let client = DaemonClient::with_timeout(
-                    &api_url,
-                    api_token,
-                    std::time::Duration::from_secs(3),
-                )?;
+                let client = target.client_with_timeout(std::time::Duration::from_secs(3))?;
                 let daemon_result = match fetch_daemon_profiles(&client).await {
                     Ok(o) => o,
                     Err(e) => exit_with_error(output, e.to_string()),
@@ -1922,7 +1871,7 @@ async fn run(cli: Cli) -> Result<()> {
                         SetupFsArg::Btrfs => "mkfs.btrfs",
                     }),
                     rsync_available: which_on_path("rsync"),
-                    is_local_context: is_local_target(&api_url, via_ssh_tunnel),
+                    is_local_context: target.is_local(),
                 };
                 let opts = ss::StorageSetupOptions {
                     state_dir,
@@ -1936,10 +1885,11 @@ async fn run(cli: Cli) -> Result<()> {
                     thin,
                 };
                 let config_file = config_path_or_default();
-                let api_addr = api_url
+                let api_addr = target
+                    .api_url()
                     .strip_prefix("http://")
-                    .or_else(|| api_url.strip_prefix("https://"))
-                    .unwrap_or(api_url.as_str())
+                    .or_else(|| target.api_url().strip_prefix("https://"))
+                    .unwrap_or(target.api_url())
                     .trim_end_matches('/');
                 match ss::build_storage_setup_plan(&data_dir, &config_file, api_addr, opts, &facts)
                 {
@@ -2001,14 +1951,10 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Commands::Doctor => {
             let config = load_config(config_path.as_deref());
-            let client = DaemonClient::with_timeout(
-                &api_url,
-                cli_api_token.clone().or_else(|| config.api_token.clone()),
-                std::time::Duration::from_secs(3),
-            )?;
+            let client = target.client_with_timeout(std::time::Duration::from_secs(3))?;
             let report = match fetch_diagnostics(&client).await {
                 Ok(r) => r,
-                Err(_) if is_local_target(&api_url, via_ssh_tunnel) => {
+                Err(_) if target.is_local() => {
                     // Daemon is not running locally: run the probe directly on the host.
                     eprintln!("(daemon not reachable; running local host probe)");
                     let storage = husker_storage::StorageConfig {
@@ -2069,12 +2015,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Capabilities => {
             unreachable!("capabilities handled before target resolution")
         }
-        Commands::Completions { shell } => {
-            use clap::CommandFactory;
-            let mut cmd = Cli::command();
-            let name = cmd.get_name().to_string();
-            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
-            Ok(())
+        Commands::Completions { .. } => {
+            unreachable!("completions handled before target resolution")
         }
     }
 }
@@ -2085,6 +2027,7 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
     let mut contexts = load_contexts();
     match action {
         ContextAction::Add { name, url } => {
+            validate_context_url(&url)?;
             contexts.contexts.insert(
                 name.clone(),
                 ContextEntry {
@@ -2190,7 +2133,7 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
                 print_output(
                     output,
                     &serde_json::json!({ "current": serde_json::Value::Null }),
-                    "No current context (using http://127.0.0.1:7777)",
+                    format!("No current context (using {DEFAULT_API_URL})"),
                 );
             }
         },
@@ -2199,13 +2142,11 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
 }
 
 async fn port_forward(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     name: String,
     action: PortForwardAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         PortForwardAction::Add {
             host_port,
@@ -2320,12 +2261,10 @@ async fn port_forward(
 }
 
 async fn host_group_command(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     action: HostGroupAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         HostGroupAction::Create { name, description } => {
             let mut body = serde_json::json!({
@@ -2449,13 +2388,11 @@ async fn host_group_command(
 }
 
 async fn pool_command(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     action: PoolAction,
     output: OutputFormat,
     config: Config,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         PoolAction::Create {
             name,
@@ -2616,13 +2553,11 @@ async fn pool_command(
 }
 
 async fn service_command(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     action: ServiceAction,
     output: OutputFormat,
     config: Config,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         ServiceAction::Create {
             name,
@@ -2981,12 +2916,10 @@ async fn service_command(
 }
 
 async fn snapshot_command(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     action: SnapshotAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         SnapshotAction::Create { name, vm } => {
             let resp = client
@@ -3159,12 +3092,10 @@ async fn snapshot_command(
 }
 
 async fn image_command(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     action: ImageAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         ImageAction::Import {
             name,
@@ -3202,7 +3133,7 @@ async fn image_command(
             }
         }
         ImageAction::ImportOci { reference, name } => {
-            preflight_capability(&api_url, api_token.as_deref(), "oci_import").await?;
+            preflight_capability(client, "oci_import").await?;
             let name = name.unwrap_or_else(|| oci_default_image_name(&reference));
             let resp = client
                 .send(
@@ -3424,12 +3355,10 @@ async fn image_command(
 }
 
 async fn volume_command(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     action: VolumeAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         VolumeAction::Create { name, size } => {
             let size_bytes =
@@ -3547,12 +3476,10 @@ async fn volume_command(
 }
 
 async fn secret_command(
-    api_url: String,
-    api_token: Option<String>,
+    client: &DaemonClient,
     action: SecretAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         SecretAction::Create { name, value } => {
             let resp = client
@@ -3720,14 +3647,13 @@ type WsStream =
 /// On macOS, always uses the WebSocket path through the daemon.
 #[cfg(feature = "linux-net")]
 async fn run_shell(
-    api_url: String,
+    target: &DaemonTarget,
     config_path: Option<PathBuf>,
     name: String,
     command: Option<String>,
-    api_token: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(&api_url, api_token.map(str::to_owned));
+    let client = target.daemon();
     let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
 
     if !resp.status().is_success() {
@@ -3777,31 +3703,29 @@ async fn run_shell(
     }
 
     // Direct vsock unavailable — use WebSocket through daemon.
-    run_shell_ws(&api_url, &name, command.as_deref(), api_token, output).await
+    run_shell_ws(target, &name, command.as_deref(), output).await
 }
 
 #[cfg(not(feature = "linux-net"))]
 async fn run_shell(
-    api_url: String,
+    target: &DaemonTarget,
     _config_path: Option<PathBuf>,
     name: String,
     command: Option<String>,
-    api_token: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    run_shell_ws(&api_url, &name, command.as_deref(), api_token, output).await
+    run_shell_ws(target, &name, command.as_deref(), output).await
 }
 
 /// WebSocket-based interactive shell, works on both Linux and macOS.
 async fn run_shell_ws(
-    api_url: &str,
+    target: &DaemonTarget,
     name: &str,
     command: Option<&str>,
-    api_token: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
     // Pre-check: verify VM is running before opening the WebSocket.
-    let client = DaemonClient::new(api_url, api_token.map(str::to_owned));
+    let client = target.daemon();
     let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
     if !resp.status().is_success() {
         let err = client.error(resp, &format!("VM '{name}'")).await;
@@ -3829,7 +3753,8 @@ async fn run_shell_ws(
         );
     }
 
-    let ws_url = api_url
+    let ws_url = target
+        .api_url()
         .replacen("http://", "ws://", 1)
         .replacen("https://", "wss://", 1);
     let url = format!("{ws_url}/v1/vms/{name}/shell");
@@ -3837,7 +3762,7 @@ async fn run_shell_ws(
     let mut ws_request = url
         .into_client_request()
         .context("building websocket request")?;
-    if let Some(token) = api_token {
+    if let Some(token) = target.api_token() {
         let value = format!("Bearer {token}");
         let header = tungstenite::http::HeaderValue::from_str(&value)
             .context("invalid API token for websocket auth header")?;
@@ -4095,81 +4020,6 @@ async fn run_shell_bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
             }
         }
     }
-}
-
-/// A saved daemon target: a name mapped to an API URL (http:// or ssh://).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ContextEntry {
-    api_url: String,
-}
-
-/// Named daemon targets ("contexts") plus the currently selected one, persisted
-/// to `~/.config/husker/contexts.toml`. Lets a host switch between, say, a local
-/// Apple VZ daemon and a remote Linux Firecracker daemon without retyping URLs.
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct Contexts {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    current: Option<String>,
-    #[serde(default)]
-    contexts: std::collections::BTreeMap<String, ContextEntry>,
-}
-
-/// Path to the contexts file (`HUSKER_CONTEXTS_FILE` overrides; used by tests).
-fn contexts_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("HUSKER_CONTEXTS_FILE") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".config/husker/contexts.toml")
-}
-
-/// Load saved contexts, or an empty set if the file is absent or unreadable.
-fn load_contexts() -> Contexts {
-    std::fs::read_to_string(contexts_path())
-        .ok()
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Persist contexts, creating the parent directory if needed.
-fn save_contexts(contexts: &Contexts) -> Result<()> {
-    let path = contexts_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let body = toml::to_string_pretty(contexts).context("serializing contexts")?;
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
-}
-
-/// Resolve the daemon API URL to use. Precedence: an explicit `--api-url` /
-/// `HUSKER_API_URL` always wins; otherwise an explicitly named context
-/// (`--context`/`HUSKER_CONTEXT`); otherwise the saved current context; otherwise
-/// the local default. An explicitly named context that does not exist is an error;
-/// a stale `current` falls back to the default rather than bricking the CLI.
-fn resolve_effective_api_url(
-    explicit_api_url: Option<&str>,
-    context_name: Option<&str>,
-    contexts: &Contexts,
-) -> Result<String> {
-    const DEFAULT_API_URL: &str = "http://127.0.0.1:7777";
-    if let Some(url) = explicit_api_url {
-        return Ok(url.to_string());
-    }
-    if let Some(name) = context_name {
-        let entry = contexts.contexts.get(name).ok_or_else(|| {
-            anyhow::anyhow!("unknown context '{name}' (list with `husker context list`)")
-        })?;
-        return Ok(entry.api_url.clone());
-    }
-    if let Some(name) = contexts.current.as_deref()
-        && let Some(entry) = contexts.contexts.get(name)
-    {
-        return Ok(entry.api_url.clone());
-    }
-    Ok(DEFAULT_API_URL.to_string())
 }
 
 /// Validate the configuration file and report results.
@@ -4790,192 +4640,6 @@ pub(crate) fn extract_archive_over(bytes: &[u8], dst: &Path) -> Result<Vec<Strin
     Ok(written)
 }
 
-/// The husker daemon's default listen port, used as the remote end of an
-/// `ssh://` tunnel.
-const SSH_REMOTE_DAEMON_PORT: u16 = 7777;
-
-/// A parsed `ssh://[user@]host[:sshport]` daemon target.
-#[derive(Debug, PartialEq, Eq)]
-struct SshTarget {
-    user: Option<String>,
-    host: String,
-    ssh_port: Option<u16>,
-}
-
-/// Parse an `ssh://[user@]host[:sshport]` API URL into its parts.
-fn parse_ssh_url(url: &str) -> Result<SshTarget> {
-    let rest = url
-        .strip_prefix("ssh://")
-        .context("API URL must start with ssh://")?;
-    let (user, hostport) = match rest.split_once('@') {
-        Some((u, hp)) => {
-            if u.is_empty() {
-                anyhow::bail!("ssh:// URL has an empty user");
-            }
-            (Some(u.to_string()), hp)
-        }
-        None => (None, rest),
-    };
-    let (host, ssh_port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => {
-            let port: u16 = p
-                .parse()
-                .with_context(|| format!("invalid ssh port in ssh:// URL: {p}"))?;
-            (h.to_string(), Some(port))
-        }
-        None => (hostport.to_string(), None),
-    };
-    if host.is_empty() {
-        anyhow::bail!("ssh:// URL is missing a host");
-    }
-    Ok(SshTarget {
-        user,
-        host,
-        ssh_port,
-    })
-}
-
-/// Build the `ssh` argv for a `-L` local-forward tunnel from `local_port` to the
-/// remote daemon's `remote_port` on its loopback.
-///
-/// `control_path` enables SSH connection multiplexing: the first invocation opens
-/// a master connection at that socket and later invocations reuse it, skipping the
-/// handshake so a repeated `husker ... ssh://...` dev loop stays fast.
-fn ssh_tunnel_args(target: &SshTarget, local_port: u16, remote_port: u16) -> Vec<String> {
-    // A dedicated foreground tunnel: `-N` (no remote command) keeps the ssh
-    // process alive for exactly as long as the forward is needed, so the
-    // SshTunnel guard can tear it down on drop. No ControlMaster/ControlPersist:
-    // a persisted master backgrounds itself and exits the foreground process with
-    // status 0, which wait_ready() cannot distinguish from a failed connection.
-    // LogLevel=ERROR keeps ssh's banner/MOTD chatter off our streams.
-    let mut args = vec![
-        "-N".to_string(),
-        "-o".to_string(),
-        "ExitOnForwardFailure=yes".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=10".to_string(),
-        "-o".to_string(),
-        "LogLevel=ERROR".to_string(),
-        "-L".to_string(),
-        format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
-    ];
-    if let Some(p) = target.ssh_port {
-        args.push("-p".to_string());
-        args.push(p.to_string());
-    }
-    args.push(match &target.user {
-        Some(u) => format!("{u}@{}", target.host),
-        None => target.host.clone(),
-    });
-    args
-}
-
-/// PID of the live `ssh` tunnel child (`0` = none), read by the atexit hook.
-static SSH_TUNNEL_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// Record the ssh tunnel's pid and install the atexit teardown hook once.
-fn register_ssh_tunnel_for_atexit(pid: i32) {
-    SSH_TUNNEL_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
-    static REGISTER: std::sync::Once = std::sync::Once::new();
-    REGISTER.call_once(|| unsafe {
-        libc::atexit(kill_ssh_tunnel_atexit);
-    });
-}
-
-/// atexit hook: SIGKILL the ssh tunnel child if one is still recorded. husker
-/// exits most paths via `std::process::exit` (to skip tokio runtime shutdown),
-/// which bypasses `SshTunnel`'s `Drop`. Without this, the orphaned `ssh -N` keeps
-/// husker's inherited stderr open, so a piped/captured invocation hangs on a
-/// never-closing pipe (and the tunnel + forwarded port leak). `SshTunnel::drop`
-/// clears the pid first, so a clean exit never targets a reused pid here.
-extern "C" fn kill_ssh_tunnel_atexit() {
-    let pid = SSH_TUNNEL_PID.load(std::sync::atomic::Ordering::SeqCst);
-    if pid > 0 {
-        // Safety: kill(2) is async-signal-safe and valid from an atexit handler.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-    }
-}
-
-/// A live SSH local-forward tunnel to a remote husker daemon. The `ssh` child is
-/// killed on drop (`kill_on_drop`), so the tunnel lives exactly as long as this
-/// guard is held. A `std::process::exit` bypasses that drop, so the tunnel pid is
-/// also registered for an atexit teardown (see `register_ssh_tunnel_for_atexit`).
-struct SshTunnel {
-    child: tokio::process::Child,
-    local_port: u16,
-}
-
-impl Drop for SshTunnel {
-    fn drop(&mut self) {
-        // Clear the atexit pid before the Child's kill_on_drop tears ssh down, so
-        // the atexit hook cannot later SIGKILL a reused pid on a clean exit.
-        SSH_TUNNEL_PID.store(0, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl SshTunnel {
-    /// Open a tunnel for an `ssh://` URL and wait until it accepts connections.
-    async fn establish(url: &str) -> Result<Self> {
-        let target = parse_ssh_url(url)?;
-        let local_port = reserve_local_port()?;
-        let args = ssh_tunnel_args(&target, local_port, SSH_REMOTE_DAEMON_PORT);
-        let mut cmd = tokio::process::Command::new("ssh");
-        // The tunnel produces no application output; null its stdio so a login
-        // banner/MOTD never corrupts husker's stdout and a prompt can't block on
-        // stdin. ssh's own errors still reach the user's terminal via stderr.
-        cmd.args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let child = cmd
-            .spawn()
-            .context("spawning ssh for the ssh:// tunnel (is the ssh client installed?)")?;
-        if let Some(pid) = child.id() {
-            register_ssh_tunnel_for_atexit(pid as i32);
-        }
-        let mut tunnel = SshTunnel { child, local_port };
-        tunnel.wait_ready().await?;
-        Ok(tunnel)
-    }
-
-    async fn wait_ready(&mut self) -> Result<()> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                anyhow::bail!(
-                    "ssh tunnel exited before it was ready (status {status}); \
-                     check that you can `ssh` to the host and the daemon listens on \
-                     127.0.0.1:{SSH_REMOTE_DAEMON_PORT}"
-                );
-            }
-            if tokio::net::TcpStream::connect(("127.0.0.1", self.local_port))
-                .await
-                .is_ok()
-            {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!("timed out establishing the ssh:// tunnel to the daemon");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        }
-    }
-
-    fn local_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.local_port)
-    }
-}
-
-/// Reserve an ephemeral loopback port by binding and immediately releasing it, so
-/// `ssh -L` can claim it for the forward.
-fn reserve_local_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .context("reserving a local port for the ssh:// tunnel")?;
-    Ok(listener.local_addr()?.port())
-}
-
 /// Human-facing phrase describing what backend a capability requires.
 fn capability_requirement(cap: &str) -> &'static str {
     match cap {
@@ -5018,15 +4682,15 @@ fn capability_gate(health: &serde_json::Value, cap: &str) -> Result<(), String> 
 /// capability `cap`. Best-effort: an unreachable or unparseable health response,
 /// or a daemon too old to advertise capabilities, falls through so the command
 /// proceeds (and the server rejects it if truly unsupported).
-async fn preflight_capability(api_url: &str, api_token: Option<&str>, cap: &str) -> Result<()> {
-    let Ok(client) = DaemonClient::with_timeout(
-        api_url,
-        api_token.map(str::to_owned),
-        std::time::Duration::from_secs(5),
-    ) else {
-        return Ok(());
-    };
-    let Ok(resp) = client.try_send(client.get("/v1/health")).await else {
+async fn preflight_capability(daemon: &DaemonClient, cap: &str) -> Result<()> {
+    let Ok(resp) = daemon
+        .try_send(
+            daemon
+                .get("/v1/health")
+                .timeout(std::time::Duration::from_secs(5)),
+        )
+        .await
+    else {
         return Ok(());
     };
     if !resp.status().is_success() {
@@ -7275,83 +6939,6 @@ default_auto_resume = false
         );
     }
 
-    fn ctx(url: &str) -> ContextEntry {
-        ContextEntry {
-            api_url: url.to_string(),
-        }
-    }
-
-    #[test]
-    fn resolve_api_url_explicit_wins_over_everything() {
-        let mut c = Contexts {
-            current: Some("linux".into()),
-            ..Default::default()
-        };
-        c.contexts.insert("linux".into(), ctx("ssh://ubuntu@host"));
-        let u =
-            resolve_effective_api_url(Some("http://192.0.2.9:7777"), Some("linux"), &c).unwrap();
-        assert_eq!(u, "http://192.0.2.9:7777");
-    }
-
-    #[test]
-    fn resolve_api_url_named_context() {
-        let mut c = Contexts::default();
-        c.contexts.insert("linux".into(), ctx("ssh://ubuntu@host"));
-        let u = resolve_effective_api_url(None, Some("linux"), &c).unwrap();
-        assert_eq!(u, "ssh://ubuntu@host");
-    }
-
-    #[test]
-    fn resolve_api_url_uses_current_when_no_flag() {
-        let mut c = Contexts {
-            current: Some("mac".into()),
-            ..Default::default()
-        };
-        c.contexts
-            .insert("mac".into(), ctx("http://127.0.0.1:7777"));
-        let u = resolve_effective_api_url(None, None, &c).unwrap();
-        assert_eq!(u, "http://127.0.0.1:7777");
-    }
-
-    #[test]
-    fn resolve_api_url_defaults_to_localhost() {
-        let u = resolve_effective_api_url(None, None, &Contexts::default()).unwrap();
-        assert_eq!(u, "http://127.0.0.1:7777");
-    }
-
-    #[test]
-    fn resolve_api_url_unknown_named_context_errors() {
-        let err = resolve_effective_api_url(None, Some("nope"), &Contexts::default()).unwrap_err();
-        assert!(
-            err.to_string().contains("nope"),
-            "names the bad context: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_api_url_stale_current_falls_back() {
-        let c = Contexts {
-            current: Some("ghost".into()),
-            ..Default::default()
-        };
-        let u = resolve_effective_api_url(None, None, &c).unwrap();
-        assert_eq!(u, "http://127.0.0.1:7777");
-    }
-
-    #[test]
-    fn contexts_roundtrip_toml() {
-        let mut c = Contexts {
-            current: Some("linux".into()),
-            ..Default::default()
-        };
-        c.contexts.insert("linux".into(), ctx("ssh://ubuntu@host"));
-        c.contexts
-            .insert("mac".into(), ctx("http://127.0.0.1:7777"));
-        let s = toml::to_string_pretty(&c).unwrap();
-        let back: Contexts = toml::from_str(&s).unwrap();
-        assert_eq!(c, back);
-    }
-
     #[test]
     fn capability_gate_blocks_when_unsupported() {
         let health = serde_json::json!({
@@ -7380,100 +6967,6 @@ default_auto_resume = false
         // No capabilities field (daemon too old to advertise): do not block.
         let health = serde_json::json!({ "version": "0.4.4" });
         assert!(capability_gate(&health, "fork").is_ok());
-    }
-
-    #[test]
-    fn parse_ssh_url_full() {
-        let t = parse_ssh_url("ssh://ubuntu@192.0.2.5:2222").unwrap();
-        assert_eq!(t.user.as_deref(), Some("ubuntu"));
-        assert_eq!(t.host, "192.0.2.5");
-        assert_eq!(t.ssh_port, Some(2222));
-    }
-
-    #[test]
-    fn parse_ssh_url_host_only() {
-        let t = parse_ssh_url("ssh://host.example").unwrap();
-        assert_eq!(t.user, None);
-        assert_eq!(t.host, "host.example");
-        assert_eq!(t.ssh_port, None);
-    }
-
-    #[test]
-    fn parse_ssh_url_user_no_port() {
-        let t = parse_ssh_url("ssh://ubuntu@host").unwrap();
-        assert_eq!(t.user.as_deref(), Some("ubuntu"));
-        assert_eq!(t.host, "host");
-        assert_eq!(t.ssh_port, None);
-    }
-
-    #[test]
-    fn parse_ssh_url_rejects_non_ssh_and_empty_host() {
-        assert!(parse_ssh_url("http://host").is_err());
-        assert!(parse_ssh_url("ssh://").is_err());
-    }
-
-    #[test]
-    fn ssh_tunnel_args_builds_local_forward() {
-        let t = SshTarget {
-            user: Some("ubuntu".into()),
-            host: "192.0.2.5".into(),
-            ssh_port: Some(2222),
-        };
-        let args = ssh_tunnel_args(&t, 15000, 7777);
-        assert!(
-            args.contains(&"-N".to_string()),
-            "runs without a remote command"
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-L" && w[1] == "127.0.0.1:15000:127.0.0.1:7777"),
-            "forwards local 15000 to remote daemon: {args:?}"
-        );
-        assert!(
-            args.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"),
-            "passes the ssh port: {args:?}"
-        );
-        assert_eq!(args.last().unwrap(), "ubuntu@192.0.2.5");
-    }
-
-    #[test]
-    fn ssh_tunnel_args_is_dedicated_foreground_tunnel() {
-        // Regression: ControlPersist makes ssh background the master connection and
-        // exit the foreground process with status 0 as soon as the forward is up.
-        // wait_ready() treats any child exit as failure ("exited before it was
-        // ready"), so a persisted tunnel is misreported even though the forward
-        // works. The tunnel must be a dedicated foreground `ssh -N` that lives
-        // exactly as long as the SshTunnel guard (killed on drop), with no shared
-        // control master to leak across invocations.
-        let t = SshTarget {
-            user: None,
-            host: "h".into(),
-            ssh_port: None,
-        };
-        let args = ssh_tunnel_args(&t, 100, 7777);
-        assert!(
-            !args.iter().any(|a| a.starts_with("ControlPersist=")),
-            "must not persist a backgrounded master: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a == "ControlMaster=auto"),
-            "must be self-contained (no shared master): {args:?}"
-        );
-    }
-
-    #[test]
-    fn ssh_tunnel_args_no_user_no_port() {
-        let t = SshTarget {
-            user: None,
-            host: "h".into(),
-            ssh_port: None,
-        };
-        let args = ssh_tunnel_args(&t, 100, 7777);
-        assert_eq!(args.last().unwrap(), "h");
-        assert!(
-            !args.contains(&"-p".to_string()),
-            "no -p when ssh_port absent"
-        );
     }
 
     #[test]
@@ -8150,17 +7643,6 @@ default_auto_resume = false
         assert!(storage_mount_satisfied(false, false)); // flag off -> always ok
         assert!(storage_mount_satisfied(true, true)); // mounted -> ok
         assert!(!storage_mount_satisfied(true, false)); // flag on, not mounted -> refuse
-    }
-
-    #[test]
-    fn is_local_target_excludes_ssh_tunnels() {
-        // Genuinely local: a direct http URL to localhost, no tunnel.
-        assert!(is_local_target("http://127.0.0.1:7777", false));
-        assert!(is_local_target("http://localhost:7777", false));
-        // Remote over ssh: the tunnel URL is localhost but the host is remote.
-        assert!(!is_local_target("http://127.0.0.1:45321", true));
-        // Remote http context (non-localhost) is never local.
-        assert!(!is_local_target("http://192.0.2.5:7777", false));
     }
 
     #[test]

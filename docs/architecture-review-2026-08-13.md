@@ -68,6 +68,8 @@ Primary files:
 
 ### 4. Consolidate daemon target resolution — Worth exploring
 
+Status: implemented after VM creation planning.
+
 Context persistence, SSH tunnel lifetime, effective URL resolution, locality,
 capability probing, and connection diagnostics are spread across distant
 regions of `main.rs`.
@@ -111,9 +113,9 @@ Primary file:
 
 ## Recommended order
 
-The first three recommendations are complete: daemon adapter, complete Job
-lifecycle, and VM creation planning. The strongest next improvement is daemon
-target resolution, followed by eliminating parallel CLI schema policy.
+The first four recommendations are complete: daemon adapter, complete Job
+lifecycle, VM creation planning, and daemon target resolution. The strongest
+next improvement is eliminating parallel CLI schema policy.
 
 ## Implementation note
 
@@ -140,3 +142,12 @@ missing-default diagnostics run only for a genuinely local target, so a remote
 daemon reached through an SSH loopback tunnel is never mistaken for the local
 host. The planner owns pool checkout as the other acquisition variant, and the
 Job lifecycle consumes the same prepared plan as `run`.
+
+The new daemon target module owns context persistence, precedence resolution,
+URL validation, direct-versus-SSH transport selection, parsed-host locality,
+SSH process lifetime, and construction of the authenticated `DaemonClient`.
+Command dispatch now carries one connected `DaemonTarget`, so helpers cannot
+quietly reconstruct clients with different authentication or timeout policy.
+Local-only commands return before daemon resolution, host-local operations
+reject remote targets before opening a tunnel, and an SSH tunnel's loopback
+endpoint can no longer make the remote daemon appear local.

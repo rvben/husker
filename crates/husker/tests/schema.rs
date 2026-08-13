@@ -151,6 +151,23 @@ fn schema_works_without_config_or_network() {
 }
 
 #[test]
+fn schema_does_not_resolve_the_daemon_target() {
+    // Schema is a local introspection command. An invalid daemon URL must not
+    // prevent it from running or turn it into an accidental network command.
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .args(["--api-url", "ssh://", "schema"])
+        .output()
+        .expect("husker schema should run");
+
+    assert!(
+        output.status.success(),
+        "husker schema should ignore daemon target resolution: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn schema_global_args_is_array() {
     let output = Command::cargo_bin("husker")
         .unwrap()
