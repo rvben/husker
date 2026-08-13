@@ -77,7 +77,7 @@ regions of `main.rs`.
 Deepen one target module with direct HTTP and SSH adapters. It should own the
 resolved endpoint and tunnel lifetime, then construct the daemon adapter.
 
-Primary file:
+Primary files:
 
 - `crates/husker/src/main.rs`
 
@@ -100,26 +100,61 @@ Primary files:
 - `crates/husker/tests/schema.rs`
 - `docs/api/cli-output-json.md`
 
-### 6. Deepen daemon runtime assembly — Speculative
+### 6. Deepen the daemon runtime — Implemented
 
-Core configuration and runtime startup repeat across platform branches. A
-shared runtime module could own reconcile, background loops, metrics, serving,
-and draining while platform adapters retain backend assembly.
+The pressure-test validated a narrower seam than the original "runtime
+assembly" candidate. Platform branches should continue to own backend
+construction, host networking preparation, and host-resource cleanup. The
+shared daemon runtime should begin only after a branch has assembled its
+`HuskerCore`; its closed `LinuxNet` mode owns Linux-only startup recovery and
+workers.
 
-This must not erase the explicit networking and shutdown differences recorded
-by ADR-0001 and ADR-0005.
+That lifecycle was copied across three branches and had two observable failure
+modes:
 
-Primary file:
+- Service reconciliation, reclaim, idle-policy, log-rotation, and metrics tasks
+  were detached. They were not stopped before VM draining, so a reconciliation
+  tick could create or mutate a VM while shutdown was trying to stop it.
+- `serve_with_auth(...).await?` returned early on a bind or serving error.
+  Startup service reconciliation could already have created VMs, but the error
+  path skipped VM draining; on Linux it also skipped NAT and bridge cleanup.
+
+The deepened module now supervises every background task, stops mutating workers
+before draining, drains on both successful and failed server outcomes, and
+preserves the original server error after cleanup. Its platform interface has
+two explicit runtime modes, `Basic` and `LinuxNet`, rather than independent
+feature booleans that permit invalid combinations or obscure ADR-0001 and
+ADR-0005.
+
+Two interface shapes were pressure-tested:
+
+- A broad async platform trait was rejected as shallow: its prepare, spawn,
+  serve, drain, and cleanup methods would expose nearly the entire lifecycle and
+  make the interface as complicated as the implementation.
+- A runtime owner plus a small `Basic`/`LinuxNet` mode was selected. The owner
+  holds the core, endpoints, worker handles, and common loop settings; the mode
+  contributes only Linux startup recovery and Linux-only workers. Host network
+  teardown stays visibly in the Linux platform branch, but runs regardless of
+  the runtime result.
+
+This passes the deletion test: removing the module would reintroduce three
+lifecycle sequences, detached task ownership, and duplicated failure-ordering
+policy rather than merely relocating a helper. The interface is also the right
+test surface for startup ordering, task cancellation before drain, cleanup on a
+server error, and error preservation.
+
+Primary files:
 
 - `crates/husker/src/daemon.rs`
+- `crates/husker-core/src/diagnostics.rs`
 
 ## Recommended order
 
-The first five recommendations are complete: daemon adapter, complete Job
-lifecycle, VM creation planning, daemon target resolution, and CLI contract
-policy. The strongest remaining candidate is daemon runtime assembly, although
-it remains speculative and should be pressure-tested against the platform ADRs
-before implementation.
+All six recommendations are complete: daemon adapter, complete Job lifecycle,
+VM creation planning, daemon target resolution, CLI contract policy, and the
+supervised daemon runtime. No unvalidated candidate from this review should be
+implemented by inertia; the strongest next architecture action is a fresh scan
+after these seams have accumulated real change pressure.
 
 ## Implementation note
 
@@ -166,3 +201,21 @@ follow clispec v0.2 item semantics, documentation examples are executable
 contract samples, unsupported structured modes fail cleanly, and unknown
 daemon-specific error kinds normalize at the CLI seam. ADR-0007 records the
 compatibility policy.
+
+The daemon-runtime pressure-test kept backend and networking assembly on their
+platform branches, consistent with ADR-0001 and ADR-0005. It found that the
+real shared seam starts after `HuskerCore` construction: detached mutating loops
+previously survived into VM draining, and an API server error bypassed both
+drain and Linux network cleanup. A supervised runtime with an explicit Linux
+network extension was therefore a strong recommendation rather than a
+speculative deduplication exercise.
+
+The implemented daemon runtime owns every post-core worker and gives mutating
+loops a shared cooperative shutdown signal. Shutdown is bounded: workers are
+joined before auto-resume ingress is closed and VMs are drained, while a stuck
+worker is aborted after five seconds. Server failures still pass through drain.
+The Linux platform branch now initializes cgroups before creating its bridge
+and attempts both NAT and bridge teardown after every later outcome, preserving
+the original runtime error over secondary cleanup failures. Runtime-ordering,
+stuck-worker, error-precedence, and resume-listener tests make the interface the
+test surface. ADR-0008 records the lifecycle and platform ownership policy.
