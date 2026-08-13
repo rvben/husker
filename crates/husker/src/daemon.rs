@@ -86,15 +86,6 @@ pub(crate) fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
     Ok((base, prefix_len))
 }
 
-/// Whether a VM create request will boot via Firecracker and therefore needs
-/// the client-side Firecracker binary preflight. Cloud-image and explicit
-/// `--vmm qemu` requests are served by QEMU, where the preflight would block
-/// hosts that have QEMU but no Firecracker installed.
-#[cfg(all(target_os = "linux", feature = "linux-net"))]
-pub(crate) fn needs_firecracker_preflight(body: &serde_json::Value) -> bool {
-    body.get("cloud_image").is_none() && body["vmm"].as_str() != Some("qemu")
-}
-
 /// Ensure Firecracker is available. If the binary can't be found, auto-install
 /// when `HUSKER_AUTO_INSTALL_FIRECRACKER=1` is set, prompt interactively on a
 /// TTY, or bail with a hint otherwise.

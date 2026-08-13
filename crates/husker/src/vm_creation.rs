@@ -568,6 +568,26 @@ fn needs_firecracker_preflight(_body: &husker_core::CreateVmRequest) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "linux", feature = "linux-net"))]
+    #[test]
+    fn firecracker_preflight_only_for_firecracker_bound_requests() {
+        let mut request = husker_core::CreateVmRequest {
+            name: "vm".into(),
+            ..Default::default()
+        };
+        assert!(needs_firecracker_preflight(&request));
+
+        request.vmm = Some("firecracker".into());
+        assert!(needs_firecracker_preflight(&request));
+
+        request.vmm = Some("qemu".into());
+        assert!(!needs_firecracker_preflight(&request));
+
+        request.vmm = None;
+        request.cloud_image = Some("/img.qcow2".into());
+        assert!(!needs_firecracker_preflight(&request));
+    }
+
     #[test]
     fn pool_conflicts_report_every_creation_input_in_stable_order() {
         let args = VmRequestArgs {

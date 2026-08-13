@@ -6304,25 +6304,6 @@ mod tests {
         assert!(list_fields.iter().any(|f| f["name"] == "guest_ip"));
     }
 
-    #[cfg(all(target_os = "linux", feature = "linux-net"))]
-    #[test]
-    fn firecracker_preflight_only_for_firecracker_bound_requests() {
-        use serde_json::json;
-        assert!(needs_firecracker_preflight(&json!({"name": "a"})));
-        assert!(needs_firecracker_preflight(
-            &json!({"name": "a", "vmm": "firecracker"})
-        ));
-        assert!(!needs_firecracker_preflight(
-            &json!({"name": "a", "vmm": "qemu"})
-        ));
-        assert!(!needs_firecracker_preflight(
-            &json!({"name": "a", "cloud_image": "/img.qcow2"})
-        ));
-        assert!(!needs_firecracker_preflight(
-            &json!({"name": "a", "vmm": "qemu", "cloud_image": "/img.qcow2"})
-        ));
-    }
-
     #[test]
     fn cli_schema_includes_volume_get() {
         let schema = build_cli_schema();
