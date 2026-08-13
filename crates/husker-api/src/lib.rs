@@ -2227,6 +2227,20 @@ mod tests {
         let (status, _) = map_error(CoreError::ServiceAlreadyExists("test".into()));
         assert_eq!(status, StatusCode::CONFLICT);
 
+        let (status, body) = map_error(CoreError::PoolTemplateOwned {
+            vm: "template".into(),
+            pool: "web".into(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.kind, "pool_template_owned");
+
+        let (status, body) = map_error(CoreError::PoolTemplateUnavailable {
+            pool: "web".into(),
+            template: uuid::Uuid::nil(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.kind, "pool_template_unavailable");
+
         let (status, _) = map_error(CoreError::ImageAlreadyExists("test".into()));
         assert_eq!(status, StatusCode::CONFLICT);
 

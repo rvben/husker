@@ -80,6 +80,18 @@ impl<B: VmmBackend> HuskerCore<B> {
                 husker_state::StateError::PoolAlreadyExists(_) => {
                     CoreError::PoolAlreadyExists(req.name.clone())
                 }
+                husker_state::StateError::PoolTemplateOwned { pool, .. } => {
+                    CoreError::PoolTemplateOwned {
+                        vm: template.name.clone(),
+                        pool,
+                    }
+                }
+                husker_state::StateError::PoolTemplateUnavailable { template, .. } => {
+                    CoreError::PoolTemplateUnavailable {
+                        pool: req.name.clone(),
+                        template,
+                    }
+                }
                 other => CoreError::State(other),
             });
         }
@@ -108,8 +120,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         pool_name: &str,
         vm_name: Option<&str>,
     ) -> Result<VmRecord, CoreError> {
-        // Surface a clear pool-not-found before touching the template.
-        self.get_pool(pool_name)?;
+        // Resolve the source by the durable identity stored in the pool. Pool
+        // and template names may legitimately diverge across legacy state or a
+        // future rename; the UUID is the aggregate ownership key.
+        let (_pool, template) = self.resolve_pool_template(pool_name)?;
         // Default the member name to "<pool>-<short id>" when unspecified.
         let generated;
         let name = match vm_name {
@@ -120,23 +134,43 @@ impl<B: VmmBackend> HuskerCore<B> {
                 &generated
             }
         };
-        // The template VM is named after the pool; fork it into a fresh VM.
-        self.fork_vm(pool_name, name).await
+        self.fork_vm(&template.name, name).await
     }
 
     /// Delete a hot pool: destroy its template VM, then remove the record.
     pub async fn delete_pool(&self, name: &str) -> Result<(), CoreError> {
-        self.get_pool(name)?;
-        match self.destroy_vm(name).await {
-            Ok(()) => {}
-            Err(CoreError::VmNotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-        self.state.delete_pool_by_name(name).map_err(|e| match e {
-            husker_state::StateError::PoolNotFoundByName(_) => CoreError::PoolNotFound(name.into()),
-            other => CoreError::State(other),
-        })?;
+        let (pool, template) = self.resolve_pool_template(name)?;
+        let _template_guard = self.vm_name_lock(&template.name).lock_owned().await;
+        self.destroy_pool_template_locked(&template, &pool).await?;
         info!(pool = %name, "hot pool deleted");
         Ok(())
+    }
+
+    pub(crate) fn ensure_vm_is_not_pool_template(
+        &self,
+        record: &VmRecord,
+    ) -> Result<(), CoreError> {
+        if let Some(pool) = self.state.get_pool_by_template_vm_id(record.id)? {
+            return Err(CoreError::PoolTemplateOwned {
+                vm: record.name.clone(),
+                pool: pool.name,
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_pool_template(&self, name: &str) -> Result<(PoolRecord, VmRecord), CoreError> {
+        let pool = self.get_pool(name)?;
+        let template = self
+            .state
+            .get_vm(pool.template_vm_id)
+            .map_err(|error| match error {
+                husker_state::StateError::VmNotFound(_) => CoreError::PoolTemplateUnavailable {
+                    pool: pool.name.clone(),
+                    template: pool.template_vm_id,
+                },
+                other => CoreError::State(other),
+            })?;
+        Ok((pool, template))
     }
 }

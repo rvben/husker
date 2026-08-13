@@ -659,6 +659,17 @@ fn core_with_pool(
     Arc<RecordingVmm>,
     tempfile::TempDir,
 ) {
+    core_with_named_pool_template(pool_name, pool_name)
+}
+
+fn core_with_named_pool_template(
+    pool_name: &str,
+    template_name: &str,
+) -> (
+    Arc<HuskerCore<SharedRecordingVmm>>,
+    Arc<RecordingVmm>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let inner = RecordingVmm::new();
     let vmm = SharedRecordingVmm(Arc::clone(&inner));
@@ -671,7 +682,7 @@ fn core_with_pool(
     let template_id = Uuid::new_v4();
     let template = husker_state::VmRecord {
         id: template_id,
-        name: pool_name.into(),
+        name: template_name.into(),
         state: "suspended".into(),
         pid: None,
         vcpu_count: 1,
@@ -720,7 +731,7 @@ fn core_with_pool(
         template_id,
         VmInfo {
             id: template_id,
-            name: pool_name.into(),
+            name: template_name.into(),
             state: VmState::Running,
             pid: Some(1),
             vcpu_count: 1,
@@ -793,6 +804,54 @@ async fn delete_pool_destroys_template_and_removes_record() {
         1,
         "the template VM must be destroyed when the pool is deleted"
     );
+}
+
+#[tokio::test]
+async fn direct_destroy_cannot_orphan_a_pool_template() {
+    let (core, vmm, _tmp) = core_with_pool("web");
+
+    let error = core.destroy_vm("web").await.unwrap_err();
+
+    assert!(
+        matches!(error, CoreError::PoolTemplateOwned { ref vm, ref pool }
+            if vm == "web" && pool == "web"),
+        "got {error:?}"
+    );
+    assert_eq!(core.get_pool("web").unwrap().name, "web");
+    assert_eq!(core.get_vm("web").unwrap().state, "suspended");
+    assert!(vmm.calls.lock().unwrap().destroyed.is_empty());
+}
+
+#[tokio::test]
+async fn direct_stop_and_resume_cannot_mutate_a_pool_template() {
+    let (core, vmm, _tmp) = core_with_pool("web");
+
+    let stop_error = core.stop_vm("web").await.unwrap_err();
+    assert!(matches!(stop_error, CoreError::PoolTemplateOwned { .. }));
+    let resume_error = core.resume_vm("web").await.unwrap_err();
+    assert!(matches!(resume_error, CoreError::PoolTemplateOwned { .. }));
+
+    assert_eq!(core.get_vm("web").unwrap().state, "suspended");
+    let calls = vmm.calls.lock().unwrap();
+    assert!(calls.destroyed.is_empty());
+    assert!(calls.restore.is_empty());
+}
+
+#[tokio::test]
+async fn delete_pool_targets_its_stored_template_identity() {
+    let (core, vmm, _tmp) = core_with_named_pool_template("web", "template-generation-7");
+
+    core.delete_pool("web").await.unwrap();
+
+    assert!(matches!(
+        core.get_pool("web"),
+        Err(CoreError::PoolNotFound(_))
+    ));
+    assert!(matches!(
+        core.get_vm("template-generation-7"),
+        Err(CoreError::VmNotFound(_))
+    ));
+    assert_eq!(vmm.calls.lock().unwrap().destroyed.len(), 1);
 }
 
 #[tokio::test]

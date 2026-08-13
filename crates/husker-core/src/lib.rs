@@ -67,6 +67,10 @@ pub enum CoreError {
     PoolNotFound(String),
     #[error("pool already exists: {0}")]
     PoolAlreadyExists(String),
+    #[error("VM '{vm}' is the template owned by pool '{pool}'; delete the pool instead")]
+    PoolTemplateOwned { vm: String, pool: String },
+    #[error("pool '{pool}' template VM is unavailable: {template}")]
+    PoolTemplateUnavailable { pool: String, template: Uuid },
     #[error("snapshot not found: {0}")]
     SnapshotNotFound(String),
     #[error("snapshot already exists: {0}")]

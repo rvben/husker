@@ -95,6 +95,14 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::PoolAlreadyExists(_) => {
             (StatusCode::CONFLICT, "pool_already_exists", err.to_string())
         }
+        CoreError::PoolTemplateOwned { .. } => {
+            (StatusCode::CONFLICT, "pool_template_owned", err.to_string())
+        }
+        CoreError::PoolTemplateUnavailable { .. } => (
+            StatusCode::CONFLICT,
+            "pool_template_unavailable",
+            err.to_string(),
+        ),
         CoreError::ImageAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "image_already_exists",

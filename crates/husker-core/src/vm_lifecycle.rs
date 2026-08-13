@@ -967,6 +967,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // same per-name mutation lock used by those operations.
         let _stop_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        self.ensure_vm_is_not_pool_template(&record)?;
         match record.state.as_str() {
             "running" | "paused" => {}
             "stopped" => {
@@ -1006,6 +1007,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         info!(%name, "pausing VM");
         let _pause_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        self.ensure_vm_is_not_pool_template(&record)?;
         match record.state.as_str() {
             "running" => {}
             "paused" => {
@@ -1047,11 +1049,35 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// If that generation was retired while the caller waited for the name
     /// lock, its destroy is already complete and must not touch the replacement.
     pub(crate) async fn destroy_vm_locked(&self, record: &VmRecord) -> Result<(), CoreError> {
+        self.destroy_vm_generation_locked(record, None).await
+    }
+
+    /// Destroy the exact template generation owned by `pool` and retire both
+    /// state records atomically after external cleanup succeeds.
+    pub(crate) async fn destroy_pool_template_locked(
+        &self,
+        record: &VmRecord,
+        pool: &PoolRecord,
+    ) -> Result<(), CoreError> {
+        self.destroy_vm_generation_locked(record, Some(pool)).await
+    }
+
+    async fn destroy_vm_generation_locked(
+        &self,
+        record: &VmRecord,
+        owning_pool: Option<&PoolRecord>,
+    ) -> Result<(), CoreError> {
         let name = record.name.as_str();
 
         match self.state.get_vm_by_name(name) {
             Ok(current) if current.id == record.id => {}
             Ok(current) => {
+                if let Some(pool) = owning_pool {
+                    return Err(CoreError::PoolTemplateUnavailable {
+                        pool: pool.name.clone(),
+                        template: pool.template_vm_id,
+                    });
+                }
                 info!(
                     %name,
                     requested_id = %record.id,
@@ -1061,6 +1087,18 @@ impl<B: VmmBackend> HuskerCore<B> {
                 return Ok(());
             }
             Err(husker_state::StateError::VmNotFoundByName(_)) => {
+                if let Some(pool) = owning_pool {
+                    return match self.state.get_pool_by_name(&pool.name) {
+                        Ok(_) => Err(CoreError::PoolTemplateUnavailable {
+                            pool: pool.name.clone(),
+                            template: pool.template_vm_id,
+                        }),
+                        Err(husker_state::StateError::PoolNotFoundByName(_)) => {
+                            Err(CoreError::PoolNotFound(pool.name.clone()))
+                        }
+                        Err(error) => Err(CoreError::State(error)),
+                    };
+                }
                 debug!(
                     %name,
                     requested_id = %record.id,
@@ -1069,6 +1107,24 @@ impl<B: VmmBackend> HuskerCore<B> {
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
+        }
+
+        match self.state.get_pool_by_template_vm_id(record.id)? {
+            Some(pool)
+                if owning_pool.is_some_and(|owner| {
+                    owner.id == pool.id && owner.template_vm_id == record.id
+                }) => {}
+            Some(pool) => {
+                return Err(CoreError::PoolTemplateOwned {
+                    vm: record.name.clone(),
+                    pool: pool.name,
+                });
+            }
+            None => {
+                if let Some(pool) = owning_pool {
+                    return Err(CoreError::PoolNotFound(pool.name.clone()));
+                }
+            }
         }
 
         info!(%name, "destroying VM");
@@ -1116,7 +1172,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
 
             if let Err(error) = host_cleanup {
-                self.state.mark_vm_stopped(record.id)?;
+                if owning_pool.is_none() {
+                    self.state.mark_vm_stopped(record.id)?;
+                }
                 warn!(%name, %error, "host cleanup failed; retained VM ownership for retry");
                 return Err(error);
             }
@@ -1161,7 +1219,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.network_last_active.lock().remove(&record.id);
         self.active_sessions.lock().remove(&record.id);
 
-        self.state.retire_vm(record.id)?;
+        if let Some(pool) = owning_pool {
+            self.state.retire_pool_template(pool.id, record.id)?;
+        } else {
+            self.state.retire_vm(record.id)?;
+        }
         info!(%name, "VM destroyed");
         Ok(())
     }

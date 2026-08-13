@@ -38,8 +38,16 @@ pub enum StateError {
     ServiceAlreadyExists(String),
     #[error("pool not found by name: {0}")]
     PoolNotFoundByName(String),
+    #[error("pool not found: {0}")]
+    PoolNotFound(Uuid),
     #[error("pool already exists: {0}")]
     PoolAlreadyExists(String),
+    #[error("pool '{pool}' template VM is unavailable or not suspended: {template}")]
+    PoolTemplateUnavailable { pool: String, template: Uuid },
+    #[error("template VM {template} is owned by pool '{pool}'")]
+    PoolTemplateOwned { template: Uuid, pool: String },
+    #[error("pool {pool} does not own template VM {template}")]
+    PoolTemplateMismatch { pool: Uuid, template: Uuid },
     #[error("snapshot not found: {0}")]
     SnapshotNotFound(Uuid),
     #[error("snapshot not found by name: {0}")]
@@ -369,6 +377,60 @@ const MIGRATIONS: &[(u32, &str)] = &[
          WHEN EXISTS (SELECT 1 FROM vms WHERE volume = OLD.name)
          BEGIN
              SELECT RAISE(ABORT, 'volume is attached');
+         END;",
+    ),
+    (
+        4,
+        "DELETE FROM pools
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM vms
+                 WHERE vms.id = pools.template_vm_id
+                   AND vms.state = 'suspended'
+             );
+
+         DELETE FROM pools
+             WHERE EXISTS (
+                 SELECT 1 FROM pools AS keeper
+                 WHERE keeper.template_vm_id = pools.template_vm_id
+                   AND (keeper.created_at < pools.created_at
+                        OR (keeper.created_at = pools.created_at AND keeper.id < pools.id))
+             );
+
+         CREATE UNIQUE INDEX idx_pools_template_vm_id ON pools(template_vm_id);
+
+         CREATE TRIGGER pool_template_must_be_suspended_on_insert
+         BEFORE INSERT ON pools
+         WHEN NOT EXISTS (
+             SELECT 1 FROM vms
+             WHERE vms.id = NEW.template_vm_id AND vms.state = 'suspended'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'pool template is unavailable or not suspended');
+         END;
+
+         CREATE TRIGGER pool_template_must_be_suspended_on_update
+         BEFORE UPDATE OF template_vm_id ON pools
+         WHEN NOT EXISTS (
+             SELECT 1 FROM vms
+             WHERE vms.id = NEW.template_vm_id AND vms.state = 'suspended'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'pool template is unavailable or not suspended');
+         END;
+
+         CREATE TRIGGER pool_template_state_is_immutable
+         BEFORE UPDATE OF state ON vms
+         WHEN NEW.state <> 'suspended'
+              AND EXISTS (SELECT 1 FROM pools WHERE template_vm_id = OLD.id)
+         BEGIN
+             SELECT RAISE(ABORT, 'pool template state is immutable');
+         END;
+
+         CREATE TRIGGER pool_template_cannot_be_deleted
+         BEFORE DELETE ON vms
+         WHEN EXISTS (SELECT 1 FROM pools WHERE template_vm_id = OLD.id)
+         BEGIN
+             SELECT RAISE(ABORT, 'pool template cannot be deleted');
          END;",
     ),
 ];
@@ -1000,6 +1062,16 @@ impl StateStore {
     pub fn retire_vm(&self, id: Uuid) -> Result<(), StateError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(pool) = tx
+            .query_row(
+                "SELECT name FROM pools WHERE template_vm_id = ?1 LIMIT 1",
+                params![id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(StateError::PoolTemplateOwned { template: id, pool });
+        }
         let cid = tx
             .query_row(
                 "SELECT vsock_cid FROM vms WHERE id = ?1",
@@ -1247,7 +1319,41 @@ impl StateStore {
     /// Insert a new pool record.
     pub fn insert_pool(&self, record: &PoolRecord) -> Result<(), StateError> {
         let conn = self.lock()?;
-        conn.execute(
+        let name_exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pools WHERE name = ?1)",
+            params![&record.name],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if name_exists {
+            return Err(StateError::PoolAlreadyExists(record.name.clone()));
+        }
+        let template_state = conn
+            .query_row(
+                "SELECT state FROM vms WHERE id = ?1",
+                params![record.template_vm_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if template_state.as_deref() != Some("suspended") {
+            return Err(StateError::PoolTemplateUnavailable {
+                pool: record.name.clone(),
+                template: record.template_vm_id,
+            });
+        }
+        if let Some(pool) = conn
+            .query_row(
+                "SELECT name FROM pools WHERE template_vm_id = ?1 LIMIT 1",
+                params![record.template_vm_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(StateError::PoolTemplateOwned {
+                template: record.template_vm_id,
+                pool,
+            });
+        }
+        let insert_result = conn.execute(
             "INSERT INTO pools (id, name, template_vm_id, rootfs_path, kernel_path,
                                 initrd_path, vcpu_count, mem_size_mib, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -1263,15 +1369,41 @@ impl StateStore {
                 record.created_at.to_rfc3339(),
                 record.updated_at.to_rfc3339(),
             ],
-        )
-        .map_err(|e| match &e {
-            rusqlite::Error::SqliteFailure(err, _)
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                StateError::PoolAlreadyExists(record.name.clone())
+        );
+        if let Err(error) = insert_result {
+            match &error {
+                rusqlite::Error::SqliteFailure(err, Some(message))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation
+                        && message.contains("pools.name") =>
+                {
+                    return Err(StateError::PoolAlreadyExists(record.name.clone()));
+                }
+                rusqlite::Error::SqliteFailure(err, Some(message))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation
+                        && message.contains("pools.template_vm_id") =>
+                {
+                    let pool = conn.query_row(
+                        "SELECT name FROM pools WHERE template_vm_id = ?1 LIMIT 1",
+                        params![record.template_vm_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    return Err(StateError::PoolTemplateOwned {
+                        template: record.template_vm_id,
+                        pool,
+                    });
+                }
+                rusqlite::Error::SqliteFailure(err, Some(message))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation
+                        && message.contains("pool template is unavailable or not suspended") =>
+                {
+                    return Err(StateError::PoolTemplateUnavailable {
+                        pool: record.name.clone(),
+                        template: record.template_vm_id,
+                    });
+                }
+                _ => return Err(StateError::Database(error)),
             }
-            _ => StateError::Database(e),
-        })?;
+        }
         Ok(())
     }
 
@@ -1289,6 +1421,23 @@ impl StateStore {
             rusqlite::Error::QueryReturnedNoRows => StateError::PoolNotFoundByName(name.into()),
             other => StateError::Database(other),
         })
+    }
+
+    /// Find the pool that owns a template VM, if any.
+    pub fn get_pool_by_template_vm_id(
+        &self,
+        template_vm_id: Uuid,
+    ) -> Result<Option<PoolRecord>, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, template_vm_id, rootfs_path, kernel_path, initrd_path,
+                    vcpu_count, mem_size_mib, created_at, updated_at
+             FROM pools WHERE template_vm_id = ?1",
+            params![template_vm_id.to_string()],
+            row_to_pool_record,
+        )
+        .optional()
+        .map_err(StateError::Database)
     }
 
     /// List all pools, oldest first.
@@ -1312,6 +1461,54 @@ impl StateStore {
         if deleted == 0 {
             return Err(StateError::PoolNotFoundByName(name.into()));
         }
+        Ok(())
+    }
+
+    /// Atomically retire a pool and the exact template VM it owns, returning
+    /// the template's CID to the allocator in the same transaction.
+    pub fn retire_pool_template(
+        &self,
+        pool_id: Uuid,
+        template_vm_id: Uuid,
+    ) -> Result<(), StateError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored_template = tx
+            .query_row(
+                "SELECT template_vm_id FROM pools WHERE id = ?1",
+                params![pool_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(StateError::PoolNotFound(pool_id))?;
+        if parse_uuid(&stored_template).map_err(StateError::Database)? != template_vm_id {
+            return Err(StateError::PoolTemplateMismatch {
+                pool: pool_id,
+                template: template_vm_id,
+            });
+        }
+        let cid = tx
+            .query_row(
+                "SELECT vsock_cid FROM vms WHERE id = ?1",
+                params![template_vm_id.to_string()],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?
+            .ok_or(StateError::VmNotFound(template_vm_id))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO freed_cids (cid) VALUES (?1)",
+            params![cid],
+        )?;
+        tx.execute(
+            "DELETE FROM pools WHERE id = ?1",
+            params![pool_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM vms WHERE id = ?1",
+            params![template_vm_id.to_string()],
+        )?;
+        tx.commit()?;
+        debug!(%pool_id, %template_vm_id, cid, "retired pool template and released CID");
         Ok(())
     }
 
@@ -4161,6 +4358,11 @@ mod tests {
     fn pool_crud_roundtrips() {
         let store = StateStore::open_memory().unwrap();
         let template = Uuid::new_v4();
+        let mut template_record = make_record("web-template");
+        template_record.id = template;
+        template_record.state = "suspended".into();
+        template_record.pid = None;
+        store.insert_vm(&template_record).unwrap();
         let rec = PoolRecord {
             id: Uuid::new_v4(),
             name: "web".into(),
@@ -4199,6 +4401,114 @@ mod tests {
             store.delete_pool_by_name("web"),
             Err(StateError::PoolNotFoundByName(_))
         ));
+    }
+
+    #[test]
+    fn pool_requires_an_existing_suspended_template() {
+        let store = StateStore::open_memory().unwrap();
+        let template_id = Uuid::new_v4();
+        let now = Utc::now();
+        let pool = PoolRecord {
+            id: Uuid::new_v4(),
+            name: "orphan".into(),
+            template_vm_id: template_id,
+            rootfs_path: "/img/base.ext4".into(),
+            kernel_path: "/img/vmlinux".into(),
+            initrd_path: None,
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(matches!(
+            store.insert_pool(&pool),
+            Err(StateError::PoolTemplateUnavailable { template, .. })
+                if template == template_id
+        ));
+
+        let mut running = make_record("not-suspended");
+        running.id = template_id;
+        store.insert_vm(&running).unwrap();
+        assert!(matches!(
+            store.insert_pool(&pool),
+            Err(StateError::PoolTemplateUnavailable { template, .. })
+                if template == template_id
+        ));
+    }
+
+    #[test]
+    fn pool_template_cannot_be_reused_or_retired_directly() {
+        let store = StateStore::open_memory().unwrap();
+        let mut template = make_record("template");
+        template.state = "suspended".into();
+        template.pid = None;
+        store.insert_vm(&template).unwrap();
+        let now = Utc::now();
+        let first = PoolRecord {
+            id: Uuid::new_v4(),
+            name: "first".into(),
+            template_vm_id: template.id,
+            rootfs_path: template.rootfs_path.clone(),
+            kernel_path: template.kernel_path.clone(),
+            initrd_path: None,
+            vcpu_count: Some(template.vcpu_count),
+            mem_size_mib: Some(template.mem_size_mib),
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_pool(&first).unwrap();
+        let mut second = first.clone();
+        second.id = Uuid::new_v4();
+        second.name = "second".into();
+
+        assert!(matches!(
+            store.insert_pool(&second),
+            Err(StateError::PoolTemplateOwned { template: id, ref pool })
+                if id == template.id && pool == "first"
+        ));
+        assert!(matches!(
+            store.retire_vm(template.id),
+            Err(StateError::PoolTemplateOwned { template: id, ref pool })
+                if id == template.id && pool == "first"
+        ));
+        assert!(store.get_vm(template.id).is_ok());
+        assert_eq!(store.get_pool_by_name("first").unwrap().id, first.id);
+    }
+
+    #[test]
+    fn retiring_a_pool_template_atomically_removes_both_and_releases_its_cid() {
+        let store = StateStore::open_memory().unwrap();
+        let mut template = make_record("template");
+        template.state = "suspended".into();
+        template.pid = None;
+        store.insert_vm(&template).unwrap();
+        let now = Utc::now();
+        let pool = PoolRecord {
+            id: Uuid::new_v4(),
+            name: "aggregate".into(),
+            template_vm_id: template.id,
+            rootfs_path: template.rootfs_path.clone(),
+            kernel_path: template.kernel_path.clone(),
+            initrd_path: None,
+            vcpu_count: Some(template.vcpu_count),
+            mem_size_mib: Some(template.mem_size_mib),
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_pool(&pool).unwrap();
+
+        store.retire_pool_template(pool.id, template.id).unwrap();
+
+        assert!(matches!(
+            store.get_pool_by_name("aggregate"),
+            Err(StateError::PoolNotFoundByName(_))
+        ));
+        assert!(matches!(
+            store.get_vm(template.id),
+            Err(StateError::VmNotFound(_))
+        ));
+        assert_eq!(store.allocate_cid().unwrap(), template.vsock_cid);
     }
 
     #[test]
@@ -4366,7 +4676,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_migrations(&conn, BASELINE_SCHEMA_VERSION, MIGRATIONS).unwrap();
+        apply_migrations(&conn, BASELINE_SCHEMA_VERSION, &MIGRATIONS[..2]).unwrap();
 
         let attachments = conn
             .prepare("SELECT name, volume FROM vms ORDER BY name")
@@ -4389,6 +4699,63 @@ mod tests {
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn pool_invariant_migration_repairs_legacy_invalid_ownership() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vms (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 state TEXT NOT NULL
+             );
+             CREATE TABLE pools (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 template_vm_id TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             INSERT INTO vms (id, name, state) VALUES
+                 ('suspended-id', 'template', 'suspended'),
+                 ('running-id', 'running', 'running');
+             INSERT INTO pools (id, name, template_vm_id, created_at) VALUES
+                 ('a', 'keeper', 'suspended-id', '2024-01-01T00:00:00Z'),
+                 ('b', 'duplicate', 'suspended-id', '2024-01-02T00:00:00Z'),
+                 ('c', 'dangling', 'missing-id', '2024-01-03T00:00:00Z'),
+                 ('d', 'not-suspended', 'running-id', '2024-01-04T00:00:00Z');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+
+        apply_migrations(&conn, BASELINE_SCHEMA_VERSION, MIGRATIONS).unwrap();
+
+        let pools = conn
+            .prepare("SELECT name, template_vm_id FROM pools ORDER BY name")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(pools, vec![("keeper".into(), "suspended-id".into())]);
+        assert!(
+            conn.execute(
+                "UPDATE vms SET state = 'running' WHERE id = 'suspended-id'",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute("DELETE FROM vms WHERE id = 'suspended-id'", [])
+                .is_err()
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            4
         );
     }
 

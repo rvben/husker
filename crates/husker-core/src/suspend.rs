@@ -374,6 +374,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // source's rootfs aliased to a clone during `/snapshot/load`.
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        self.ensure_vm_is_not_pool_template(&record)?;
         // Only a "suspended" restore removed DNAT and installed resume
         // listeners (see `suspend_vm_locked`); a "paused" VM never touched
         // networking, so its resume must not either, and it is not part of
