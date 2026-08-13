@@ -192,7 +192,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         });
         let idle_opted_in = idle_timeout_secs.is_some();
         if idle_opted_in
-            && !husker_vmm::Capabilities::for_backend(backend_selection.backend().as_str()).snapshot
+            && !husker_vmm::Capabilities::for_backend_kind(backend_selection.backend()).snapshot
         {
             return Err(CoreError::InvalidArgument(
                 "idle policy requires a full-state snapshot backend (firecracker)".into(),
@@ -543,7 +543,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: backend.to_string(),
+            vmm: backend,
             boot_mode: if is_cloud {
                 "uefi".to_string()
             } else {
@@ -771,7 +771,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 },
                 service_id: tags.map(|t| t.service_id),
                 service_ordinal: tags.map(|t| t.ordinal),
-                vmm: backend.to_string(),
+                vmm: backend,
                 boot_mode: boot_mode_str,
                 balloon: req.balloon,
                 volume: None,
@@ -885,7 +885,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: backend.to_string(),
+            vmm: backend,
             boot_mode: "direct".to_string(),
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),

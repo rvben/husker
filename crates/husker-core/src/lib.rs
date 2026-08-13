@@ -38,8 +38,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub use husker_state::{
-    HostGroupRecord, ImageRecord, PoolRecord, SecretRecord, ServiceRecord, SnapshotRecord,
-    VmLifecycleState, VmRecord, VolumeRecord,
+    BackendKind, HostGroupRecord, ImageRecord, PoolRecord, SecretRecord, ServiceRecord,
+    SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 
@@ -2224,7 +2224,7 @@ pub fn evaluate_policy(
     let Some(idle_timeout) = record.idle_timeout_secs else {
         return PolicyAction::None;
     };
-    if record.vmm != "firecracker" {
+    if record.vmm != BackendKind::Firecracker {
         return PolicyAction::None;
     }
     if record.service_id.is_some() || record.forked_from.is_some() {
@@ -2601,7 +2601,7 @@ mod tests {
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "firecracker".into(),
+            vmm: BackendKind::Firecracker,
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
@@ -2921,7 +2921,7 @@ mod tests {
         let (core, tmp) = resume_mock_core(false).await;
         let mut rec = sample_vm_record("aw");
         rec.state = VmLifecycleState::Suspended;
-        rec.vmm = "firecracker".into();
+        rec.vmm = BackendKind::Firecracker;
         rec.auto_resume = true;
         core.state.insert_vm(&rec).unwrap();
         stage_suspend_slot(tmp.path(), rec.id);
@@ -3332,7 +3332,7 @@ mod tests {
 
         let mut src = sample_vm_record("src");
         src.state = VmLifecycleState::Suspended;
-        src.vmm = "firecracker".into();
+        src.vmm = BackendKind::Firecracker;
         core.state.insert_vm(&src).unwrap();
 
         // `try_fork_vm` reflink/copies this file into the fork's own dir;
@@ -4153,7 +4153,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            state: state.into(),
+            state: state.parse().expect("test lifecycle state must be valid"),
             pid,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -4170,7 +4170,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: vmm.into(),
+            vmm: vmm.parse().expect("test backend kind must be valid"),
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
@@ -4461,7 +4461,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "apple_vz".into(),
+            vmm: BackendKind::AppleVz,
             boot_mode: "direct".into(),
             balloon: false,
             volume: Some("mydata".into()),
@@ -5064,7 +5064,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "qemu".into(),
+            vmm: BackendKind::Qemu,
             boot_mode: "uefi".into(),
             balloon: false,
             volume: None,
@@ -5212,7 +5212,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "apple_vz".into(),
+            vmm: BackendKind::AppleVz,
             boot_mode: "efi".into(),
             balloon: false,
             volume: None,
@@ -6127,7 +6127,7 @@ mod idle_policy_tests {
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "firecracker".into(),
+            vmm: BackendKind::Firecracker,
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
@@ -6144,7 +6144,7 @@ mod idle_policy_tests {
     fn running(idle_timeout: Option<u64>) -> VmRecord {
         let mut r = sample_vm_record("v");
         r.state = VmLifecycleState::Running;
-        r.vmm = "firecracker".into();
+        r.vmm = BackendKind::Firecracker;
         r.idle_timeout_secs = idle_timeout;
         r
     }
@@ -6196,7 +6196,7 @@ mod idle_policy_tests {
     #[test]
     fn non_firecracker_never_acts() {
         let mut r = running(Some(1));
-        r.vmm = "qemu".into();
+        r.vmm = BackendKind::Qemu;
         assert!(matches!(
             evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(99)), false, false),
             PolicyAction::None

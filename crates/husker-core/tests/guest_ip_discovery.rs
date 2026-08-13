@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use husker_core::HuskerCore;
-use husker_state::{StateStore, VmRecord};
+use husker_state::{BackendKind, StateStore, VmRecord};
 use husker_storage::StorageConfig;
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
@@ -140,7 +140,7 @@ fn make_vm_record(
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: "apple_vz".into(),
+        vmm: BackendKind::AppleVz,
         boot_mode: boot_mode.into(),
         balloon: false,
         volume: None,

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use husker_core::{CoreError, HuskerCore};
+use husker_core::{BackendKind, CoreError, HuskerCore};
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
     VmmError,
@@ -153,7 +153,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: "firecracker".into(),
+        vmm: BackendKind::Firecracker,
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,

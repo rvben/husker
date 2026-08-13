@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+pub use husker_types::{BackendKind, InvalidBackendKind};
+
 /// Kernel parameters that suppress probes for legacy hardware no direct-kernel
 /// guest can have.
 ///
@@ -102,51 +104,6 @@ pub struct VmInfo {
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
     pub vsock_cid: u32,
-}
-
-/// The concrete VMM implementation that owns a VM.
-///
-/// This is intentionally broader than [`VmmKind`]: Linux callers can request
-/// Firecracker or QEMU, while Apple VZ is selected by the platform backend.
-/// Creation returns this identity so callers persist what actually ran rather
-/// than trying to reproduce dispatch policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendKind {
-    Firecracker,
-    Qemu,
-    AppleVz,
-}
-
-impl BackendKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BackendKind::Firecracker => "firecracker",
-            BackendKind::Qemu => "qemu",
-            BackendKind::AppleVz => "apple_vz",
-        }
-    }
-}
-
-impl std::fmt::Display for BackendKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for BackendKind {
-    type Err = VmmError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "firecracker" => Ok(BackendKind::Firecracker),
-            "qemu" => Ok(BackendKind::Qemu),
-            "apple_vz" => Ok(BackendKind::AppleVz),
-            other => Err(VmmError::InvalidConfig(format!(
-                "unknown backend kind '{other}'"
-            ))),
-        }
-    }
 }
 
 impl From<VmmKind> for BackendKind {
@@ -296,7 +253,7 @@ impl std::str::FromStr for VmmKind {
 /// husker's Linux backend multiplexes Firecracker and QEMU per VM, so support
 /// for a feature is a property of the VM's backend *kind*, not of the single
 /// active [`VmmBackend`] object. Callers therefore resolve capabilities from the
-/// persisted backend string via [`Capabilities::for_backend`] and check them
+/// persisted [`BackendKind`] via [`Capabilities::for_backend_kind`] and check them
 /// before starting an operation that a backend cannot finish (e.g. pausing a VM
 /// for suspend), failing fast instead of hitting [`VmmError::Unsupported`]
 /// mid-flight.
@@ -313,17 +270,24 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Static capabilities for a backend identified by its persisted kind string
-    /// (`"firecracker"`, `"qemu"`, `"apple_vz"`). Unrecognised kinds get the
-    /// conservative default so callers fail closed.
-    pub fn for_backend(kind: &str) -> Capabilities {
+    /// Static capabilities for a persisted backend identity.
+    pub const fn for_backend_kind(kind: BackendKind) -> Capabilities {
         match kind {
-            "firecracker" => Capabilities {
+            BackendKind::Firecracker => Capabilities {
                 snapshot: true,
                 fork: true,
             },
-            _ => Capabilities::default(),
+            BackendKind::Qemu | BackendKind::AppleVz => Capabilities {
+                snapshot: false,
+                fork: false,
+            },
         }
+    }
+
+    /// Static capabilities for a backend-reported kind string. Unrecognised
+    /// kinds get the conservative default so callers fail closed.
+    pub fn for_backend(kind: &str) -> Capabilities {
+        kind.parse().map(Self::for_backend_kind).unwrap_or_default()
     }
 }
 
@@ -547,7 +511,9 @@ pub trait VmmBackend: Send + Sync {
     ) -> Result<BackendSelection, VmmError> {
         Ok(BackendSelection::new(
             requirements,
-            self.backend_kind().parse()?,
+            self.backend_kind()
+                .parse()
+                .map_err(|error: InvalidBackendKind| VmmError::InvalidConfig(error.to_string()))?,
         ))
     }
 
@@ -737,14 +703,14 @@ mod tests {
     fn capabilities_for_backend_maps_each_kind() {
         // Firecracker is the only husker backend that implements full-state
         // snapshot/restore and fork today.
-        let fc = Capabilities::for_backend("firecracker");
+        let fc = Capabilities::for_backend_kind(BackendKind::Firecracker);
         assert!(fc.snapshot);
         assert!(fc.fork);
         // QEMU and Apple VZ return Unsupported from snapshot_vm/restore_vm.
-        assert!(!Capabilities::for_backend("qemu").snapshot);
-        assert!(!Capabilities::for_backend("qemu").fork);
-        assert!(!Capabilities::for_backend("apple_vz").snapshot);
-        assert!(!Capabilities::for_backend("apple_vz").fork);
+        assert!(!Capabilities::for_backend_kind(BackendKind::Qemu).snapshot);
+        assert!(!Capabilities::for_backend_kind(BackendKind::Qemu).fork);
+        assert!(!Capabilities::for_backend_kind(BackendKind::AppleVz).snapshot);
+        assert!(!Capabilities::for_backend_kind(BackendKind::AppleVz).fork);
     }
 
     #[test]

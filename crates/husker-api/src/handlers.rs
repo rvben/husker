@@ -2377,7 +2377,7 @@ pub(crate) fn record_to_response(r: VmRecord) -> VmResponse {
         created_at: r.created_at.to_rfc3339(),
         updated_at: r.updated_at.to_rfc3339(),
         userdata_status: r.userdata_status,
-        vmm: r.vmm,
+        vmm: r.vmm.to_string(),
         boot_mode: r.boot_mode,
         rootfs_path: r.rootfs_path,
         kernel_path: r.kernel_path,

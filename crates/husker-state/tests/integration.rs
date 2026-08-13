@@ -1,5 +1,5 @@
 use chrono::Utc;
-use husker_state::{PortForwardRecord, StateStore, VmLifecycleState, VmRecord};
+use husker_state::{BackendKind, PortForwardRecord, StateStore, VmLifecycleState, VmRecord};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -24,7 +24,7 @@ fn make_record(name: &str) -> VmRecord {
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: "firecracker".into(),
+        vmm: BackendKind::Firecracker,
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,

@@ -36,7 +36,7 @@ use axum::http::StatusCode;
 #[cfg(test)]
 use errors::{map_agent_connect_error, map_error};
 #[cfg(test)]
-use husker_core::{CoreError, VmLifecycleState, VmRecord};
+use husker_core::{BackendKind, CoreError, VmLifecycleState, VmRecord};
 #[cfg(test)]
 use router::{is_protected_route, is_rate_limited_route};
 #[cfg(test)]
@@ -454,7 +454,7 @@ mod tests {
                 userdata_env: None,
                 service_id: Some(svc_id),
                 service_ordinal: Some(0),
-                vmm: "firecracker".into(),
+                vmm: BackendKind::Firecracker,
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
@@ -490,7 +490,7 @@ mod tests {
                 userdata_env: None,
                 service_id: None,
                 service_ordinal: None,
-                vmm: "firecracker".into(),
+                vmm: BackendKind::Firecracker,
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
@@ -829,7 +829,7 @@ mod tests {
                 userdata_env: None,
                 service_id: None,
                 service_ordinal: None,
-                vmm: "firecracker".into(),
+                vmm: BackendKind::Firecracker,
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
@@ -1173,7 +1173,7 @@ mod tests {
                 userdata_env: None,
                 service_id: None,
                 service_ordinal: None,
-                vmm: "firecracker".into(),
+                vmm: BackendKind::Firecracker,
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
@@ -1293,7 +1293,7 @@ mod tests {
                 userdata_env: None,
                 service_id: None,
                 service_ordinal: None,
-                vmm: "firecracker".into(),
+                vmm: BackendKind::Firecracker,
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
@@ -1426,7 +1426,7 @@ mod tests {
                 userdata_env: None,
                 service_id: None,
                 service_ordinal: None,
-                vmm: "firecracker".into(),
+                vmm: BackendKind::Firecracker,
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
@@ -1664,7 +1664,7 @@ mod tests {
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "firecracker".into(),
+            vmm: BackendKind::Firecracker,
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
@@ -1684,6 +1684,7 @@ mod tests {
         r.idle_timeout_secs = Some(120);
         r.auto_resume = false;
         let resp = record_to_response(r);
+        assert_eq!(resp.vmm, "firecracker");
         assert_eq!(resp.idle_timeout_secs, Some(120));
         assert_eq!(resp.suspend_ttl_secs, None);
         assert_eq!(resp.auto_resume, Some(false));
@@ -2489,7 +2490,7 @@ mod tests {
                 userdata_env: None,
                 service_id: None,
                 service_ordinal: None,
-                vmm: "firecracker".into(),
+                vmm: BackendKind::Firecracker,
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: Some("data".into()),

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
+pub use husker_types::BackendKind;
+
 /// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
 /// every call site that used the old `MutexGuard<Connection>` is unchanged.
 type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
@@ -219,8 +221,8 @@ pub struct VmRecord {
     pub service_id: Option<Uuid>,
     /// Stable instance ordinal within the owning service (0..desired-1).
     pub service_ordinal: Option<u32>,
-    /// VMM backend that created this VM ("firecracker" or "qemu").
-    pub vmm: String,
+    /// VMM backend that owns this VM.
+    pub vmm: BackendKind,
     /// How the VM boots: "direct" (host kernel) or "uefi" (OVMF + cloud image).
     pub boot_mode: String,
     /// Whether a virtio memory balloon device was installed at boot.
@@ -558,6 +560,22 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'unknown VM lifecycle state');
          END;",
     ),
+    (
+        6,
+        "CREATE TRIGGER vm_backend_must_be_known_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.vmm NOT IN ('firecracker', 'qemu', 'apple_vz')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM backend kind');
+         END;
+
+         CREATE TRIGGER vm_backend_must_be_known_on_update
+         BEFORE UPDATE OF vmm ON vms
+         WHEN NEW.vmm NOT IN ('firecracker', 'qemu', 'apple_vz')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM backend kind');
+         END;",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -650,7 +668,7 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.userdata_env,
             record.service_id.map(|id| id.to_string()),
             record.service_ordinal,
-            record.vmm,
+            record.vmm.as_str(),
             record.boot_mode,
             record.balloon as i64,
             record.volume,
@@ -2455,6 +2473,17 @@ fn parse_datetime(s: &str) -> rusqlite::Result<DateTime<Utc>> {
     })
 }
 
+fn parse_backend_kind(s: &str) -> rusqlite::Result<BackendKind> {
+    s.parse()
+        .map_err(|error: husker_types::InvalidBackendKind| {
+            rusqlite::Error::FromSqlConversionFailure(
+                19,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
 fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
     let id_str: String = row.get(0)?;
     let created_str: String = row.get(12)?;
@@ -2496,7 +2525,10 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
                 })?),
             }
         },
-        vmm: row.get(19)?,
+        vmm: {
+            let value: String = row.get(19)?;
+            parse_backend_kind(&value)?
+        },
         boot_mode: row.get(20)?,
         balloon: {
             let raw: i64 = row.get(21)?;
@@ -2734,7 +2766,7 @@ mod tests {
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "firecracker".into(),
+            vmm: BackendKind::Firecracker,
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
@@ -2833,10 +2865,10 @@ mod tests {
     fn vmm_field_round_trips() {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("qemu-vm");
-        rec.vmm = "qemu".into();
+        rec.vmm = BackendKind::Qemu;
         store.insert_vm(&rec).unwrap();
         let fetched = store.get_vm_by_name("qemu-vm").unwrap();
-        assert_eq!(fetched.vmm, "qemu");
+        assert_eq!(fetched.vmm, BackendKind::Qemu);
     }
 
     #[test]
@@ -2866,7 +2898,8 @@ mod tests {
 
         let fetched = store.get_vm_by_name("legacy-vm").unwrap();
         assert_eq!(
-            fetched.vmm, "firecracker",
+            fetched.vmm,
+            BackendKind::Firecracker,
             "legacy row should default to firecracker"
         );
     }
@@ -4791,7 +4824,7 @@ mod tests {
         assert_eq!(vm.vcpu_count, 2);
         assert_eq!(vm.guest_ip.as_deref(), Some("192.0.2.50"));
         // New columns backfilled with their schema-correct defaults.
-        assert_eq!(vm.vmm, "firecracker");
+        assert_eq!(vm.vmm, BackendKind::Firecracker);
         assert_eq!(vm.boot_mode, "direct");
         assert_eq!(vm.network, "nat");
         assert!(vm.auto_resume, "auto_resume defaults to enabled");
@@ -4862,6 +4895,50 @@ mod tests {
 
         let error = store.get_vm(record.id).unwrap_err();
         assert!(error.to_string().contains("unknown VM lifecycle state"));
+    }
+
+    #[test]
+    fn database_rejects_unknown_vm_backend_kinds() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("guarded-backend");
+        store.insert_vm(&record).unwrap();
+
+        let error = store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE vms SET vmm = 'xen' WHERE id = ?1",
+                params![record.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown VM backend kind"));
+        assert_eq!(
+            store.get_vm(record.id).unwrap().vmm,
+            BackendKind::Firecracker
+        );
+    }
+
+    #[test]
+    fn row_decoder_surfaces_corrupt_vm_backend_kind() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("corrupt-backend");
+        store.insert_vm(&record).unwrap();
+
+        // Simulate a database corrupted outside Husker by removing the guard.
+        // The typed row boundary must still reject the value instead of
+        // assigning capabilities to an implementation that does not exist.
+        let conn = store.lock().unwrap();
+        conn.execute_batch("DROP TRIGGER vm_backend_must_be_known_on_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE vms SET vmm = 'xen' WHERE id = ?1",
+            params![record.id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store.get_vm(record.id).unwrap_err();
+        assert!(error.to_string().contains("unknown backend kind 'xen'"));
     }
 
     #[test]

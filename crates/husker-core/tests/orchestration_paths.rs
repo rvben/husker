@@ -310,7 +310,7 @@ fn vm_record(
         userdata_env,
         service_id: None,
         service_ordinal: None,
-        vmm: "firecracker".into(),
+        vmm: BackendKind::Firecracker,
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
@@ -1277,7 +1277,7 @@ async fn port_forward_applies_for_qemu_backed_vm() {
         Some("192.0.2.2".into()),
         Some("hpfq-tap0".into()),
     );
-    vm.vmm = "qemu".into();
+    vm.vmm = BackendKind::Qemu;
     state.insert_vm(&vm).unwrap();
 
     // Core wired to the test bridge (build_core hardcodes husker0).
@@ -2361,8 +2361,11 @@ async fn create_vm_persists_the_selected_backend() {
         .await
         .unwrap();
 
-    assert_eq!(created.vmm, "qemu");
-    assert_eq!(core.get_vm("backend-authority").unwrap().vmm, "qemu");
+    assert_eq!(created.vmm, BackendKind::Qemu);
+    assert_eq!(
+        core.get_vm("backend-authority").unwrap().vmm,
+        BackendKind::Qemu
+    );
 }
 
 // The concurrent-create test drives the full create path to completion. The

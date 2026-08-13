@@ -46,7 +46,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 expected: "suspended".into(),
             });
         }
-        if !husker_vmm::Capabilities::for_backend(&source.vmm).fork {
+        if !husker_vmm::Capabilities::for_backend_kind(source.vmm).fork {
             return Err(CoreError::Vmm(husker_vmm::VmmError::Unsupported(format!(
                 "backend '{}' does not support fork",
                 source.vmm
@@ -212,7 +212,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: source.vmm.clone(),
+            vmm: source.vmm,
             boot_mode: source.boot_mode.clone(),
             balloon: false,
             volume: None,

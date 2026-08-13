@@ -9,6 +9,7 @@ members = [
     "crates/husker-agent-proto",
     "crates/husker-api",
     "crates/husker-state",
+    "crates/husker-types",
     "crates/husker-cloudinit",
     "crates/husker-oci",
 ]
@@ -92,6 +93,7 @@ husker-storage = { path = "crates/husker-storage" }
 husker-agent-proto = { path = "crates/husker-agent-proto" }
 husker-api = { path = "crates/husker-api", default-features = false }
 husker-state = { path = "crates/husker-state" }
+husker-types = { path = "crates/husker-types" }
 husker-cloudinit = { path = "crates/husker-cloudinit" }
 husker-oci = { path = "crates/husker-oci" }
 

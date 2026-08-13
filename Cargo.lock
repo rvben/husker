@@ -1217,6 +1217,7 @@ name = "husker-state"
 version = "0.4.43"
 dependencies = [
  "chrono",
+ "husker-types",
  "r2d2",
  "r2d2_sqlite",
  "rusqlite",
@@ -1242,6 +1243,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "husker-types"
+version = "0.4.43"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "husker-vmm"
 version = "0.4.43"
 dependencies = [
@@ -1249,6 +1259,7 @@ dependencies = [
  "dispatch2",
  "http-body-util",
  "husker-agent-proto",
+ "husker-types",
  "hyper",
  "hyper-util",
  "libc",

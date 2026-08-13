@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use husker_core::{CoreError, CreatePoolRequest, HuskerCore, VmLifecycleState};
+use husker_core::{BackendKind, CoreError, CreatePoolRequest, HuskerCore, VmLifecycleState};
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
     VmmError,
@@ -232,7 +232,7 @@ fn core_with_running_vm_backend(
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: vmm_kind.into(),
+        vmm: vmm_kind.parse().expect("test backend kind must be valid"),
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
@@ -315,7 +315,7 @@ fn core_store_with_vm(
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: "firecracker".into(),
+        vmm: BackendKind::Firecracker,
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
@@ -704,7 +704,7 @@ fn core_with_named_pool_template(
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: "firecracker".into(),
+        vmm: BackendKind::Firecracker,
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,

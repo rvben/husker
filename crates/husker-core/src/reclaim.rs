@@ -17,10 +17,10 @@
 // is intentionally absent there rather than silenced with `allow(dead_code)`.
 #[cfg(any(feature = "linux-net", test))]
 use chrono::{DateTime, Duration, Utc};
-#[cfg(test)]
-use husker_state::VmLifecycleState;
 #[cfg(any(feature = "linux-net", test))]
 use husker_state::VmRecord;
+#[cfg(test)]
+use husker_state::{BackendKind, VmLifecycleState};
 
 /// Whether a VM is a reclaimable resource leak: a genuinely-abandoned stopped
 /// VM still holding host network resources.
@@ -188,7 +188,7 @@ mod tests {
             userdata_env: None,
             service_id: None,
             service_ordinal: None,
-            vmm: "firecracker".into(),
+            vmm: BackendKind::Firecracker,
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
