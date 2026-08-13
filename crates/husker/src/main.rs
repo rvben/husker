@@ -746,6 +746,27 @@ async fn run(cli: Cli) -> Result<()> {
         );
         return Ok(());
     }
+    if matches!(command, Commands::Capabilities) {
+        let capabilities = serde_json::json!({
+            "name": "husker",
+            "version": env!("CARGO_PKG_VERSION"),
+            "clispec": "0.3",
+            "output": ["text", "json"],
+            "features": ["schema", "pagination", "field selection", "read-only introspection"]
+        });
+        if output == OutputFormat::Json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&structured_output("capabilities", &capabilities)?)?
+            );
+        } else {
+            println!(
+                "husker {} - clispec 0.3; text/json output, pagination, field selection",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        return Ok(());
+    }
     if let Commands::Completions { shell } = command {
         use clap::CommandFactory;
         let mut cli = Cli::command();
@@ -6132,7 +6153,7 @@ mod tests {
             .expect("not_found error entry must exist");
         assert_eq!(not_found["exit_code"], 2);
 
-        // Commands are a flat array of canonical paths.
+        // Commands are a flat array of full command paths.
         let cmds = schema["commands"]
             .as_array()
             .expect("commands must be an array");

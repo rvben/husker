@@ -19,18 +19,12 @@ fn schema_document() -> serde_json::Value {
 }
 
 fn command_at_path<'a>(document: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
-    let mut commands = document["commands"].as_array().expect("commands array");
-    let mut command = None;
-    for name in path.split(' ') {
-        command = commands
-            .iter()
-            .find(|command| command["name"].as_str() == Some(name));
-        let found = command.unwrap_or_else(|| panic!("missing command path '{path}'"));
-        if let Some(subcommands) = found.get("subcommands").and_then(|value| value.as_array()) {
-            commands = subcommands;
-        }
-    }
-    command.expect("path contains at least one command")
+    document["commands"]
+        .as_array()
+        .expect("commands array")
+        .iter()
+        .find(|command| command["name"].as_str() == Some(path))
+        .unwrap_or_else(|| panic!("missing command path '{path}'"))
 }
 
 fn named_entry<'a>(entries: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
@@ -256,7 +250,11 @@ fn schema_uses_semantic_output_types_and_full_command_paths() {
     );
     assert_eq!(
         named_entry(&list["output_fields"], "auto_resume")["type"],
-        "boolean|null"
+        "boolean"
+    );
+    assert_eq!(
+        named_entry(&list["output_fields"], "auto_resume")["nullable"],
+        true
     );
 
     let port_forward_add = command_at_path(&document, "port-forward add");

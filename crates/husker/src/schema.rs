@@ -304,36 +304,64 @@ fn enrich_v0_3(schema: &mut serde_json::Value) {
         ) {
             object.insert("output_kind".into(), serde_json::json!("opaque"));
             object.insert("media_type".into(), serde_json::json!("text/plain"));
+            if name == "shell" {
+                object.insert("requires_tty".into(), serde_json::json!(true));
+            }
             object.remove("output_fields");
-            continue;
-        }
-
-        object.insert("cardinality".into(), serde_json::json!("bounded"));
-        if name == "list" {
-            object.insert("cardinality".into(), serde_json::json!("unbounded"));
-            object.insert(
-                "pagination".into(),
-                serde_json::json!({
-                    "style": "offset",
-                    "limit_arg": "--limit",
-                    "offset_arg": "--offset"
-                }),
-            );
-            object.insert("fields_arg".into(), serde_json::json!("--fields"));
-        }
-        if name == "schema" {
-            object.insert("cardinality".into(), serde_json::json!("single"));
-            object.insert(
-                "stdout_schema".into(),
-                serde_json::json!({"$ref": "https://clispec.dev/schema/v0.3.json"}),
-            );
-        }
-        if name == "capabilities" {
-            object.insert("cardinality".into(), serde_json::json!("single"));
-            object.insert(
-                "example".into(),
-                serde_json::json!({"args": ["capabilities"]}),
-            );
+        } else {
+            object.insert("cardinality".into(), serde_json::json!("bounded"));
+            if name == "list" {
+                object.insert("cardinality".into(), serde_json::json!("unbounded"));
+                object.insert(
+                    "pagination".into(),
+                    serde_json::json!({
+                        "style": "offset",
+                        "limit_arg": "--limit",
+                        "offset_arg": "--offset"
+                    }),
+                );
+                object.insert("fields_arg".into(), serde_json::json!("--fields"));
+            }
+            if name == "schema" {
+                object.insert("cardinality".into(), serde_json::json!("single"));
+                object.insert(
+                    "stdout_schema".into(),
+                    serde_json::json!({"$ref": "https://clispec.dev/schema/v0.3.json"}),
+                );
+            }
+            if name == "capabilities" {
+                object.insert("cardinality".into(), serde_json::json!("single"));
+                object.insert(
+                    "example".into(),
+                    serde_json::json!({"args": ["capabilities"]}),
+                );
+            }
+            if let Some(fields) = object
+                .get_mut("output_fields")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for field in fields {
+                    let Some(field) = field.as_object_mut() else {
+                        continue;
+                    };
+                    let old_type = field["type"].as_str().unwrap_or_default().to_string();
+                    if let Some(base_type) = old_type.strip_suffix("|null") {
+                        field.insert("type".into(), serde_json::json!(base_type));
+                        field.insert("nullable".into(), serde_json::json!(true));
+                    }
+                    if field["type"] == "array" {
+                        field.insert("items".into(), serde_json::json!({"type": "object"}));
+                    }
+                }
+            }
+            if object
+                .get("output_fields")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+                && !object.contains_key("stdout_schema")
+            {
+                object.insert("stdout_schema".into(), serde_json::json!({}));
+            }
         }
         if object
             .get("args")
@@ -341,14 +369,6 @@ fn enrich_v0_3(schema: &mut serde_json::Value) {
             .is_some_and(|args| args.iter().any(|arg| arg["name"] == "--yes"))
         {
             object.insert("confirmation_bypass_arg".into(), serde_json::json!("--yes"));
-        }
-        if object
-            .get("output_fields")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty)
-            && !object.contains_key("stdout_schema")
-        {
-            object.insert("stdout_schema".into(), serde_json::json!({}));
         }
     }
 }

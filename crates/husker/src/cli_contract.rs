@@ -88,7 +88,7 @@ pub(crate) enum OutputContract {
     /// update the contract in the same change.
     Object(&'static [FieldContract]),
     /// A JSON envelope containing an array. Clispec describes one array item,
-    /// as required by v0.2, while runtime validation also checks the envelope.
+    /// as required by the schema contract, while runtime validation also checks the envelope.
     List {
         envelope: &'static [FieldContract],
         items_field: &'static str,

@@ -1170,6 +1170,13 @@ const CONTEXT_SHOW: &[F] = &[
     F::optional("api_url", T::String),
 ];
 const DOCTOR_OUTPUT: &[F] = &[F::required("checks", T::Array)];
+const CAPABILITIES_OUTPUT: &[F] = &[
+    F::required("name", T::String),
+    F::required("version", T::String),
+    F::required("clispec", T::String),
+    F::required("output", T::Array),
+    F::required("features", T::Array),
+];
 const PF_ADD: &[F] = &[
     F::required("status", T::String),
     F::required("action", T::String),
@@ -1474,6 +1481,7 @@ pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
     CommandContract::object("context remove", true, NAMED_ACTION),
     CommandContract::object("context show", false, CONTEXT_SHOW),
     CommandContract::self_describing("schema", false),
+    CommandContract::object("capabilities", false, CAPABILITIES_OUTPUT),
     CommandContract::unsupported("setup storage", true),
     CommandContract::object("doctor", false, DOCTOR_OUTPUT),
     CommandContract::unsupported("completions", false),
