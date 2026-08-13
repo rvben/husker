@@ -1,5 +1,7 @@
 use chrono::Utc;
-use husker_state::{BackendKind, PortForwardRecord, StateStore, VmLifecycleState, VmRecord};
+use husker_state::{
+    BackendKind, NetworkMode, PortForwardRecord, StateStore, VmLifecycleState, VmRecord,
+};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -28,7 +30,7 @@ fn make_record(name: &str) -> VmRecord {
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
-        network: "nat".into(),
+        network: NetworkMode::Nat,
         last_activity_at: Utc::now(),
         suspended_at: None,
         idle_timeout_secs: None,

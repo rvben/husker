@@ -34,7 +34,7 @@ pub struct VmResponse {
     /// Name of the persistent volume attached to this VM, or None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<String>,
-    /// Network mode for this VM: "nat" (husker-managed NAT) or "bridged" (LAN bridge via DHCP).
+    /// Network mode for this VM: "nat", "bridged", or "none".
     pub network: String,
     /// Idle window in seconds before this VM is suspended, if the idle policy is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]

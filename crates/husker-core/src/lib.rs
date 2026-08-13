@@ -38,8 +38,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub use husker_state::{
-    BackendKind, HostGroupRecord, ImageRecord, PoolRecord, SecretRecord, ServiceRecord,
-    SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
+    BackendKind, HostGroupRecord, ImageRecord, NetworkMode, PoolRecord, SecretRecord,
+    ServiceRecord, SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 
@@ -209,9 +209,9 @@ pub struct CreateVmRequest {
     /// Exactly one VM may hold a given volume at a time.
     #[serde(default)]
     pub volume: Option<String>,
-    /// Network mode: "nat" (default) or "bridged". Bridged requires a cloud image
-    /// and a configured `lan_bridge`; the VM's TAP is attached directly to the
-    /// host LAN bridge and DHCP assigns its address.
+    /// Network mode: "nat" (default), "bridged", or "none". Bridged requires a
+    /// cloud image and configured `lan_bridge`; none omits the guest NIC. Both
+    /// non-NAT modes currently require Linux host networking.
     #[serde(default)]
     pub network: Option<String>,
     /// Host directories to share into the guest over virtiofs.
@@ -1446,17 +1446,15 @@ fn infer_image_format(path: &Path) -> String {
 
 /// Validate and normalize the network mode field.
 ///
-/// Returns "nat" or "bridged". Unknown values are rejected with an
-/// `InvalidArgument` error listing the accepted values.
-pub fn validate_network_mode(n: Option<&str>) -> Result<&'static str, CoreError> {
-    match n {
-        None | Some("nat") => Ok("nat"),
-        Some("bridged") => Ok("bridged"),
-        Some("none") => Ok("none"),
-        Some(other) => Err(CoreError::InvalidArgument(format!(
-            "unknown network mode '{other}' (accepted: nat, bridged, none)"
-        ))),
-    }
+/// Returns the default NAT mode when omitted. Unknown values are rejected with
+/// an `InvalidArgument` error listing the accepted wire values.
+pub fn validate_network_mode(value: Option<&str>) -> Result<NetworkMode, CoreError> {
+    value
+        .unwrap_or(NetworkMode::Nat.as_str())
+        .parse::<NetworkMode>()
+        .map_err(|error| {
+            CoreError::InvalidArgument(format!("{error} (accepted: nat, bridged, none)"))
+        })
 }
 
 /// Validate and default an image-import kind ("rootfs" when unset).
@@ -2605,7 +2603,7 @@ mod tests {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,
@@ -3009,6 +3007,19 @@ mod tests {
             core.has_resume_listener_for_test(rec.id),
             "reinstall_resume_listeners must bind a resume listener for a suspended, auto_resume VM with forwards"
         );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn startup_does_not_reattach_an_isolated_suspended_vm() {
+        let core = test_core().await;
+        let mut rec = sample_vm_record("isolated-suspended");
+        rec.state = VmLifecycleState::Suspended;
+        rec.network = NetworkMode::Isolated;
+        rec.tap_device = None;
+        core.state.insert_vm(&rec).unwrap();
+
+        assert_eq!(core.reattach_suspended_vm_networks().await.unwrap(), 0);
     }
 
     #[cfg(feature = "linux-net")]
@@ -3494,9 +3505,18 @@ mod tests {
     #[cfg(feature = "linux-net")]
     #[test]
     fn validate_network_mode_accepts_none_and_rejects_unknown() {
-        assert_eq!(validate_network_mode(Some("none")).unwrap(), "none");
-        assert_eq!(validate_network_mode(Some("nat")).unwrap(), "nat");
-        assert_eq!(validate_network_mode(Some("bridged")).unwrap(), "bridged");
+        assert_eq!(
+            validate_network_mode(Some("none")).unwrap(),
+            NetworkMode::Isolated
+        );
+        assert_eq!(
+            validate_network_mode(Some("nat")).unwrap(),
+            NetworkMode::Nat
+        );
+        assert_eq!(
+            validate_network_mode(Some("bridged")).unwrap(),
+            NetworkMode::Bridged
+        );
         let err = validate_network_mode(Some("off")).unwrap_err();
         assert!(
             matches!(err, CoreError::InvalidArgument(ref m) if m.contains("none")),
@@ -4174,7 +4194,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: chrono::Utc::now(),
             suspended_at: None,
             idle_timeout_secs: None,
@@ -4465,7 +4485,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             boot_mode: "direct".into(),
             balloon: false,
             volume: Some("mydata".into()),
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: chrono::Utc::now(),
             suspended_at: None,
             idle_timeout_secs: None,
@@ -4896,17 +4916,23 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[test]
     fn validate_network_mode_defaults_to_nat() {
-        assert_eq!(validate_network_mode(None).unwrap(), "nat");
+        assert_eq!(validate_network_mode(None).unwrap(), NetworkMode::Nat);
     }
 
     #[test]
     fn validate_network_mode_accepts_nat() {
-        assert_eq!(validate_network_mode(Some("nat")).unwrap(), "nat");
+        assert_eq!(
+            validate_network_mode(Some("nat")).unwrap(),
+            NetworkMode::Nat
+        );
     }
 
     #[test]
     fn validate_network_mode_accepts_bridged() {
-        assert_eq!(validate_network_mode(Some("bridged")).unwrap(), "bridged");
+        assert_eq!(
+            validate_network_mode(Some("bridged")).unwrap(),
+            NetworkMode::Bridged
+        );
     }
 
     #[test]
@@ -5036,10 +5062,11 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         );
     }
 
-    /// Port-forward add on a bridged VM must be rejected with a clear message.
+    /// Port-forwarding is a NAT-only facility. Non-NAT modes must be rejected
+    /// before guest-IP/TAP lookup or any host-network operation.
     #[cfg(feature = "linux-net")]
     #[tokio::test]
-    async fn add_port_forward_rejects_bridged_vm() {
+    async fn add_port_forward_rejects_non_nat_vm() {
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
 
@@ -5068,7 +5095,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             boot_mode: "uefi".into(),
             balloon: false,
             volume: None,
-            network: "bridged".into(),
+            network: NetworkMode::Bridged,
             last_activity_at: chrono::Utc::now(),
             suspended_at: None,
             idle_timeout_secs: None,
@@ -5077,6 +5104,13 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             forked_from: None,
         };
         state.insert_vm(&vm).unwrap();
+        let mut isolated = vm.clone();
+        isolated.id = uuid::Uuid::new_v4();
+        isolated.name = "isolated-vm".into();
+        isolated.vsock_cid = 11;
+        isolated.tap_device = None;
+        isolated.network = NetworkMode::Isolated;
+        state.insert_vm(&isolated).unwrap();
 
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),
@@ -5097,23 +5131,28 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             runtime_dir,
         );
 
-        let err = core
-            .add_port_forward("bridged-vm", 8080, 80, None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("bridged")),
-            "expected InvalidArgument mentioning bridged, got {err:?}"
-        );
+        for (name, mode, host_port) in [
+            ("bridged-vm", NetworkMode::Bridged, 8080),
+            ("isolated-vm", NetworkMode::Isolated, 8081),
+        ] {
+            let err = core
+                .add_port_forward(name, host_port, 80, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, CoreError::InvalidArgument(ref msg)
+                    if msg.contains(mode.as_str()) && msg.contains("NAT")),
+                "expected InvalidArgument naming {mode} and NAT, got {err:?}"
+            );
+        }
     }
 
-    /// On non-linux-net builds, requesting bridged mode must fail with a
-    /// Linux-only message. Uses cloud_image to bypass the host-kernel validation
-    /// that runs before try_create_vm (cloud_image skips the kernel/rootfs checks).
-    /// The bridged rejection fires in try_create_vm before the cloud_image check.
+    /// Apple VZ always installs NAT, so accepting bridged or isolated mode would
+    /// persist a topology the backend did not enforce. Both must fail before the
+    /// cloud-image path touches disk or starts a VM.
     #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
-    async fn bridged_rejected_on_non_linux_net() {
+    async fn non_nat_modes_are_rejected_on_apple_vz() {
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
@@ -5128,33 +5167,23 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             runtime_dir,
         );
 
-        // cloud_image is set so the kernel/rootfs host-path check is skipped in
-        // create_vm_record. The bridged rejection in try_create_vm fires first.
-        let req = CreateVmRequest {
-            name: "vm3".into(),
-            kernel_path: None,
-            rootfs_path: None,
-            cloud_image: Some("/images/ubuntu.qcow2".into()),
-            network: Some("bridged".into()),
-            vcpu_count: None,
-            mem_size_mib: None,
-            initrd_path: None,
-            userdata: None,
-            env: vec![],
-            vmm: None,
-            disk_size: None,
-            ssh_authorized_keys: vec![],
-            balloon: false,
-            volume: None,
-            mounts: vec![],
-            ..Default::default()
-        };
+        for (index, mode) in ["bridged", "none"].into_iter().enumerate() {
+            // cloud_image skips the host-kernel validation. The topology guard
+            // fires before the deliberately nonexistent image is inspected.
+            let req = CreateVmRequest {
+                name: format!("non-nat-{index}"),
+                cloud_image: Some("/images/ubuntu.qcow2".into()),
+                network: Some(mode.into()),
+                ..Default::default()
+            };
 
-        let err = core.create_vm(req).await.unwrap_err();
-        assert!(
-            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("Linux")),
-            "expected InvalidArgument mentioning Linux, got {err:?}"
-        );
+            let err = core.create_vm(req).await.unwrap_err();
+            assert!(
+                matches!(err, CoreError::InvalidArgument(ref msg)
+                    if msg.contains("Linux") && msg.contains(mode)),
+                "expected InvalidArgument naming Linux and {mode}, got {err:?}"
+            );
+        }
     }
 
     // ── macOS cloud-image path tests ─────────────────────────────────────────
@@ -5216,7 +5245,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             boot_mode: "efi".into(),
             balloon: false,
             volume: None,
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: chrono::Utc::now(),
             suspended_at: None,
             idle_timeout_secs: None,
@@ -6131,7 +6160,7 @@ mod idle_policy_tests {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,

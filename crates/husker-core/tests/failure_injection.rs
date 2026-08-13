@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use husker_core::{BackendKind, CoreError, HuskerCore};
+use husker_core::{BackendKind, CoreError, HuskerCore, NetworkMode};
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
     VmmError,
@@ -488,7 +488,7 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
-        network: "nat".into(),
+        network: NetworkMode::Nat,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,

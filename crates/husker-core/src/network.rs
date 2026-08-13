@@ -126,11 +126,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     ) -> Result<husker_state::PortForwardRecord, CoreError> {
         let record = self.lookup_vm(name)?;
 
-        // Bridged VMs are directly on the LAN; NAT port-forwarding does not apply to them.
-        if record.network == "bridged" {
+        if record.network != NetworkMode::Nat {
             return Err(CoreError::InvalidArgument(format!(
-                "VM '{name}' uses bridged networking and is directly on the LAN; \
-                 port forwards apply to NAT VMs only"
+                "VM '{name}' uses {} networking; port forwards apply to NAT VMs only",
+                record.network
             )));
         }
 
@@ -246,6 +245,12 @@ impl<B: VmmBackend> HuskerCore<B> {
     ) -> Result<husker_state::PortForwardRecord, CoreError> {
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        if record.network != NetworkMode::Nat {
+            return Err(CoreError::InvalidArgument(format!(
+                "VM '{name}' uses {} networking; port forwards apply to NAT VMs only",
+                record.network
+            )));
+        }
         if record.state != VmLifecycleState::Running {
             return Err(CoreError::InvalidState {
                 name: name.into(),
@@ -366,6 +371,22 @@ impl<B: VmmBackend> HuskerCore<B> {
                 continue;
             }
 
+            let bridge = match vm.network {
+                NetworkMode::Isolated => continue,
+                NetworkMode::Nat => self.bridge_name.as_str(),
+                NetworkMode::Bridged => {
+                    self.lan_bridge
+                        .as_deref()
+                        .ok_or_else(|| CoreError::InvalidState {
+                            name: vm.name.clone(),
+                            actual:
+                                "suspended with bridged networking but no LAN bridge configured"
+                                    .into(),
+                            expected: "a configured LAN bridge".into(),
+                        })?
+                }
+            };
+
             let tap = vm
                 .tap_device
                 .as_deref()
@@ -374,19 +395,6 @@ impl<B: VmmBackend> HuskerCore<B> {
                     actual: "suspended without a preserved TAP device".into(),
                     expected: "suspended with a preserved TAP device".into(),
                 })?;
-            let bridge = if vm.network == "bridged" {
-                self.lan_bridge
-                    .as_deref()
-                    .ok_or_else(|| CoreError::InvalidState {
-                        name: vm.name.clone(),
-                        actual: "suspended with bridged networking but no LAN bridge configured"
-                            .into(),
-                        expected: "a configured LAN bridge".into(),
-                    })?
-            } else {
-                &self.bridge_name
-            };
-
             if let Err(error) = self.host_network.attach_to_bridge(tap, bridge).await {
                 warn!(
                     name = %vm.name,
@@ -420,6 +428,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         let mut restored = 0usize;
         let mut skipped_suspended = 0usize;
         for vm in vms {
+            if vm.network != NetworkMode::Nat {
+                continue;
+            }
             if vm.state == VmLifecycleState::Suspended {
                 // A suspended VM has no live guest; DNAT would blackhole traffic to a
                 // dead IP and bypass the resume listener. Skip; listeners are
@@ -505,7 +516,10 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         };
         for vm in vms {
-            if vm.state != VmLifecycleState::Suspended || !vm.auto_resume {
+            if vm.network != NetworkMode::Nat
+                || vm.state != VmLifecycleState::Suspended
+                || !vm.auto_resume
+            {
                 continue;
             }
             let forwards = self

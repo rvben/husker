@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use husker_core::{BackendKind, CoreError, CreatePoolRequest, HuskerCore, VmLifecycleState};
+use husker_core::{
+    BackendKind, CoreError, CreatePoolRequest, HuskerCore, NetworkMode, VmLifecycleState,
+};
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
     VmmError,
@@ -236,7 +238,7 @@ fn core_with_running_vm_backend(
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
-        network: "nat".into(),
+        network: NetworkMode::Nat,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,
@@ -319,7 +321,7 @@ fn core_store_with_vm(
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
-        network: "nat".into(),
+        network: NetworkMode::Nat,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,
@@ -708,7 +710,7 @@ fn core_with_named_pool_template(
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
-        network: "nat".into(),
+        network: NetworkMode::Nat,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,

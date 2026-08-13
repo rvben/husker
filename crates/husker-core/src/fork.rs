@@ -52,7 +52,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 source.vmm
             ))));
         }
-        if source.network != "nat" {
+        if source.network != NetworkMode::Nat {
             return Err(CoreError::InvalidArgument(
                 "fork is only supported for NAT-mode VMs".into(),
             ));
@@ -216,7 +216,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot_mode: source.boot_mode.clone(),
             balloon: false,
             volume: None,
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,

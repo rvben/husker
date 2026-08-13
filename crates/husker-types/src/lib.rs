@@ -50,6 +50,55 @@ impl std::str::FromStr for BackendKind {
     }
 }
 
+/// The host networking topology assigned to a VM.
+///
+/// The stable wire value for [`NetworkMode::Isolated`] is `"none"`, matching
+/// the CLI flag while naming the runtime property directly in Rust.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    Nat,
+    Bridged,
+    #[serde(rename = "none")]
+    Isolated,
+}
+
+impl NetworkMode {
+    pub const ALL: [Self; 3] = [Self::Nat, Self::Bridged, Self::Isolated];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nat => "nat",
+            Self::Bridged => "bridged",
+            Self::Isolated => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown network mode '{0}'")]
+pub struct InvalidNetworkMode(String);
+
+impl std::str::FromStr for NetworkMode {
+    type Err = InvalidNetworkMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nat" => Ok(Self::Nat),
+            "bridged" => Ok(Self::Bridged),
+            "none" => Ok(Self::Isolated),
+            other => Err(InvalidNetworkMode(other.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +121,25 @@ mod tests {
 
         assert!("QEMU".parse::<BackendKind>().is_err());
         assert!("unknown".parse::<BackendKind>().is_err());
+    }
+
+    #[test]
+    fn network_mode_has_a_stable_round_trip_for_every_value() {
+        for mode in NetworkMode::ALL {
+            let wire_value = mode.as_str();
+            assert_eq!(wire_value.parse::<NetworkMode>().unwrap(), mode);
+            assert_eq!(mode.to_string(), wire_value);
+            assert_eq!(
+                serde_json::to_string(&mode).unwrap(),
+                format!("\"{wire_value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<NetworkMode>(&format!("\"{wire_value}\"")).unwrap(),
+                mode
+            );
+        }
+
+        assert!("NAT".parse::<NetworkMode>().is_err());
+        assert!("unknown".parse::<NetworkMode>().is_err());
     }
 }

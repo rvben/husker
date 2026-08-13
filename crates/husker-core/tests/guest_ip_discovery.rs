@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use husker_core::HuskerCore;
-use husker_state::{BackendKind, StateStore, VmRecord};
+use husker_state::{BackendKind, NetworkMode, StateStore, VmRecord};
 use husker_storage::StorageConfig;
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
@@ -144,7 +144,7 @@ fn make_vm_record(
         boot_mode: boot_mode.into(),
         balloon: false,
         volume: None,
-        network: "nat".into(),
+        network: NetworkMode::Nat,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,

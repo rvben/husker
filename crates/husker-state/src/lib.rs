@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
-pub use husker_types::BackendKind;
+pub use husker_types::{BackendKind, NetworkMode};
 
 /// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
 /// every call site that used the old `MutexGuard<Connection>` is unchanged.
@@ -229,8 +229,8 @@ pub struct VmRecord {
     pub balloon: bool,
     /// Name of the persistent volume attached to this VM, or None.
     pub volume: Option<String>,
-    /// Network mode: "nat" (husker-managed NAT) or "bridged" (LAN bridge via DHCP).
-    pub network: String,
+    /// Host networking topology assigned to this VM.
+    pub network: NetworkMode,
     /// Last control-plane interaction, debounced observability mirror of the
     /// in-memory activity signal used by the idle policy.
     pub last_activity_at: DateTime<Utc>,
@@ -576,6 +576,22 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'unknown VM backend kind');
          END;",
     ),
+    (
+        7,
+        "CREATE TRIGGER vm_network_must_be_known_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.network NOT IN ('nat', 'bridged', 'none')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM network mode');
+         END;
+
+         CREATE TRIGGER vm_network_must_be_known_on_update
+         BEFORE UPDATE OF network ON vms
+         WHEN NEW.network NOT IN ('nat', 'bridged', 'none')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM network mode');
+         END;",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -672,7 +688,7 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.boot_mode,
             record.balloon as i64,
             record.volume,
-            record.network,
+            record.network.as_str(),
             record.last_activity_at.to_rfc3339(),
             record.suspended_at.map(|d| d.to_rfc3339()),
             record.idle_timeout_secs.map(|v| v as i64),
@@ -2484,6 +2500,17 @@ fn parse_backend_kind(s: &str) -> rusqlite::Result<BackendKind> {
         })
 }
 
+fn parse_network_mode(s: &str) -> rusqlite::Result<NetworkMode> {
+    s.parse()
+        .map_err(|error: husker_types::InvalidNetworkMode| {
+            rusqlite::Error::FromSqlConversionFailure(
+                23,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
 fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
     let id_str: String = row.get(0)?;
     let created_str: String = row.get(12)?;
@@ -2535,7 +2562,10 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
             raw != 0
         },
         volume: row.get(22)?,
-        network: row.get(23)?,
+        network: {
+            let value: String = row.get(23)?;
+            parse_network_mode(&value)?
+        },
         last_activity_at: {
             let s: Option<String> = row.get(24)?;
             match s {
@@ -2770,7 +2800,7 @@ mod tests {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: Utc::now(),
             suspended_at: None,
             idle_timeout_secs: None,
@@ -4738,10 +4768,10 @@ mod tests {
     fn network_field_round_trips() {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("net-vm");
-        rec.network = "nat".to_string();
+        rec.network = NetworkMode::Bridged;
         store.insert_vm(&rec).unwrap();
         let fetched = store.get_vm_by_name("net-vm").unwrap();
-        assert_eq!(fetched.network, "nat");
+        assert_eq!(fetched.network, NetworkMode::Bridged);
     }
 
     #[test]
@@ -4766,7 +4796,8 @@ mod tests {
         }
         let rec = store.get_vm_by_name("legacy-net").unwrap();
         assert_eq!(
-            rec.network, "nat",
+            rec.network,
+            NetworkMode::Nat,
             "legacy VM row without network column must default to nat"
         );
     }
@@ -4826,7 +4857,7 @@ mod tests {
         // New columns backfilled with their schema-correct defaults.
         assert_eq!(vm.vmm, BackendKind::Firecracker);
         assert_eq!(vm.boot_mode, "direct");
-        assert_eq!(vm.network, "nat");
+        assert_eq!(vm.network, NetworkMode::Nat);
         assert!(vm.auto_resume, "auto_resume defaults to enabled");
         assert!(!vm.balloon, "balloon defaults to off");
 
@@ -4939,6 +4970,47 @@ mod tests {
 
         let error = store.get_vm(record.id).unwrap_err();
         assert!(error.to_string().contains("unknown backend kind 'xen'"));
+    }
+
+    #[test]
+    fn database_rejects_unknown_vm_network_modes() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("guarded-network");
+        store.insert_vm(&record).unwrap();
+
+        let error = store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE vms SET network = 'host' WHERE id = ?1",
+                params![record.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown VM network mode"));
+        assert_eq!(store.get_vm(record.id).unwrap().network, NetworkMode::Nat);
+    }
+
+    #[test]
+    fn row_decoder_surfaces_corrupt_vm_network_mode() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("corrupt-network");
+        store.insert_vm(&record).unwrap();
+
+        // Simulate a database corrupted outside Husker by removing the guard.
+        // The typed row boundary must reject the value instead of letting it
+        // fall through a NAT or bridge policy branch.
+        let conn = store.lock().unwrap();
+        conn.execute_batch("DROP TRIGGER vm_network_must_be_known_on_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE vms SET network = 'host' WHERE id = ?1",
+            params![record.id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store.get_vm(record.id).unwrap_err();
+        assert!(error.to_string().contains("unknown network mode 'host'"));
     }
 
     #[test]

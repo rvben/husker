@@ -147,7 +147,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         // Bridged mode preconditions: must have a cloud image and a configured LAN bridge.
         // These checks run before any resource allocation so tests can verify them in-memory.
-        if network_mode == "bridged" {
+        if network_mode == NetworkMode::Bridged {
             if req.cloud_image.is_none() {
                 return Err(CoreError::InvalidArgument(
                     "bridged networking requires --cloud-image \
@@ -215,7 +215,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         // NAT mode: allocate a static IP. Bridged mode: skip allocation; the LAN DHCP
         // server assigns the address. The rollback field stays None so unwind skips it.
-        let guest_ip = if network_mode == "nat" {
+        let guest_ip = if network_mode == NetworkMode::Nat {
             let ip = self.ip_allocator.allocate()?;
             resources.guest_ip = Some(ip);
             Some(ip)
@@ -235,10 +235,17 @@ impl<B: VmmBackend> HuskerCore<B> {
         let gateway = self.ip_allocator.gateway();
         let netmask = husker_net::prefix_len_to_netmask(self.ip_allocator.prefix_len());
 
-        if let Some(ip) = guest_ip {
-            debug!(tap = %tap_name, %ip, %gateway, cid, "NAT resources allocated");
-        } else {
-            debug!(tap = %tap_name, cid, "bridged resources allocated (no IP)");
+        match network_mode {
+            NetworkMode::Nat => {
+                let ip = guest_ip.expect("NAT mode always has a guest IP");
+                debug!(tap = %tap_name, %ip, %gateway, cid, "NAT resources allocated");
+            }
+            NetworkMode::Bridged => {
+                debug!(tap = %tap_name, cid, "bridged resources allocated (no IP)");
+            }
+            NetworkMode::Isolated => {
+                debug!(cid, "isolated VM resources allocated (no TAP or IP)");
+            }
         }
 
         // `none` gets no host network plumbing at all: no TAP, so no interface in
@@ -246,7 +253,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // guest. Isolation is structural rather than filtered, so it cannot be
         // bypassed by a rule-ordering mistake, link-local IPv6, or ARP tricks.
         // vsock is unaffected, so exec, file transfer and the agent still work.
-        let has_host_networking = network_mode != "none";
+        let has_host_networking = network_mode != NetworkMode::Isolated;
         self.state.set_host_resource_lease_network(
             lease.id,
             has_host_networking.then_some(tap_name.as_str()),
@@ -258,7 +265,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
             // Attach the TAP to the appropriate bridge: the LAN bridge for bridged mode,
             // or the husker NAT bridge for NAT mode.
-            let attach_bridge = if network_mode == "bridged" {
+            let attach_bridge = if network_mode == NetworkMode::Bridged {
                 self.lan_bridge
                     .as_deref()
                     .expect("lan_bridge checked above")
@@ -344,7 +351,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             // cloud-init does not stall waiting for DHCP before the agent comes up.
             // For bridged mode, omit network-config entirely: cloud-init falls back to
             // DHCP on all NICs, and the LAN DHCP server assigns the address.
-            let seed_network = if network_mode == "nat" {
+            let seed_network = if network_mode == NetworkMode::Nat {
                 Some(husker_cloudinit::NetworkConfig {
                     ip: guest_ip.expect("NAT mode always has a guest_ip"),
                     prefix_len: self.ip_allocator.prefix_len(),
@@ -513,7 +520,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let now = chrono::Utc::now();
 
         // NAT: persist the allocated IP and gateway; bridged: both stay None (DHCP-assigned).
-        let (record_guest_ip, record_host_ip) = if network_mode == "nat" {
+        let (record_guest_ip, record_host_ip) = if network_mode == NetworkMode::Nat {
             (guest_ip.map(|ip| ip.to_string()), Some(gateway.to_string()))
         } else {
             (None, None)
@@ -551,7 +558,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
-            network: network_mode.to_string(),
+            network: network_mode,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs,
@@ -578,15 +585,23 @@ impl<B: VmmBackend> HuskerCore<B> {
         tags: Option<ServiceTag>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
-        // Validate the network mode field even though only "nat" is meaningful here,
-        // so callers get a clear error for unknown values.
+        // Apple VZ always installs a NAT attachment. Reject every other mode
+        // before allocating resources so persistence never promises networking
+        // semantics the backend did not enforce.
         let network_mode = validate_network_mode(req.network.as_deref())?;
 
-        // Bridged mode is a Linux-only feature (requires TAP + host bridge management).
-        if network_mode == "bridged" {
-            return Err(CoreError::InvalidArgument(
-                "bridged networking is only supported on Linux".into(),
-            ));
+        match network_mode {
+            NetworkMode::Nat => {}
+            NetworkMode::Bridged => {
+                return Err(CoreError::InvalidArgument(
+                    "bridged networking is only supported on Linux".into(),
+                ));
+            }
+            NetworkMode::Isolated => {
+                return Err(CoreError::InvalidArgument(
+                    "isolated networking (--net none) is only supported on Linux".into(),
+                ));
+            }
         }
 
         let backend_selection = self
@@ -775,7 +790,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 boot_mode: boot_mode_str,
                 balloon: req.balloon,
                 volume: None,
-                network: network_mode.to_string(),
+                network: network_mode,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -889,7 +904,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             boot_mode: "direct".to_string(),
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
-            network: network_mode.to_string(),
+            network: network_mode,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,
@@ -1308,7 +1323,6 @@ fn map_vm_insert_error(error: husker_state::StateError) -> CoreError {
     }
 }
 
-#[cfg(feature = "linux-net")]
 fn backend_selection_error(error: husker_vmm::VmmError) -> CoreError {
     match error {
         husker_vmm::VmmError::InvalidConfig(message) => CoreError::InvalidArgument(message),

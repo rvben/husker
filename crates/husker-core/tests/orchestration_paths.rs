@@ -6,7 +6,7 @@ use chrono::Utc;
 use husker_core::{
     CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
     CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskerCore, ImportImageRequest,
-    RestoreSnapshotRequest, RotateSecretRequest,
+    NetworkMode, RestoreSnapshotRequest, RotateSecretRequest,
 };
 #[cfg(feature = "linux-net")]
 use husker_state::PortForwardRecord;
@@ -314,7 +314,7 @@ fn vm_record(
         boot_mode: "direct".into(),
         balloon: false,
         volume: None,
-        network: "nat".into(),
+        network: NetworkMode::Nat,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,
@@ -2348,6 +2348,13 @@ async fn create_vm_persists_the_selected_backend() {
     // Daemon capability identity is deliberately different: persistence must
     // follow the per-create selection, not this coarse backend advertisement.
     assert_eq!(core.backend_kind(), "apple_vz");
+    // Isolated networking avoids host setup on Linux. The Apple path does not
+    // provision a host TAP and truthfully supports only its NAT attachment.
+    let network = if cfg!(feature = "linux-net") {
+        "none"
+    } else {
+        "nat"
+    };
     let created = core
         .create_vm(CreateVmRequest {
             name: "backend-authority".into(),
@@ -2355,7 +2362,7 @@ async fn create_vm_persists_the_selected_backend() {
             rootfs_path: Some(rootfs),
             vcpu_count: Some(1),
             mem_size_mib: Some(128),
-            network: Some("none".into()),
+            network: Some(network.into()),
             ..Default::default()
         })
         .await

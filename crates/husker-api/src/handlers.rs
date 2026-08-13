@@ -2382,7 +2382,7 @@ pub(crate) fn record_to_response(r: VmRecord) -> VmResponse {
         rootfs_path: r.rootfs_path,
         kernel_path: r.kernel_path,
         volume: r.volume,
-        network: r.network,
+        network: r.network.to_string(),
         idle_timeout_secs: r.idle_timeout_secs,
         suspend_ttl_secs: r.suspend_ttl_secs,
         // Only surface auto_resume for VMs that opted into the policy, so the payload

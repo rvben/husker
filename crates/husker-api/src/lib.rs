@@ -36,7 +36,7 @@ use axum::http::StatusCode;
 #[cfg(test)]
 use errors::{map_agent_connect_error, map_error};
 #[cfg(test)]
-use husker_core::{BackendKind, CoreError, VmLifecycleState, VmRecord};
+use husker_core::{BackendKind, CoreError, NetworkMode, VmLifecycleState, VmRecord};
 #[cfg(test)]
 use router::{is_protected_route, is_rate_limited_route};
 #[cfg(test)]
@@ -458,7 +458,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
-                network: "nat".into(),
+                network: NetworkMode::Nat,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -494,7 +494,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
-                network: "nat".into(),
+                network: NetworkMode::Nat,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -833,7 +833,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
-                network: "nat".into(),
+                network: NetworkMode::Nat,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -1177,7 +1177,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
-                network: "nat".into(),
+                network: NetworkMode::Nat,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -1297,7 +1297,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
-                network: "nat".into(),
+                network: NetworkMode::Nat,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -1430,7 +1430,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: None,
-                network: "nat".into(),
+                network: NetworkMode::Nat,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -1668,7 +1668,7 @@ mod tests {
             boot_mode: "direct".into(),
             balloon: false,
             volume: None,
-            network: "nat".into(),
+            network: NetworkMode::Nat,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,
@@ -2494,7 +2494,7 @@ mod tests {
                 boot_mode: "direct".into(),
                 balloon: false,
                 volume: Some("data".into()),
-                network: "nat".into(),
+                network: NetworkMode::Nat,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,

@@ -46,6 +46,16 @@ impl MockVmm {
 impl VmmBackend for MockVmm {
     type VsockStream = tokio::net::UnixStream;
 
+    fn select_backend(
+        &self,
+        requirements: husker_vmm::BackendRequirements,
+    ) -> Result<husker_vmm::BackendSelection, VmmError> {
+        Ok(husker_vmm::BackendSelection::new(
+            requirements,
+            BackendKind::AppleVz,
+        ))
+    }
+
     async fn create_vm(
         &self,
         selection: husker_vmm::BackendSelection,
