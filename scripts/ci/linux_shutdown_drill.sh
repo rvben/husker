@@ -9,6 +9,9 @@ set -euo pipefail
 # 2. SIGTERM stops workers before drain, then removes NAT and the bridge.
 # 3. When KVM assets are supplied, SIGTERM drains a live Firecracker VM,
 #    releases its TAP, persists `stopped`, and does not resurrect it on restart.
+# 4. A suspended Firecracker VM survives a daemon restart with its preserved
+#    TAP reattached to the replacement bridge, then resumes on the first
+#    forwarded TCP connection and carries that connection end to end.
 #
 # The drill owns one exact bridge/table, isolated ports, and a temporary data
 # directory. The first two scenarios do not require KVM. Set both
@@ -20,6 +23,7 @@ PREFIX="[linux-shutdown]"
 PORT="${HUSKER_LINUX_SHUTDOWN_PORT:-17879}"
 FAIL_PORT="${HUSKER_LINUX_SHUTDOWN_FAIL_PORT:-17880}"
 METRICS_PORT="${HUSKER_LINUX_SHUTDOWN_METRICS_PORT:-17881}"
+FORWARD_PORT="${HUSKER_LINUX_SHUTDOWN_FORWARD_PORT:-19282}"
 BRIDGE="${HUSKER_LINUX_SHUTDOWN_BRIDGE:-huskershut}"
 SUBNET="${HUSKER_LINUX_SHUTDOWN_SUBNET:-198.19.253.0/30}"
 CID_BASE="${HUSKER_LINUX_SHUTDOWN_CID_BASE:-900}"
@@ -30,6 +34,8 @@ SUCCESS_LOG="${WORK_DIR}/sigterm.log"
 FAILURE_LOG="${WORK_DIR}/bind-failure.log"
 LIVE_LOG="${WORK_DIR}/live-vm.log"
 RESTART_LOG="${WORK_DIR}/restart.log"
+SUSPEND_LOG="${WORK_DIR}/suspend.log"
+SUSPEND_RESTART_LOG="${WORK_DIR}/suspend-restart.log"
 DAEMON_PID=""
 OCCUPIER_PID=""
 VM_ID=""
@@ -41,7 +47,9 @@ log() { echo "${PREFIX} $*"; }
 fail() {
   echo "${PREFIX} ERROR: $*" >&2
   local file
-  for file in "${FAILURE_LOG}" "${SUCCESS_LOG}" "${LIVE_LOG}" "${RESTART_LOG}"; do
+  for file in \
+    "${FAILURE_LOG}" "${SUCCESS_LOG}" "${LIVE_LOG}" "${RESTART_LOG}" \
+    "${SUSPEND_LOG}" "${SUSPEND_RESTART_LOG}"; do
     if [[ -s "${file}" ]]; then
       echo "${PREFIX} diagnostic log: ${file}" >&2
       sed -n '1,240p' "${file}" >&2
@@ -59,7 +67,7 @@ fi
 for command in curl ip nft pgrep python3; do
   command -v "${command}" >/dev/null || fail "missing required command: ${command}"
 done
-for value in "${PORT}" "${FAIL_PORT}" "${METRICS_PORT}" "${CID_BASE}"; do
+for value in "${PORT}" "${FAIL_PORT}" "${METRICS_PORT}" "${FORWARD_PORT}" "${CID_BASE}"; do
   [[ "${value}" =~ ^[0-9]+$ ]] || fail "ports and CID base must be decimal integers"
 done
 [[ "${BRIDGE}" =~ ^husker[[:alnum:]]{1,9}$ ]] \
@@ -140,6 +148,30 @@ wait_for_health() {
 json_field() {
   local field="$1"
   python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "${field}"
+}
+
+wait_for_vm_state() {
+  local expected="$1"
+  local actual=""
+  for _ in {1..120}; do
+    actual="$(curl -fsS "http://127.0.0.1:${PORT}/v1/vms/${VM_NAME}" 2>/dev/null \
+      | json_field state 2>/dev/null || true)"
+    [[ "${actual}" == "${expected}" ]] && return 0
+    sleep 0.25
+  done
+  fail "VM ${VM_NAME} did not reach state ${expected} (last state: ${actual:-unavailable})"
+}
+
+assert_tap_master() {
+  local expected_bridge="$1"
+  local master=""
+  [[ -e "/sys/class/net/${VM_TAP}" ]] \
+    || fail "expected suspended VM TAP ${VM_TAP} to exist"
+  if [[ -L "/sys/class/net/${VM_TAP}/master" ]]; then
+    master="$(basename "$(readlink "/sys/class/net/${VM_TAP}/master")")"
+  fi
+  [[ "${master}" == "${expected_bridge}" ]] \
+    || fail "TAP ${VM_TAP} master was ${master:-none}, expected ${expected_bridge}"
 }
 
 assert_log_order() {
@@ -321,3 +353,102 @@ wait "${DAEMON_PID}" || fail "restart daemon returned failure after SIGTERM"
 DAEMON_PID=""
 assert_network_absent
 log "PASS: live VM drained, VMM/TAP removed, stopped state survived restart"
+
+log "validating suspended VM resume after daemon restart"
+rm -rf "${DATA_DIR}"
+mkdir -p "${DATA_DIR}"
+VM_NAME="shutdown-suspended-vm"
+VM_ID=""
+VM_PID=""
+VM_TAP="husker${CID_BASE}"
+env "${daemon_env[@]}" "${BIN}" --output text daemon --listen "127.0.0.1:${PORT}" \
+  >"${SUSPEND_LOG}" 2>&1 &
+DAEMON_PID=$!
+wait_for_health "${PORT}" || fail "suspend daemon did not become healthy"
+
+create_body="$({
+  python3 -c 'import json, sys
+body = {
+    "name": sys.argv[1], "kernel_path": sys.argv[2], "rootfs_path": sys.argv[3],
+    "vcpu_count": 1, "mem_size_mib": 256, "auto_resume": True,
+    "userdata": "#!/bin/sh\nnohup sh -c '\''while true; do nc -l -p 9000 -e /bin/cat; done'\'' >/tmp/echo.log 2>&1 </dev/null &\n",
+}
+if sys.argv[4]:
+    body["initrd_path"] = sys.argv[4]
+print(json.dumps(body))' "${VM_NAME}" "${KERNEL}" "${ROOTFS}" "${INITRD}"
+})"
+vm_json="$(curl -fsS -H 'Content-Type: application/json' -d "${create_body}" \
+  "http://127.0.0.1:${PORT}/v1/vms")" \
+  || fail "failed to create suspend/restart VM"
+VM_ID="$(json_field id <<<"${vm_json}")"
+VM_PID="$(json_field pid <<<"${vm_json}")"
+vm_cid="$(json_field vsock_cid <<<"${vm_json}")"
+VM_TAP="husker${vm_cid}"
+
+userdata_status=""
+for _ in {1..120}; do
+  userdata_status="$(curl -fsS "http://127.0.0.1:${PORT}/v1/vms/${VM_NAME}" 2>/dev/null \
+    | json_field userdata_status 2>/dev/null || true)"
+  [[ "${userdata_status}" == "completed" ]] && break
+  [[ "${userdata_status}" != "failed" ]] \
+    || fail "suspend/restart VM userdata failed to start the echo listener"
+  sleep 0.5
+done
+[[ "${userdata_status}" == "completed" ]] \
+  || fail "suspend/restart VM userdata did not complete"
+
+curl -fsS -H 'Content-Type: application/json' \
+  -d "{\"host_port\":${FORWARD_PORT},\"guest_port\":9000}" \
+  "http://127.0.0.1:${PORT}/v1/vms/${VM_NAME}/ports" >/dev/null \
+  || fail "failed to add suspend/restart VM port forward"
+curl -fsS -X POST "http://127.0.0.1:${PORT}/v1/vms/${VM_NAME}/suspend" >/dev/null \
+  || fail "failed to suspend VM before daemon restart"
+wait_for_vm_state "suspended"
+assert_vmm_absent
+assert_tap_master "${BRIDGE}"
+
+kill -TERM "${DAEMON_PID}"
+wait "${DAEMON_PID}" || fail "daemon returned failure while preserving suspended VM"
+DAEMON_PID=""
+assert_network_absent
+[[ -e "/sys/class/net/${VM_TAP}" ]] \
+  || fail "suspended VM TAP ${VM_TAP} was deleted during daemon shutdown"
+[[ ! -L "/sys/class/net/${VM_TAP}/master" ]] \
+  || fail "suspended VM TAP ${VM_TAP} remained enslaved after bridge deletion"
+
+env "${daemon_env[@]}" "${BIN}" --output text daemon --listen "127.0.0.1:${PORT}" \
+  >"${SUSPEND_RESTART_LOG}" 2>&1 &
+DAEMON_PID=$!
+wait_for_health "${PORT}" || fail "suspend/restart daemon did not become healthy"
+wait_for_vm_state "suspended"
+assert_tap_master "${BRIDGE}"
+
+python3 -c 'import socket, sys
+payload = b"husker-suspended-restart-proof\n"
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=45) as conn:
+    conn.settimeout(45)
+    conn.sendall(payload)
+    received = b""
+    while len(received) < len(payload):
+        chunk = conn.recv(len(payload) - len(received))
+        if not chunk:
+            break
+        received += chunk
+if received != payload:
+    raise SystemExit(f"echo mismatch: expected {payload!r}, got {received!r}")' "${FORWARD_PORT}" \
+  || fail "first forwarded connection did not resume the VM and echo end to end"
+wait_for_vm_state "running"
+resumed_vm="$(curl -fsS "http://127.0.0.1:${PORT}/v1/vms/${VM_NAME}")" \
+  || fail "resumed VM record disappeared"
+VM_PID="$(json_field pid <<<"${resumed_vm}")"
+[[ "${VM_PID}" =~ ^[0-9]+$ && -r "/proc/${VM_PID}/cmdline" ]] \
+  || fail "resumed VM did not expose a live VMM pid"
+
+kill -TERM "${DAEMON_PID}"
+wait "${DAEMON_PID}" || fail "resumed VM daemon returned failure after SIGTERM"
+DAEMON_PID=""
+assert_vmm_absent
+! ip link show "${VM_TAP}" >/dev/null 2>&1 \
+  || fail "resumed VM TAP ${VM_TAP} leaked after final daemon shutdown"
+assert_network_absent
+log "PASS: suspended VM TAP reattached after restart and first connect resumed the guest"
