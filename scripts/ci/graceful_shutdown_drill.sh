@@ -7,6 +7,15 @@ DATA_DIR="$(mktemp -d)"
 LOG_FILE="$(mktemp)"
 PID=""
 
+fail() {
+  echo "[graceful-shutdown] ERROR: $*" >&2
+  if [[ -s "${LOG_FILE}" ]]; then
+    echo "[graceful-shutdown] daemon log:" >&2
+    sed -n '1,240p' "${LOG_FILE}" >&2
+  fi
+  exit 1
+}
+
 cleanup() {
   if [[ -n "${PID}" ]] && kill -0 "${PID}" 2>/dev/null; then
     kill "${PID}" 2>/dev/null || true
@@ -38,10 +47,12 @@ for _ in {1..50}; do
   if curl -fsS "${BASE_URL}/v1/health" >/dev/null 2>&1; then
     break
   fi
+  kill -0 "${PID}" 2>/dev/null || fail "daemon exited before becoming healthy"
   sleep 0.2
 done
 
-curl -fsS "${BASE_URL}/v1/health" >/dev/null
+curl -fsS "${BASE_URL}/v1/health" >/dev/null \
+  || fail "daemon did not become healthy within 10 seconds"
 echo "[graceful-shutdown] daemon healthy, sending SIGTERM"
 kill -TERM "${PID}"
 wait "${PID}"

@@ -7,10 +7,14 @@ set -euo pipefail
 # 1. An API bind failure after bridge/NAT setup still stops workers, drains, and
 #    removes both the nftables table and bridge.
 # 2. SIGTERM stops workers before drain, then removes NAT and the bridge.
+# 3. When KVM assets are supplied, SIGTERM drains a live Firecracker VM,
+#    releases its TAP, persists `stopped`, and does not resurrect it on restart.
 #
 # The drill owns one exact bridge/table, isolated ports, and a temporary data
-# directory. It does not require KVM or start a VM; VM drain behavior is covered
-# deterministically by the runtime ordering tests in daemon.rs.
+# directory. The first two scenarios do not require KVM. Set both
+# HUSKER_LINUX_SHUTDOWN_KERNEL and HUSKER_LINUX_SHUTDOWN_ROOTFS to enable the
+# live-VM scenario; CI also sets HUSKER_LINUX_SHUTDOWN_REQUIRE_VM=1 so missing
+# KVM/assets cannot silently turn the release gate green.
 
 PREFIX="[linux-shutdown]"
 PORT="${HUSKER_LINUX_SHUTDOWN_PORT:-17879}"
@@ -24,14 +28,20 @@ WORK_DIR="$(mktemp -d)"
 DATA_DIR="${WORK_DIR}/data"
 SUCCESS_LOG="${WORK_DIR}/sigterm.log"
 FAILURE_LOG="${WORK_DIR}/bind-failure.log"
+LIVE_LOG="${WORK_DIR}/live-vm.log"
+RESTART_LOG="${WORK_DIR}/restart.log"
 DAEMON_PID=""
 OCCUPIER_PID=""
+VM_ID=""
+VM_PID=""
+VM_TAP="husker${CID_BASE}"
+VM_NAME="shutdown-live-vm"
 
 log() { echo "${PREFIX} $*"; }
 fail() {
   echo "${PREFIX} ERROR: $*" >&2
   local file
-  for file in "${FAILURE_LOG}" "${SUCCESS_LOG}"; do
+  for file in "${FAILURE_LOG}" "${SUCCESS_LOG}" "${LIVE_LOG}" "${RESTART_LOG}"; do
     if [[ -s "${file}" ]]; then
       echo "${PREFIX} diagnostic log: ${file}" >&2
       sed -n '1,240p' "${file}" >&2
@@ -46,7 +56,7 @@ fi
 if [[ "$(id -u)" != "0" ]]; then
   fail "requires root (bridge and nftables administration)"
 fi
-for command in curl ip nft python3; do
+for command in curl ip nft pgrep python3; do
   command -v "${command}" >/dev/null || fail "missing required command: ${command}"
 done
 for value in "${PORT}" "${FAIL_PORT}" "${METRICS_PORT}" "${CID_BASE}"; do
@@ -68,6 +78,7 @@ fi
 
 reset_owned_network() {
   nft delete table ip "${NFT_TABLE}" 2>/dev/null || true
+  ip link delete "${VM_TAP}" 2>/dev/null || true
   ip link delete "${BRIDGE}" 2>/dev/null || true
 }
 
@@ -79,6 +90,13 @@ cleanup() {
   if [[ -n "${OCCUPIER_PID}" ]] && kill -0 "${OCCUPIER_PID}" 2>/dev/null; then
     kill "${OCCUPIER_PID}" 2>/dev/null || true
     wait "${OCCUPIER_PID}" 2>/dev/null || true
+  fi
+  # A daemon crash could orphan its Firecracker child. Kill only the exact PID
+  # whose command line still names this drill's captured VM UUID; never sweep
+  # unrelated VMMs on a shared host.
+  if [[ -n "${VM_PID}" && -n "${VM_ID}" && -r "/proc/${VM_PID}/cmdline" ]] \
+    && tr '\0' ' ' <"/proc/${VM_PID}/cmdline" | grep -Fq "${VM_ID}"; then
+    kill -KILL "${VM_PID}" 2>/dev/null || true
   fi
   reset_owned_network
   rm -rf "${WORK_DIR}"
@@ -97,6 +115,31 @@ assert_network_absent() {
     || fail "bridge ${BRIDGE} leaked after daemon exit"
   ! nft list table ip "${NFT_TABLE}" >/dev/null 2>&1 \
     || fail "nftables table ${NFT_TABLE} leaked after daemon exit"
+}
+
+assert_vmm_absent() {
+  if [[ -n "${VM_PID}" && -r "/proc/${VM_PID}/cmdline" ]] \
+    && tr '\0' ' ' <"/proc/${VM_PID}/cmdline" | grep -Fq "${VM_ID}"; then
+    fail "Firecracker process ${VM_PID} for ${VM_ID} survived daemon shutdown"
+  fi
+  if [[ -n "${VM_ID}" ]] \
+    && pgrep -af '[f]irecracker' | grep -Fq "${VM_ID}"; then
+    fail "a Firecracker process for ${VM_ID} survived daemon shutdown"
+  fi
+}
+
+wait_for_health() {
+  local port="$1"
+  for _ in {1..100}; do
+    curl -fsS "http://127.0.0.1:${port}/v1/health" >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+json_field() {
+  local field="$1"
+  python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "${field}"
 }
 
 assert_log_order() {
@@ -169,11 +212,7 @@ mkdir -p "${DATA_DIR}"
 env "${daemon_env[@]}" "${BIN}" --output text daemon --listen "127.0.0.1:${PORT}" \
   >"${SUCCESS_LOG}" 2>&1 &
 DAEMON_PID=$!
-for _ in {1..100}; do
-  curl -fsS "http://127.0.0.1:${PORT}/v1/health" >/dev/null 2>&1 && break
-  sleep 0.1
-done
-curl -fsS "http://127.0.0.1:${PORT}/v1/health" >/dev/null \
+wait_for_health "${PORT}" \
   || fail "daemon did not become healthy"
 curl -fsS "http://127.0.0.1:${METRICS_PORT}/v1/metrics" >/dev/null \
   || fail "metrics endpoint did not become healthy"
@@ -195,3 +234,90 @@ assert_log_order "${SUCCESS_LOG}" \
   || fail "metrics endpoint remained reachable after shutdown"
 
 log "PASS: bind failure and SIGTERM both stopped workers, drained, and removed ${NFT_TABLE}/${BRIDGE}"
+
+KERNEL="${HUSKER_LINUX_SHUTDOWN_KERNEL:-}"
+ROOTFS="${HUSKER_LINUX_SHUTDOWN_ROOTFS:-}"
+INITRD="${HUSKER_LINUX_SHUTDOWN_INITRD:-}"
+REQUIRE_VM="${HUSKER_LINUX_SHUTDOWN_REQUIRE_VM:-0}"
+if [[ -z "${KERNEL}" || -z "${ROOTFS}" ]]; then
+  [[ "${REQUIRE_VM}" != "1" ]] \
+    || fail "live-VM drill required but kernel/rootfs paths were not both supplied"
+  log "SKIP: live-VM drain (set HUSKER_LINUX_SHUTDOWN_KERNEL and HUSKER_LINUX_SHUTDOWN_ROOTFS)"
+  exit 0
+fi
+[[ -r /dev/kvm ]] || fail "live-VM drill requires readable /dev/kvm"
+command -v firecracker >/dev/null || fail "live-VM drill requires firecracker on PATH"
+[[ -f "${KERNEL}" ]] || fail "kernel not found: ${KERNEL}"
+[[ -f "${ROOTFS}" ]] || fail "rootfs not found: ${ROOTFS}"
+[[ -z "${INITRD}" || -f "${INITRD}" ]] || fail "initrd not found: ${INITRD}"
+
+log "validating SIGTERM drain of a live Firecracker VM"
+rm -rf "${DATA_DIR}"
+mkdir -p "${DATA_DIR}"
+env "${daemon_env[@]}" "${BIN}" --output text daemon --listen "127.0.0.1:${PORT}" \
+  >"${LIVE_LOG}" 2>&1 &
+DAEMON_PID=$!
+wait_for_health "${PORT}" || fail "live-VM daemon did not become healthy"
+
+create_body="$({
+  python3 -c 'import json, sys
+body = {
+    "name": sys.argv[1], "kernel_path": sys.argv[2], "rootfs_path": sys.argv[3],
+    "vcpu_count": 1, "mem_size_mib": 256,
+}
+if sys.argv[4]:
+    body["initrd_path"] = sys.argv[4]
+print(json.dumps(body))' "${VM_NAME}" "${KERNEL}" "${ROOTFS}" "${INITRD}"
+})"
+vm_json="$(curl -fsS -H 'Content-Type: application/json' -d "${create_body}" \
+  "http://127.0.0.1:${PORT}/v1/vms")" \
+  || fail "failed to create live VM"
+VM_ID="$(json_field id <<<"${vm_json}")"
+VM_PID="$(json_field pid <<<"${vm_json}")"
+vm_cid="$(json_field vsock_cid <<<"${vm_json}")"
+VM_TAP="husker${vm_cid}"
+[[ "$(json_field state <<<"${vm_json}")" == "running" ]] \
+  || fail "created VM was not running"
+[[ "${VM_PID}" =~ ^[0-9]+$ && -r "/proc/${VM_PID}/cmdline" ]] \
+  || fail "created VM did not expose a live VMM pid"
+tr '\0' ' ' <"/proc/${VM_PID}/cmdline" | grep -Fq "${VM_ID}" \
+  || fail "recorded VMM pid did not belong to ${VM_ID}"
+ip link show "${VM_TAP}" >/dev/null 2>&1 \
+  || fail "expected live VM TAP ${VM_TAP}"
+
+kill -TERM "${DAEMON_PID}"
+wait "${DAEMON_PID}" || fail "live-VM daemon returned failure after SIGTERM"
+DAEMON_PID=""
+assert_vmm_absent
+! ip link show "${VM_TAP}" >/dev/null 2>&1 \
+  || fail "VM TAP ${VM_TAP} leaked after daemon shutdown"
+assert_network_absent
+assert_log_order "${LIVE_LOG}" \
+  "shutdown signal received" \
+  "stopping daemon background workers" \
+  "daemon background workers stopped" \
+  "shutting down, draining VMs" \
+  "draining VM" \
+  "drained VMs on shutdown" \
+  "released VM host resources during shutdown" \
+  "removing nftables table" \
+  "deleting bridge"
+
+log "validating persisted stopped state after daemon restart"
+env "${daemon_env[@]}" "${BIN}" --output text daemon --listen "127.0.0.1:${PORT}" \
+  >"${RESTART_LOG}" 2>&1 &
+DAEMON_PID=$!
+wait_for_health "${PORT}" || fail "restart daemon did not become healthy"
+restarted_vm="$(curl -fsS "http://127.0.0.1:${PORT}/v1/vms/${VM_NAME}")" \
+  || fail "drained VM record was missing after restart"
+[[ "$(json_field state <<<"${restarted_vm}")" == "stopped" ]] \
+  || fail "drained VM did not remain stopped after restart"
+assert_vmm_absent
+! ip link show "${VM_TAP}" >/dev/null 2>&1 \
+  || fail "drained VM TAP ${VM_TAP} was recreated on restart"
+
+kill -TERM "${DAEMON_PID}"
+wait "${DAEMON_PID}" || fail "restart daemon returned failure after SIGTERM"
+DAEMON_PID=""
+assert_network_absent
+log "PASS: live VM drained, VMM/TAP removed, stopped state survived restart"

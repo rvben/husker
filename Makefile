@@ -279,6 +279,8 @@ graceful-shutdown-drill:
 
 # Privileged Linux bridge/nftables shutdown drill. Gated because it needs root
 # and CAP_NET_ADMIN; accepts HUSKER_LINUX_DRILL_BIN for a prebuilt Linux binary.
+# Supplying HUSKER_LINUX_SHUTDOWN_KERNEL/ROOTFS also validates a live Firecracker
+# VM drain; HUSKER_LINUX_SHUTDOWN_REQUIRE_VM=1 makes that scenario mandatory.
 test-linux-shutdown-drill-gated:
 	@if [ "$$HUSKER_RUN_LINUX_SHUTDOWN_DRILL" = "1" ]; then \
 		scripts/ci/linux_shutdown_drill.sh; \

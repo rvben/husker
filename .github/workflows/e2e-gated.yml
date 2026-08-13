@@ -33,18 +33,6 @@ jobs:
             HUSKER_RUN_NET_E2E=1 \
             make test-net-e2e-gated
 
-      # Exercise daemon-owned worker shutdown and host-network cleanup after
-      # both an API bind failure and SIGTERM. The drill owns a distinct bridge,
-      # nftables table, data directory, and high ports.
-      - name: Daemon shutdown lifecycle drill
-        run: |
-          sudo env \
-            HOME=/root \
-            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
-            HUSKER_RUN_LINUX_SHUTDOWN_DRILL=1 \
-            make test-linux-shutdown-drill-gated
-
       # Resolve kernel + rootfs + initrd from the latest images-* release for the
       # general daemon e2e, which boots real Firecracker VMs.
       - name: Fetch guest images
@@ -64,6 +52,24 @@ jobs:
             echo "rootfs=${work}/rootfs.ext4"
             echo "initrd=${work}/initramfs.gz"
           } >> "$GITHUB_OUTPUT"
+
+      # Exercise daemon-owned worker shutdown and host-network cleanup after an
+      # API bind failure and SIGTERM, including a live Firecracker VM. Requiring
+      # the VM scenario prevents missing KVM/assets from silently weakening the
+      # gate. The drill owns a distinct bridge, TAP/CID, nftables table, data
+      # directory, and high ports.
+      - name: Daemon shutdown lifecycle drill
+        run: |
+          sudo env \
+            HOME=/root \
+            PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_TARGET_DIR=/var/tmp/husker-e2e-target \
+            HUSKER_RUN_LINUX_SHUTDOWN_DRILL=1 \
+            HUSKER_LINUX_SHUTDOWN_REQUIRE_VM=1 \
+            HUSKER_LINUX_SHUTDOWN_KERNEL="${{ steps.images.outputs.kernel }}" \
+            HUSKER_LINUX_SHUTDOWN_ROOTFS="${{ steps.images.outputs.rootfs }}" \
+            HUSKER_LINUX_SHUTDOWN_INITRD="${{ steps.images.outputs.initrd }}" \
+            make test-linux-shutdown-drill-gated
 
       # The general daemon e2e stands up an isolated daemon (own bridge/subnet/
       # CID/data-dir/high port) and boots real VMs against it - safe alongside
