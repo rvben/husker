@@ -565,7 +565,12 @@ impl VmmBackend for FirecrackerBackend {
         "firecracker"
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
+    async fn create_vm(
+        &self,
+        selection: crate::BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
+        selection.validate_for_backend(&config, BackendKind::Firecracker)?;
         if !config.host_shares.is_empty() {
             return Err(VmmError::Unsupported(
                 "host bind-mounts (--mount) are not supported on Firecracker; use --vmm qemu"
@@ -622,7 +627,7 @@ impl VmmBackend for FirecrackerBackend {
             )
             .await
         {
-            Ok(info) => Ok(CreatedVm::new(info, BackendKind::Firecracker)),
+            Ok(info) => Ok(CreatedVm::new(info, selection)),
             Err(e) => {
                 // Capture diagnostics before removing the artifacts.
                 let serial_tail = crate::tail_lines(&serial_log_path, 20);
@@ -1350,7 +1355,10 @@ mod tests {
             host_shares: Vec::new(),
         };
 
-        let err = backend.create_vm(config).await.unwrap_err();
+        let err = backend
+            .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, VmmError::VmAlreadyExists(ref name) if name == "existing"),
             "expected VmAlreadyExists, got: {err}"
@@ -1382,7 +1390,10 @@ mod tests {
             host_shares: Vec::new(),
         };
 
-        let err = backend.create_vm(config).await.unwrap_err();
+        let err = backend
+            .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, VmmError::ProcessError(_)),
             "expected ProcessError, got: {err}"
@@ -1624,7 +1635,10 @@ mod tests {
             tag: "fs0".into(),
         }];
 
-        let err = backend.create_vm(config).await.unwrap_err();
+        let err = backend
+            .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, VmmError::Unsupported(_)),
             "expected Unsupported, got {err:?}"

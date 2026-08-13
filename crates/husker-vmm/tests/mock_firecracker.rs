@@ -212,7 +212,10 @@ async fn create_vm_missing_binary() {
         host_shares: Vec::new(),
     };
 
-    let err = backend.create_vm(config).await.unwrap_err();
+    let err = backend
+        .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, VmmError::ProcessError(ref msg) if msg.contains("spawn firecracker")),
         "expected ProcessError, got: {err}"
@@ -248,7 +251,10 @@ async fn create_vm_failure_cleans_up_serial_log() {
         host_shares: Vec::new(),
     };
 
-    let _ = backend.create_vm(config).await.unwrap_err();
+    let _ = backend
+        .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+        .await
+        .unwrap_err();
 
     // No .serial.log files should remain after a failed create
     let serial_logs: Vec<_> = std::fs::read_dir(&runtime_dir)
@@ -342,7 +348,10 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         host_shares: Vec::new(),
     };
 
-    let err = backend.create_vm(config).await.unwrap_err();
+    let err = backend
+        .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+        .await
+        .unwrap_err();
     // Firecracker API failures are wrapped in ProcessError with the original
     // API error message as the prefix (followed by any available diagnostic tails).
     assert!(

@@ -621,7 +621,12 @@ impl crate::VmmBackend for QemuKvmBackend {
         "qemu"
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
+    async fn create_vm(
+        &self,
+        selection: crate::BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
+        selection.validate_for_backend(&config, BackendKind::Qemu)?;
         if !std::path::Path::new("/dev/kvm").exists() {
             return Err(VmmError::InvalidConfig(
                 "/dev/kvm missing (KVM not available on this host)".into(),
@@ -634,7 +639,7 @@ impl crate::VmmBackend for QemuKvmBackend {
         }
         self.create(config)
             .await
-            .map(|info| CreatedVm::new(info, BackendKind::Qemu))
+            .map(|info| CreatedVm::new(info, selection))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {

@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::firecracker::FirecrackerBackend;
 use crate::qemu::QemuKvmBackend;
 use crate::{
-    BackendKind, BackendRequirements, BootKind, CreatedVm, RestoreTarget, SnapshotMeta,
-    SnapshotPaths, VmConfig, VmInfo, VmmBackend, VmmError, VmmKind,
+    BackendKind, BackendRequirements, BackendSelection, BootKind, CreatedVm, RestoreTarget,
+    SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmmBackend, VmmError, VmmKind,
 };
 
 /// Unified vsock stream over the two backends' concrete stream types. Both
@@ -199,24 +199,33 @@ impl VmmBackend for LinuxDispatchBackend {
         "firecracker"
     }
 
-    fn select_backend(&self, requirements: BackendRequirements) -> Result<BackendKind, VmmError> {
-        select_vmm_kind(requirements, self.default_kind).map(BackendKind::from)
+    fn select_backend(
+        &self,
+        requirements: BackendRequirements,
+    ) -> Result<BackendSelection, VmmError> {
+        let backend = select_vmm_kind(requirements, self.default_kind).map(BackendKind::from)?;
+        Ok(BackendSelection::new(requirements, backend))
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
-        let kind = select_vmm_kind(
-            BackendRequirements {
-                requested: config.vmm,
-                boot: config.boot.kind(),
-                has_host_shares: !config.host_shares.is_empty(),
-            },
-            self.default_kind,
-        )?;
-        let created = match kind {
-            VmmKind::Firecracker => self.firecracker.create_vm(config).await?,
-            VmmKind::Qemu => self.qemu.create_vm(config).await?,
+    async fn create_vm(
+        &self,
+        selection: BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
+        selection.validate_config(&config)?;
+        let kind = match selection.backend() {
+            BackendKind::Firecracker => VmmKind::Firecracker,
+            BackendKind::Qemu => VmmKind::Qemu,
+            BackendKind::AppleVz => {
+                return Err(VmmError::InvalidConfig(
+                    "Apple VZ cannot be selected by the Linux VMM dispatcher".into(),
+                ));
+            }
         };
-        debug_assert_eq!(created.backend, BackendKind::from(kind));
+        let created = match kind {
+            VmmKind::Firecracker => self.firecracker.create_vm(selection, config).await?,
+            VmmKind::Qemu => self.qemu.create_vm(selection, config).await?,
+        };
         self.routes.lock().await.insert(created.info.id, kind);
         Ok(created)
     }

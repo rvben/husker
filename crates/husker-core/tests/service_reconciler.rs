@@ -46,7 +46,11 @@ impl MockVmm {
 impl VmmBackend for MockVmm {
     type VsockStream = tokio::net::UnixStream;
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
+    async fn create_vm(
+        &self,
+        selection: husker_vmm::BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
         let id = Uuid::new_v4();
         let info = VmInfo {
             id,
@@ -58,7 +62,7 @@ impl VmmBackend for MockVmm {
             vsock_cid: config.vsock_cid,
         };
         self.inner.vms.lock().await.insert(id, info.clone());
-        Ok(CreatedVm::new(info, BackendKind::AppleVz))
+        Ok(CreatedVm::new(info, selection))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {

@@ -168,7 +168,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             .map(str::parse::<husker_vmm::VmmKind>)
             .transpose()
             .map_err(backend_selection_error)?;
-        let selected_backend = self
+        let backend_selection = self
             .vmm
             .select_backend(husker_vmm::BackendRequirements {
                 requested: requested_vmm_kind,
@@ -192,7 +192,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         });
         let idle_opted_in = idle_timeout_secs.is_some();
         if idle_opted_in
-            && !husker_vmm::Capabilities::for_backend(selected_backend.as_str()).snapshot
+            && !husker_vmm::Capabilities::for_backend(backend_selection.backend().as_str()).snapshot
         {
             return Err(CoreError::InvalidArgument(
                 "idle policy requires a full-state snapshot backend (firecracker)".into(),
@@ -504,7 +504,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             host_shares,
         };
 
-        let husker_vmm::CreatedVm { info, backend } = self.vmm.create_vm(vm_config).await?;
+        let created = self.vmm.create_vm(backend_selection, vm_config).await?;
+        let backend = created.backend();
+        let info = created.info;
         resources.vm_id = Some(info.id);
 
         let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
@@ -586,6 +588,19 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "bridged networking is only supported on Linux".into(),
             ));
         }
+
+        let backend_selection = self
+            .vmm
+            .select_backend(husker_vmm::BackendRequirements {
+                requested: None,
+                boot: if req.cloud_image.is_some() {
+                    husker_vmm::BootKind::Efi
+                } else {
+                    husker_vmm::BootKind::DirectKernel
+                },
+                has_host_shares: false,
+            })
+            .map_err(backend_selection_error)?;
 
         // Idle policy requires a full-state snapshot backend (Firecracker); Apple VZ
         // has no snapshot/restore support, so any opt-in is rejected before any host
@@ -725,7 +740,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                 host_shares: vec![],
             };
 
-            let husker_vmm::CreatedVm { info, backend } = self.vmm.create_vm(vm_config).await?;
+            let created = self.vmm.create_vm(backend_selection, vm_config).await?;
+            let backend = created.backend();
+            let info = created.info;
             resources.vm_id = Some(info.id);
 
             let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
@@ -837,7 +854,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             host_shares: vec![],
         };
 
-        let husker_vmm::CreatedVm { info, backend } = self.vmm.create_vm(vm_config).await?;
+        let created = self.vmm.create_vm(backend_selection, vm_config).await?;
+        let backend = created.backend();
+        let info = created.info;
         resources.vm_id = Some(info.id);
 
         let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());

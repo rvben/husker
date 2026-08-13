@@ -2762,6 +2762,7 @@ mod tests {
 
         async fn create_vm(
             &self,
+            _selection: husker_vmm::BackendSelection,
             _config: husker_vmm::VmConfig,
         ) -> Result<husker_vmm::CreatedVm, husker_vmm::VmmError> {
             Err(husker_vmm::VmmError::Unsupported(
@@ -3167,6 +3168,7 @@ mod tests {
 
         async fn create_vm(
             &self,
+            _selection: husker_vmm::BackendSelection,
             _config: husker_vmm::VmConfig,
         ) -> Result<husker_vmm::CreatedVm, husker_vmm::VmmError> {
             Err(husker_vmm::VmmError::Unsupported(

@@ -162,12 +162,19 @@ impl From<VmmKind> for BackendKind {
 #[derive(Debug, Clone)]
 pub struct CreatedVm {
     pub info: VmInfo,
-    pub backend: BackendKind,
+    backend: BackendKind,
 }
 
 impl CreatedVm {
-    pub fn new(info: VmInfo, backend: BackendKind) -> Self {
-        Self { info, backend }
+    pub fn new(info: VmInfo, selection: BackendSelection) -> Self {
+        Self {
+            info,
+            backend: selection.backend(),
+        }
+    }
+
+    pub fn backend(&self) -> BackendKind {
+        self.backend
     }
 }
 
@@ -186,6 +193,74 @@ pub struct BackendRequirements {
     pub requested: Option<VmmKind>,
     pub boot: BootKind,
     pub has_host_shares: bool,
+}
+
+impl BackendRequirements {
+    /// Derive the routing inputs carried by a complete VM configuration.
+    pub fn from_config(config: &VmConfig) -> Self {
+        Self {
+            requested: config.vmm,
+            boot: config.boot.kind(),
+            has_host_shares: !config.host_shares.is_empty(),
+        }
+    }
+}
+
+/// A backend decision made before host resources are allocated.
+///
+/// The token retains the inputs used to make the decision. Creation validates
+/// those inputs against the completed [`VmConfig`] before routing, preventing
+/// capability checks and execution from silently selecting different backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendSelection {
+    requirements: BackendRequirements,
+    backend: BackendKind,
+}
+
+impl BackendSelection {
+    /// Construct a selection in a backend implementation.
+    pub fn new(requirements: BackendRequirements, backend: BackendKind) -> Self {
+        Self {
+            requirements,
+            backend,
+        }
+    }
+
+    pub fn backend(self) -> BackendKind {
+        self.backend
+    }
+
+    pub fn requirements(self) -> BackendRequirements {
+        self.requirements
+    }
+
+    pub fn validate_config(self, config: &VmConfig) -> Result<(), VmmError> {
+        let actual = BackendRequirements::from_config(config);
+        if actual == self.requirements {
+            Ok(())
+        } else {
+            Err(VmmError::InvalidConfig(format!(
+                "VM configuration changed after backend selection: selected for {:?}, got {:?}",
+                self.requirements, actual
+            )))
+        }
+    }
+
+    pub(crate) fn validate_for_backend(
+        self,
+        config: &VmConfig,
+        expected: BackendKind,
+    ) -> Result<(), VmmError> {
+        self.validate_config(config)?;
+        if self.backend == expected {
+            Ok(())
+        } else {
+            Err(VmmError::InvalidConfig(format!(
+                "backend selection chose '{}', but creation was sent to '{}'",
+                self.backend, expected
+            )))
+        }
+    }
 }
 
 /// Boot shape relevant to backend selection, without artifact paths.
@@ -450,19 +525,38 @@ pub trait VmmBackend: Send + Sync {
     /// The stream type returned by vsock connections.
     type VsockStream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
 
-    /// Create and boot a new VM with the given configuration.
+    /// Create and boot a VM using a prior backend selection.
+    ///
+    /// Implementations must validate that `selection` still matches `config`
+    /// before performing side effects.
     fn create_vm(
         &self,
+        selection: BackendSelection,
         config: VmConfig,
     ) -> impl std::future::Future<Output = Result<CreatedVm, VmmError>> + Send;
 
-    /// Resolve the backend that would handle a create request.
+    /// Resolve the backend that will handle a create request.
     ///
-    /// Dispatching backends override this so capability checks use the same
-    /// policy as `create_vm`. Single-backend implementations derive their
-    /// answer from `backend_kind`.
-    fn select_backend(&self, _requirements: BackendRequirements) -> Result<BackendKind, VmmError> {
-        self.backend_kind().parse()
+    /// The returned token is passed unchanged to [`Self::create_vm`], binding
+    /// pre-allocation capability checks, execution routing, and persisted
+    /// backend identity to one decision. Single-backend implementations derive
+    /// their answer from [`Self::backend_kind`].
+    fn select_backend(
+        &self,
+        requirements: BackendRequirements,
+    ) -> Result<BackendSelection, VmmError> {
+        Ok(BackendSelection::new(
+            requirements,
+            self.backend_kind().parse()?,
+        ))
+    }
+
+    /// Select a backend from an already-complete configuration.
+    ///
+    /// Most orchestration callers should select earlier, before allocation;
+    /// this convenience is for direct backend users and focused backend tests.
+    fn select_backend_for_config(&self, config: &VmConfig) -> Result<BackendSelection, VmmError> {
+        self.select_backend(BackendRequirements::from_config(config))
     }
 
     /// Stop a running VM gracefully.
@@ -555,8 +649,89 @@ pub trait VmmBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendKind, Capabilities, VmmKind, tail_lines};
+    use super::{
+        BackendKind, BackendRequirements, BackendSelection, BootKind, BootMode, Capabilities,
+        HostShare, VmConfig, VmmKind, tail_lines,
+    };
     use std::io::Write;
+
+    fn direct_config() -> VmConfig {
+        VmConfig {
+            name: "selection-test".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_path: "/kernel".into(),
+            rootfs_path: "/rootfs".into(),
+            kernel_args: None,
+            initrd_path: None,
+            vsock_cid: 3,
+            tap_device: None,
+            guest_mac: None,
+            vmm: None,
+            boot: BootMode::DirectKernel,
+            seed_path: None,
+            balloon: false,
+            volume_path: None,
+            host_shares: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn backend_selection_is_bound_to_the_completed_configuration() {
+        let config = direct_config();
+        let requirements = BackendRequirements::from_config(&config);
+        let selection = BackendSelection::new(requirements, BackendKind::Firecracker);
+
+        selection.validate_config(&config).unwrap();
+        selection
+            .validate_for_backend(&config, BackendKind::Firecracker)
+            .unwrap();
+        assert!(
+            selection
+                .validate_for_backend(&config, BackendKind::Qemu)
+                .is_err()
+        );
+        assert_eq!(selection.backend(), BackendKind::Firecracker);
+        assert_eq!(selection.requirements(), requirements);
+    }
+
+    #[test]
+    fn backend_selection_rejects_every_routing_input_drift() {
+        let config = direct_config();
+        let selection = BackendSelection::new(
+            BackendRequirements::from_config(&config),
+            BackendKind::Firecracker,
+        );
+
+        let mut changed_request = config.clone();
+        changed_request.vmm = Some(VmmKind::Qemu);
+        assert!(selection.validate_config(&changed_request).is_err());
+
+        let mut changed_boot = config.clone();
+        changed_boot.boot = BootMode::Uefi {
+            ovmf_code: "/code".into(),
+            ovmf_vars_template: "/vars".into(),
+        };
+        assert!(selection.validate_config(&changed_boot).is_err());
+
+        let mut changed_shares = config;
+        changed_shares.host_shares.push(HostShare {
+            host: "/host".into(),
+            guest: "/guest".into(),
+            read_only: true,
+            tag: "fs0".into(),
+        });
+        assert!(selection.validate_config(&changed_shares).is_err());
+
+        assert_eq!(
+            selection.requirements(),
+            BackendRequirements {
+                requested: None,
+                boot: BootKind::DirectKernel,
+                has_host_shares: false,
+            }
+        );
+    }
 
     #[test]
     fn capabilities_for_backend_maps_each_kind() {

@@ -65,7 +65,6 @@ struct PauseGate {
 #[derive(Clone)]
 struct MockVmm {
     inner: Arc<MockInner>,
-    creation_backend: BackendKind,
     selection_backend: BackendKind,
 }
 
@@ -84,13 +83,12 @@ impl MockVmm {
                 #[cfg(not(feature = "linux-net"))]
                 last_config: Mutex::new(None),
             }),
-            creation_backend: BackendKind::AppleVz,
             selection_backend: BackendKind::AppleVz,
         }
     }
 
-    fn with_creation_backend(mut self, backend_kind: BackendKind) -> Self {
-        self.creation_backend = backend_kind;
+    fn with_selection_backend(mut self, backend_kind: BackendKind) -> Self {
+        self.selection_backend = backend_kind;
         self
     }
 
@@ -139,7 +137,11 @@ impl MockVmm {
 impl VmmBackend for MockVmm {
     type VsockStream = tokio::net::UnixStream;
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
+    async fn create_vm(
+        &self,
+        selection: husker_vmm::BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
         let id = Uuid::new_v4();
         let info = VmInfo {
             id,
@@ -162,7 +164,7 @@ impl VmmBackend for MockVmm {
             gate.release.notified().await;
         }
         self.upsert_vm(info.clone()).await;
-        Ok(CreatedVm::new(info, self.creation_backend))
+        Ok(CreatedVm::new(info, selection))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
@@ -261,7 +263,18 @@ impl VmmBackend for MockVmm {
     }
 
     fn backend_kind(&self) -> &'static str {
-        self.selection_backend.as_str()
+        "apple_vz"
+    }
+
+    fn select_backend(
+        &self,
+        requirements: husker_vmm::BackendRequirements,
+    ) -> Result<husker_vmm::BackendSelection, VmmError> {
+        let backend = requirements
+            .requested
+            .map(BackendKind::from)
+            .unwrap_or(self.selection_backend);
+        Ok(husker_vmm::BackendSelection::new(requirements, backend))
     }
 }
 
@@ -2301,7 +2314,7 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
 }
 
 #[tokio::test]
-async fn create_vm_persists_the_backend_that_created_it() {
+async fn create_vm_persists_the_selected_backend() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("run");
     let data_dir = tmp.path().join("data");
@@ -2315,7 +2328,7 @@ async fn create_vm_persists_the_backend_that_created_it() {
     let rootfs = tmp.path().join("rootfs.ext4");
     std::fs::write(&rootfs, b"rootfs").unwrap();
 
-    let mock = MockVmm::new().with_creation_backend(BackendKind::Qemu);
+    let mock = MockVmm::new().with_selection_backend(BackendKind::Qemu);
     let state = StateStore::open_memory().unwrap();
     #[cfg(feature = "linux-net")]
     let core = Arc::new(HuskerCore::new(
@@ -2333,7 +2346,7 @@ async fn create_vm_persists_the_backend_that_created_it() {
     #[cfg(not(feature = "linux-net"))]
     let core = build_core(mock, state, &data_dir, &runtime_dir);
     // Daemon capability identity is deliberately different: persistence must
-    // follow the create result, not this coarse backend advertisement.
+    // follow the per-create selection, not this coarse backend advertisement.
     assert_eq!(core.backend_kind(), "apple_vz");
     let created = core
         .create_vm(CreateVmRequest {

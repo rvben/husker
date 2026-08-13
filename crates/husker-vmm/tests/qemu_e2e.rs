@@ -76,7 +76,11 @@ async fn qemu_boots_and_vsock() {
         volume_path: None,
         host_shares: Vec::new(),
     };
-    let info = backend.create_vm(config).await.expect("create_vm").info;
+    let info = backend
+        .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+        .await
+        .expect("create_vm")
+        .info;
 
     // Poll for vsock connectivity with backoff rather than a fixed sleep so
     // fast guests are not penalised and the overall deadline is bounded.
@@ -279,7 +283,11 @@ async fn qemu_host_share_visible_in_guest() {
             tag: "fs0".into(),
         }],
     };
-    let info = backend.create_vm(config).await.expect("create_vm").info;
+    let info = backend
+        .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+        .await
+        .expect("create_vm")
+        .info;
 
     // Poll for vsock connectivity with the same bounded backoff as the other tests.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -408,7 +416,11 @@ async fn qemu_host_share_via_initramfs() {
             tag: "fs0".into(),
         }],
     };
-    let info = backend.create_vm(config).await.expect("create_vm").info;
+    let info = backend
+        .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+        .await
+        .expect("create_vm")
+        .info;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_millis(200);

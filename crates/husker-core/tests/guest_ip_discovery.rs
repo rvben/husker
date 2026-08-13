@@ -9,8 +9,8 @@ use husker_core::HuskerCore;
 use husker_state::{StateStore, VmRecord};
 use husker_storage::StorageConfig;
 use husker_vmm::{
-    BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
-    VmmBackend, VmmError,
+    CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
+    VmmError,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -35,7 +35,11 @@ impl UnreachableVsockVmm {
 impl VmmBackend for UnreachableVsockVmm {
     type VsockStream = tokio::net::UnixStream;
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
+    async fn create_vm(
+        &self,
+        selection: husker_vmm::BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
         let id = Uuid::new_v4();
         let info = VmInfo {
             id,
@@ -47,12 +51,7 @@ impl VmmBackend for UnreachableVsockVmm {
             vsock_cid: config.vsock_cid,
         };
         self.upsert_vm(info.clone()).await;
-        let backend = if cfg!(feature = "linux-net") {
-            BackendKind::Firecracker
-        } else {
-            BackendKind::AppleVz
-        };
-        Ok(CreatedVm::new(info, backend))
+        Ok(CreatedVm::new(info, selection))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {

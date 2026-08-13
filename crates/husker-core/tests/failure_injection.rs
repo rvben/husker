@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use husker_core::{CoreError, HuskerCore};
 use husker_vmm::{
-    BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
-    VmmBackend, VmmError,
+    CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
+    VmmError,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -358,7 +358,11 @@ impl VmmBackend for FailingVmm {
         }
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
+    async fn create_vm(
+        &self,
+        selection: husker_vmm::BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
         if self.should_fail("create") {
             return Err(VmmError::ApiError("injected create failure".into()));
         }
@@ -373,12 +377,7 @@ impl VmmBackend for FailingVmm {
             vsock_cid: config.vsock_cid,
         };
         self.vms.lock().await.insert(id, info.clone());
-        let backend = if cfg!(feature = "linux-net") {
-            BackendKind::Firecracker
-        } else {
-            BackendKind::AppleVz
-        };
-        Ok(CreatedVm::new(info, backend))
+        Ok(CreatedVm::new(info, selection))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {

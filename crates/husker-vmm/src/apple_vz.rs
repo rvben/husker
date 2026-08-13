@@ -499,7 +499,12 @@ impl VmmBackend for AppleVzBackend {
         "apple_vz"
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
+    async fn create_vm(
+        &self,
+        selection: crate::BackendSelection,
+        config: VmConfig,
+    ) -> Result<CreatedVm, VmmError> {
+        selection.validate_for_backend(&config, BackendKind::AppleVz)?;
         {
             let instances = self.instances.lock().await;
             if instances.values().any(|i| i.info.name == config.name) {
@@ -555,7 +560,7 @@ impl VmmBackend for AppleVzBackend {
             },
         );
 
-        Ok(CreatedVm::new(info, BackendKind::AppleVz))
+        Ok(CreatedVm::new(info, selection))
     }
 
     /// Best-effort, asynchronous shutdown: requests a guest stop and marks the VM
@@ -1016,7 +1021,9 @@ mod tests {
             ovmf_code: "/nonexistent/OVMF_CODE.fd".into(),
             ovmf_vars_template: "/nonexistent/OVMF_VARS.fd".into(),
         });
-        let result = backend.create_vm(config).await;
+        let result = backend
+            .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+            .await;
         assert!(
             matches!(&result, Err(VmmError::InvalidConfig(msg)) if msg.contains("OVMF boot")),
             "expected InvalidConfig with OVMF hint, got {result:?}"
