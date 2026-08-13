@@ -110,19 +110,26 @@ impl<B: VmmBackend> HuskerCore<B> {
         let t_start = std::time::Instant::now();
         let guest_ip = self.ip_allocator.allocate()?;
         resources.guest_ip = Some(guest_ip);
-        let cid = self.state.allocate_cid()?;
+        let lease = self.state.begin_host_resource_lease(fork_name)?;
+        let cid = lease.vsock_cid;
         resources.cid = Some(cid);
+        resources.host_resource_lease_id = Some(lease.id);
         let tap_name = format!("husker{cid}");
         let mac = husker_net::generate_mac(cid);
         let gateway = self.ip_allocator.gateway();
         let prefix_len = self.ip_allocator.prefix_len();
+        self.state.set_host_resource_lease_network(
+            lease.id,
+            Some(&tap_name),
+            Some(&guest_ip.to_string()),
+        )?;
 
         // Create the TAP (Firecracker binds it during restore) but do NOT attach it
         // to the bridge yet: the fork resumes with the source's IP and MAC, so
         // bridging it before the guest is re-homed would put a duplicate identity on
         // the shared L2. It joins the bridge only after ReconfigureNetwork below.
-        self.host_network.create_tap(&tap_name).await?;
         resources.tap_name = Some(tap_name.clone());
+        self.host_network.create_tap(&tap_name).await?;
 
         // Clone the source's live rootfs into the fork's dir (reflink CoW).
         let fork_dir = self.storage.vm_dir(fork_name);
@@ -217,10 +224,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             auto_resume: true,
             forked_from: Some(source.id),
         };
-        self.state.insert_vm(&record).map_err(|e| match e {
-            husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
-            other => CoreError::State(other),
-        })?;
+        self.state
+            .commit_vm_from_host_resource_lease(&record, lease.id)
+            .map_err(|e| match e {
+                husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
+                other => CoreError::State(other),
+            })?;
         let total = t_start.elapsed();
         info!(
             source = %source.name,

@@ -1020,6 +1020,13 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
         DaemonRuntimeMode::Basic => {}
         #[cfg(feature = "linux-net")]
         DaemonRuntimeMode::LinuxNet { .. } => {
+            let recovered = core
+                .recover_host_resource_leases()
+                .await
+                .context("recovering interrupted VM host resources")?;
+            if recovered > 0 {
+                tracing::info!(recovered, "recovered interrupted VM creations");
+            }
             let reattached = core
                 .reattach_suspended_vm_networks()
                 .await

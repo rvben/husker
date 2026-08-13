@@ -85,7 +85,6 @@ impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
         eligible: impl Fn(&VmRecord) -> bool,
         reason: ReclaimReason,
     ) -> usize {
-        use std::net::Ipv4Addr;
         use tracing::{info, warn};
 
         let vms = match self.state.list_vms() {
@@ -118,27 +117,15 @@ impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
                 .state
                 .list_port_forwards_for_vm(current.id)
                 .unwrap_or_default();
+            if let Err(error) = self.release_vm_host_network(&current).await {
+                warn!(name = %current.name, %error, "reclaim: host cleanup failed; retained ownership for retry");
+                continue;
+            }
             if let Some(ref tap) = current.tap_device {
-                if let Err(e) = self
-                    .host_network
-                    .remove_all_port_forwards(tap, &self.bridge_name)
-                    .await
-                {
-                    warn!(name = %current.name, tap, error = %e, "reclaim: remove port forwards failed");
-                }
-                if let Err(e) = self.host_network.delete_tap(tap).await {
-                    warn!(name = %current.name, tap, error = %e, "reclaim: delete TAP failed");
-                }
                 let mut nc = self.network_counters.lock();
                 for pf in &forwards {
                     nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
                 }
-            }
-            if let Some(ref guest_ip_str) = current.guest_ip
-                && let Ok(guest_ip) = guest_ip_str.parse::<Ipv4Addr>()
-                && let Err(e) = self.ip_allocator.release(guest_ip)
-            {
-                warn!(name = %current.name, %guest_ip, error = %e, "reclaim: release IP failed");
             }
             if let Err(e) = self.state.delete_port_forwards_for_vm(current.id) {
                 warn!(name = %current.name, error = %e, "reclaim: delete port-forward rows failed");

@@ -21,15 +21,27 @@ use uuid::Uuid;
 struct TestHostNetwork {
     taps: Mutex<HashSet<String>>,
     forwards: Mutex<HashSet<(u16, String)>>,
+    fail_next_create_tap: std::sync::atomic::AtomicBool,
     fail_next_attach: std::sync::atomic::AtomicBool,
+    fail_next_delete_tap: std::sync::atomic::AtomicBool,
     fail_next_forward: std::sync::atomic::AtomicBool,
     fail_next_remove_forward: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "linux-net")]
 impl TestHostNetwork {
+    fn fail_next_create_tap(&self) {
+        self.fail_next_create_tap
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn fail_next_attach(&self) {
         self.fail_next_attach
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail_next_delete_tap(&self) {
+        self.fail_next_delete_tap
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -53,12 +65,30 @@ impl husker_net::HostNetwork for TestHostNetwork {
     fn create_tap<'a>(&'a self, name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
         Box::pin(async move {
             self.taps.lock().await.insert(name.to_string());
+            if self
+                .fail_next_create_tap
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "ip link set up".into(),
+                    message: "injected failure after TAP creation".into(),
+                });
+            }
             Ok(())
         })
     }
 
     fn delete_tap<'a>(&'a self, name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
         Box::pin(async move {
+            if self
+                .fail_next_delete_tap
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "ip link delete".into(),
+                    message: "injected TAP cleanup failure".into(),
+                });
+            }
             self.taps.lock().await.remove(name);
             Ok(())
         })
@@ -139,6 +169,15 @@ impl husker_net::HostNetwork for TestHostNetwork {
         _bridge_name: &'a str,
     ) -> husker_net::NetworkFuture<'a, ()> {
         Box::pin(async move {
+            if self
+                .fail_next_remove_forward
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "nft delete rule".into(),
+                    message: "injected nft cleanup failure".into(),
+                });
+            }
             self.forwards
                 .lock()
                 .await
@@ -387,6 +426,19 @@ fn fresh_linux_core(
     data_dir: &std::path::Path,
     network: Arc<TestHostNetwork>,
 ) -> Arc<HuskerCore<FailingVmm>> {
+    fresh_linux_core_with_state(
+        data_dir,
+        husker_state::StateStore::open_memory().unwrap(),
+        network,
+    )
+}
+
+#[cfg(feature = "linux-net")]
+fn fresh_linux_core_with_state(
+    data_dir: &std::path::Path,
+    state: husker_state::StateStore,
+    network: Arc<TestHostNetwork>,
+) -> Arc<HuskerCore<FailingVmm>> {
     let storage = husker_storage::StorageConfig {
         data_dir: data_dir.to_path_buf(),
         state_dir: data_dir.to_path_buf(),
@@ -394,7 +446,7 @@ fn fresh_linux_core(
     Arc::new(
         HuskerCore::new(
             FailingVmm::new(&[]),
-            husker_state::StateStore::open_memory().unwrap(),
+            state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
             storage,
             "husker0".into(),
@@ -459,6 +511,136 @@ async fn attach_failure_rolls_back_tap_and_ip() {
 
 #[cfg(feature = "linux-net")]
 #[tokio::test]
+async fn partial_tap_creation_is_owned_and_rolled_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    network.fail_next_create_tap();
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+
+    let error = core
+        .create_vm(linux_create_request("partial-tap", &kernel, &rootfs))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert!(!network.has_tap("husker3").await);
+
+    let created = core
+        .create_vm(linux_create_request("after-partial", &kernel, &rootfs))
+        .await
+        .unwrap();
+    assert_eq!(created.vsock_cid, 3);
+    assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.2"));
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let state_path = tmp.path().join("state.db");
+    let network = Arc::new(TestHostNetwork::default());
+    network.fail_next_attach();
+    network.fail_next_delete_tap();
+
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    let error = core
+        .create_vm(linux_create_request("interrupted", &kernel, &rootfs))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert!(network.has_tap("husker3").await);
+    drop(core);
+
+    let restarted = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    assert_eq!(restarted.recover_host_resource_leases().await.unwrap(), 1);
+    assert!(!network.has_tap("husker3").await);
+
+    let created = restarted
+        .create_vm(linux_create_request("after-recovery", &kernel, &rootfs))
+        .await
+        .unwrap();
+    assert_eq!(created.vsock_cid, 3);
+    assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.2"));
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let state_path = tmp.path().join("state.db");
+    let network = Arc::new(TestHostNetwork::default());
+    network.fail_next_attach();
+    network.fail_next_delete_tap();
+
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    core.create_vm(linux_create_request("retry-recovery", &kernel, &rootfs))
+        .await
+        .unwrap_err();
+    assert!(network.has_tap("husker3").await);
+    drop(core);
+
+    let restarted = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    network.fail_next_remove_forward();
+    let error = restarted.recover_host_resource_leases().await.unwrap_err();
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert!(
+        !network.has_tap("husker3").await,
+        "TAP cleanup must still run after nftables cleanup fails"
+    );
+
+    assert_eq!(restarted.recover_host_resource_leases().await.unwrap(), 1);
+    let created = restarted
+        .create_vm(linux_create_request("after-retry", &kernel, &rootfs))
+        .await
+        .unwrap();
+    assert_eq!(created.vsock_cid, 3);
+    assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.2"));
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn incomplete_rollback_does_not_reuse_live_host_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    network.fail_next_attach();
+    network.fail_next_delete_tap();
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+
+    core.create_vm(linux_create_request("leaked", &kernel, &rootfs))
+        .await
+        .unwrap_err();
+    let created = core
+        .create_vm(linux_create_request("while-leased", &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    assert_eq!(created.vsock_cid, 4);
+    assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.3"));
+    assert!(network.has_tap("husker3").await);
+    assert!(network.has_tap("husker4").await);
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
 async fn nft_failure_does_not_persist_a_port_forward() {
     let tmp = tempfile::tempdir().unwrap();
     let (kernel, rootfs) = linux_boot_fixture(tmp.path());
@@ -502,6 +684,65 @@ async fn nft_cleanup_failure_retains_the_port_forward_record() {
     assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
     assert_eq!(core.list_port_forwards("forward-owner").unwrap().len(), 1);
     assert_eq!(network.forwards.lock().await.len(), 1);
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn destroy_cleanup_failure_retains_resource_ownership_for_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+    let created = core
+        .create_vm(linux_create_request("cleanup-retry", &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    network.fail_next_delete_tap();
+    let error = core.destroy_vm("cleanup-retry").await.unwrap_err();
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    let retained = core.get_vm("cleanup-retry").unwrap();
+    assert_eq!(retained.state, "stopped");
+    assert_eq!(retained.vsock_cid, created.vsock_cid);
+    assert_eq!(retained.tap_device, created.tap_device);
+    assert_eq!(retained.guest_ip, created.guest_ip);
+
+    core.destroy_vm("cleanup-retry").await.unwrap();
+    assert!(matches!(
+        core.get_vm("cleanup-retry"),
+        Err(CoreError::VmNotFound(_))
+    ));
+    let replacement = core
+        .create_vm(linux_create_request("after-destroy", &kernel, &rootfs))
+        .await
+        .unwrap();
+    assert_eq!(replacement.vsock_cid, created.vsock_cid);
+    assert_eq!(replacement.guest_ip, created.guest_ip);
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn reclaim_cleanup_failure_keeps_the_vm_resource_fields_for_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+    let created = core
+        .create_vm(linux_create_request("reclaim-retry", &kernel, &rootfs))
+        .await
+        .unwrap();
+    core.stop_vm("reclaim-retry").await.unwrap();
+
+    network.fail_next_delete_tap();
+    assert_eq!(core.reclaim_abandoned_vms(0).await, 0);
+    let retained = core.get_vm("reclaim-retry").unwrap();
+    assert_eq!(retained.tap_device, created.tap_device);
+    assert_eq!(retained.guest_ip, created.guest_ip);
+
+    assert_eq!(core.reclaim_abandoned_vms(0).await, 1);
+    let reclaimed = core.get_vm("reclaim-retry").unwrap();
+    assert_eq!(reclaimed.tap_device, None);
+    assert_eq!(reclaimed.guest_ip, None);
 }
 
 #[cfg(not(feature = "linux-net"))]

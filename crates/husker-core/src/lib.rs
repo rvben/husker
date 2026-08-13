@@ -10,6 +10,8 @@ mod port_proxy;
 mod agent_ops;
 mod diagnostics;
 mod fork;
+#[cfg(feature = "linux-net")]
+mod host_resources;
 mod idle;
 mod images;
 mod network;
@@ -626,6 +628,8 @@ struct AllocatedResources {
     #[cfg(feature = "linux-net")]
     guest_ip: Option<Ipv4Addr>,
     cid: Option<u32>,
+    #[cfg(feature = "linux-net")]
+    host_resource_lease_id: Option<Uuid>,
     #[cfg(feature = "linux-net")]
     tap_name: Option<String>,
     vm_dir: Option<PathBuf>,
@@ -2302,6 +2306,65 @@ pub struct IdleMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "linux-net")]
+    use std::collections::HashMap;
+
+    #[cfg(feature = "linux-net")]
+    struct SuccessfulHostNetwork;
+
+    #[cfg(feature = "linux-net")]
+    impl husker_net::HostNetwork for SuccessfulHostNetwork {
+        fn create_tap<'a>(&'a self, _name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn delete_tap<'a>(&'a self, _name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn attach_to_bridge<'a>(
+            &'a self,
+            _tap_name: &'a str,
+            _bridge_name: &'a str,
+        ) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn add_port_forward<'a>(
+            &'a self,
+            _host_port: u16,
+            _guest_ip: Ipv4Addr,
+            _guest_port: u16,
+            _tap_name: &'a str,
+            _bridge_name: &'a str,
+        ) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn remove_port_forward<'a>(
+            &'a self,
+            _host_port: u16,
+            _tap_name: &'a str,
+            _bridge_name: &'a str,
+        ) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn remove_all_port_forwards<'a>(
+            &'a self,
+            _tap_name: &'a str,
+            _bridge_name: &'a str,
+        ) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_all_port_forward_counters<'a>(
+            &'a self,
+            _bridge_name: &'a str,
+        ) -> husker_net::NetworkFuture<'a, HashMap<String, (u64, u64)>> {
+            Box::pin(async { Ok(HashMap::new()) })
+        }
+    }
 
     #[test]
     fn plausible_guest_ip_accepts_lan_and_nat_addresses() {
@@ -2409,21 +2472,24 @@ mod tests {
     async fn test_core() -> Arc<HuskerCore<AutoResumeMockVmm>> {
         let dir = std::env::temp_dir().join(format!("husker-core-test-{}", Uuid::new_v4()));
         let runtime_dir = dir.join("run");
-        Arc::new(HuskerCore::new(
-            AutoResumeMockVmm {
-                fail_vsock_connect: false,
-                backend_kind: husker_vmm::BackendKind::Firecracker,
-            },
-            husker_state::StateStore::open_memory().unwrap(),
-            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
-            husker_storage::StorageConfig {
-                data_dir: dir.clone(),
-                state_dir: dir,
-            },
-            "husker0".into(),
-            vec![],
-            runtime_dir,
-        ))
+        Arc::new(
+            HuskerCore::new(
+                AutoResumeMockVmm {
+                    fail_vsock_connect: false,
+                    backend_kind: husker_vmm::BackendKind::Firecracker,
+                },
+                husker_state::StateStore::open_memory().unwrap(),
+                husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+                husker_storage::StorageConfig {
+                    data_dir: dir.clone(),
+                    state_dir: dir,
+                },
+                "husker0".into(),
+                vec![],
+                runtime_dir,
+            )
+            .with_host_network(Arc::new(SuccessfulHostNetwork)),
+        )
     }
 
     /// Like `test_core`, but with a QEMU-selecting backend for tests that
@@ -2563,8 +2629,8 @@ mod tests {
         let mut rec = sample_vm_record(name);
         rec.state = "stopped".into();
         rec.tap_device = Some(format!("tap-{name}"));
-        rec.host_ip = Some("192.0.2.1".into());
-        rec.guest_ip = Some("192.0.2.2".into());
+        rec.host_ip = Some("172.20.0.1".into());
+        rec.guest_ip = Some("172.20.0.2".into());
         rec.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
         rec
     }
@@ -2574,6 +2640,9 @@ mod tests {
     async fn reclaim_sweep_clears_abandoned_vm_and_deletes_forwards() {
         let core = test_core().await;
         let rec = abandoned_crashed_vm("crashed");
+        core.ip_allocator
+            .reserve(rec.guest_ip.as_deref().unwrap().parse().unwrap())
+            .unwrap();
         core.state.insert_vm(&rec).unwrap();
         core.state
             .insert_port_forward(&husker_state::PortForwardRecord {
@@ -2587,9 +2656,8 @@ mod tests {
             })
             .unwrap();
 
-        // grace = 60s; the VM stopped 3600s ago, so it is reclaimed. The
-        // best-effort husker_net TAP/IP release is a no-op here (no real device);
-        // the state mutation is what this asserts.
+        // grace = 60s; the VM stopped 3600s ago, so its injected host resources
+        // are released before their durable ownership fields are cleared.
         let reclaimed = core.reclaim_abandoned_vms(60).await;
         assert_eq!(reclaimed, 1);
 
@@ -2631,6 +2699,9 @@ mod tests {
         let mut rec = abandoned_crashed_vm("shutdown-service");
         rec.updated_at = chrono::Utc::now();
         rec.service_id = Some(Uuid::new_v4());
+        core.ip_allocator
+            .reserve(rec.guest_ip.as_deref().unwrap().parse().unwrap())
+            .unwrap();
         core.state.insert_vm(&rec).unwrap();
 
         assert_eq!(core.reclaim_shutdown_vms().await, 1);

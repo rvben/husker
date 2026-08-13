@@ -551,8 +551,22 @@ pub async fn create_tap(name: &str) -> Result<(), NetError> {
 pub async fn delete_tap(name: &str) -> Result<(), NetError> {
     validate_interface_name(name)?;
     info!(tap = name, "deleting TAP device");
-    run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await?;
-    Ok(())
+    match run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_missing_interface_error(&error) => {
+            debug!(tap = name, "TAP already absent");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_missing_interface_error(error: &NetError) -> bool {
+    matches!(
+        error,
+        NetError::CommandFailed { message, .. }
+            if message.contains("Cannot find device") || message.contains("does not exist")
+    )
 }
 
 // ── Guest network isolation ────────────────────────────────────────────
@@ -1059,18 +1073,14 @@ pub async fn remove_port_forward(
     let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
         // A missing table (nft "No such file or directory") means there are no
-        // rules to remove, which is success. Surface any OTHER failure (nft not
-        // installed, permission denied) at warn so it does not vanish silently
-        // while leaving orphaned DNAT rules behind.
-        Err(e) => {
-            if matches!(&e, NetError::CommandFailed { message, .. } if message.contains("No such file or directory"))
-            {
-                debug!(table = %table, "nft table absent; no port-forward rules to remove");
-            } else {
-                warn!(table = %table, error = %e, "nft list failed during port-forward removal; rules may remain");
-            }
+        // rules to remove, which is success. Propagate any OTHER failure (nft
+        // not installed, permission denied) so callers retain durable ownership
+        // instead of silently leaving orphaned DNAT rules behind.
+        Err(e) if is_missing_nft_table_error(&e) => {
+            debug!(table = %table, "nft table absent; no port-forward rules to remove");
             return Ok(());
         }
+        Err(e) => return Err(e),
     };
 
     let comment_tag = format!("husker-pf:{}:{}", tap_name, host_port);
@@ -1112,18 +1122,14 @@ pub async fn remove_all_port_forwards(tap_name: &str, bridge_name: &str) -> Resu
     let output = match run_cmd("nft", &["-j", "list", "table", "ip", &table]).await {
         Ok(output) => output,
         // A missing table (nft "No such file or directory") means there are no
-        // rules to remove, which is success. Surface any OTHER failure (nft not
-        // installed, permission denied) at warn so it does not vanish silently
-        // while leaving orphaned DNAT rules behind.
-        Err(e) => {
-            if matches!(&e, NetError::CommandFailed { message, .. } if message.contains("No such file or directory"))
-            {
-                debug!(table = %table, "nft table absent; no port-forward rules to remove");
-            } else {
-                warn!(table = %table, error = %e, "nft list failed during port-forward removal; rules may remain");
-            }
+        // rules to remove, which is success. Propagate any OTHER failure (nft
+        // not installed, permission denied) so callers retain durable ownership
+        // instead of silently leaving orphaned DNAT rules behind.
+        Err(e) if is_missing_nft_table_error(&e) => {
+            debug!(table = %table, "nft table absent; no port-forward rules to remove");
             return Ok(());
         }
+        Err(e) => return Err(e),
     };
 
     let prefix = format!("husker-pf:{tap_name}:");
@@ -1157,6 +1163,14 @@ pub async fn remove_all_port_forwards(tap_name: &str, bridge_name: &str) -> Resu
         });
     }
     Ok(())
+}
+
+fn is_missing_nft_table_error(error: &NetError) -> bool {
+    matches!(
+        error,
+        NetError::CommandFailed { message, .. }
+            if message.contains("No such file or directory")
+    )
 }
 
 /// Remove this daemon's per-bridge nftables table.
@@ -2118,6 +2132,39 @@ default via 192.168.1.1 dev eth0 proto dhcp metric 100
         assert!(validate_interface_name("a").is_ok());
         // Exactly 15 characters
         assert!(validate_interface_name("abcdefghijklmno").is_ok());
+    }
+
+    #[test]
+    fn missing_tap_is_already_clean_for_idempotent_recovery() {
+        for message in [
+            "Cannot find device \"husker3\"",
+            "Device \"husker3\" does not exist.",
+        ] {
+            let error = NetError::CommandFailed {
+                cmd: "ip tuntap del dev husker3 mode tap".into(),
+                message: message.into(),
+            };
+            assert!(is_missing_interface_error(&error));
+        }
+        assert!(!is_missing_interface_error(&NetError::CommandFailed {
+            cmd: "ip tuntap del dev husker3 mode tap".into(),
+            message: "Operation not permitted".into(),
+        }));
+    }
+
+    #[test]
+    fn only_an_absent_nft_table_counts_as_already_clean() {
+        let missing = NetError::CommandFailed {
+            cmd: "nft -j list table ip husker_husker0".into(),
+            message: "No such file or directory".into(),
+        };
+        assert!(is_missing_nft_table_error(&missing));
+
+        let denied = NetError::CommandFailed {
+            cmd: "nft -j list table ip husker_husker0".into(),
+            message: "Operation not permitted".into(),
+        };
+        assert!(!is_missing_nft_table_error(&denied));
     }
 
     #[test]

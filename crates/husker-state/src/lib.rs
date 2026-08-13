@@ -5,7 +5,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
@@ -66,6 +66,10 @@ pub enum StateError {
     VolumeAlreadyExists(String),
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
+    #[error("host-resource lease not found: {0}")]
+    HostResourceLeaseNotFound(Uuid),
+    #[error("VM record does not match host-resource lease: {0}")]
+    HostResourceLeaseMismatch(Uuid),
     #[error("lock poisoned")]
     LockPoisoned,
     #[error("IO error: {0}")]
@@ -139,6 +143,19 @@ pub struct PortForwardRecord {
     /// Host bind address for the userspace proxy (macOS). `None` means the
     /// platform default (127.0.0.1 on macOS; all-interfaces on Linux nftables).
     pub bind_addr: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Durable ownership of Linux host resources allocated before a VM record can
+/// take ownership. A lease survives daemon restart until creation commits or
+/// cleanup releases it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostResourceLease {
+    pub id: Uuid,
+    pub vm_name: String,
+    pub vsock_cid: u32,
+    pub tap_device: Option<String>,
+    pub guest_ip: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -297,9 +314,17 @@ const BASELINE_SCHEMA_VERSION: u32 = 1;
 /// exactly once, in its own transaction, when `user_version` is below its
 /// number. Append-only: never edit, reorder, or renumber a migration that has
 /// shipped; keep the numbers strictly ascending and greater than the baseline.
-const MIGRATIONS: &[(u32, &str)] = &[
-    // (2, "ALTER TABLE vms RENAME COLUMN old TO new"),
-];
+const MIGRATIONS: &[(u32, &str)] = &[(
+    2,
+    "CREATE TABLE host_resource_leases (
+            id TEXT PRIMARY KEY,
+            vm_name TEXT NOT NULL UNIQUE,
+            vsock_cid INTEGER NOT NULL UNIQUE,
+            tap_device TEXT,
+            guest_ip TEXT,
+            created_at TEXT NOT NULL
+        );",
+)];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
 /// database that predates versioning, then apply every migration newer than the
@@ -335,6 +360,60 @@ fn apply_migrations(
             current = target;
         }
     }
+    Ok(())
+}
+
+fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> {
+    conn.execute(
+        "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
+                          tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
+                          created_at, updated_at, userdata, userdata_status, userdata_env,
+                          service_id, service_ordinal, vmm, boot_mode, balloon, volume,
+                          network, last_activity_at, suspended_at, idle_timeout_secs,
+                          suspend_ttl_secs, auto_resume, forked_from)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+        params![
+            record.id.to_string(),
+            record.name,
+            record.state,
+            record.pid,
+            record.vcpu_count,
+            record.mem_size_mib,
+            record.vsock_cid,
+            record.tap_device,
+            record.host_ip,
+            record.guest_ip,
+            record.kernel_path,
+            record.rootfs_path,
+            record.created_at.to_rfc3339(),
+            record.updated_at.to_rfc3339(),
+            record.userdata,
+            record.userdata_status,
+            record.userdata_env,
+            record.service_id.map(|id| id.to_string()),
+            record.service_ordinal,
+            record.vmm,
+            record.boot_mode,
+            record.balloon as i64,
+            record.volume,
+            record.network,
+            record.last_activity_at.to_rfc3339(),
+            record.suspended_at.map(|d| d.to_rfc3339()),
+            record.idle_timeout_secs.map(|v| v as i64),
+            record.suspend_ttl_secs.map(|v| v as i64),
+            record.auto_resume as i64,
+            record.forked_from.map(|u| u.to_string()),
+        ],
+    )
+    .map_err(|e| match &e {
+        rusqlite::Error::SqliteFailure(err, Some(msg))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+                && msg.contains("vms.name") =>
+        {
+            StateError::VmAlreadyExists(record.name.clone())
+        }
+        _ => StateError::Database(e),
+    })?;
     Ok(())
 }
 
@@ -582,57 +661,7 @@ impl StateStore {
     /// Returns `StateError::VmAlreadyExists` if a VM with the same name exists.
     pub fn insert_vm(&self, record: &VmRecord) -> Result<(), StateError> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO vms (id, name, state, pid, vcpu_count, mem_size_mib, vsock_cid,
-                              tap_device, host_ip, guest_ip, kernel_path, rootfs_path,
-                              created_at, updated_at, userdata, userdata_status, userdata_env,
-                              service_id, service_ordinal, vmm, boot_mode, balloon, volume,
-                              network, last_activity_at, suspended_at, idle_timeout_secs,
-                              suspend_ttl_secs, auto_resume, forked_from)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
-            params![
-                record.id.to_string(),
-                record.name,
-                record.state,
-                record.pid,
-                record.vcpu_count,
-                record.mem_size_mib,
-                record.vsock_cid,
-                record.tap_device,
-                record.host_ip,
-                record.guest_ip,
-                record.kernel_path,
-                record.rootfs_path,
-                record.created_at.to_rfc3339(),
-                record.updated_at.to_rfc3339(),
-                record.userdata,
-                record.userdata_status,
-                record.userdata_env,
-                record.service_id.map(|id| id.to_string()),
-                record.service_ordinal,
-                record.vmm,
-                record.boot_mode,
-                record.balloon as i64,
-                record.volume,
-                record.network,
-                record.last_activity_at.to_rfc3339(),
-                record.suspended_at.map(|d| d.to_rfc3339()),
-                record.idle_timeout_secs.map(|v| v as i64),
-                record.suspend_ttl_secs.map(|v| v as i64),
-                record.auto_resume as i64,
-                record.forked_from.map(|u| u.to_string()),
-            ],
-        )
-        .map_err(|e| match &e {
-            rusqlite::Error::SqliteFailure(err, Some(msg))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation
-                    && msg.contains("vms.name") =>
-            {
-                StateError::VmAlreadyExists(record.name.clone())
-            }
-            _ => StateError::Database(e),
-        })?;
-        Ok(())
+        insert_vm_on(&conn, record)
     }
 
     /// Get a VM by its ID.
@@ -870,6 +899,29 @@ impl StateStore {
         if deleted == 0 {
             return Err(StateError::VmNotFound(id));
         }
+        Ok(())
+    }
+
+    /// Atomically delete a VM and return its CID to the allocator. Until the
+    /// deletion commits, the VM record remains the durable CID owner.
+    pub fn retire_vm(&self, id: Uuid) -> Result<(), StateError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let cid = tx
+            .query_row(
+                "SELECT vsock_cid FROM vms WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?
+            .ok_or(StateError::VmNotFound(id))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO freed_cids (cid) VALUES (?1)",
+            params![cid],
+        )?;
+        tx.execute("DELETE FROM vms WHERE id = ?1", params![id.to_string()])?;
+        tx.commit()?;
+        debug!(%id, cid, "retired VM and released CID");
         Ok(())
     }
 
@@ -1515,6 +1567,181 @@ impl StateStore {
             params![cid],
         )?;
         debug!(cid, "released CID");
+        Ok(())
+    }
+
+    /// Atomically allocate a CID and persist its creation-attempt owner.
+    pub fn begin_host_resource_lease(
+        &self,
+        vm_name: &str,
+    ) -> Result<HostResourceLease, StateError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let freed: Option<u32> = tx
+            .query_row(
+                "SELECT cid FROM freed_cids ORDER BY cid LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let vsock_cid = if let Some(cid) = freed {
+            tx.execute("DELETE FROM freed_cids WHERE cid = ?1", params![cid])?;
+            cid
+        } else {
+            let cid = tx.query_row(
+                "SELECT next_cid FROM cid_allocator WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE cid_allocator SET next_cid = next_cid + 1 WHERE id = 1",
+                [],
+            )?;
+            cid
+        };
+
+        let lease = HostResourceLease {
+            id: Uuid::new_v4(),
+            vm_name: vm_name.to_string(),
+            vsock_cid,
+            tap_device: None,
+            guest_ip: None,
+            created_at: Utc::now(),
+        };
+        tx.execute(
+            "INSERT INTO host_resource_leases
+                (id, vm_name, vsock_cid, tap_device, guest_ip, created_at)
+             VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+            params![
+                lease.id.to_string(),
+                lease.vm_name,
+                lease.vsock_cid,
+                lease.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        debug!(
+            cid = lease.vsock_cid,
+            vm = vm_name,
+            "leased CID for VM creation"
+        );
+        Ok(lease)
+    }
+
+    /// List creation-attempt leases that still own host resources.
+    pub fn list_host_resource_leases(&self) -> Result<Vec<HostResourceLease>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_name, vsock_cid, tap_device, guest_ip, created_at
+             FROM host_resource_leases ORDER BY created_at, id",
+        )?;
+        let leases = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let created_at: String = row.get(5)?;
+                Ok(HostResourceLease {
+                    id: parse_uuid(&id)?,
+                    vm_name: row.get(1)?,
+                    vsock_cid: row.get(2)?,
+                    tap_device: row.get(3)?,
+                    guest_ip: row.get(4)?,
+                    created_at: parse_datetime(&created_at)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(leases)
+    }
+
+    /// Persist the network identity a lease will create before touching the
+    /// host, so restart recovery knows the exact TAP and address to reclaim.
+    pub fn set_host_resource_lease_network(
+        &self,
+        id: Uuid,
+        tap_device: Option<&str>,
+        guest_ip: Option<&str>,
+    ) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE host_resource_leases SET tap_device = ?2, guest_ip = ?3 WHERE id = ?1",
+            params![id.to_string(), tap_device, guest_ip],
+        )?;
+        if updated == 0 {
+            return Err(StateError::HostResourceLeaseNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Atomically transfer a creation lease to its final VM record. The
+    /// identity check prevents a caller from adopting another attempt's CID or
+    /// network resources.
+    pub fn commit_vm_from_host_resource_lease(
+        &self,
+        record: &VmRecord,
+        lease_id: Uuid,
+    ) -> Result<(), StateError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let lease = tx
+            .query_row(
+                "SELECT id, vm_name, vsock_cid, tap_device, guest_ip, created_at
+                 FROM host_resource_leases WHERE id = ?1",
+                params![lease_id.to_string()],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let created_at: String = row.get(5)?;
+                    Ok(HostResourceLease {
+                        id: parse_uuid(&id)?,
+                        vm_name: row.get(1)?,
+                        vsock_cid: row.get(2)?,
+                        tap_device: row.get(3)?,
+                        guest_ip: row.get(4)?,
+                        created_at: parse_datetime(&created_at)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(StateError::HostResourceLeaseNotFound(lease_id))?;
+        if lease.vm_name != record.name
+            || lease.vsock_cid != record.vsock_cid
+            || lease.tap_device != record.tap_device
+            || lease.guest_ip != record.guest_ip
+        {
+            return Err(StateError::HostResourceLeaseMismatch(lease_id));
+        }
+
+        insert_vm_on(&tx, record)?;
+        tx.execute(
+            "DELETE FROM host_resource_leases WHERE id = ?1",
+            params![lease_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Release a creation lease and return its CID to the allocator atomically.
+    pub fn release_host_resource_lease(&self, id: Uuid) -> Result<(), StateError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let cid: Option<u32> = tx
+            .query_row(
+                "SELECT vsock_cid FROM host_resource_leases WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(cid) = cid {
+            tx.execute(
+                "INSERT OR IGNORE INTO freed_cids (cid) VALUES (?1)",
+                params![cid],
+            )?;
+            tx.execute(
+                "DELETE FROM host_resource_leases WHERE id = ?1",
+                params![id.to_string()],
+            )?;
+            debug!(cid, %id, "released host-resource lease");
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2284,6 +2511,23 @@ mod tests {
     }
 
     #[test]
+    fn retiring_a_vm_releases_its_cid_with_the_record_deletion() {
+        let store = StateStore::open_memory().unwrap();
+        let cid = store.allocate_cid().unwrap();
+        let mut rec = make_record("retire-me");
+        rec.vsock_cid = cid;
+        store.insert_vm(&rec).unwrap();
+
+        store.retire_vm(rec.id).unwrap();
+
+        assert!(matches!(
+            store.get_vm(rec.id),
+            Err(StateError::VmNotFound(_))
+        ));
+        assert_eq!(store.allocate_cid().unwrap(), cid);
+    }
+
+    #[test]
     fn vm_record_roundtrips_idle_policy_fields() {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("idle-vm");
@@ -2341,6 +2585,74 @@ mod tests {
         assert_eq!(store.allocate_cid().unwrap(), 3);
         assert_eq!(store.allocate_cid().unwrap(), 4);
         assert_eq!(store.allocate_cid().unwrap(), 5);
+    }
+
+    #[test]
+    fn host_resource_lease_survives_restart_until_cleanup_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        let abandoned = {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .begin_host_resource_lease("interrupted-create")
+                .unwrap()
+        };
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.list_host_resource_leases().unwrap(),
+            vec![abandoned.clone()]
+        );
+        let next = store.begin_host_resource_lease("next-create").unwrap();
+        assert_eq!(abandoned.vsock_cid, 3);
+        assert_eq!(next.vsock_cid, 4, "the abandoned lease still owns CID 3");
+
+        store.release_host_resource_lease(abandoned.id).unwrap();
+        let reused = store.begin_host_resource_lease("after-cleanup").unwrap();
+        assert_eq!(reused.vsock_cid, 3);
+    }
+
+    #[test]
+    fn host_resource_lease_records_network_identity_before_host_setup() {
+        let store = StateStore::open_memory().unwrap();
+        let lease = store.begin_host_resource_lease("network-owner").unwrap();
+
+        store
+            .set_host_resource_lease_network(lease.id, Some("husker3"), Some("172.20.0.2"))
+            .unwrap();
+
+        let recorded = store.list_host_resource_leases().unwrap().remove(0);
+        assert_eq!(recorded.tap_device.as_deref(), Some("husker3"));
+        assert_eq!(recorded.guest_ip.as_deref(), Some("172.20.0.2"));
+    }
+
+    #[test]
+    fn committing_a_vm_atomically_transfers_its_host_resource_lease() {
+        let store = StateStore::open_memory().unwrap();
+        let lease = store.begin_host_resource_lease("committed-vm").unwrap();
+        store
+            .set_host_resource_lease_network(lease.id, Some("husker3"), Some("172.20.0.2"))
+            .unwrap();
+        let mut vm = make_record("committed-vm");
+        vm.vsock_cid = lease.vsock_cid;
+        vm.tap_device = Some("husker3".into());
+        vm.guest_ip = Some("172.20.0.2".into());
+
+        store
+            .commit_vm_from_host_resource_lease(&vm, lease.id)
+            .unwrap();
+
+        assert_eq!(store.get_vm(vm.id).unwrap().name, "committed-vm");
+        assert!(store.list_host_resource_leases().unwrap().is_empty());
+        assert_eq!(
+            store
+                .begin_host_resource_lease("next-vm")
+                .unwrap()
+                .vsock_cid,
+            4,
+            "the committed VM, not the journal, still owns CID 3"
+        );
     }
 
     #[test]
@@ -3734,18 +4046,19 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version as u32, BASELINE_SCHEMA_VERSION);
+        assert_eq!(version as u32, MIGRATIONS.last().unwrap().0);
+        assert!(store.list_host_resource_leases().unwrap().is_empty());
     }
 
     #[test]
-    fn fresh_db_starts_at_baseline_version() {
+    fn fresh_db_reaches_the_latest_schema_version() {
         let store = StateStore::open_memory().unwrap();
         let version: i64 = store
             .lock()
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version as u32, BASELINE_SCHEMA_VERSION);
+        assert_eq!(version as u32, MIGRATIONS.last().unwrap().0);
     }
 
     #[test]

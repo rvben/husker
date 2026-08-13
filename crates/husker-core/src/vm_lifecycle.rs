@@ -220,8 +220,10 @@ impl<B: VmmBackend> HuskerCore<B> {
             None
         };
 
-        let cid = self.state.allocate_cid()?;
+        let lease = self.state.begin_host_resource_lease(&req.name)?;
+        let cid = lease.vsock_cid;
         resources.cid = Some(cid);
+        resources.host_resource_lease_id = Some(lease.id);
 
         let tap_name = format!("husker{cid}");
         let mac = husker_net::generate_mac(cid);
@@ -242,9 +244,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         // bypassed by a rule-ordering mistake, link-local IPv6, or ARP tricks.
         // vsock is unaffected, so exec, file transfer and the agent still work.
         let has_host_networking = network_mode != "none";
+        self.state.set_host_resource_lease_network(
+            lease.id,
+            has_host_networking.then_some(tap_name.as_str()),
+            guest_ip.as_ref().map(|ip| ip.to_string()).as_deref(),
+        )?;
         if has_host_networking {
-            self.host_network.create_tap(&tap_name).await?;
             resources.tap_name = Some(tap_name.clone());
+            self.host_network.create_tap(&tap_name).await?;
 
             // Attach the TAP to the appropriate bridge: the LAN bridge for bridged mode,
             // or the husker NAT bridge for NAT mode.
@@ -559,10 +566,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             forked_from: None,
         };
 
-        self.state.insert_vm(&record).map_err(|e| match e {
-            husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
-            other => CoreError::State(other),
-        })?;
+        self.state
+            .commit_vm_from_host_resource_lease(&record, lease.id)
+            .map_err(|e| match e {
+                husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
+                other => CoreError::State(other),
+            })?;
 
         Ok(record)
     }
@@ -919,6 +928,8 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Roll back partially allocated resources in reverse order.
     pub(crate) async fn rollback_create(&self, resources: AllocatedResources) {
+        #[cfg(feature = "linux-net")]
+        let mut host_cleanup_succeeded = true;
         if let Some(vm_id) = resources.vm_id {
             debug!(%vm_id, "rolling back: destroying VM");
             if let Err(e) = self.vmm.destroy_vm(vm_id).await {
@@ -939,12 +950,15 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .remove_all_port_forwards(tap, &self.bridge_name)
                 .await
             {
+                host_cleanup_succeeded = false;
                 warn!(tap, error = %e, "rollback: failed to remove port forwards");
             }
             if let Err(e) = self.host_network.delete_tap(tap).await {
+                host_cleanup_succeeded = false;
                 warn!(tap, error = %e, "rollback: failed to delete TAP device");
             }
         }
+        #[cfg(not(feature = "linux-net"))]
         if let Some(cid) = resources.cid {
             debug!(cid, "rolling back: releasing CID");
             if let Err(e) = self.state.release_cid(cid) {
@@ -952,7 +966,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
         #[cfg(feature = "linux-net")]
-        if let Some(guest_ip) = resources.guest_ip {
+        if host_cleanup_succeeded
+            && let Some(lease_id) = resources.host_resource_lease_id
+            && let Err(e) = self.state.release_host_resource_lease(lease_id)
+        {
+            warn!(%lease_id, error = %e, "rollback: failed to release host-resource lease");
+        }
+        #[cfg(feature = "linux-net")]
+        if host_cleanup_succeeded && let Some(guest_ip) = resources.guest_ip {
             debug!(%guest_ip, "rolling back: releasing IP");
             if let Err(e) = self.ip_allocator.release(guest_ip) {
                 warn!(%guest_ip, error = %e, "rollback: failed to release IP");
@@ -1099,28 +1120,14 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .list_port_forwards_for_vm(record.id)
                 .unwrap_or_default();
 
-            if let Some(ref tap) = record.tap_device {
-                if let Err(e) = self
-                    .host_network
-                    .remove_all_port_forwards(tap, &self.bridge_name)
-                    .await
-                {
-                    warn!(%name, tap, error = %e, "failed to remove port forwards during destroy");
-                }
-                if let Err(e) = self.host_network.delete_tap(tap).await {
-                    warn!(%name, tap, error = %e, "failed to delete TAP device during destroy");
-                }
+            let host_cleanup = self.release_vm_host_network(record).await;
+            if let Some(ref tap) = record.tap_device
+                && host_cleanup.is_ok()
+            {
                 let mut nc = self.network_counters.lock();
                 for pf in &forwards {
                     nc.remove(&format!("husker-pf:{tap}:{}", pf.host_port));
                 }
-            }
-
-            if let Some(ref guest_ip_str) = record.guest_ip
-                && let Ok(guest_ip) = guest_ip_str.parse::<Ipv4Addr>()
-                && let Err(e) = self.ip_allocator.release(guest_ip)
-            {
-                warn!(%name, %guest_ip, error = %e, "failed to release IP during destroy");
             }
 
             // A reaped *suspended* VM may still have a bound resume-listener
@@ -1131,14 +1138,18 @@ impl<B: VmmBackend> HuskerCore<B> {
             if let Some(proxy) = self.resume_listeners.lock().remove(&record.id) {
                 proxy.drain_and_close(record.id);
             }
+
+            if let Err(error) = host_cleanup {
+                self.state.mark_vm_stopped(record.id)?;
+                warn!(%name, %error, "host cleanup failed; retained VM ownership for retry");
+                return Err(error);
+            }
         }
 
-        self.state.release_cid(record.vsock_cid)?;
         // Abort any macOS userspace port-forward listeners before dropping the
         // rows. (`destroy_vm` already holds the per-VM name lock.)
         #[cfg(not(feature = "linux-net"))]
         self.port_proxy.stop_all(record.id);
-        self.state.delete_port_forwards_for_vm(record.id)?;
 
         let vm_dir = self.storage.vm_dir(&record.name);
         if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
@@ -1174,7 +1185,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.network_last_active.lock().remove(&record.id);
         self.active_sessions.lock().remove(&record.id);
 
-        self.state.delete_vm(record.id)?;
+        self.state.retire_vm(record.id)?;
         info!(%name, "VM destroyed");
         Ok(())
     }
