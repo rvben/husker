@@ -1,6 +1,24 @@
 use super::*;
 
 impl<B: VmmBackend> HuskerCore<B> {
+    /// Stop ingress that can transition VM state during daemon shutdown.
+    ///
+    /// Linux auto-resume listeners must be dropped without draining their
+    /// socket backlog: draining deliberately services queued connections and
+    /// could resume a suspended VM after the shutdown drain took its snapshot.
+    pub fn quiesce_shutdown_ingress(&self) {
+        #[cfg(feature = "linux-net")]
+        {
+            let mut listeners = self.resume_listeners.lock();
+            let count = listeners.len();
+            listeners.clear();
+            drop(listeners);
+            if count > 0 {
+                info!(count, "closed auto-resume listeners for daemon shutdown");
+            }
+        }
+    }
+
     /// Path to a VM's serial console log file.
     pub fn serial_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
         let record = self.lookup_vm(name)?;

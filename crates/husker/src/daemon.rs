@@ -284,7 +284,7 @@ pub(crate) fn remove_orphan_clone_dirs(
 /// Runs after `mark_stale_vms_stopped`, so at this point nothing this daemon
 /// manages is running. Suspended VMs are skipped: they intentionally preserve
 /// their TAP, IP, and rootfs so `resume` can restore the same identity in place.
-pub(crate) async fn reconcile_host_resources(
+async fn reconcile_host_resources(
     state: &husker_state::StateStore,
     storage: &husker_storage::StorageConfig,
     runtime_dir: &Path,
@@ -386,9 +386,6 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
 
     let runtime_dir = storage.runtime_dir();
     let db_path = storage.db_path();
-    let api_token = config.api_token.clone();
-    let service_reconcile_enabled = config.service_reconcile_enabled;
-    let service_reconcile_interval = config.service_reconcile_interval_secs;
     let api_policy = husker_api::ApiPolicy {
         max_request_bytes: config.api_max_request_bytes,
         max_file_read_bytes: config.api_max_file_read_bytes,
@@ -450,6 +447,18 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         let (base, prefix_len) = parse_cidr(&config.bridge_subnet)?;
         let ip_allocator = husker_net::IpAllocator::new(base, prefix_len);
 
+        // Fail before creating host-network resources. The old hard exit lived
+        // after bridge/NAT setup and made cleanup impossible on cgroup failure.
+        #[cfg(target_os = "linux")]
+        let cgroup = Arc::new(
+            husker_vmm::cgroup::CgroupSupervisor::init(husker_vmm::cgroup::CgroupConfig {
+                enabled: config.resource_limits,
+                memory_overhead_mib: config.memory_overhead_mib,
+                cpu_limit: config.cpu_limit,
+            })
+            .context("initializing cgroup resource limits")?,
+        );
+
         // The allocator is in-memory and starts empty on each restart. Rebuild
         // its state from persisted VMs so a new allocation cannot collide with an
         // IP still recorded for an existing VM, and so releasing such an IP on
@@ -487,174 +496,175 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         .await
         .context("checking bridge subnet for conflicts")?;
 
-        husker_net::create_bridge(&config.bridge_name, ip_allocator.gateway(), prefix_len)
+        let bridge_name = config.bridge_name.clone();
+        husker_net::create_bridge(&bridge_name, ip_allocator.gateway(), prefix_len)
             .await
             .context("creating bridge")?;
 
-        // Resolve the NAT uplink ("auto" follows the IPv4 default route) and
-        // surface anything that would silently leave guests without WAN.
-        let uplink = husker_net::resolve_host_interface(&config.host_interface);
-        for warning in &uplink.warnings {
-            tracing::warn!("{warning}");
-        }
-        tracing::info!(
-            iface = %uplink.effective,
-            source = ?uplink.source,
-            "guest NAT uplink"
-        );
-
-        // Build the isolation policy from config. Resolvers that parse as IPv4
-        // become DNS carve-outs so guests keep name resolution under the deny.
-        let isolation = config.guest_isolation.then(|| {
-            let resolvers = config
-                .dns_servers
-                .iter()
-                .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
-                .collect();
-            husker_net::IsolationPolicy { resolvers }
-        });
-        if isolation.is_some() {
-            tracing::info!("guest isolation enabled: NAT guests denied LAN + host access");
-        }
-        husker_net::init_nat(
-            &config.bridge_name,
-            &config.bridge_subnet,
-            &uplink.effective,
-            isolation.as_ref(),
-        )
-        .await
-        .context("initializing nftables")?;
-
-        #[cfg(target_os = "linux")]
-        let core = {
-            let cgroup = std::sync::Arc::new(
-                husker_vmm::cgroup::CgroupSupervisor::init(husker_vmm::cgroup::CgroupConfig {
-                    enabled: config.resource_limits,
-                    memory_overhead_mib: config.memory_overhead_mib,
-                    cpu_limit: config.cpu_limit,
-                })
-                .unwrap_or_else(|e| {
-                    if config.resource_limits {
-                        eprintln!("husker: resource_limits enabled but cgroup setup failed: {e}");
-                        std::process::exit(1);
-                    }
-                    husker_vmm::cgroup::CgroupSupervisor::disabled()
-                }),
-            );
-            let firecracker = husker_vmm::firecracker::FirecrackerBackend::new(
-                &config.firecracker_bin,
-                &runtime_dir,
-                std::sync::Arc::clone(&cgroup),
-            );
-            let qemu =
-                husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir, cgroup);
-            let default_kind = match config.vmm {
-                VmmSelection::Qemu => husker_vmm::VmmKind::Qemu,
-                VmmSelection::Firecracker => husker_vmm::VmmKind::Firecracker,
-            };
-            let vmm = husker_vmm::LinuxDispatchBackend::new(firecracker, qemu, default_kind);
-            if husker::agent_embedded() {
-                tracing::info!("cloud-image support enabled (guest agent embedded)");
-            } else {
-                tracing::info!(
-                    "cloud-image support disabled (no embedded agent; run make build-agent)"
-                );
+        // From this point on, every return path flows through host-network
+        // teardown. This includes nftables initialization and runtime failures.
+        let runtime_result: Result<()> = async {
+            // Resolve the NAT uplink ("auto" follows the IPv4 default route) and
+            // surface anything that would silently leave guests without WAN.
+            let uplink = husker_net::resolve_host_interface(&config.host_interface);
+            for warning in &uplink.warnings {
+                tracing::warn!("{warning}");
             }
-            Arc::new(
-                husker_core::HuskerCore::new(
-                    vmm,
-                    state,
-                    ip_allocator,
-                    storage,
-                    config.bridge_name.clone(),
-                    config.dns_servers,
-                    runtime_dir.clone(),
-                )
-                .with_embedded_agent(husker::EMBEDDED_AGENT)
-                .with_storage_volume(config.storage_volume)
-                .with_resource_limits(config.resource_limits)
-                .with_host_interface(uplink.effective.clone())
-                .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
-                .with_lan_bridge(config.lan_bridge.clone())
-                .with_default_vmm_kind(default_kind)
-                .with_default_images(
-                    Some(config.default_kernel.clone()),
-                    Some(config.default_rootfs.clone()),
-                    config.default_initrd.clone(),
-                )
-                .with_default_resources(config.default_memory, config.default_cpus)
-                .with_profiles(
-                    config
-                        .profiles
-                        .iter()
-                        .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
-                        .collect(),
-                )
-                .with_idle_policy(config.idle_policy.clone().into()),
-            )
-        };
-        #[cfg(not(target_os = "linux"))]
-        let core = {
-            // linux-net without target_os=linux (not a real deployment target):
-            // no QEMU/vsock available, so Firecracker only.
-            let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
-                &config.firecracker_bin,
-                &runtime_dir,
-                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
+            tracing::info!(
+                iface = %uplink.effective,
+                source = ?uplink.source,
+                "guest NAT uplink"
             );
-            Arc::new(
-                husker_core::HuskerCore::new(
-                    vmm,
-                    state,
-                    ip_allocator,
-                    storage,
-                    config.bridge_name.clone(),
-                    config.dns_servers,
-                    runtime_dir.clone(),
-                )
-                .with_storage_volume(config.storage_volume)
-                .with_resource_limits(config.resource_limits)
-                .with_host_interface(uplink.effective.clone())
-                .with_default_images(
-                    Some(config.default_kernel.clone()),
-                    Some(config.default_rootfs.clone()),
-                    config.default_initrd.clone(),
-                )
-                .with_default_resources(config.default_memory, config.default_cpus)
-                .with_profiles(
-                    config
-                        .profiles
-                        .iter()
-                        .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
-                        .collect(),
-                )
-                .with_idle_policy(config.idle_policy.clone().into()),
+
+            // Build the isolation policy from config. Resolvers that parse as IPv4
+            // become DNS carve-outs so guests keep name resolution under the deny.
+            let isolation = config.guest_isolation.then(|| {
+                let resolvers = config
+                    .dns_servers
+                    .iter()
+                    .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                    .collect();
+                husker_net::IsolationPolicy { resolvers }
+            });
+            if isolation.is_some() {
+                tracing::info!("guest isolation enabled: NAT guests denied LAN + host access");
+            }
+            husker_net::init_nat(
+                &config.bridge_name,
+                &config.bridge_subnet,
+                &uplink.effective,
+                isolation.as_ref(),
             )
-        };
-        run_linux_daemon(
-            core,
-            listen,
-            api_token.clone(),
-            config.metrics_listen,
-            config.metrics_token.clone(),
-            BackgroundLoops {
-                service_reconcile_enabled,
-                service_reconcile_interval,
-                reclaim_grace_secs: config.reclaim_grace_secs,
-            },
-        )
-        .await?;
+            .await
+            .context("initializing nftables")?;
+
+            let runtime_config = DaemonRuntimeConfig::from_config(
+                &config,
+                listen,
+                DaemonRuntimeMode::LinuxNet {
+                    reclaim_grace_secs: config.reclaim_grace_secs,
+                },
+            );
+
+            #[cfg(target_os = "linux")]
+            let core = {
+                let firecracker = husker_vmm::firecracker::FirecrackerBackend::new(
+                    &config.firecracker_bin,
+                    &runtime_dir,
+                    Arc::clone(&cgroup),
+                );
+                let qemu =
+                    husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir, cgroup);
+                let default_kind = match config.vmm {
+                    VmmSelection::Qemu => husker_vmm::VmmKind::Qemu,
+                    VmmSelection::Firecracker => husker_vmm::VmmKind::Firecracker,
+                };
+                let vmm = husker_vmm::LinuxDispatchBackend::new(firecracker, qemu, default_kind);
+                if husker::agent_embedded() {
+                    tracing::info!("cloud-image support enabled (guest agent embedded)");
+                } else {
+                    tracing::info!(
+                        "cloud-image support disabled (no embedded agent; run make build-agent)"
+                    );
+                }
+                Arc::new(
+                    husker_core::HuskerCore::new(
+                        vmm,
+                        state,
+                        ip_allocator,
+                        storage,
+                        config.bridge_name.clone(),
+                        config.dns_servers,
+                        runtime_dir.clone(),
+                    )
+                    .with_embedded_agent(husker::EMBEDDED_AGENT)
+                    .with_storage_volume(config.storage_volume)
+                    .with_resource_limits(config.resource_limits)
+                    .with_host_interface(uplink.effective.clone())
+                    .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
+                    .with_lan_bridge(config.lan_bridge.clone())
+                    .with_default_vmm_kind(default_kind)
+                    .with_default_images(
+                        Some(config.default_kernel.clone()),
+                        Some(config.default_rootfs.clone()),
+                        config.default_initrd.clone(),
+                    )
+                    .with_default_resources(config.default_memory, config.default_cpus)
+                    .with_profiles(
+                        config
+                            .profiles
+                            .iter()
+                            .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
+                            .collect(),
+                    )
+                    .with_idle_policy(config.idle_policy.clone().into()),
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let core = {
+                // linux-net without target_os=linux (not a real deployment target):
+                // no QEMU/vsock available, so Firecracker only.
+                let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
+                    &config.firecracker_bin,
+                    &runtime_dir,
+                    std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
+                );
+                Arc::new(
+                    husker_core::HuskerCore::new(
+                        vmm,
+                        state,
+                        ip_allocator,
+                        storage,
+                        config.bridge_name.clone(),
+                        config.dns_servers,
+                        runtime_dir.clone(),
+                    )
+                    .with_storage_volume(config.storage_volume)
+                    .with_resource_limits(config.resource_limits)
+                    .with_host_interface(uplink.effective.clone())
+                    .with_default_images(
+                        Some(config.default_kernel.clone()),
+                        Some(config.default_rootfs.clone()),
+                        config.default_initrd.clone(),
+                    )
+                    .with_default_resources(config.default_memory, config.default_cpus)
+                    .with_profiles(
+                        config
+                            .profiles
+                            .iter()
+                            .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
+                            .collect(),
+                    )
+                    .with_idle_policy(config.idle_policy.clone().into()),
+                )
+            };
+            run_daemon_runtime(core, runtime_config).await
+        }
+        .await;
 
         // Network cleanup after VM drain. If the process is killed
         // (SIGKILL, panic, OOM), the stale bridge cleanup at startup above
         // handles the next launch.
-        let _ = husker_net::cleanup_nat(&config.bridge_name).await;
-        let _ = husker_net::delete_bridge(&config.bridge_name).await;
-        Ok(())
+        finish_linux_network(
+            runtime_result,
+            async {
+                husker_net::cleanup_nat(&bridge_name)
+                    .await
+                    .context("cleaning up daemon NAT rules")
+            },
+            async {
+                husker_net::delete_bridge(&bridge_name)
+                    .await
+                    .context("deleting daemon bridge")
+            },
+        )
+        .await
     }
 
     #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
     {
+        let runtime_config =
+            DaemonRuntimeConfig::from_config(&config, listen, DaemonRuntimeMode::Basic);
         let vmm = husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
 
         let core = Arc::new(
@@ -677,25 +687,13 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                 ),
         );
 
-        run_initial_service_reconcile(&core).await;
-        spawn_service_reconcile_loop(
-            Arc::clone(&core),
-            service_reconcile_enabled,
-            service_reconcile_interval,
-        );
-        spawn_log_rotation(Arc::clone(&core));
-        spawn_metrics_endpoint(
-            Arc::clone(&core),
-            config.metrics_listen,
-            config.metrics_token.clone(),
-        );
-        husker_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
-        drain_vms_on_shutdown(&core).await;
-        Ok(())
+        run_daemon_runtime(core, runtime_config).await
     }
 
     #[cfg(all(not(feature = "linux-net"), not(target_os = "macos")))]
     {
+        let runtime_config =
+            DaemonRuntimeConfig::from_config(&config, listen, DaemonRuntimeMode::Basic);
         // No networking stack available (no `linux-net` feature, not macOS).
         // The API server can still run; VM operations will fail at create time
         // because no networking is configured. Primarily used by CI drills.
@@ -725,27 +723,13 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                 ),
         );
 
-        run_initial_service_reconcile(&core).await;
-        spawn_service_reconcile_loop(
-            Arc::clone(&core),
-            service_reconcile_enabled,
-            service_reconcile_interval,
-        );
-        spawn_log_rotation(Arc::clone(&core));
-        spawn_metrics_endpoint(
-            Arc::clone(&core),
-            config.metrics_listen,
-            config.metrics_token.clone(),
-        );
-        husker_api::serve_with_auth(Arc::clone(&core), listen, api_token).await?;
-        drain_vms_on_shutdown(&core).await;
-        Ok(())
+        run_daemon_runtime(core, runtime_config).await
     }
 }
 
 /// Run an initial service reconcile for all services, then create the ordinal index.
 /// Always run on daemon startup (independent of the periodic-loop setting).
-pub(crate) async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
+async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
     core: &Arc<husker_core::HuskerCore<B>>,
 ) {
     // Recover any source rootfs left stranded by a fork that crashed mid-load,
@@ -788,75 +772,282 @@ pub(crate) async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 's
     }
 }
 
-/// Spawn the standalone unauthenticated metrics endpoint if `metrics_listen` is
-/// configured. Runs on its own task alongside the main API server; a bind failure
-/// is logged, not fatal (the daemon must still serve its API).
-pub(crate) fn spawn_metrics_endpoint<B: husker_vmm::VmmBackend + 'static>(
-    core: std::sync::Arc<husker_core::HuskerCore<B>>,
-    metrics_listen: Option<std::net::SocketAddr>,
+/// Configuration for the lifecycle that begins after a platform adapter has
+/// assembled its `HuskerCore`.
+#[derive(Debug)]
+struct DaemonRuntimeConfig {
+    listen: SocketAddr,
+    api_token: Option<String>,
+    metrics_listen: Option<SocketAddr>,
     metrics_token: Option<String>,
-) {
-    if let Some(addr) = metrics_listen {
-        tokio::spawn(async move {
-            if let Err(e) = husker_api::serve_metrics(core, addr, metrics_token).await {
-                tracing::error!(%addr, error = %e, "metrics endpoint failed to serve");
-            }
-        });
+    service_reconcile_enabled: bool,
+    service_reconcile_interval: u64,
+    mode: DaemonRuntimeMode,
+}
+
+impl DaemonRuntimeConfig {
+    fn from_config(config: &Config, listen: SocketAddr, mode: DaemonRuntimeMode) -> Self {
+        Self {
+            listen,
+            api_token: config.api_token.clone(),
+            metrics_listen: config.metrics_listen,
+            metrics_token: config.metrics_token.clone(),
+            service_reconcile_enabled: config.service_reconcile_enabled,
+            service_reconcile_interval: config.service_reconcile_interval_secs,
+            mode,
+        }
     }
 }
 
-/// Run the shared post-core daemon logic for the Linux (linux-net) path.
-///
-/// Runs service reconcile, restores port-forward rules, spawns background loops,
-/// serves the API, and drains VMs on shutdown.
-/// Knobs for the daemon's periodic background loops (self-healing reconcile and
-/// crashed-VM reclaim). Bundled to keep `run_linux_daemon`'s arity manageable.
-#[cfg(feature = "linux-net")]
-pub(crate) struct BackgroundLoops {
-    pub service_reconcile_enabled: bool,
-    pub service_reconcile_interval: u64,
-    pub reclaim_grace_secs: u64,
+/// The only valid platform extensions to the shared daemon runtime. Keeping
+/// this as a closed enum makes Linux-only recovery and workers explicit without
+/// admitting impossible combinations of feature booleans.
+#[derive(Debug)]
+enum DaemonRuntimeMode {
+    #[cfg_attr(feature = "linux-net", allow(dead_code))]
+    Basic,
+    #[cfg(feature = "linux-net")]
+    LinuxNet { reclaim_grace_secs: u64 },
 }
 
+/// Own every task started by the daemon runtime. Mutating workers receive a
+/// cooperative stop signal, so an in-flight reconciliation completes before VM
+/// draining begins. Read-only endpoints may be aborted after those workers stop.
+struct RuntimeWorkers {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    cooperative: Vec<tokio::task::JoinHandle<()>>,
+    abortable: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl RuntimeWorkers {
+    const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn new() -> Self {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Self {
+            shutdown,
+            cooperative: Vec::new(),
+            abortable: Vec::new(),
+        }
+    }
+
+    fn shutdown_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    fn supervise(&mut self, worker: Option<tokio::task::JoinHandle<()>>) {
+        if let Some(worker) = worker {
+            self.cooperative.push(worker);
+        }
+    }
+
+    fn supervise_abortable(&mut self, worker: Option<tokio::task::JoinHandle<()>>) {
+        if let Some(worker) = worker {
+            self.abortable.push(worker);
+        }
+    }
+
+    async fn stop_with_grace(&mut self, grace: std::time::Duration) {
+        self.shutdown.send_replace(true);
+        let deadline = tokio::time::Instant::now() + grace;
+        for mut worker in self.cooperative.drain(..) {
+            match tokio::time::timeout_at(deadline, &mut worker).await {
+                Ok(result) => report_worker_exit(result, "background worker"),
+                Err(_) => {
+                    tracing::warn!("background worker did not stop within grace period; aborting");
+                    worker.abort();
+                    report_worker_exit(worker.await, "background worker");
+                }
+            }
+        }
+        for worker in &self.abortable {
+            worker.abort();
+        }
+        for worker in self.abortable.drain(..) {
+            report_worker_exit(worker.await, "background endpoint");
+        }
+    }
+}
+
+impl Drop for RuntimeWorkers {
+    fn drop(&mut self) {
+        // A panic or future early-return must never detach daemon-owned work.
+        for worker in self.cooperative.iter().chain(&self.abortable) {
+            worker.abort();
+        }
+    }
+}
+
+fn report_worker_exit(result: std::result::Result<(), tokio::task::JoinError>, kind: &str) {
+    if let Err(error) = result
+        && !error.is_cancelled()
+    {
+        tracing::error!(%error, "{kind} failed while stopping daemon runtime");
+    }
+}
+
+async fn wait_for_runtime_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+/// Complete the daemon lifecycle in a fixed order and preserve the original
+/// server outcome: stop workers, drain VMs, then return the serving result.
+async fn finish_daemon_runtime<S, D>(workers: RuntimeWorkers, serve: S, drain: D) -> Result<()>
+where
+    S: std::future::Future<Output = Result<()>>,
+    D: std::future::Future<Output = ()>,
+{
+    finish_daemon_runtime_with_grace(workers, serve, drain, RuntimeWorkers::SHUTDOWN_GRACE).await
+}
+
+async fn finish_daemon_runtime_with_grace<S, D>(
+    mut workers: RuntimeWorkers,
+    serve: S,
+    drain: D,
+    worker_grace: std::time::Duration,
+) -> Result<()>
+where
+    S: std::future::Future<Output = Result<()>>,
+    D: std::future::Future<Output = ()>,
+{
+    let serve_result = serve.await;
+    workers.stop_with_grace(worker_grace).await;
+    drain.await;
+    serve_result
+}
+
+/// Attempt both Linux host-network teardown steps and preserve the most useful
+/// failure. A runtime failure is primary because it explains why serving ended;
+/// otherwise the first cleanup failure becomes the returned error.
 #[cfg(feature = "linux-net")]
-pub(crate) async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
-    core: std::sync::Arc<husker_core::HuskerCore<B>>,
-    listen: std::net::SocketAddr,
-    api_token: Option<String>,
-    metrics_listen: Option<std::net::SocketAddr>,
-    metrics_token: Option<String>,
-    loops: BackgroundLoops,
+async fn finish_linux_network<N, B>(
+    runtime_result: Result<()>,
+    cleanup_nat: N,
+    delete_bridge: B,
+) -> Result<()>
+where
+    N: std::future::Future<Output = Result<()>>,
+    B: std::future::Future<Output = Result<()>>,
+{
+    let nat_result = cleanup_nat.await;
+    let bridge_result = delete_bridge.await;
+
+    match runtime_result {
+        Err(runtime_error) => {
+            if let Err(error) = nat_result {
+                tracing::warn!(%error, "secondary NAT cleanup failure");
+            }
+            if let Err(error) = bridge_result {
+                tracing::warn!(%error, "secondary bridge cleanup failure");
+            }
+            Err(runtime_error)
+        }
+        Ok(()) => match (nat_result, bridge_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(secondary)) => {
+                tracing::warn!(error = %secondary, "secondary bridge cleanup failure");
+                Err(error)
+            }
+        },
+    }
+}
+
+/// Run the shared post-core daemon lifecycle. Platform adapters retain backend
+/// construction and host-network setup/teardown; this interface owns startup
+/// reconciliation, workers, serving, cancellation, draining, and outcome order.
+async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
+    core: Arc<husker_core::HuskerCore<B>>,
+    config: DaemonRuntimeConfig,
 ) -> Result<()> {
     run_initial_service_reconcile(&core).await;
-    let reconcile = core.reconcile_port_forwards_from_state().await;
-    if reconcile.restored > 0 {
-        tracing::info!(
-            restored = reconcile.restored,
-            "restored persisted port-forward nftables rules"
-        );
+
+    match &config.mode {
+        DaemonRuntimeMode::Basic => {}
+        #[cfg(feature = "linux-net")]
+        DaemonRuntimeMode::LinuxNet { .. } => {
+            let reconcile = core.reconcile_port_forwards_from_state().await;
+            if reconcile.restored > 0 {
+                tracing::info!(
+                    restored = reconcile.restored,
+                    "restored persisted port-forward nftables rules"
+                );
+            }
+            if reconcile.skipped_suspended > 0 {
+                tracing::info!(
+                    skipped = reconcile.skipped_suspended,
+                    "skipped DNAT restore for suspended VMs; re-installing resume listeners instead"
+                );
+            }
+            core.reinstall_resume_listeners().await;
+        }
     }
-    if reconcile.skipped_suspended > 0 {
-        tracing::info!(
-            skipped = reconcile.skipped_suspended,
-            "skipped DNAT restore for suspended VMs; re-installing resume listeners instead"
-        );
+
+    let mut workers = RuntimeWorkers::new();
+    workers.supervise(spawn_service_reconcile_loop(
+        Arc::clone(&core),
+        config.service_reconcile_enabled,
+        config.service_reconcile_interval,
+        workers.shutdown_signal(),
+    ));
+    workers.supervise(Some(spawn_log_rotation(
+        Arc::clone(&core),
+        workers.shutdown_signal(),
+    )));
+    workers.supervise_abortable(spawn_metrics_endpoint(
+        Arc::clone(&core),
+        config.metrics_listen,
+        config.metrics_token,
+    ));
+
+    #[cfg(feature = "linux-net")]
+    if let DaemonRuntimeMode::LinuxNet { reclaim_grace_secs } = config.mode {
+        workers.supervise(spawn_reclaim_loop(
+            Arc::clone(&core),
+            reclaim_grace_secs,
+            workers.shutdown_signal(),
+        ));
+        workers.supervise(Some(spawn_idle_policy_loop(
+            Arc::clone(&core),
+            core.idle_policy().poll_interval_secs,
+            workers.shutdown_signal(),
+        )));
     }
-    core.reinstall_resume_listeners().await;
-    spawn_service_reconcile_loop(
-        std::sync::Arc::clone(&core),
-        loops.service_reconcile_enabled,
-        loops.service_reconcile_interval,
-    );
-    spawn_reclaim_loop(std::sync::Arc::clone(&core), loops.reclaim_grace_secs);
-    spawn_idle_policy_loop(
-        std::sync::Arc::clone(&core),
-        core.idle_policy().poll_interval_secs,
-    );
-    spawn_log_rotation(std::sync::Arc::clone(&core));
-    spawn_metrics_endpoint(std::sync::Arc::clone(&core), metrics_listen, metrics_token);
-    husker_api::serve_with_auth(std::sync::Arc::clone(&core), listen, api_token).await?;
-    drain_vms_on_shutdown(&core).await;
-    Ok(())
+
+    let serve = async {
+        husker_api::serve_with_auth(Arc::clone(&core), config.listen, config.api_token)
+            .await
+            .context("serving daemon API")
+    };
+    let drain = async {
+        core.quiesce_shutdown_ingress();
+        drain_vms_on_shutdown(&core).await;
+    };
+    finish_daemon_runtime(workers, serve, drain).await
+}
+
+/// Spawn the standalone metrics endpoint if configured. It is read-only and is
+/// aborted after cooperative mutating workers have stopped. A bind failure is
+/// logged, not fatal: the daemon must still serve its primary API.
+fn spawn_metrics_endpoint<B: husker_vmm::VmmBackend + 'static>(
+    core: Arc<husker_core::HuskerCore<B>>,
+    metrics_listen: Option<SocketAddr>,
+    metrics_token: Option<String>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    metrics_listen.map(|addr| {
+        tokio::spawn(async move {
+            if let Err(error) = husker_api::serve_metrics(core, addr, metrics_token).await {
+                tracing::error!(%addr, %error, "metrics endpoint failed to serve");
+            }
+        })
+    })
 }
 
 /// Spawn the periodic self-healing reconcile loop (only when enabled).
@@ -864,119 +1055,139 @@ pub(crate) async fn run_linux_daemon<B: husker_vmm::VmmBackend + 'static>(
 /// resources (TAP/nftables/IP) from VMs abandoned past `grace_secs`, keeping the
 /// stopped record. Disabled when `grace_secs == 0`. Linux only.
 #[cfg(feature = "linux-net")]
-pub(crate) fn spawn_reclaim_loop<B: husker_vmm::VmmBackend + 'static>(
+fn spawn_reclaim_loop<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     grace_secs: u64,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if grace_secs == 0 {
-        return;
+        return None;
     }
     // Sweep at roughly half the grace period, bounded to [30s, 300s], so a leak
     // is reclaimed reasonably soon after the grace expires without busy-looping.
     let interval = std::time::Duration::from_secs((grace_secs / 2).clamp(30, 300));
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // consume the immediate first tick
         loop {
-            ticker.tick().await;
-            let n = core.reclaim_abandoned_vms(grace_secs).await;
-            if n > 0 {
-                tracing::info!(
-                    reclaimed = n,
-                    "reclaim sweep released abandoned VM resources"
-                );
+            tokio::select! {
+                biased;
+                () = wait_for_runtime_shutdown(&mut shutdown) => break,
+                _ = ticker.tick() => {
+                    let n = core.reclaim_abandoned_vms(grace_secs).await;
+                    if n > 0 {
+                        tracing::info!(
+                            reclaimed = n,
+                            "reclaim sweep released abandoned VM resources"
+                        );
+                    }
+                }
             }
         }
-    });
+    }))
 }
 
-pub(crate) fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
+fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     enabled: bool,
     interval_secs: u64,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !enabled {
-        return;
+        return None;
     }
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // consume the immediate first tick
         loop {
-            ticker.tick().await;
-            let services = match core.list_services() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "reconcile loop: list_services failed");
-                    continue;
+            tokio::select! {
+                biased;
+                () = wait_for_runtime_shutdown(&mut shutdown) => break,
+                _ = ticker.tick() => {
+                    let services = match core.list_services() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "reconcile loop: list_services failed");
+                            continue;
+                        }
+                    };
+                    for svc in &services {
+                        let o = core.reconcile_service(svc).await;
+                        if !o.created.is_empty() || !o.destroyed.is_empty() || !o.failed.is_empty() {
+                            tracing::info!(
+                                service = %svc.name,
+                                created = o.created.len(),
+                                destroyed = o.destroyed.len(),
+                                failed = o.failed.len(),
+                                "reconcile loop"
+                            );
+                        }
+                    }
+                    // Attempt to create the unique ordinal index after reconciling all
+                    // services. It is idempotent (CREATE UNIQUE INDEX IF NOT EXISTS) and
+                    // only fails while a duplicate ordinal still exists. Each tick's
+                    // reconcile removes duplicates, so a later tick will succeed.
+                    if let Err(e) = core.create_service_ordinal_index() {
+                        tracing::warn!(error = %e, "reconcile loop: failed to create ordinal index");
+                    }
                 }
-            };
-            for svc in &services {
-                let o = core.reconcile_service(svc).await;
-                if !o.created.is_empty() || !o.destroyed.is_empty() || !o.failed.is_empty() {
-                    tracing::info!(
-                        service = %svc.name,
-                        created = o.created.len(),
-                        destroyed = o.destroyed.len(),
-                        failed = o.failed.len(),
-                        "reconcile loop"
-                    );
-                }
-            }
-            // Attempt to create the unique ordinal index after reconciling all
-            // services. It is idempotent (CREATE UNIQUE INDEX IF NOT EXISTS) and
-            // only fails while a duplicate ordinal still exists. Each tick's
-            // reconcile removes duplicates, so a later tick will succeed.
-            if let Err(e) = core.create_service_ordinal_index() {
-                tracing::warn!(error = %e, "reconcile loop: failed to create ordinal index");
             }
         }
-    });
+    }))
 }
 
 /// Spawn the periodic idle-policy evaluation loop: one `idle_policy_tick` per
 /// poll interval, suspending idle VMs and reaping expired suspends.
 ///
-/// Only called from `run_linux_daemon`: suspend/resume relies on the
+/// Only called from the `LinuxNet` daemon runtime: suspend/resume relies on the
 /// nftables DNAT removal and userspace resume listeners that `linux-net`
-/// provides, so the idle policy loop has no non-Linux counterpart.
+/// provides, so the idle policy loop has no basic-runtime counterpart.
 #[cfg(feature = "linux-net")]
-pub(crate) fn spawn_idle_policy_loop<B: husker_vmm::VmmBackend + 'static>(
+fn spawn_idle_policy_loop<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     poll_interval_secs: u64,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     let interval = std::time::Duration::from_secs(poll_interval_secs.max(1));
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // consume the immediate first tick
         loop {
-            ticker.tick().await;
-            core.idle_policy_tick().await;
+            tokio::select! {
+                biased;
+                () = wait_for_runtime_shutdown(&mut shutdown) => break,
+                _ = ticker.tick() => core.idle_policy_tick().await,
+            }
         }
-    });
+    })
 }
 
 /// Spawn a background task that rotates oversized serial logs every hour.
-pub(crate) fn spawn_log_rotation<B: husker_vmm::VmmBackend + 'static>(
+fn spawn_log_rotation<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         interval.tick().await; // first tick fires immediately, skip it
         loop {
-            interval.tick().await;
-            let count = core.rotate_serial_logs().await;
-            if count > 0 {
-                tracing::info!(count, "rotated serial logs");
+            tokio::select! {
+                biased;
+                () = wait_for_runtime_shutdown(&mut shutdown) => break,
+                _ = interval.tick() => {
+                    let count = core.rotate_serial_logs().await;
+                    if count > 0 {
+                        tracing::info!(count, "rotated serial logs");
+                    }
+                }
             }
         }
-    });
+    })
 }
 
 /// Drain all running/paused VMs with a 30-second timeout.
-pub(crate) async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(
-    core: &husker_core::HuskerCore<B>,
-) {
+async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(core: &husker_core::HuskerCore<B>) {
     tracing::info!("shutting down, draining VMs");
     match tokio::time::timeout(std::time::Duration::from_secs(30), core.drain_vms()).await {
         Ok(count) => {
@@ -987,5 +1198,144 @@ pub(crate) async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(
         Err(_) => {
             tracing::warn!("VM drain timed out after 30s");
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    type Events = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    fn record(events: &Events, event: &'static str) {
+        events.lock().expect("events lock poisoned").push(event);
+    }
+
+    #[tokio::test]
+    async fn runtime_stops_workers_before_drain() {
+        let events = Events::default();
+        let mut workers = RuntimeWorkers::new();
+        let mut shutdown = workers.shutdown_signal();
+        let worker_events = Arc::clone(&events);
+        workers.supervise(Some(tokio::spawn(async move {
+            wait_for_runtime_shutdown(&mut shutdown).await;
+            record(&worker_events, "worker stopping");
+            tokio::task::yield_now().await;
+            record(&worker_events, "worker stopped");
+        })));
+
+        let serve_events = Arc::clone(&events);
+        let serve = async move {
+            record(&serve_events, "server stopped");
+            Ok(())
+        };
+        let drain_events = Arc::clone(&events);
+        let drain = async move { record(&drain_events, "VMs drained") };
+
+        finish_daemon_runtime(workers, serve, drain).await.unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "server stopped",
+                "worker stopping",
+                "worker stopped",
+                "VMs drained"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_drains_and_preserves_server_error() {
+        let events = Events::default();
+        let workers = RuntimeWorkers::new();
+        let drain_events = Arc::clone(&events);
+
+        let error = finish_daemon_runtime(
+            workers,
+            async { anyhow::bail!("primary server failure") },
+            async move { record(&drain_events, "VMs drained") },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "primary server failure");
+        assert_eq!(*events.lock().unwrap(), ["VMs drained"]);
+    }
+
+    struct RecordDrop {
+        events: Events,
+    }
+
+    impl Drop for RecordDrop {
+        fn drop(&mut self) {
+            record(&self.events, "worker aborted");
+        }
+    }
+
+    #[tokio::test]
+    async fn stuck_worker_is_aborted_before_drain() {
+        let events = Events::default();
+        let mut workers = RuntimeWorkers::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let worker_events = Arc::clone(&events);
+        workers.supervise(Some(tokio::spawn(async move {
+            let _drop = RecordDrop {
+                events: worker_events,
+            };
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        })));
+        ready_rx.await.unwrap();
+
+        let drain_events = Arc::clone(&events);
+        finish_daemon_runtime_with_grace(
+            workers,
+            async { Ok(()) },
+            async move { record(&drain_events, "VMs drained") },
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*events.lock().unwrap(), ["worker aborted", "VMs drained"]);
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn linux_cleanup_attempts_both_steps_and_preserves_runtime_error() {
+        let events = Events::default();
+        let nat_events = Arc::clone(&events);
+        let bridge_events = Arc::clone(&events);
+
+        let error = finish_linux_network(
+            Err(anyhow::anyhow!("runtime failed")),
+            async move {
+                record(&nat_events, "NAT cleaned");
+                anyhow::bail!("NAT cleanup failed")
+            },
+            async move {
+                record(&bridge_events, "bridge deleted");
+                anyhow::bail!("bridge cleanup failed")
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "runtime failed");
+        assert_eq!(*events.lock().unwrap(), ["NAT cleaned", "bridge deleted"]);
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn linux_cleanup_error_is_returned_after_successful_runtime() {
+        let error = finish_linux_network(
+            Ok(()),
+            async { anyhow::bail!("NAT cleanup failed") },
+            async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "NAT cleanup failed");
     }
 }

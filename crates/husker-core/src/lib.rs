@@ -2948,6 +2948,26 @@ mod tests {
 
     #[cfg(feature = "linux-net")]
     #[tokio::test]
+    async fn shutdown_quiesce_closes_resume_listener_without_resuming() {
+        let core = test_core().await;
+        let rec = staged_suspended_vm_with_forward(&core, "shutdown", 0).await;
+
+        core.reinstall_resume_listeners().await;
+        assert!(core.has_resume_listener_for_test(rec.id));
+        core.quiesce_shutdown_ingress();
+        assert!(
+            !core.has_resume_listener_for_test(rec.id),
+            "shutdown quiescence must close auto-resume listeners"
+        );
+        assert_eq!(
+            core.get_vm("shutdown").unwrap().state,
+            "suspended",
+            "closing shutdown ingress must not resume a suspended VM"
+        );
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
     async fn suspend_stamps_suspended_at_and_resume_clears_it_and_resets_timers() {
         let core = test_core().await;
         let rec = sample_vm_record("c1");
