@@ -122,6 +122,40 @@ pub struct FirecrackerBackend {
 /// give each fork its own vsock socket so concurrent forks of one snapshot do
 /// not collide on the host UDS. The later of the two requirements wins.
 const FORK_MIN_FIRECRACKER: (u32, u32, u32) = (1, 16, 0);
+const GUEST_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait for a guest-triggered Firecracker exit and force termination when the
+/// guest does not shut down within the bound. A successful `stop_vm` must mean
+/// the process no longer owns its TAP/rootfs/vsock resources; merely accepting
+/// `SendCtrlAltDel` is not sufficient for callers that immediately clean them.
+async fn wait_for_exit_or_kill(
+    process: &mut tokio::process::Child,
+    grace: std::time::Duration,
+) -> Result<bool, VmmError> {
+    if let Ok(Some(_)) = process.try_wait() {
+        return Ok(false);
+    }
+    match tokio::time::timeout(grace, process.wait()).await {
+        Ok(Ok(_)) => Ok(false),
+        Ok(Err(wait_error)) => {
+            process.kill().await.map_err(|kill_error| {
+                VmmError::ProcessError(format!(
+                    "wait for firecracker exit: {wait_error}; force kill also failed: {kill_error}"
+                ))
+            })?;
+            Ok(true)
+        }
+        Err(_) => {
+            process.kill().await.map_err(|error| {
+                VmmError::ProcessError(format!(
+                    "firecracker did not exit within {}s and force kill failed: {error}",
+                    grace.as_secs_f64()
+                ))
+            })?;
+            Ok(true)
+        }
+    }
+}
 
 /// Parse Firecracker's `--version` output into `(major, minor, patch)`. The
 /// first line looks like `Firecracker v1.16.0`; the first whitespace token that
@@ -611,17 +645,31 @@ impl VmmBackend for FirecrackerBackend {
             instance.socket_path.clone()
         };
 
-        Self::fc_put(
+        let graceful_request = Self::fc_put(
             &socket_path,
             "/actions",
             &serde_json::json!({ "action_type": "SendCtrlAltDel" }),
         )
-        .await?;
+        .await;
 
-        // Re-acquire lock to update state
+        // Re-acquire the instance and do not return while Firecracker can still
+        // hold the TAP open. Shutdown cleanup runs immediately after this call.
         let mut instances = self.instances.lock().await;
         if let Some(instance) = instances.get_mut(&id) {
+            let grace = match graceful_request {
+                Ok(()) => GUEST_SHUTDOWN_GRACE,
+                Err(error) => {
+                    tracing::warn!(%id, %error, "guest shutdown request failed; force-stopping firecracker");
+                    std::time::Duration::ZERO
+                }
+            };
+            let forced = wait_for_exit_or_kill(&mut instance.process, grace).await?;
+            if forced {
+                tracing::warn!(%id, "guest did not exit cleanly; force-killed firecracker");
+            }
             instance.info.state = VmState::Stopped;
+            instance.info.pid = None;
+            instance.cgroup.remove();
         }
         Ok(())
     }
@@ -631,8 +679,19 @@ impl VmmBackend for FirecrackerBackend {
         let mut instance = instances.remove(&id).ok_or(VmmError::VmNotFound(id))?;
 
         tracing::debug!(%id, "destroying firecracker VM");
-        if let Err(e) = instance.process.kill().await {
-            tracing::warn!(%id, error = %e, "failed to kill firecracker process during destroy");
+        match instance.process.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(e) = instance.process.kill().await {
+                    tracing::warn!(%id, error = %e, "failed to kill firecracker process during destroy");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%id, error = %e, "failed to inspect firecracker process during destroy; attempting kill");
+                if let Err(kill_error) = instance.process.kill().await {
+                    tracing::warn!(%id, error = %kill_error, "failed to kill firecracker process during destroy");
+                }
+            }
         }
         for path in [
             &instance.socket_path,
@@ -1449,6 +1508,33 @@ mod tests {
         let info = backend.vm_info(id).await.unwrap();
         assert_eq!(info.state, VmState::Stopped);
         assert!(info.pid.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_wait_contract_observes_a_clean_process_exit() {
+        let mut process = tokio::process::Command::new("true").spawn().unwrap();
+
+        let forced = wait_for_exit_or_kill(&mut process, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(!forced);
+        assert!(process.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_wait_contract_kills_a_process_after_the_grace_period() {
+        let mut process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+
+        let forced = wait_for_exit_or_kill(&mut process, std::time::Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        assert!(forced);
+        assert!(process.try_wait().unwrap().is_some());
     }
 
     /// `set_balloon` on an unknown id returns VmNotFound.
