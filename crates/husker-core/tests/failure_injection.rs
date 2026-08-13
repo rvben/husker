@@ -16,6 +16,145 @@ use husker_vmm::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(feature = "linux-net")]
+#[derive(Default)]
+struct TestHostNetwork {
+    taps: Mutex<HashSet<String>>,
+    forwards: Mutex<HashSet<(u16, String)>>,
+    fail_next_attach: std::sync::atomic::AtomicBool,
+    fail_next_forward: std::sync::atomic::AtomicBool,
+    fail_next_remove_forward: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "linux-net")]
+impl TestHostNetwork {
+    fn fail_next_attach(&self) {
+        self.fail_next_attach
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn has_tap(&self, name: &str) -> bool {
+        self.taps.lock().await.contains(name)
+    }
+
+    fn fail_next_forward(&self) {
+        self.fail_next_forward
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail_next_remove_forward(&self) {
+        self.fail_next_remove_forward
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "linux-net")]
+impl husker_net::HostNetwork for TestHostNetwork {
+    fn create_tap<'a>(&'a self, name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            self.taps.lock().await.insert(name.to_string());
+            Ok(())
+        })
+    }
+
+    fn delete_tap<'a>(&'a self, name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            self.taps.lock().await.remove(name);
+            Ok(())
+        })
+    }
+
+    fn attach_to_bridge<'a>(
+        &'a self,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            if self
+                .fail_next_attach
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "ip link set master".into(),
+                    message: "injected attach failure".into(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn add_port_forward<'a>(
+        &'a self,
+        host_port: u16,
+        _guest_ip: std::net::Ipv4Addr,
+        _guest_port: u16,
+        tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            if self
+                .fail_next_forward
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "nft add rule".into(),
+                    message: "injected nft failure".into(),
+                });
+            }
+            self.forwards
+                .lock()
+                .await
+                .insert((host_port, tap_name.to_string()));
+            Ok(())
+        })
+    }
+
+    fn remove_port_forward<'a>(
+        &'a self,
+        host_port: u16,
+        tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            if self
+                .fail_next_remove_forward
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "nft delete rule".into(),
+                    message: "injected nft cleanup failure".into(),
+                });
+            }
+            self.forwards
+                .lock()
+                .await
+                .remove(&(host_port, tap_name.to_string()));
+            Ok(())
+        })
+    }
+
+    fn remove_all_port_forwards<'a>(
+        &'a self,
+        tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            self.forwards
+                .lock()
+                .await
+                .retain(|(_, tap)| tap != tap_name);
+            Ok(())
+        })
+    }
+
+    fn read_all_port_forward_counters<'a>(
+        &'a self,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, HashMap<String, (u64, u64)>> {
+        Box::pin(async { Ok(HashMap::new()) })
+    }
+}
+
 struct FailingVmm {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     fail_ops: HashSet<&'static str>,
@@ -36,6 +175,14 @@ impl FailingVmm {
 
 impl VmmBackend for FailingVmm {
     type VsockStream = tokio::net::UnixStream;
+
+    fn backend_kind(&self) -> &'static str {
+        if cfg!(feature = "linux-net") {
+            "firecracker"
+        } else {
+            "apple_vz"
+        }
+    }
 
     async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
         if self.should_fail("create") {
@@ -220,10 +367,6 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
 /// A fresh core with no pre-inserted VM, whose data dir is a real temp path so
 /// the create path can clone a rootfs before the (failing) vmm step.
 ///
-/// macOS/VZ only: the Linux (`linux-net`) create path performs real `ip tuntap`
-/// TAP creation before reaching the mockable vmm step, which needs root, mutates
-/// host network state, and collides with a live daemon - not unit-testable. The
-/// Linux create-rollback belongs in a gated e2e or behind a mockable net layer.
 #[cfg(not(feature = "linux-net"))]
 fn fresh_core(
     data_dir: &std::path::Path,
@@ -237,6 +380,128 @@ fn fresh_core(
     };
     let runtime_dir = data_dir.join("run");
     Arc::new(HuskerCore::new(vmm, state_store, storage, runtime_dir))
+}
+
+#[cfg(feature = "linux-net")]
+fn fresh_linux_core(
+    data_dir: &std::path::Path,
+    network: Arc<TestHostNetwork>,
+) -> Arc<HuskerCore<FailingVmm>> {
+    let storage = husker_storage::StorageConfig {
+        data_dir: data_dir.to_path_buf(),
+        state_dir: data_dir.to_path_buf(),
+    };
+    Arc::new(
+        HuskerCore::new(
+            FailingVmm::new(&[]),
+            husker_state::StateStore::open_memory().unwrap(),
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            data_dir.join("run"),
+        )
+        .with_host_network(network),
+    )
+}
+
+#[cfg(feature = "linux-net")]
+fn linux_boot_fixture(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let rootfs = data_dir.join("rootfs.ext4");
+    let mut rootfs_bytes = vec![0u8; 1024 * 1024];
+    rootfs_bytes[1080] = 0x53;
+    rootfs_bytes[1081] = 0xef;
+    std::fs::write(&rootfs, rootfs_bytes).unwrap();
+
+    let kernel = data_dir.join("vmlinux");
+    let mut kernel_bytes = vec![0u8; 128];
+    kernel_bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    kernel_bytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, kernel_bytes).unwrap();
+    (kernel, rootfs)
+}
+
+#[cfg(feature = "linux-net")]
+fn linux_create_request(
+    name: &str,
+    kernel: &std::path::Path,
+    rootfs: &std::path::Path,
+) -> husker_core::CreateVmRequest {
+    husker_core::CreateVmRequest {
+        name: name.into(),
+        kernel_path: Some(kernel.to_path_buf()),
+        rootfs_path: Some(rootfs.to_path_buf()),
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn attach_failure_rolls_back_tap_and_ip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+
+    let network = Arc::new(TestHostNetwork::default());
+    network.fail_next_attach();
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+    let request = |name: &str| linux_create_request(name, &kernel, &rootfs);
+
+    let error = core.create_vm(request("attach-fails")).await.unwrap_err();
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert!(!network.has_tap("husker3").await);
+    assert!(core.list_vms().unwrap().is_empty());
+
+    let created = core.create_vm(request("after-rollback")).await.unwrap();
+    assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.2"));
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn nft_failure_does_not_persist_a_port_forward() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+    core.create_vm(linux_create_request("forward-owner", &kernel, &rootfs))
+        .await
+        .unwrap();
+
+    network.fail_next_forward();
+    let error = core
+        .add_port_forward("forward-owner", 18080, 80, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert!(core.list_port_forwards("forward-owner").unwrap().is_empty());
+    assert!(network.forwards.lock().await.is_empty());
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn nft_cleanup_failure_retains_the_port_forward_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+    core.create_vm(linux_create_request("forward-owner", &kernel, &rootfs))
+        .await
+        .unwrap();
+    core.add_port_forward("forward-owner", 18080, 80, None)
+        .await
+        .unwrap();
+
+    network.fail_next_remove_forward();
+    let error = core
+        .remove_port_forward("forward-owner", 18080)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert_eq!(core.list_port_forwards("forward-owner").unwrap().len(), 1);
+    assert_eq!(network.forwards.lock().await.len(), 1);
 }
 
 #[cfg(not(feature = "linux-net"))]

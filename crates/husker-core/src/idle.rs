@@ -92,7 +92,8 @@ impl<B: VmmBackend> HuskerCore<B> {
     async fn snapshot_pf_counters(&self) -> std::collections::HashMap<String, (u64, u64)> {
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            husker_net::read_all_port_forward_counters(&self.bridge_name),
+            self.host_network
+                .read_all_port_forward_counters(&self.bridge_name),
         )
         .await
         {

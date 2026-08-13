@@ -145,8 +145,10 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             for pf in &forwards {
                 if let Some(tap) = record.tap_device.as_deref() {
-                    let _ =
-                        husker_net::remove_port_forward(pf.host_port, tap, &self.bridge_name).await;
+                    let _ = self
+                        .host_network
+                        .remove_port_forward(pf.host_port, tap, &self.bridge_name)
+                        .await;
                 }
             }
         }
@@ -414,14 +416,16 @@ impl<B: VmmBackend> HuskerCore<B> {
                         (record.tap_device.as_deref(), record.guest_ip.as_deref())
                         && let Ok(gip) = gip.parse()
                     {
-                        let _ = husker_net::add_port_forward(
-                            pf.host_port,
-                            gip,
-                            pf.guest_port,
-                            tap,
-                            &self.bridge_name,
-                        )
-                        .await;
+                        let _ = self
+                            .host_network
+                            .add_port_forward(
+                                pf.host_port,
+                                gip,
+                                pf.guest_port,
+                                tap,
+                                &self.bridge_name,
+                            )
+                            .await;
                     }
                 }
                 if let Some(proxy) = self.resume_listeners.lock().remove(&record.id) {

@@ -720,6 +720,8 @@ pub struct HuskerCore<B: VmmBackend> {
     state: husker_state::StateStore,
     #[cfg(feature = "linux-net")]
     ip_allocator: husker_net::IpAllocator,
+    #[cfg(feature = "linux-net")]
+    host_network: Arc<dyn husker_net::HostNetwork>,
     storage: husker_storage::StorageConfig,
     storage_driver: Arc<dyn husker_storage::StorageDriver>,
     /// Whether the data dir is a mounted reflink storage volume (config flag);
@@ -971,6 +973,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vmm,
             state,
             ip_allocator,
+            host_network: Arc::new(husker_net::SystemHostNetwork),
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             storage_volume: false,
@@ -1077,6 +1080,14 @@ impl<B: VmmBackend> HuskerCore<B> {
     #[cfg(feature = "linux-net")]
     pub fn with_host_interface(mut self, host_interface: String) -> Self {
         self.host_interface = host_interface;
+        self
+    }
+
+    /// Override Linux host-network operations. This keeps lifecycle rollback
+    /// testable without root privileges or changes to the developer's host.
+    #[cfg(feature = "linux-net")]
+    pub fn with_host_network(mut self, host_network: Arc<dyn husker_net::HostNetwork>) -> Self {
+        self.host_network = host_network;
         self
     }
 
@@ -2893,10 +2904,9 @@ mod tests {
     /// A suspended VM's forward must not be restored as kernel DNAT (there is
     /// no live guest to route to), and `reinstall_resume_listeners` must bind
     /// a userspace resume listener for it instead so an inbound connection
-    /// still auto-resumes the VM. `test_core` (not `resume_mock_core`) is
-    /// fine here: nothing in this test triggers an actual `nft`/vsock call,
-    /// since the suspended VM is skipped before `husker_net::add_port_forward`
-    /// and `install_resume_listeners` only binds a plain host TCP listener.
+    /// still auto-resumes the VM. `test_core` (not `resume_mock_core`) is fine
+    /// here: the suspended VM is skipped before the host-network boundary and
+    /// `install_resume_listeners` only binds a plain host TCP listener.
     #[cfg(feature = "linux-net")]
     #[tokio::test]
     async fn startup_skips_dnat_for_suspended_and_reinstalls_listeners() {
@@ -3218,12 +3228,11 @@ mod tests {
         (core, tmp)
     }
 
-    /// `fork_vm` calls `husker_net::create_tap`/`attach_to_bridge` directly
-    /// (not through `VmmBackend`), so no mock backend choice can avoid real
-    /// TAP/bridge syscalls; this needs a live Linux host with `CAP_NET_ADMIN`
-    /// and is gated behind `HUSKER_RUN_NET_E2E`, following the precedent set
-    /// by `orchestration_paths::port_forward_applies_for_qemu_backed_vm`. It
-    /// uses a dedicated throwaway bridge/subnet (distinct from that other
+    /// The default host-network implementation used by `fork_vm` performs real
+    /// TAP/bridge syscalls, so this end-to-end test needs a live Linux host with
+    /// `CAP_NET_ADMIN`. It is gated behind `HUSKER_RUN_NET_E2E`, following the
+    /// precedent set by `orchestration_paths::port_forward_applies_for_qemu_backed_vm`.
+    /// It uses a dedicated throwaway bridge/subnet (distinct from that other
     /// test's `hpfq0`/`192.0.2.0/24` and from the shared default
     /// `husker0`/`172.20.0.0/24`) and tears it down at the end.
     #[cfg(feature = "linux-net")]

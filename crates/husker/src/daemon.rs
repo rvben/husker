@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "linux-net")]
+use husker_net::DaemonNetwork as _;
 
 use crate::config::Config;
 #[cfg(all(feature = "linux-net", target_os = "linux"))]
@@ -279,6 +281,7 @@ async fn reconcile_host_resources(
     state: &husker_state::StateStore,
     storage: &husker_storage::StorageConfig,
     runtime_dir: &Path,
+    #[cfg(feature = "linux-net")] host_network: &dyn husker_net::HostNetwork,
 ) {
     let vms = match state.list_vms() {
         Ok(v) => v,
@@ -300,7 +303,7 @@ async fn reconcile_host_resources(
         }
         #[cfg(feature = "linux-net")]
         if let Some(tap) = vm.tap_device.as_deref()
-            && husker_net::delete_tap(tap).await.is_ok()
+            && host_network.delete_tap(tap).await.is_ok()
         {
             taps += 1;
         }
@@ -416,10 +419,20 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         tracing::info!(stale_count, "marked stale VMs as stopped");
     }
 
+    #[cfg(feature = "linux-net")]
+    let host_network = Arc::new(husker_net::SystemHostNetwork);
+
     // Reclaim host resources (TAP devices, sockets, orphaned rootfs clones) that a
     // prior daemon incarnation may have leaked on an unclean exit. Runs after the
     // stale-state pass, so nothing this daemon manages is running.
-    reconcile_host_resources(&state, &storage, &runtime_dir).await;
+    reconcile_host_resources(
+        &state,
+        &storage,
+        &runtime_dir,
+        #[cfg(feature = "linux-net")]
+        host_network.as_ref(),
+    )
+    .await;
 
     // macOS userspace port-forward proxies do not survive a daemon restart, so
     // every persisted forward is stale. Clear them so `list` reflects reality.
@@ -473,7 +486,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         }
 
         // Clean up any stale bridge from a previous run
-        let _ = husker_net::delete_bridge(&config.bridge_name).await;
+        let _ = host_network.delete_bridge(&config.bridge_name).await;
 
         // With our own bridge removed, any host route still overlapping the
         // configured subnet is a foreign conflict: reject it now with guidance
@@ -487,48 +500,43 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         .await
         .context("checking bridge subnet for conflicts")?;
 
-        let bridge_name = config.bridge_name.clone();
-        husker_net::create_bridge(&bridge_name, ip_allocator.gateway(), prefix_len)
-            .await
-            .context("creating bridge")?;
+        // Resolve the NAT uplink ("auto" follows the IPv4 default route) and
+        // surface anything that would silently leave guests without WAN.
+        let uplink = husker_net::resolve_host_interface(&config.host_interface);
+        for warning in &uplink.warnings {
+            tracing::warn!("{warning}");
+        }
+        tracing::info!(
+            iface = %uplink.effective,
+            source = ?uplink.source,
+            "guest NAT uplink"
+        );
 
-        // From this point on, every return path flows through host-network
+        // Build the isolation policy from config. Resolvers that parse as IPv4
+        // become DNS carve-outs so guests keep name resolution under the deny.
+        let isolation = config.guest_isolation.then(|| {
+            let resolvers = config
+                .dns_servers
+                .iter()
+                .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                .collect();
+            husker_net::IsolationPolicy { resolvers }
+        });
+        if isolation.is_some() {
+            tracing::info!("guest isolation enabled: NAT guests denied LAN + host access");
+        }
+        let linux_network = LinuxHostNetworkConfig {
+            bridge_name: config.bridge_name.clone(),
+            gateway_ip: ip_allocator.gateway(),
+            prefix_len,
+            bridge_subnet: config.bridge_subnet.clone(),
+            host_interface: uplink.effective.clone(),
+            isolation,
+        };
+
+        // Once bridge setup begins, every return path flows through host-network
         // teardown. This includes nftables initialization and runtime failures.
-        let runtime_result: Result<()> = async {
-            // Resolve the NAT uplink ("auto" follows the IPv4 default route) and
-            // surface anything that would silently leave guests without WAN.
-            let uplink = husker_net::resolve_host_interface(&config.host_interface);
-            for warning in &uplink.warnings {
-                tracing::warn!("{warning}");
-            }
-            tracing::info!(
-                iface = %uplink.effective,
-                source = ?uplink.source,
-                "guest NAT uplink"
-            );
-
-            // Build the isolation policy from config. Resolvers that parse as IPv4
-            // become DNS carve-outs so guests keep name resolution under the deny.
-            let isolation = config.guest_isolation.then(|| {
-                let resolvers = config
-                    .dns_servers
-                    .iter()
-                    .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
-                    .collect();
-                husker_net::IsolationPolicy { resolvers }
-            });
-            if isolation.is_some() {
-                tracing::info!("guest isolation enabled: NAT guests denied LAN + host access");
-            }
-            husker_net::init_nat(
-                &config.bridge_name,
-                &config.bridge_subnet,
-                &uplink.effective,
-                isolation.as_ref(),
-            )
-            .await
-            .context("initializing nftables")?;
-
+        run_linux_network(host_network.as_ref(), &linux_network, async {
             let runtime_config = DaemonRuntimeConfig::from_config(
                 &config,
                 listen,
@@ -568,6 +576,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                         config.dns_servers,
                         runtime_dir.clone(),
                     )
+                    .with_host_network(host_network.clone())
                     .with_embedded_agent(husker::EMBEDDED_AGENT)
                     .with_storage_volume(config.storage_volume)
                     .with_resource_limits(config.resource_limits)
@@ -609,6 +618,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                         config.dns_servers,
                         runtime_dir.clone(),
                     )
+                    .with_host_network(host_network.clone())
                     .with_storage_volume(config.storage_volume)
                     .with_resource_limits(config.resource_limits)
                     .with_host_interface(uplink.effective.clone())
@@ -629,25 +639,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                 )
             };
             run_daemon_runtime(core, runtime_config).await
-        }
-        .await;
-
-        // Network cleanup after VM drain. If the process is killed
-        // (SIGKILL, panic, OOM), the stale bridge cleanup at startup above
-        // handles the next launch.
-        finish_linux_network(
-            runtime_result,
-            async {
-                husker_net::cleanup_nat(&bridge_name)
-                    .await
-                    .context("cleaning up daemon NAT rules")
-            },
-            async {
-                husker_net::delete_bridge(&bridge_name)
-                    .await
-                    .context("deleting daemon bridge")
-            },
-        )
+        })
         .await
     }
 
@@ -919,9 +911,65 @@ where
     serve_result
 }
 
-/// Attempt both Linux host-network teardown steps and preserve the most useful
-/// failure. A runtime failure is primary because it explains why serving ended;
-/// otherwise the first cleanup failure becomes the returned error.
+#[cfg(feature = "linux-net")]
+struct LinuxHostNetworkConfig {
+    bridge_name: String,
+    gateway_ip: std::net::Ipv4Addr,
+    prefix_len: u8,
+    bridge_subnet: String,
+    host_interface: String,
+    isolation: Option<husker_net::IsolationPolicy>,
+}
+
+/// Own bridge and NAT setup around the daemon runtime so every post-create
+/// return path tears both resources down.
+#[cfg(feature = "linux-net")]
+async fn run_linux_network<N, R>(
+    network: &N,
+    config: &LinuxHostNetworkConfig,
+    runtime: R,
+) -> Result<()>
+where
+    N: husker_net::DaemonNetwork + ?Sized,
+    R: std::future::Future<Output = Result<()>>,
+{
+    network
+        .create_bridge(&config.bridge_name, config.gateway_ip, config.prefix_len)
+        .await
+        .context("creating bridge")?;
+
+    let runtime_result = async {
+        network
+            .init_nat(
+                &config.bridge_name,
+                &config.bridge_subnet,
+                &config.host_interface,
+                config.isolation.as_ref(),
+            )
+            .await
+            .context("initializing nftables")?;
+        runtime.await
+    }
+    .await;
+
+    finish_linux_network(
+        runtime_result,
+        async {
+            network
+                .cleanup_nat(&config.bridge_name)
+                .await
+                .context("cleaning up daemon NAT rules")
+        },
+        async {
+            network
+                .delete_bridge(&config.bridge_name)
+                .await
+                .context("deleting daemon bridge")
+        },
+    )
+    .await
+}
+
 #[cfg(feature = "linux-net")]
 async fn finish_linux_network<N, B>(
     runtime_result: Result<()>,
@@ -1221,6 +1269,60 @@ async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(core: &husker_core::Hu
 mod runtime_tests {
     use super::*;
 
+    #[cfg(feature = "linux-net")]
+    #[derive(Default)]
+    struct FailingNatNetwork {
+        bridge_present: std::sync::atomic::AtomicBool,
+        nat_cleanup_attempted: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "linux-net")]
+    impl husker_net::DaemonNetwork for FailingNatNetwork {
+        fn create_bridge<'a>(
+            &'a self,
+            _name: &'a str,
+            _gateway_ip: std::net::Ipv4Addr,
+            _prefix_len: u8,
+        ) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async move {
+                self.bridge_present
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn delete_bridge<'a>(&'a self, _name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async move {
+                self.bridge_present
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn init_nat<'a>(
+            &'a self,
+            _bridge_name: &'a str,
+            _bridge_subnet: &'a str,
+            _host_interface: &'a str,
+            _isolation: Option<&'a husker_net::IsolationPolicy>,
+        ) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async {
+                Err(husker_net::NetError::CommandFailed {
+                    cmd: "nft add table".into(),
+                    message: "injected NAT setup failure".into(),
+                })
+            })
+        }
+
+        fn cleanup_nat<'a>(&'a self, _bridge_name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+            Box::pin(async move {
+                self.nat_cleanup_attempted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
     type Events = Arc<std::sync::Mutex<Vec<&'static str>>>;
 
     fn record(events: &Events, event: &'static str) {
@@ -1353,5 +1455,34 @@ mod runtime_tests {
         .unwrap_err();
 
         assert_eq!(error.to_string(), "NAT cleanup failed");
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn nat_setup_failure_releases_the_created_bridge() {
+        let network = FailingNatNetwork::default();
+        let config = LinuxHostNetworkConfig {
+            bridge_name: "husker-test".into(),
+            gateway_ip: std::net::Ipv4Addr::new(172, 20, 0, 1),
+            prefix_len: 24,
+            bridge_subnet: "172.20.0.0/24".into(),
+            host_interface: "eth0".into(),
+            isolation: None,
+        };
+        let error = run_linux_network(&network, &config, async { Ok(()) })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("initializing nftables"));
+        assert!(
+            !network
+                .bridge_present
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            network
+                .nat_cleanup_attempted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }

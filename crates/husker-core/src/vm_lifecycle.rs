@@ -243,7 +243,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // vsock is unaffected, so exec, file transfer and the agent still work.
         let has_host_networking = network_mode != "none";
         if has_host_networking {
-            husker_net::create_tap(&tap_name).await?;
+            self.host_network.create_tap(&tap_name).await?;
             resources.tap_name = Some(tap_name.clone());
 
             // Attach the TAP to the appropriate bridge: the LAN bridge for bridged mode,
@@ -255,7 +255,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 &self.bridge_name
             };
-            husker_net::attach_to_bridge(&tap_name, attach_bridge).await?;
+            self.host_network
+                .attach_to_bridge(&tap_name, attach_bridge)
+                .await?;
         }
 
         let vm_dir = self.storage.vm_dir(&req.name);
@@ -932,10 +934,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         #[cfg(feature = "linux-net")]
         if let Some(ref tap) = resources.tap_name {
             debug!(tap, "rolling back: removing TAP");
-            if let Err(e) = husker_net::remove_all_port_forwards(tap, &self.bridge_name).await {
+            if let Err(e) = self
+                .host_network
+                .remove_all_port_forwards(tap, &self.bridge_name)
+                .await
+            {
                 warn!(tap, error = %e, "rollback: failed to remove port forwards");
             }
-            if let Err(e) = husker_net::delete_tap(tap).await {
+            if let Err(e) = self.host_network.delete_tap(tap).await {
                 warn!(tap, error = %e, "rollback: failed to delete TAP device");
             }
         }
@@ -1094,10 +1100,14 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .unwrap_or_default();
 
             if let Some(ref tap) = record.tap_device {
-                if let Err(e) = husker_net::remove_all_port_forwards(tap, &self.bridge_name).await {
+                if let Err(e) = self
+                    .host_network
+                    .remove_all_port_forwards(tap, &self.bridge_name)
+                    .await
+                {
                     warn!(%name, tap, error = %e, "failed to remove port forwards during destroy");
                 }
-                if let Err(e) = husker_net::delete_tap(tap).await {
+                if let Err(e) = self.host_network.delete_tap(tap).await {
                     warn!(%name, tap, error = %e, "failed to delete TAP device during destroy");
                 }
                 let mut nc = self.network_counters.lock();

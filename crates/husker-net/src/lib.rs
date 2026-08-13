@@ -1,7 +1,9 @@
 //! Linux networking helpers for bridge/TAP lifecycle, NAT, and port forwarding.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
@@ -28,6 +30,174 @@ pub enum NetError {
         conflict: String,
         dev: String,
     },
+}
+
+/// Boxed network operation used by the object-safe host-network boundary.
+pub type NetworkFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, NetError>> + Send + 'a>>;
+
+/// Per-VM Linux host-network operations used by the lifecycle orchestrator.
+///
+/// Keeping command execution behind this boundary lets core exercise failure
+/// and rollback behavior without root privileges or changes to the host.
+pub trait HostNetwork: Send + Sync {
+    fn create_tap<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()>;
+
+    fn delete_tap<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()>;
+
+    fn attach_to_bridge<'a>(
+        &'a self,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()>;
+
+    fn add_port_forward<'a>(
+        &'a self,
+        host_port: u16,
+        guest_ip: Ipv4Addr,
+        guest_port: u16,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()>;
+
+    fn remove_port_forward<'a>(
+        &'a self,
+        host_port: u16,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()>;
+
+    fn remove_all_port_forwards<'a>(
+        &'a self,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()>;
+
+    fn read_all_port_forward_counters<'a>(
+        &'a self,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, HashMap<String, (u64, u64)>>;
+}
+
+/// Daemon-wide Linux bridge and NAT lifecycle operations.
+///
+/// This stays separate from [`HostNetwork`] so core depends only on per-VM
+/// capabilities while the platform adapter owns bridge/NAT setup and teardown.
+pub trait DaemonNetwork: Send + Sync {
+    fn create_bridge<'a>(
+        &'a self,
+        name: &'a str,
+        gateway_ip: Ipv4Addr,
+        prefix_len: u8,
+    ) -> NetworkFuture<'a, ()>;
+
+    fn delete_bridge<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()>;
+
+    fn init_nat<'a>(
+        &'a self,
+        bridge_name: &'a str,
+        bridge_subnet: &'a str,
+        host_interface: &'a str,
+        isolation: Option<&'a IsolationPolicy>,
+    ) -> NetworkFuture<'a, ()>;
+
+    fn cleanup_nat<'a>(&'a self, bridge_name: &'a str) -> NetworkFuture<'a, ()>;
+}
+
+/// Production host-network implementation backed by `ip` and `nft` commands.
+#[derive(Debug, Default)]
+pub struct SystemHostNetwork;
+
+impl HostNetwork for SystemHostNetwork {
+    fn create_tap<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()> {
+        Box::pin(create_tap(name))
+    }
+
+    fn delete_tap<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()> {
+        Box::pin(delete_tap(name))
+    }
+
+    fn attach_to_bridge<'a>(
+        &'a self,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(attach_to_bridge(tap_name, bridge_name))
+    }
+
+    fn add_port_forward<'a>(
+        &'a self,
+        host_port: u16,
+        guest_ip: Ipv4Addr,
+        guest_port: u16,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(add_port_forward(
+            host_port,
+            guest_ip,
+            guest_port,
+            tap_name,
+            bridge_name,
+        ))
+    }
+
+    fn remove_port_forward<'a>(
+        &'a self,
+        host_port: u16,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(remove_port_forward(host_port, tap_name, bridge_name))
+    }
+
+    fn remove_all_port_forwards<'a>(
+        &'a self,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(remove_all_port_forwards(tap_name, bridge_name))
+    }
+
+    fn read_all_port_forward_counters<'a>(
+        &'a self,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, HashMap<String, (u64, u64)>> {
+        Box::pin(read_all_port_forward_counters(bridge_name))
+    }
+}
+
+impl DaemonNetwork for SystemHostNetwork {
+    fn create_bridge<'a>(
+        &'a self,
+        name: &'a str,
+        gateway_ip: Ipv4Addr,
+        prefix_len: u8,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(create_bridge(name, gateway_ip, prefix_len))
+    }
+
+    fn delete_bridge<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()> {
+        Box::pin(delete_bridge(name))
+    }
+
+    fn init_nat<'a>(
+        &'a self,
+        bridge_name: &'a str,
+        bridge_subnet: &'a str,
+        host_interface: &'a str,
+        isolation: Option<&'a IsolationPolicy>,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(init_nat(
+            bridge_name,
+            bridge_subnet,
+            host_interface,
+            isolation,
+        ))
+    }
+
+    fn cleanup_nat<'a>(&'a self, bridge_name: &'a str) -> NetworkFuture<'a, ()> {
+        Box::pin(cleanup_nat(bridge_name))
+    }
 }
 
 /// Linux interface name length limit (IFNAMSIZ - 1 for null terminator).

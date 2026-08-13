@@ -119,10 +119,14 @@ impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
                 .list_port_forwards_for_vm(current.id)
                 .unwrap_or_default();
             if let Some(ref tap) = current.tap_device {
-                if let Err(e) = husker_net::remove_all_port_forwards(tap, &self.bridge_name).await {
+                if let Err(e) = self
+                    .host_network
+                    .remove_all_port_forwards(tap, &self.bridge_name)
+                    .await
+                {
                     warn!(name = %current.name, tap, error = %e, "reclaim: remove port forwards failed");
                 }
-                if let Err(e) = husker_net::delete_tap(tap).await {
+                if let Err(e) = self.host_network.delete_tap(tap).await {
                     warn!(name = %current.name, tap, error = %e, "reclaim: delete TAP failed");
                 }
                 let mut nc = self.network_counters.lock();

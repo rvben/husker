@@ -167,7 +167,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             return Ok(found.clone());
         }
 
-        husker_net::add_port_forward(host_port, guest_ip, guest_port, tap_name, &self.bridge_name)
+        self.host_network
+            .add_port_forward(host_port, guest_ip, guest_port, tap_name, &self.bridge_name)
             .await?;
 
         let pf_record = husker_state::PortForwardRecord {
@@ -189,8 +190,10 @@ impl<B: VmmBackend> HuskerCore<B> {
                 other => CoreError::State(other),
             })
         {
-            if let Err(rollback_err) =
-                husker_net::remove_port_forward(host_port, tap_name, &self.bridge_name).await
+            if let Err(rollback_err) = self
+                .host_network
+                .remove_port_forward(host_port, tap_name, &self.bridge_name)
+                .await
             {
                 warn!(
                     %name,
@@ -216,7 +219,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             .as_deref()
             .ok_or_else(|| CoreError::VmNotFound(format!("{name}: no TAP device")))?;
 
-        husker_net::remove_port_forward(host_port, tap_name, &self.bridge_name).await?;
+        self.host_network
+            .remove_port_forward(host_port, tap_name, &self.bridge_name)
+            .await?;
         self.state.delete_port_forward(host_port)?;
         self.network_counters
             .lock()
@@ -382,7 +387,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 &self.bridge_name
             };
 
-            if let Err(error) = husker_net::attach_to_bridge(tap, bridge).await {
+            if let Err(error) = self.host_network.attach_to_bridge(tap, bridge).await {
                 warn!(
                     name = %vm.name,
                     tap,
@@ -445,14 +450,16 @@ impl<B: VmmBackend> HuskerCore<B> {
             };
 
             for pf in forwards {
-                match husker_net::add_port_forward(
-                    pf.host_port,
-                    guest_ip,
-                    pf.guest_port,
-                    tap_name,
-                    &self.bridge_name,
-                )
-                .await
+                match self
+                    .host_network
+                    .add_port_forward(
+                        pf.host_port,
+                        guest_ip,
+                        pf.guest_port,
+                        tap_name,
+                        &self.bridge_name,
+                    )
+                    .await
                 {
                     Ok(()) => {
                         restored += 1;

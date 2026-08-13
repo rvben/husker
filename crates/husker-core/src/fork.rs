@@ -121,7 +121,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // to the bridge yet: the fork resumes with the source's IP and MAC, so
         // bridging it before the guest is re-homed would put a duplicate identity on
         // the shared L2. It joins the bridge only after ReconfigureNetwork below.
-        husker_net::create_tap(&tap_name).await?;
+        self.host_network.create_tap(&tap_name).await?;
         resources.tap_name = Some(tap_name.clone());
 
         // Clone the source's live rootfs into the fork's dir (reflink CoW).
@@ -179,7 +179,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await?;
 
         // Now that the guest carries its own MAC and IP, join it to the bridge.
-        husker_net::attach_to_bridge(&tap_name, &self.bridge_name).await?;
+        self.host_network
+            .attach_to_bridge(&tap_name, &self.bridge_name)
+            .await?;
 
         // Persist the fork as a running VM.
         let now = chrono::Utc::now();
