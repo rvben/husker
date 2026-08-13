@@ -341,6 +341,63 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(self.state.list_port_forwards_for_vm(record.id)?)
     }
 
+    /// Reattach the preserved TAPs of suspended VMs after the daemon recreates
+    /// its managed bridge during startup.
+    ///
+    /// Suspending a Firecracker VM intentionally keeps its TAP so the snapshot
+    /// can resume with the same network identity. Deleting the managed bridge
+    /// during daemon shutdown detaches that TAP, however, and creating a bridge
+    /// with the same name does not restore the master relationship. This must
+    /// run after bridge creation and before resume listeners or the API become
+    /// reachable; otherwise a connect can resume a guest whose network is still
+    /// physically disconnected.
+    #[cfg(feature = "linux-net")]
+    pub async fn reattach_suspended_vm_networks(&self) -> Result<usize, CoreError> {
+        let vms = self.state.list_vms()?;
+        let mut reattached = 0usize;
+
+        for vm in vms {
+            if vm.state != "suspended" {
+                continue;
+            }
+
+            let tap = vm
+                .tap_device
+                .as_deref()
+                .ok_or_else(|| CoreError::InvalidState {
+                    name: vm.name.clone(),
+                    actual: "suspended without a preserved TAP device".into(),
+                    expected: "suspended with a preserved TAP device".into(),
+                })?;
+            let bridge = if vm.network == "bridged" {
+                self.lan_bridge
+                    .as_deref()
+                    .ok_or_else(|| CoreError::InvalidState {
+                        name: vm.name.clone(),
+                        actual: "suspended with bridged networking but no LAN bridge configured"
+                            .into(),
+                        expected: "a configured LAN bridge".into(),
+                    })?
+            } else {
+                &self.bridge_name
+            };
+
+            if let Err(error) = husker_net::attach_to_bridge(tap, bridge).await {
+                warn!(
+                    name = %vm.name,
+                    tap,
+                    bridge,
+                    error = %error,
+                    "failed to reattach suspended VM network during startup"
+                );
+                return Err(error.into());
+            }
+            reattached += 1;
+        }
+
+        Ok(reattached)
+    }
+
     /// Rebuild nftables port-forward rules from persisted state on startup.
     ///
     /// This closes drift after daemon restarts because `init_nat` recreates the

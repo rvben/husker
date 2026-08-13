@@ -973,6 +973,16 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
         DaemonRuntimeMode::Basic => {}
         #[cfg(feature = "linux-net")]
         DaemonRuntimeMode::LinuxNet { .. } => {
+            let reattached = core
+                .reattach_suspended_vm_networks()
+                .await
+                .context("reattaching suspended VM networks")?;
+            if reattached > 0 {
+                tracing::info!(
+                    reattached,
+                    "reattached suspended VM networks to host bridges"
+                );
+            }
             let reconcile = core.reconcile_port_forwards_from_state().await;
             if reconcile.restored > 0 {
                 tracing::info!(
