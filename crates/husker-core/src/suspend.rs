@@ -268,12 +268,13 @@ impl<B: VmmBackend> HuskerCore<B> {
                 && tokio::fs::try_exists(&paths.memory).await.unwrap_or(false)
                 && tokio::fs::try_exists(&paths.vmstate).await.unwrap_or(false);
             let recovered_to = if slot_complete {
+                self.state.update_vm_runtime(vm.id, "suspended", None)?;
                 "suspended"
             } else {
                 let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(vm.id)).await;
+                self.state.mark_vm_stopped(vm.id)?;
                 "stopped"
             };
-            self.state.update_vm_state(vm.id, recovered_to)?;
             warn!(vm = %vm.name, recovered_to, "reconciled interrupted suspend");
             reconciled += 1;
         }

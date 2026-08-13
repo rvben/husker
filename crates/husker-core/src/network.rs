@@ -106,7 +106,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             return vm.clone();
         }
         info!(name = %vm.name, "VM process is gone; marking stopped");
-        if let Err(e) = self.state.update_vm_state(vm.id, "stopped") {
+        if let Err(e) = self.state.mark_vm_stopped(vm.id) {
             warn!(name = %vm.name, error = %e, "failed to persist stopped state");
         }
         let mut updated = vm.clone();

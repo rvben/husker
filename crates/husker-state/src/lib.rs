@@ -748,6 +748,26 @@ impl StateStore {
         Ok(())
     }
 
+    /// Retire a VM's live runtime identity when it reaches the stopped state.
+    ///
+    /// State, PID, and suspend ownership are one lifecycle invariant: a stopped
+    /// VM has no VMM process and no resumable suspend slot. Keeping this update
+    /// atomic prevents callers from persisting a terminal state that still
+    /// points at an obsolete process or remains fenced as suspended.
+    pub fn mark_vm_stopped(&self, id: Uuid) -> Result<(), StateError> {
+        let conn = self.lock()?;
+        let updated = conn.execute(
+            "UPDATE vms
+             SET state = 'stopped', pid = NULL, suspended_at = NULL, updated_at = ?1
+             WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        if updated == 0 {
+            return Err(StateError::VmNotFound(id));
+        }
+        Ok(())
+    }
+
     /// Clear a VM's host network fields (`tap_device`, `host_ip`, `guest_ip`)
     /// after its leaked resources have been reclaimed, keeping the (stopped)
     /// record. The record no longer references a freed TAP/IP, so a later
@@ -1591,9 +1611,18 @@ impl StateStore {
         let conn = self.lock()?;
         let now = Utc::now().to_rfc3339();
         let count = conn.execute(
-            "UPDATE vms SET state = 'stopped', updated_at = ?1
+            "UPDATE vms
+             SET state = 'stopped', pid = NULL, suspended_at = NULL, updated_at = ?1
              WHERE state IN ('running', 'creating', 'paused')",
             params![now],
+        )?;
+        // Terminal and suspended rows are not counted as stale transitions, but
+        // none has a live VMM process after daemon restart. Clear legacy or
+        // partially-persisted identities while preserving suspended_at for the
+        // resumable suspended lifecycle.
+        conn.execute(
+            "UPDATE vms SET pid = NULL WHERE state IN ('stopped', 'failed', 'suspended')",
+            [],
         )?;
         conn.execute(
             "UPDATE vms SET userdata_status = 'pending', updated_at = ?1
@@ -2218,6 +2247,23 @@ mod tests {
     }
 
     #[test]
+    fn mark_vm_stopped_retires_runtime_and_suspend_identity() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("retired-runtime");
+        rec.state = "suspended".into();
+        rec.pid = Some(4242);
+        rec.suspended_at = Some(Utc::now());
+        store.insert_vm(&rec).unwrap();
+
+        store.mark_vm_stopped(rec.id).unwrap();
+
+        let stopped = store.get_vm(rec.id).unwrap();
+        assert_eq!(stopped.state, "stopped");
+        assert_eq!(stopped.pid, None);
+        assert_eq!(stopped.suspended_at, None);
+    }
+
+    #[test]
     fn update_vm_guest_ip_persists() {
         let store = StateStore::open_memory().unwrap();
         let rec = make_record("ip-test");
@@ -2697,6 +2743,35 @@ mod tests {
 
         let count = store.mark_stale_vms_stopped().unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn stale_reconcile_retires_non_live_runtime_identities() {
+        let store = StateStore::open_memory().unwrap();
+
+        for state in [
+            "running",
+            "creating",
+            "paused",
+            "stopped",
+            "failed",
+            "suspended",
+        ] {
+            let mut vm = make_record(&format!("vm-{state}"));
+            vm.state = state.into();
+            vm.pid = Some(4242);
+            store.insert_vm(&vm).unwrap();
+        }
+
+        store.mark_stale_vms_stopped().unwrap();
+
+        for vm in store.list_vms().unwrap() {
+            assert_eq!(
+                vm.pid, None,
+                "non-live VM '{}' in state '{}' retained a stale PID",
+                vm.name, vm.state
+            );
+        }
     }
 
     #[test]

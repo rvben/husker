@@ -958,10 +958,9 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Idempotent: stopping an already stopped VM is a no-op.
     pub async fn stop_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "stopping VM");
-        // Hold the per-VM name lock for the whole stop so a concurrent
-        // add/remove of a userspace port forward cannot interleave with the
-        // teardown below (macOS).
-        #[cfg(not(feature = "linux-net"))]
+        // Stop competes with suspend/resume/destroy and port-forward mutation
+        // on every platform, so resolve the generation only after holding the
+        // same per-name mutation lock used by those operations.
         let _stop_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         match record.state.as_str() {
@@ -973,7 +972,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             "suspended" => {
                 // The process is already gone; discard the slot and mark stopped.
                 let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(record.id)).await;
-                self.state.update_vm_state(record.id, "stopped")?;
+                self.state.mark_vm_stopped(record.id)?;
                 return Ok(());
             }
             _ => {
@@ -985,7 +984,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
         self.vmm.stop_vm(record.id).await?;
-        self.state.update_vm_state(record.id, "stopped")?;
+        self.state.mark_vm_stopped(record.id)?;
         // macOS userspace forwards are bound to the running instance: tear them
         // down on stop. The name lock acquired above is still held.
         #[cfg(not(feature = "linux-net"))]
@@ -1001,6 +1000,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Idempotent: pausing an already paused VM is a no-op.
     pub async fn pause_vm(&self, name: &str) -> Result<(), CoreError> {
         info!(%name, "pausing VM");
+        let _pause_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         match record.state.as_str() {
             "running" => {}
@@ -1038,8 +1038,35 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// `create_vm_record` when replacing a stopped VM atomically within the
     /// same critical section, and by the idle-policy reap path (see
     /// `idle_policy_tick`), which holds the lock across its own re-check.
+    ///
+    /// The supplied record identifies one generation of a reusable VM name.
+    /// If that generation was retired while the caller waited for the name
+    /// lock, its destroy is already complete and must not touch the replacement.
     pub(crate) async fn destroy_vm_locked(&self, record: &VmRecord) -> Result<(), CoreError> {
         let name = record.name.as_str();
+
+        match self.state.get_vm_by_name(name) {
+            Ok(current) if current.id == record.id => {}
+            Ok(current) => {
+                info!(
+                    %name,
+                    requested_id = %record.id,
+                    current_id = %current.id,
+                    "VM generation was replaced while destroy waited; leaving replacement intact"
+                );
+                return Ok(());
+            }
+            Err(husker_state::StateError::VmNotFoundByName(_)) => {
+                debug!(
+                    %name,
+                    requested_id = %record.id,
+                    "VM generation was already retired; destroy is a no-op"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+
         info!(%name, "destroying VM");
 
         match self.vmm.destroy_vm(record.id).await {

@@ -229,6 +229,16 @@ async fn stop_running_vm() {
 }
 
 #[tokio::test]
+async fn stop_running_vm_retires_its_vmm_identity() {
+    let (core, _) = mock_core_with_vm("test-vm", "running");
+    core.stop_vm("test-vm").await.unwrap();
+
+    let record = core.get_vm("test-vm").unwrap();
+    assert_eq!(record.state, "stopped");
+    assert_eq!(record.pid, None);
+}
+
+#[tokio::test]
 async fn stop_paused_vm() {
     let (core, _) = mock_core_with_vm("test-vm", "paused");
     core.stop_vm("test-vm").await.unwrap();

@@ -15,7 +15,7 @@ use husker_storage::StorageConfig;
 use husker_vmm::{
     RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 /// Serializes the `run_userdata` tests, which drive the real guest agent on the
@@ -32,10 +32,26 @@ struct MockInner {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     stop_failures: Mutex<HashSet<Uuid>>,
     stop_calls: Mutex<Vec<Uuid>>,
+    #[cfg(not(feature = "linux-net"))]
+    destroy_gate: Mutex<Option<Arc<DestroyGate>>>,
+    pause_gate: Mutex<Option<Arc<PauseGate>>>,
     agent_socket: Mutex<Option<PathBuf>>,
     // Only needed by the kernel_args_composition tests (not(linux-net) builds).
     #[cfg(not(feature = "linux-net"))]
     last_config: Mutex<Option<VmConfig>>,
+}
+
+#[cfg(not(feature = "linux-net"))]
+#[derive(Default)]
+struct DestroyGate {
+    entered: Notify,
+    release: Notify,
+}
+
+#[derive(Default)]
+struct PauseGate {
+    entered: Notify,
+    release: Notify,
 }
 
 #[derive(Clone)]
@@ -50,6 +66,9 @@ impl MockVmm {
                 vms: Mutex::new(HashMap::new()),
                 stop_failures: Mutex::new(HashSet::new()),
                 stop_calls: Mutex::new(Vec::new()),
+                #[cfg(not(feature = "linux-net"))]
+                destroy_gate: Mutex::new(None),
+                pause_gate: Mutex::new(None),
                 agent_socket: Mutex::new(None),
                 #[cfg(not(feature = "linux-net"))]
                 last_config: Mutex::new(None),
@@ -71,6 +90,19 @@ impl MockVmm {
 
     async fn stop_call_count(&self) -> usize {
         self.inner.stop_calls.lock().await.len()
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    async fn block_next_destroy(&self) -> Arc<DestroyGate> {
+        let gate = Arc::new(DestroyGate::default());
+        *self.inner.destroy_gate.lock().await = Some(Arc::clone(&gate));
+        gate
+    }
+
+    async fn block_next_pause(&self) -> Arc<PauseGate> {
+        let gate = Arc::new(PauseGate::default());
+        *self.inner.pause_gate.lock().await = Some(Arc::clone(&gate));
+        gate
     }
 
     #[cfg(not(feature = "linux-net"))]
@@ -120,6 +152,11 @@ impl VmmBackend for MockVmm {
     }
 
     async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        #[cfg(not(feature = "linux-net"))]
+        if let Some(gate) = self.inner.destroy_gate.lock().await.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         self.inner.vms.lock().await.remove(&id);
         Ok(())
     }
@@ -135,6 +172,10 @@ impl VmmBackend for MockVmm {
     }
 
     async fn pause_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        if let Some(gate) = self.inner.pause_gate.lock().await.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         let mut vms = self.inner.vms.lock().await;
         match vms.get_mut(&id) {
             Some(vm) => {
@@ -376,8 +417,12 @@ async fn drain_vms_stops_running_and_paused() {
     let drained = core.drain_vms().await;
     assert_eq!(drained, 2);
     assert_eq!(mock.stop_call_count().await, 2);
-    assert_eq!(core.get_vm("running-vm").unwrap().state, "stopped");
-    assert_eq!(core.get_vm("paused-vm").unwrap().state, "stopped");
+    let running = core.get_vm("running-vm").unwrap();
+    assert_eq!(running.state, "stopped");
+    assert_eq!(running.pid, None);
+    let paused = core.get_vm("paused-vm").unwrap();
+    assert_eq!(paused.state, "stopped");
+    assert_eq!(paused.pid, None);
     assert_eq!(core.get_vm("stopped-vm").unwrap().state, "stopped");
 }
 
@@ -529,6 +574,40 @@ async fn list_vms_returns_inserted_records() {
     assert_eq!(names.len(), 2);
     assert!(names.contains("vm-a"));
     assert!(names.contains("vm-b"));
+}
+
+#[tokio::test]
+async fn refreshed_vm_retires_the_identity_of_a_missing_vmm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    state
+        .insert_vm(&vm_record(
+            Uuid::new_v4(),
+            "exited-vm",
+            "running",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    // Deliberately leave the VMM backend empty: this is the observable state
+    // after a guest-initiated shutdown that the daemon did not witness.
+    let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
+
+    let refreshed = core.get_vm_refreshed("exited-vm").await.unwrap();
+    assert_eq!(refreshed.state, "stopped");
+    assert_eq!(refreshed.pid, None);
+
+    let persisted = core.get_vm("exited-vm").unwrap();
+    assert_eq!(persisted.state, "stopped");
+    assert_eq!(persisted.pid, None);
 }
 
 #[tokio::test]
@@ -2246,6 +2325,152 @@ async fn concurrent_create_same_name_one_winner() {
     );
     // Exactly one VM persisted.
     assert_eq!(core.list_vms().unwrap().len(), 1);
+}
+
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test(flavor = "current_thread")]
+async fn destroy_waiting_behind_replacement_preserves_new_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let kernel = tmp.path().join("vmlinux");
+    let mut kbytes = vec![0u8; 64];
+    kbytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, &kbytes).unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"replacement rootfs").unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let old_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            old_id,
+            "generation-race",
+            "stopped",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    let mock = MockVmm::new();
+    mock.upsert_vm(VmInfo {
+        id: old_id,
+        name: "generation-race".into(),
+        state: VmState::Stopped,
+        pid: Some(9),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 7,
+    })
+    .await;
+    let gate = mock.block_next_destroy().await;
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+
+    let replacing_core = Arc::clone(&core);
+    let replacement = tokio::spawn(async move {
+        replacing_core
+            .create_vm(CreateVmRequest {
+                name: "generation-race".into(),
+                kernel_path: Some(kernel),
+                rootfs_path: Some(rootfs),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                ..Default::default()
+            })
+            .await
+    });
+
+    gate.entered.notified().await;
+
+    let destroying_core = Arc::clone(&core);
+    let stale_destroy =
+        tokio::spawn(async move { destroying_core.destroy_vm("generation-race").await });
+    // The current-thread runtime polls the destroy through its synchronous
+    // lookup and up to the held per-name lock, deterministically capturing the
+    // old generation before replacement is allowed to continue.
+    tokio::task::yield_now().await;
+
+    gate.release.notify_one();
+    let replacement = replacement.await.unwrap().unwrap();
+    stale_destroy.await.unwrap().unwrap();
+
+    let current = core.get_vm("generation-race").unwrap();
+    assert_eq!(current.id, replacement.id);
+    assert_ne!(current.id, old_id);
+
+    // Prove the stale destroy did not merely leave the row while deleting the
+    // replacement's name-derived disk directory: the replacement can still be
+    // stopped and snapshotted through the public lifecycle interface.
+    core.stop_vm("generation-race").await.unwrap();
+    let snapshot = core
+        .create_snapshot(CreateSnapshotRequest {
+            name: "generation-race-snapshot".into(),
+            vm: "generation-race".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot.source_vm_name, "generation-race");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_and_destroy_serialize_one_vm_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let vm_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            vm_id,
+            "pause-destroy-race",
+            "running",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    let mock = MockVmm::new();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "pause-destroy-race".into(),
+        state: VmState::Running,
+        pid: Some(99),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 7,
+    })
+    .await;
+    let gate = mock.block_next_pause().await;
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+
+    let pausing_core = Arc::clone(&core);
+    let pause = tokio::spawn(async move { pausing_core.pause_vm("pause-destroy-race").await });
+    gate.entered.notified().await;
+
+    let destroying_core = Arc::clone(&core);
+    let destroy =
+        tokio::spawn(async move { destroying_core.destroy_vm("pause-destroy-race").await });
+    tokio::task::yield_now().await;
+
+    gate.release.notify_one();
+    pause.await.unwrap().unwrap();
+    destroy.await.unwrap().unwrap();
+    assert!(matches!(
+        core.get_vm("pause-destroy-race"),
+        Err(CoreError::VmNotFound(_))
+    ));
 }
 
 #[tokio::test]

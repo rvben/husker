@@ -275,7 +275,7 @@ fn core_store_with_vm(
         id,
         name: name.into(),
         state: state.into(),
-        pid: None,
+        pid: Some(4242),
         vcpu_count: 1,
         mem_size_mib: 128,
         vsock_cid: 3,
@@ -373,6 +373,11 @@ async fn reconcile_completes_interrupted_suspend() {
         "suspended",
         "a 'suspending' VM with a valid slot must become 'suspended'"
     );
+    let recovered = core.get_vm("vmint").unwrap();
+    assert_eq!(
+        recovered.pid, None,
+        "completed suspend recovery must retire the interrupted VMM identity"
+    );
 }
 
 #[tokio::test]
@@ -389,6 +394,11 @@ async fn reconcile_drops_suspending_without_slot() {
         vm_state(&core, id),
         "stopped",
         "a 'suspending' VM without a valid slot must fall back to 'stopped'"
+    );
+    let recovered = core.get_vm("vmnoslot").unwrap();
+    assert_eq!(
+        recovered.pid, None,
+        "failed suspend recovery must retire the interrupted VMM identity"
     );
 }
 
