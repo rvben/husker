@@ -24,9 +24,16 @@ struct Calls {
 struct RecordingVmm {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     calls: Mutex<Calls>,
+    snapshot_gate: Mutex<Option<Arc<SnapshotGate>>>,
     /// When set, `snapshot_vm` returns an error, to exercise capture-failure
     /// rollback in suspend.
     fail_snapshot: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct SnapshotGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl RecordingVmm {
@@ -34,8 +41,15 @@ impl RecordingVmm {
         Arc::new(Self {
             vms: Mutex::new(HashMap::new()),
             calls: Mutex::new(Calls::default()),
+            snapshot_gate: Mutex::new(None),
             fail_snapshot: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn block_next_snapshot(&self) -> Arc<SnapshotGate> {
+        let gate = Arc::new(SnapshotGate::default());
+        *self.snapshot_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
     }
 }
 
@@ -87,6 +101,11 @@ impl VmmBackend for SharedRecordingVmm {
 
     async fn snapshot_vm(&self, id: Uuid, dst: &SnapshotPaths) -> Result<SnapshotMeta, VmmError> {
         self.0.calls.lock().unwrap().snapshot.push(id);
+        let gate = { self.0.snapshot_gate.lock().unwrap().take() };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         if self
             .0
             .fail_snapshot
@@ -510,6 +529,35 @@ async fn suspend_then_resume_round_trips() {
         calls.restore.len(),
         1,
         "restore should be called once during resume"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_waiting_behind_suspend_retires_the_suspended_generation() {
+    let (core, vmm, id, tmp) = core_with_running_vm("stop-suspend-race");
+    let gate = vmm.block_next_snapshot();
+
+    let suspending_core = Arc::clone(&core);
+    let suspend =
+        tokio::spawn(async move { suspending_core.suspend_vm("stop-suspend-race").await });
+    gate.entered.notified().await;
+
+    let stopping_core = Arc::clone(&core);
+    let stop = tokio::spawn(async move { stopping_core.stop_vm("stop-suspend-race").await });
+    tokio::task::yield_now().await;
+
+    gate.release.notify_one();
+    suspend.await.unwrap().unwrap();
+    stop.await.unwrap().unwrap();
+
+    let stopped = core.get_vm("stop-suspend-race").unwrap();
+    assert_eq!(stopped.id, id);
+    assert_eq!(stopped.state, "stopped");
+    assert_eq!(stopped.pid, None);
+    assert_eq!(stopped.suspended_at, None);
+    assert!(
+        !tmp.path().join("suspend").join(id.to_string()).exists(),
+        "the later stop must discard the completed suspend slot"
     );
 }
 
