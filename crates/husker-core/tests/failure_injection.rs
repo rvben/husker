@@ -240,6 +240,95 @@ impl husker_storage::StorageDriver for PreparingStorage {
     }
 }
 
+#[cfg(feature = "linux-net")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OciMaterializationCall {
+    reference: String,
+    destination: PathBuf,
+    guest_agent: Vec<u8>,
+}
+
+#[cfg(feature = "linux-net")]
+#[derive(Default)]
+struct RecordingOciMaterializer {
+    calls: Mutex<Vec<OciMaterializationCall>>,
+}
+
+#[cfg(feature = "linux-net")]
+impl husker_core::OciImageMaterializer for RecordingOciMaterializer {
+    fn materialize<'a>(
+        &'a self,
+        request: husker_core::OciMaterializationRequest<'a>,
+    ) -> husker_core::OciMaterializationFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().await.push(OciMaterializationCall {
+                reference: request.reference.to_string(),
+                destination: request.destination.to_path_buf(),
+                guest_agent: request.guest_agent.to_vec(),
+            });
+            if let Some(parent) = request.destination.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                    husker_core::OciMaterializationError::Runtime(error.to_string())
+                })?;
+            }
+            tokio::fs::write(request.destination, b"materialized OCI image")
+                .await
+                .map_err(|error| {
+                    husker_core::OciMaterializationError::Runtime(error.to_string())
+                })?;
+            Ok(husker_core::MaterializedOciImage { size_bytes: 4096 })
+        })
+    }
+}
+
+#[cfg(feature = "linux-net")]
+struct CatalogRacingOciMaterializer {
+    state: husker_state::StateStore,
+}
+
+#[cfg(feature = "linux-net")]
+impl husker_core::OciImageMaterializer for CatalogRacingOciMaterializer {
+    fn materialize<'a>(
+        &'a self,
+        request: husker_core::OciMaterializationRequest<'a>,
+    ) -> husker_core::OciMaterializationFuture<'a> {
+        Box::pin(async move {
+            if let Some(parent) = request.destination.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                    husker_core::OciMaterializationError::Runtime(error.to_string())
+                })?;
+            }
+            tokio::fs::write(request.destination, b"completed artifact")
+                .await
+                .map_err(|error| {
+                    husker_core::OciMaterializationError::Runtime(error.to_string())
+                })?;
+            let name = request
+                .destination
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap()
+                .to_string();
+            self.state
+                .insert_image(&husker_state::ImageRecord {
+                    id: Uuid::new_v4(),
+                    name,
+                    source_path: "winner".into(),
+                    file_path: "winner.ext4".into(),
+                    format: "ext4".into(),
+                    kind: "rootfs".into(),
+                    boot_init: Some("/winner".into()),
+                    size_bytes: 1,
+                    created_at: chrono::Utc::now(),
+                })
+                .map_err(|error| {
+                    husker_core::OciMaterializationError::Runtime(error.to_string())
+                })?;
+            Ok(husker_core::MaterializedOciImage { size_bytes: 4096 })
+        })
+    }
+}
+
 struct FailingVmm {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     fail_ops: HashSet<&'static str>,
@@ -571,6 +660,88 @@ async fn create_uses_complete_disk_preparation_boundary() {
         std::fs::read(tmp.path().join("vms/prepared/rootfs.ext4")).unwrap(),
         b"prepared-disk"
     );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn oci_import_persists_only_the_materializer_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let materializer = Arc::new(RecordingOciMaterializer::default());
+    let core = HuskerCore::new(
+        FailingVmm::new(&[]),
+        husker_state::StateStore::open_memory().unwrap(),
+        husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+        husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+        },
+        "husker0".into(),
+        vec![],
+        tmp.path().join("run"),
+    )
+    .with_embedded_agent(b"embedded-agent")
+    .with_oci_materializer(materializer.clone());
+
+    let image = core
+        .import_oci_image("web", "oci://registry.example/acme/web:v1")
+        .await
+        .unwrap();
+
+    assert_eq!(image.source_path, "oci://registry.example/acme/web:v1");
+    assert_eq!(image.size_bytes, 4096);
+    assert_eq!(
+        image.boot_init.as_deref(),
+        Some("/usr/local/bin/husker-agent")
+    );
+    let persisted = core.get_image("web").unwrap();
+    assert_eq!(persisted.id, image.id);
+    assert_eq!(persisted.file_path, image.file_path);
+    assert_eq!(persisted.size_bytes, image.size_bytes);
+    let calls = materializer.calls.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].reference, "registry.example/acme/web:v1");
+    assert_eq!(calls[0].guest_agent, b"embedded-agent");
+    assert_eq!(calls[0].destination, PathBuf::from(&image.file_path));
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn oci_catalog_race_removes_the_losing_artifact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("state.db");
+    let core_state = husker_state::StateStore::open(&db_path).unwrap();
+    let racing_state = husker_state::StateStore::open(&db_path).unwrap();
+    let core = HuskerCore::new(
+        FailingVmm::new(&[]),
+        core_state,
+        husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+        husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+        },
+        "husker0".into(),
+        vec![],
+        tmp.path().join("run"),
+    )
+    .with_embedded_agent(b"embedded-agent")
+    .with_oci_materializer(Arc::new(CatalogRacingOciMaterializer {
+        state: racing_state,
+    }));
+    let artifact = tmp.path().join("images/catalog/race.ext4");
+
+    let error = core
+        .import_oci_image("race", "example/race:latest")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, CoreError::ImageAlreadyExists(name) if name == "race"));
+    assert!(
+        !artifact.exists(),
+        "the catalog loser must remove the artifact it materialized"
+    );
+    let winner = core.get_image("race").unwrap();
+    assert_eq!(winner.source_path, "winner");
+    assert_eq!(winner.file_path, "winner.ext4");
 }
 
 #[cfg(feature = "linux-net")]

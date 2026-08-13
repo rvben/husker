@@ -98,58 +98,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             Err(other) => return Err(CoreError::State(other)),
         }
 
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            other => {
-                return Err(CoreError::InvalidArgument(format!(
-                    "unsupported host architecture for OCI import: {other}"
-                )));
-            }
-        };
-
-        // Pull + flatten into a temp dir, then inject the guest runtime. The
-        // image's runtime config (env/PATH/WorkingDir) is captured and written
-        // into the rootfs so the agent applies it on exec.
-        let work = tempfile::tempdir().map_err(|e| CoreError::Io(format!("oci work dir: {e}")))?;
-        let rootfs_dir = work.path().join("rootfs");
-        let image_config = husker_oci::pull_and_flatten(reference, arch, &rootfs_dir)
-            .await
-            .map_err(|e| CoreError::InvalidArgument(format!("pull {reference}: {e}")))?;
-        let oci_runtime = husker_agent_proto::OciRuntimeConfig {
-            env: image_config.env,
-            working_dir: image_config.working_dir,
-            entrypoint: image_config.entrypoint,
-            cmd: image_config.cmd,
-        };
-        inject_guest_runtime(&rootfs_dir, self.embedded_agent, &oci_runtime)?;
-
-        // Build the ext4 image sized to the tree plus generous overhead.
         let catalog_dir = self.storage.images_dir().join("catalog");
         tokio::fs::create_dir_all(&catalog_dir)
             .await
             .map_err(husker_storage::StorageError::Io)?;
         let image_path = catalog_dir.join(format!("{name}.ext4"));
-        let tree_size = {
-            let d = rootfs_dir.clone();
-            tokio::task::spawn_blocking(move || husker_storage::dir_apparent_size(&d))
-                .await
-                .map_err(|e| CoreError::Io(format!("size join: {e}")))?
-        };
-        // Bound disk use: refuse images whose extracted tree is implausibly large
-        // (a decompression-bomb guard on top of the compressed-download cap).
-        const MAX_ROOTFS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-        if tree_size > MAX_ROOTFS_BYTES {
-            return Err(CoreError::InvalidArgument(format!(
-                "imported rootfs is {tree_size} bytes, over the {MAX_ROOTFS_BYTES}-byte limit"
-            )));
-        }
-        let size_bytes = oci_rootfs_size_bytes(tree_size);
-        husker_storage::build_ext4_from_dir(&rootfs_dir, &image_path, size_bytes).await?;
-
-        let metadata = tokio::fs::metadata(&image_path)
+        let artifact = self
+            .oci_materializer
+            .materialize(OciMaterializationRequest {
+                reference,
+                destination: &image_path,
+                guest_agent: self.embedded_agent,
+            })
             .await
-            .map_err(husker_storage::StorageError::Io)?;
+            .map_err(map_oci_materialization_error)?;
         let record = ImageRecord {
             id: Uuid::new_v4(),
             name: name.into(),
@@ -161,7 +123,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             // supervisor does mounts/network/reaping), since they carry no
             // busybox init. The injected agent lives at this path.
             boot_init: Some("/usr/local/bin/husker-agent".to_string()),
-            size_bytes: metadata.len(),
+            size_bytes: artifact.size_bytes,
             created_at: chrono::Utc::now(),
         };
         if let Err(err) = self.state.insert_image(&record).map_err(|e| match e {
@@ -239,17 +201,20 @@ impl<B: VmmBackend> HuskerCore<B> {
     }
 }
 
-/// Size an imported OCI rootfs: the tree itself, growth headroom (the tree
-/// again, floored at 512 MiB) so package installs (`pip`/`apk`/`npm`) have
-/// real room out of the box, and a 64 MiB base for ext4 metadata/journal.
-/// The built file is sparse, so headroom costs no host disk until written;
-/// non-reflink hosts pay per-clone only for blocks that carry data. Workloads
-/// needing more room pass `--disk-size` at run/job time.
 #[cfg(feature = "linux-net")]
-fn oci_rootfs_size_bytes(tree_size: u64) -> u64 {
-    const MIN_HEADROOM: u64 = 512 * 1024 * 1024;
-    const EXT4_BASE: u64 = 64 * 1024 * 1024;
-    tree_size + tree_size.max(MIN_HEADROOM) + EXT4_BASE
+fn map_oci_materialization_error(error: OciMaterializationError) -> CoreError {
+    match error {
+        error @ (OciMaterializationError::Pull { .. }
+        | OciMaterializationError::RootfsTooLarge { .. }
+        | OciMaterializationError::MissingGuestAgent
+        | OciMaterializationError::UnsupportedArchitecture(_)) => {
+            CoreError::InvalidArgument(error.to_string())
+        }
+        error @ (OciMaterializationError::WorkDirectory(_)
+        | OciMaterializationError::Runtime(_)
+        | OciMaterializationError::SizeTask(_)) => CoreError::Io(error.to_string()),
+        OciMaterializationError::Storage(error) => CoreError::Storage(error),
+    }
 }
 
 /// The `source_path` recorded for an OCI-imported image, and the value
@@ -267,8 +232,6 @@ fn oci_source_path(reference: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "linux-net")]
-    use super::oci_rootfs_size_bytes;
     use super::oci_source_path;
 
     #[test]
@@ -291,28 +254,5 @@ mod tests {
                 "the scheme must not be read as a registry host"
             );
         }
-    }
-
-    #[cfg(feature = "linux-net")]
-    const MIB: u64 = 1024 * 1024;
-
-    #[cfg(feature = "linux-net")]
-    #[test]
-    fn small_images_get_the_headroom_floor() {
-        // A python:3.12-slim-sized tree (~135 MiB) used to become a ~334 MiB
-        // image with ~114 MiB free - pip install of a data stack hit ENOSPC.
-        let size = oci_rootfs_size_bytes(135 * MIB);
-        assert_eq!(size, (135 + 512 + 64) * MIB);
-        // Even a tiny alpine tree gets the full floor.
-        assert_eq!(oci_rootfs_size_bytes(8 * MIB), (8 + 512 + 64) * MIB);
-    }
-
-    #[cfg(feature = "linux-net")]
-    #[test]
-    fn large_images_keep_proportional_headroom() {
-        // Above the floor the headroom is the tree size itself (2x + base),
-        // matching the old formula so big toolchain images do not regress.
-        let tree = 2200 * MIB;
-        assert_eq!(oci_rootfs_size_bytes(tree), tree * 2 + 64 * MIB);
     }
 }
