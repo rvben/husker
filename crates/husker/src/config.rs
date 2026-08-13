@@ -221,7 +221,7 @@ impl From<IdlePolicyToml> for husker_core::IdlePolicyConfig {
 
 /// Whether the winning profile entry came from the local config or the daemon.
 ///
-/// Used by `build_vm_request_body` to decide whether path fields (rootfs,
+/// Used by VM creation planning to decide whether path fields (rootfs,
 /// kernel, initrd) should be resolved against the client filesystem. Local
 /// profiles are resolved; daemon profiles are sent as-is so bare catalog names
 /// (e.g. "alpine-x86_64.ext4") reach the daemon unchanged.

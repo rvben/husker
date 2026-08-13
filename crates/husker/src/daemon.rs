@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 #[cfg(all(feature = "linux-net", target_os = "linux"))]
 use crate::config::VmmSelection;
-use crate::profile_to_daemon;
+use crate::vm_creation::profile_to_daemon;
 
 pub(crate) fn validate_daemon_bind(
     listen: SocketAddr,

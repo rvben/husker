@@ -6,72 +6,21 @@
 //! the responses into the right outcome.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
 use crate::cli::OutputFormat;
+use crate::daemon_client::{ApiFailure, DaemonClient};
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::exit_code;
+use crate::vm_creation::PreparedVmCreationPlan;
 use crate::{
-    ApiFailure, SYNC_ARCHIVE_GUEST_PATH, SYNC_MANIFEST_GUEST_PATH, SYNC_OUTPUT_GUEST_PATH,
-    SYNC_WORKDIR, api_error, api_request, apply_dns_hosts, build_sync_archive, collect_sync_paths,
-    extract_archive_over, serial_boot_hint, with_api_auth, wrap_sync_command,
+    SYNC_ARCHIVE_GUEST_PATH, SYNC_MANIFEST_GUEST_PATH, SYNC_OUTPUT_GUEST_PATH, SYNC_WORKDIR,
+    apply_dns_hosts, build_sync_archive, collect_sync_paths, extract_archive_over,
+    serial_boot_hint, wrap_sync_command,
 };
-
-/// Which image/boot/idle flags were supplied. `--pool` forks the job's VM from
-/// the pool's template, so none of these apply; the caller reports any that were
-/// set as a conflict.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct PoolFlags {
-    pub rootfs: bool,
-    pub kernel: bool,
-    pub initrd: bool,
-    pub cpus: bool,
-    pub memory: bool,
-    pub vmm: bool,
-    pub cloud_image: bool,
-    pub disk_size: bool,
-    pub volume: bool,
-    pub net: bool,
-    pub profile: bool,
-    pub balloon: bool,
-    pub ssh_key: bool,
-    pub idle: bool,
-    pub idle_timeout: bool,
-    pub suspend_ttl: bool,
-    pub no_auto_resume: bool,
-}
-
-/// Names of the flags in `flags` that conflict with `--pool`, in a stable order
-/// for a deterministic error message. Empty when `--pool` was used correctly.
-pub(crate) fn pool_conflicting_flags(flags: &PoolFlags) -> Vec<&'static str> {
-    let mut conflicts = Vec::new();
-    for (set, name) in [
-        (flags.rootfs, "--rootfs"),
-        (flags.kernel, "--kernel"),
-        (flags.initrd, "--initrd"),
-        (flags.cpus, "--cpus"),
-        (flags.memory, "--memory"),
-        (flags.vmm, "--vmm"),
-        (flags.cloud_image, "--cloud-image"),
-        (flags.disk_size, "--disk-size"),
-        (flags.volume, "--volume"),
-        (flags.net, "--net"),
-        (flags.profile, "--profile"),
-        (flags.balloon, "--balloon"),
-        (flags.ssh_key, "--ssh-key"),
-        (flags.idle, "--idle"),
-        (flags.idle_timeout, "--idle-timeout"),
-        (flags.suspend_ttl, "--suspend-ttl"),
-        (flags.no_auto_resume, "--no-auto-resume"),
-    ] {
-        if set {
-            conflicts.push(name);
-        }
-    }
-    conflicts
-}
 
 /// Resolve the `(command, args)` to exec for a non-`--sync-cwd` job. An empty
 /// command runs the image's default entrypoint (the guest agent resolves it
@@ -203,16 +152,15 @@ fn parse_unmatched_manifest(bytes: &[u8], pattern_count: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Inputs for a single `husker job` run, bundled to keep `run_job`'s signature
-/// manageable. Everything is borrowed from the caller's parsed CLI state.
+/// Inputs for one complete `husker job` lifecycle. Everything is borrowed from
+/// the caller's parsed CLI state; acquisition, execution, interruption, and
+/// cleanup policy stay behind this module's interface.
 pub(crate) struct JobRequest<'a> {
-    pub client: &'a reqwest::Client,
-    pub api_url: &'a str,
-    pub api_token: Option<&'a str>,
+    pub daemon: &'a DaemonClient,
     pub output: OutputFormat,
     pub name: &'a str,
-    pub pool: Option<&'a str>,
-    pub body: Option<&'a serde_json::Value>,
+    pub creation: PreparedVmCreationPlan,
+    pub keep: bool,
     pub timeout: u64,
     pub dns: &'a [String],
     pub add_host: &'a [(String, String)],
@@ -224,50 +172,130 @@ pub(crate) struct JobRequest<'a> {
     pub secret_env: &'a serde_json::Map<String, serde_json::Value>,
 }
 
-/// The result of a completed job: what the command did, and what came back from
-/// the guest afterwards.
+/// The only process decision exposed by the Job module. `main.rs` applies it;
+/// all Job-specific precedence and cleanup decisions have already happened.
 #[derive(Debug)]
-pub(crate) struct JobOutcome {
-    /// The raw exec result JSON, carrying `exit_code`/`stdout`/`stderr`.
-    pub exec: serde_json::Value,
+pub(crate) enum JobTermination {
+    Success,
+    Exit(i32),
+    Failure(ApiFailure),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JobExecution {
+    #[serde(default = "default_job_exit_code")]
+    exit_code: i64,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+}
+
+fn default_job_exit_code() -> i64 {
+    1
+}
+
+/// Internal result of command execution, before keep/destroy and process-exit
+/// policy are applied.
+#[derive(Debug)]
+struct JobOutcome {
+    exec: JobExecution,
     /// The outcome of `--out`/`--write-back`, or `None` when the job requested
     /// no outputs. `None` and an empty [`Retrieval`] are different: nothing was
     /// asked for, versus nothing came back.
-    pub retrieval: Option<Retrieval>,
+    retrieval: Option<Retrieval>,
 }
 
-/// Orchestrate a one-shot job against the daemon: create the VM (pool checkout
-/// or fresh boot), wait for readiness, apply DNS/host overrides, optionally sync
-/// the working tree, exec the command, and pull back requested outputs. The
-/// caller handles cleanup, printing, and the process exit code.
-pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<JobOutcome> {
-    let client = req.client;
-    let api_url = req.api_url;
-    let api_token = req.api_token;
+/// Own one complete Job lifecycle. The outer process adapter receives only the
+/// final termination decision; validation, acquisition tracking, interruption,
+/// rendering, cleanup, and failure precedence remain local to this module.
+pub(crate) async fn run_job(req: JobRequest<'_>) -> JobTermination {
+    run_job_with_interrupt(req, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+async fn run_job_with_interrupt<F>(req: JobRequest<'_>, interrupt: F) -> JobTermination
+where
+    F: Future<Output = ()>,
+{
+    if let Err(failure) = validate_request(&req) {
+        return JobTermination::Failure(failure);
+    }
+
+    tokio::pin!(interrupt);
+    let create = create_job_vm(&req);
+    tokio::pin!(create);
+    tokio::select! {
+        biased;
+        result = &mut create => match result {
+            Ok(()) => (),
+            Err(error) => return JobTermination::Failure(ApiFailure::from_error(&error)),
+        },
+        _ = &mut interrupt => {
+            eprintln!(
+                "[job] interrupted before VM acquisition completed; no VM was destroyed"
+            );
+            return JobTermination::Exit(130);
+        }
+    }
+
+    let execution = execute_created_job(&req);
+    tokio::pin!(execution);
+    let result = tokio::select! {
+        result = &mut execution => result,
+        _ = &mut interrupt => {
+            if req.keep {
+                eprintln!("[job] interrupted, keeping {}", req.name);
+            } else {
+                eprintln!("[job] interrupted, destroying {}", req.name);
+                report_secondary_cleanup_failure(cleanup_vm(&req).await);
+            }
+            return JobTermination::Exit(130);
+        }
+    };
+
+    match result {
+        Ok(outcome) => finish_job(&req, outcome).await,
+        Err(error) => {
+            let failure = ApiFailure::from_error(&error);
+            if req.keep {
+                eprintln!("[job] failed, keeping {}: {}", req.name, failure.message);
+            } else {
+                report_secondary_cleanup_failure(cleanup_vm(&req).await);
+            }
+            JobTermination::Failure(failure)
+        }
+    }
+}
+
+fn validate_request(req: &JobRequest<'_>) -> std::result::Result<(), ApiFailure> {
+    if req.sync_cwd && req.command.is_empty() {
+        return Err(
+            "--sync-cwd needs a command after `--`; the image default is only used without \
+             --sync-cwd"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+async fn create_job_vm(req: &JobRequest<'_>) -> Result<()> {
+    let daemon = req.daemon;
+    let name = req.name;
+    let resp = req.creation.execute(daemon).await?;
+    if !resp.status().is_success() {
+        return Err(daemon.error(resp, &format!("VM '{name}'")).await.into());
+    }
+    Ok(())
+}
+
+async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
+    let daemon = req.daemon;
     let output = req.output;
     let name = req.name;
 
-    // 1. Create the VM: fork it from the pool, or boot from the body.
-    let resp = if let Some(pool) = req.pool {
-        api_request(
-            with_api_auth(
-                client.post(format!("{api_url}/v1/pools/{pool}/checkout")),
-                api_token,
-            )
-            .json(&serde_json::json!({ "vm_name": name })),
-        )
-        .await?
-    } else {
-        api_request(
-            with_api_auth(client.post(format!("{api_url}/v1/vms")), api_token)
-                .json(req.body.expect("non-pool job builds a create body")),
-        )
-        .await?
-    };
-    if !resp.status().is_success() {
-        let msg = api_error(resp, &format!("VM '{name}'")).await;
-        anyhow::bail!("{}", msg.message);
-    }
     if output == OutputFormat::Text {
         eprintln!("[job] vm {name} created, waiting for agent...");
     }
@@ -275,58 +303,54 @@ pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<JobOutcome> {
     // Old-daemon warning: if the requested timeout exceeds the historical
     // 30-second exec default, check the daemon version. Daemons older than
     // 0.4.2 ignore timeout_secs and cap execution at exec_timeout_secs.
-    if req.timeout > 30 {
-        let health_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap_or_default();
-        if let Ok(resp) = health_client
-            .get(format!("{api_url}/v1/health"))
-            .send()
+    if req.timeout > 30
+        && let Ok(resp) = daemon
+            .try_send(
+                daemon
+                    .get("/v1/health")
+                    .timeout(std::time::Duration::from_secs(2)),
+            )
             .await
-            && resp.status().is_success()
-            && let Ok(health) = resp.json::<serde_json::Value>().await
-            && let Some(ver_str) = health["version"].as_str()
+        && resp.status().is_success()
+        && let Ok(health) = resp.json::<serde_json::Value>().await
+        && let Some(ver_str) = health["version"].as_str()
+    {
+        let parts: Vec<u64> = ver_str.split('.').filter_map(|p| p.parse().ok()).collect();
+        if let [major, minor, patch] = parts.as_slice()
+            && (*major, *minor, *patch) < (0, 4, 2)
         {
-            let parts: Vec<u64> = ver_str.split('.').filter_map(|p| p.parse().ok()).collect();
-            if let [major, minor, patch] = parts.as_slice()
-                && (*major, *minor, *patch) < (0, 4, 2)
-            {
-                eprintln!(
-                    "[job] warning: daemon {ver_str} does not support --timeout; execution \
+            eprintln!(
+                "[job] warning: daemon {ver_str} does not support --timeout; execution \
                      will be capped at the daemon's exec_timeout_secs setting"
-                );
-            }
+            );
         }
     }
 
     // 2. Boot-mode-aware readiness wait (mirrors Commands::Wait logic).
-    let info_url = format!("{api_url}/v1/vms/{name}");
-    let resp = api_request(with_api_auth(client.get(&info_url), api_token)).await?;
+    let info_path = format!("/v1/vms/{name}");
+    let resp = daemon.send(daemon.get(&info_path)).await?;
     if !resp.status().is_success() {
-        let msg = api_error(resp, &format!("VM '{name}'")).await;
-        anyhow::bail!("{}", msg.message);
+        return Err(daemon.error(resp, &format!("VM '{name}'")).await.into());
     }
     let vm: serde_json::Value = resp.json().await?;
     let boot_mode = vm
         .get("boot_mode")
         .and_then(|b| b.as_str())
         .unwrap_or("direct");
-    let ready_url = format!("{api_url}/v1/vms/{name}/ready");
+    let ready_path = format!("/v1/vms/{name}/ready");
     let deadline = std::time::Instant::now() + husker_core::default_ready_timeout(boot_mode);
     let mut backoff = std::time::Duration::from_millis(200);
     loop {
-        let resp = api_request(with_api_auth(client.get(&ready_url), api_token)).await?;
+        let resp = daemon.send(daemon.get(&ready_path)).await?;
         if !resp.status().is_success() {
-            let msg = api_error(resp, &format!("VM '{name}'")).await;
-            anyhow::bail!("{}", msg.message);
+            return Err(daemon.error(resp, &format!("VM '{name}'")).await.into());
         }
         let rdy: serde_json::Value = resp.json().await?;
         if rdy.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
             break;
         }
         if std::time::Instant::now() + backoff >= deadline {
-            let hint = serial_boot_hint(client, api_url, api_token, name).await;
+            let hint = serial_boot_hint(daemon, name).await;
             anyhow::bail!("timed out waiting for VM '{name}' to become ready{hint}");
         }
         tokio::time::sleep(backoff).await;
@@ -334,7 +358,7 @@ pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<JobOutcome> {
     }
 
     // 2.4 Apply per-VM DNS / host overrides before running the command.
-    apply_dns_hosts(client, api_url, api_token, name, req.dns, req.add_host).await?;
+    apply_dns_hosts(daemon, name, req.dns, req.add_host).await?;
 
     // 2.5 Optionally sync the working tree into the VM (git-aware, clean-room):
     // upload a tar.gz of the cwd and wrap the command to extract and run it
@@ -349,20 +373,21 @@ pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<JobOutcome> {
         }
         let archive = build_sync_archive(&cwd)?;
         let encoded = husker_agent_proto::base64_encode(&archive);
-        let write_resp = api_request(
-            with_api_auth(
-                client.post(format!("{api_url}/v1/vms/{name}/files/write")),
-                api_token,
+        let write_resp = daemon
+            .send(
+                daemon
+                    .post(format!("/v1/vms/{name}/files/write"))
+                    .json(&serde_json::json!({
+                        "path": SYNC_ARCHIVE_GUEST_PATH,
+                        "data": encoded,
+                    })),
             )
-            .json(&serde_json::json!({
-                "path": SYNC_ARCHIVE_GUEST_PATH,
-                "data": encoded,
-            })),
-        )
-        .await?;
+            .await?;
         if !write_resp.status().is_success() {
-            let msg = api_error(write_resp, &format!("VM '{name}'")).await;
-            anyhow::bail!("{}", msg.message);
+            return Err(daemon
+                .error(write_resp, &format!("VM '{name}'"))
+                .await
+                .into());
         }
         // --write-back returns the synced files as the command left them
         // (modifications only; new build artifacts are never pulled back).
@@ -403,17 +428,11 @@ pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<JobOutcome> {
     if !req.secret_env.is_empty() {
         exec_body["secret_env"] = serde_json::Value::Object(req.secret_env.clone());
     }
-    let resp = api_request(
-        with_api_auth(
-            client.post(format!("{api_url}/v1/vms/{name}/exec")),
-            api_token,
-        )
-        .json(&exec_body),
-    )
-    .await?;
+    let resp = daemon
+        .send(daemon.post(format!("/v1/vms/{name}/exec")).json(&exec_body))
+        .await?;
     if !resp.status().is_success() {
-        let msg = api_error(resp, &format!("VM '{name}'")).await;
-        anyhow::bail!("{}", msg.message);
+        return Err(daemon.error(resp, &format!("VM '{name}'")).await.into());
     }
     let exec = resp.json().await?;
 
@@ -422,22 +441,155 @@ pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<JobOutcome> {
     if let Some(cwd) = &sync_cwd_dir
         && !retrieve_paths.is_empty()
     {
-        let r = retrieve_outputs(
-            client,
-            api_url,
-            api_token,
-            name,
-            cwd,
-            &retrieve_paths,
-            req.out,
-        )
-        .await?;
-        if output == OutputFormat::Text {
-            r.report_text();
-        }
+        let r = retrieve_outputs(daemon, name, cwd, &retrieve_paths, req.out).await?;
         retrieval = Some(r);
     }
     Ok(JobOutcome { exec, retrieval })
+}
+
+async fn finish_job(req: &JobRequest<'_>, outcome: JobOutcome) -> JobTermination {
+    let retrieval_failure = outcome.retrieval.as_ref().and_then(Retrieval::failure);
+    let exit_code = outcome.exec.exit_code;
+    let mut termination = if exit_code != 0 {
+        if let Some(failure) = &retrieval_failure
+            && req.output == OutputFormat::Text
+        {
+            eprintln!("[job] note: {}", failure.message);
+        }
+        JobTermination::Exit(exit_code.clamp(1, 255) as i32)
+    } else if let Some(failure) = retrieval_failure.as_ref() {
+        JobTermination::Failure(failure.clone())
+    } else {
+        JobTermination::Success
+    };
+
+    let cleanup_failure = if req.keep {
+        None
+    } else {
+        cleanup_vm(req).await
+    };
+    if let Some(failure) = cleanup_failure.as_ref() {
+        if matches!(&termination, JobTermination::Success) {
+            termination = JobTermination::Failure(failure.clone());
+        } else {
+            report_secondary_cleanup_failure(Some(failure.clone()));
+        }
+    }
+
+    render_outcome(
+        req,
+        &outcome,
+        retrieval_failure.as_ref(),
+        !matches!(&termination, JobTermination::Success),
+    );
+
+    if req.keep {
+        if req.output == OutputFormat::Text {
+            eprintln!(
+                "[job] exit code {exit_code}, keeping {} \
+                 (husker shell {} / husker destroy {})",
+                req.name, req.name, req.name
+            );
+        }
+    } else if cleanup_failure.is_none() && req.output == OutputFormat::Text {
+        eprintln!("[job] exit code {exit_code}, destroyed vm");
+    }
+
+    if req.sync_cwd && exit_code == 127 && req.output == OutputFormat::Text {
+        eprintln!(
+            "[job] hint: exit 127 usually means the command was not found in the sandbox image. \
+             The default image is minimal (no language toolchains); run against an image that \
+             includes your toolchain (pass a rootfs path or --cloud-image, e.g. a Docker image \
+             brought in with `husker image import-oci`)."
+        );
+    }
+
+    termination
+}
+
+fn render_outcome(
+    req: &JobRequest<'_>,
+    outcome: &JobOutcome,
+    retrieval_failure: Option<&ApiFailure>,
+    lifecycle_failed: bool,
+) {
+    if req.output == OutputFormat::Json {
+        let payload = outcome_json(req.name, outcome, retrieval_failure, lifecycle_failed);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).expect("job output must serialize")
+        );
+    } else {
+        if let Some(retrieval) = &outcome.retrieval {
+            retrieval.report_text();
+        }
+        print!("{}", outcome.exec.stdout);
+        eprint!("{}", outcome.exec.stderr);
+    }
+}
+
+fn outcome_json(
+    name: &str,
+    outcome: &JobOutcome,
+    retrieval_failure: Option<&ApiFailure>,
+    lifecycle_failed: bool,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "status": if lifecycle_failed || outcome.exec.exit_code != 0 || retrieval_failure.is_some() {
+            "error"
+        } else {
+            "ok"
+        },
+        "action": "job",
+        "vm": name,
+        "exit_code": outcome.exec.exit_code,
+        "stdout": outcome.exec.stdout,
+        "stderr": outcome.exec.stderr,
+    });
+    if let Some(retrieval) = &outcome.retrieval {
+        payload["retrieval"] = retrieval.to_json();
+    }
+    payload
+}
+
+async fn cleanup_vm(req: &JobRequest<'_>) -> Option<ApiFailure> {
+    let response = match req
+        .daemon
+        .send(
+            req.daemon
+                .delete(format!("/v1/vms/{}", req.name))
+                .timeout(std::time::Duration::from_secs(10)),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return Some(cleanup_failure(req.name, ApiFailure::from_error(&error))),
+    };
+    if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+        return None;
+    }
+    let failure = req
+        .daemon
+        .error(response, &format!("VM '{}'", req.name))
+        .await;
+    Some(cleanup_failure(req.name, failure))
+}
+
+fn cleanup_failure(name: &str, mut failure: ApiFailure) -> ApiFailure {
+    failure.message = format!(
+        "job finished but VM '{name}' could not be destroyed: {}",
+        failure.message
+    );
+    if failure.kind.is_none() {
+        failure.kind = Some("job_cleanup_failed".into());
+    }
+    failure
+}
+
+fn report_secondary_cleanup_failure(failure: Option<ApiFailure>) {
+    if let Some(failure) = failure {
+        eprintln!("[job] warning: {}", failure.message);
+    }
 }
 
 /// Bring `--out`/`--write-back` results back from the guest and classify what
@@ -456,36 +608,33 @@ pub(crate) async fn run_job(req: JobRequest<'_>) -> Result<JobOutcome> {
 /// explicitly, which is what distinguishes a missing artifact from a file the
 /// command legitimately deleted.
 async fn retrieve_outputs(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
+    daemon: &DaemonClient,
     name: &str,
     cwd: &std::path::Path,
     retrieve_paths: &[PathBuf],
     out: &[PathBuf],
 ) -> Result<Retrieval> {
-    let manifest =
-        match read_guest_file(client, api_url, api_token, name, SYNC_MANIFEST_GUEST_PATH).await? {
-            GuestFile::Read(bytes) => bytes,
-            GuestFile::Failed(failure) => {
-                return Ok(Retrieval {
-                    error: Some(ApiFailure {
-                        message: format!(
-                            "could not read the retrieval manifest from VM '{name}': {}",
-                            failure.message
-                        ),
-                        hint: Some(
-                            "the sandbox writes it after the command finishes, so a command that \
+    let manifest = match read_guest_file(daemon, name, SYNC_MANIFEST_GUEST_PATH).await? {
+        GuestFile::Read(bytes) => bytes,
+        GuestFile::Failed(failure) => {
+            return Ok(Retrieval {
+                error: Some(ApiFailure {
+                    message: format!(
+                        "could not read the retrieval manifest from VM '{name}': {}",
+                        failure.message
+                    ),
+                    hint: Some(
+                        "the sandbox writes it after the command finishes, so a command that \
                          replaces or kills the shell it runs in prevents both the manifest and \
                          the outputs from being produced"
-                                .to_string(),
-                        ),
-                        ..failure
-                    }),
-                    ..Retrieval::default()
-                });
-            }
-        };
+                            .to_string(),
+                    ),
+                    ..failure
+                }),
+                ..Retrieval::default()
+            });
+        }
+    };
 
     let out_set: std::collections::HashSet<&PathBuf> = out.iter().collect();
     let mut unmatched_out = Vec::new();
@@ -511,25 +660,24 @@ async fn retrieve_outputs(
         });
     }
 
-    let archive =
-        match read_guest_file(client, api_url, api_token, name, SYNC_OUTPUT_GUEST_PATH).await? {
-            GuestFile::Read(bytes) => bytes,
-            GuestFile::Failed(failure) => {
-                return Ok(Retrieval {
-                    unmatched_out,
-                    unmatched_write_back,
-                    error: Some(ApiFailure {
-                        message: format!(
-                            "the command produced outputs but they could not be copied back from \
+    let archive = match read_guest_file(daemon, name, SYNC_OUTPUT_GUEST_PATH).await? {
+        GuestFile::Read(bytes) => bytes,
+        GuestFile::Failed(failure) => {
+            return Ok(Retrieval {
+                unmatched_out,
+                unmatched_write_back,
+                error: Some(ApiFailure {
+                    message: format!(
+                        "the command produced outputs but they could not be copied back from \
                          VM '{name}': {}",
-                            failure.message
-                        ),
-                        ..failure
-                    }),
-                    ..Retrieval::default()
-                });
-            }
-        };
+                        failure.message
+                    ),
+                    ..failure
+                }),
+                ..Retrieval::default()
+            });
+        }
+    };
 
     Ok(Retrieval {
         files: extract_archive_over(&archive, cwd)?,
@@ -542,52 +690,6 @@ async fn retrieve_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pool_conflicts_empty_when_no_flags_set() {
-        assert!(pool_conflicting_flags(&PoolFlags::default()).is_empty());
-    }
-
-    #[test]
-    fn pool_conflicts_lists_each_set_flag_in_order() {
-        let flags = PoolFlags {
-            rootfs: true,
-            memory: true,
-            balloon: true,
-            no_auto_resume: true,
-            ..PoolFlags::default()
-        };
-        assert_eq!(
-            pool_conflicting_flags(&flags),
-            vec!["--rootfs", "--memory", "--balloon", "--no-auto-resume"]
-        );
-    }
-
-    #[test]
-    fn pool_conflicts_reports_every_flag() {
-        // Every field true -> every flag name reported (guards against a field
-        // being added to the struct but forgotten in the conflict list).
-        let all = PoolFlags {
-            rootfs: true,
-            kernel: true,
-            initrd: true,
-            cpus: true,
-            memory: true,
-            vmm: true,
-            cloud_image: true,
-            disk_size: true,
-            volume: true,
-            net: true,
-            profile: true,
-            balloon: true,
-            ssh_key: true,
-            idle: true,
-            idle_timeout: true,
-            suspend_ttl: true,
-            no_auto_resume: true,
-        };
-        assert_eq!(pool_conflicting_flags(&all).len(), 17);
-    }
 
     #[test]
     fn resolve_exec_command_empty_runs_image_default() {
@@ -658,21 +760,56 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    fn lifecycle_stub(
+        exec_exit_code: i64,
+        delete_status: StatusCode,
+        deletes: Arc<AtomicUsize>,
+    ) -> Router {
+        Router::new()
+            .route(
+                "/v1/vms",
+                post(|| async { (StatusCode::CREATED, Json(serde_json::json!({}))) }),
+            )
+            .route(
+                "/v1/vms/{name}",
+                get(|| async { Json(serde_json::json!({"boot_mode": "direct"})) }).delete(
+                    move || {
+                        let deletes = deletes.clone();
+                        async move {
+                            deletes.fetch_add(1, Ordering::SeqCst);
+                            delete_status
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/vms/{name}/ready",
+                get(|| async { Json(serde_json::json!({"ready": true})) }),
+            )
+            .route(
+                "/v1/vms/{name}/exec",
+                post(move || async move {
+                    Json(serde_json::json!({
+                        "exit_code": exec_exit_code,
+                        "stdout": "",
+                        "stderr": "",
+                    }))
+                }),
+            )
+    }
+
     fn base_request<'a>(
-        client: &'a reqwest::Client,
-        api_url: &'a str,
+        daemon: &'a DaemonClient,
         body: &'a serde_json::Value,
         command: &'a [String],
         secret_env: &'a serde_json::Map<String, serde_json::Value>,
     ) -> JobRequest<'a> {
         JobRequest {
-            client,
-            api_url,
-            api_token: None,
+            daemon,
             output: OutputFormat::Json,
             name: "job-x",
-            pool: None,
-            body: Some(body),
+            creation: PreparedVmCreationPlan::create_for_test(body.clone()),
+            keep: false,
             timeout: 10,
             dns: &[],
             add_host: &[],
@@ -685,11 +822,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lifecycle_validation_rejects_sync_without_a_command() {
+        let client = DaemonClient::new("http://example.invalid", None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = Vec::new();
+        let secret_env = serde_json::Map::new();
+        let mut request = base_request(&client, &body, &command, &secret_env);
+        request.sync_cwd = true;
+
+        let failure = validate_request(&request).unwrap_err();
+
+        assert!(failure.message.contains("--sync-cwd needs a command"));
+    }
+
+    #[test]
+    fn nonzero_command_is_rendered_as_error_status() {
+        let outcome = JobOutcome {
+            exec: JobExecution {
+                exit_code: 7,
+                stdout: "output".into(),
+                stderr: "failure".into(),
+            },
+            retrieval: None,
+        };
+
+        let payload = outcome_json("job-x", &outcome, None, false);
+
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["exit_code"], 7);
+    }
+
+    #[test]
+    fn lifecycle_failure_is_rendered_as_error_status() {
+        let outcome = JobOutcome {
+            exec: JobExecution {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            retrieval: None,
+        };
+
+        let payload = outcome_json("job-x", &outcome, None, true);
+
+        assert_eq!(payload["status"], "error");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_job_creates_waits_execs_and_returns_result() {
         // Count the exec calls to prove the command actually ran.
         let execs = Arc::new(AtomicUsize::new(0));
         let execs_route = execs.clone();
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let deletes_route = deletes.clone();
         let app = Router::new()
             .route(
                 "/v1/vms",
@@ -702,7 +888,15 @@ mod tests {
             )
             .route(
                 "/v1/vms/{name}",
-                get(|| async { Json(serde_json::json!({"boot_mode": "direct"})) }),
+                get(|| async { Json(serde_json::json!({"boot_mode": "direct"})) }).delete(
+                    move || {
+                        let deletes = deletes_route.clone();
+                        async move {
+                            deletes.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
             )
             .route(
                 "/v1/vms/{name}/ready",
@@ -724,28 +918,19 @@ mod tests {
             );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
+        let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["echo".to_string(), "hello".to_string()];
         let secret_env = serde_json::Map::new();
-        let outcome = run_job(base_request(
-            &client,
-            &api_url,
-            &body,
-            &command,
-            &secret_env,
-        ))
-        .await
-        .expect("run_job should succeed against a healthy stub");
+        let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
 
-        assert_eq!(outcome.exec["exit_code"].as_i64(), Some(7));
-        assert_eq!(outcome.exec["stdout"].as_str(), Some("hello\n"));
-        assert_eq!(outcome.exec["stderr"].as_str(), Some("warn\n"));
-        assert!(
-            outcome.retrieval.is_none(),
-            "a job that asked for no outputs reports no retrieval, not an empty one"
-        );
+        assert!(matches!(termination, JobTermination::Exit(7)));
         assert_eq!(execs.load(Ordering::SeqCst), 1, "exec must be called once");
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            1,
+            "an acquired Job VM must be destroyed exactly once"
+        );
         server.abort();
     }
 
@@ -754,6 +939,8 @@ mod tests {
         // The daemon rejects the create; run_job must return an error (not exec).
         let execs = Arc::new(AtomicUsize::new(0));
         let execs_route = execs.clone();
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let deletes_route = deletes.clone();
         let app = Router::new()
             .route(
                 "/v1/vms",
@@ -773,32 +960,172 @@ mod tests {
                         Json(serde_json::json!({"exit_code": 0}))
                     }
                 }),
+            )
+            .route(
+                "/v1/vms/{name}",
+                axum::routing::delete(move || {
+                    let deletes = deletes_route.clone();
+                    async move {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
             );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
+        let client = DaemonClient::new(&api_url, None);
         let body = serde_json::json!({ "name": "job-x" });
         let command = vec!["true".to_string()];
         let secret_env = serde_json::Map::new();
-        let err = run_job(base_request(
-            &client,
-            &api_url,
-            &body,
-            &command,
-            &secret_env,
-        ))
-        .await
-        .expect_err("a failed create must abort the job");
+        let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
 
-        assert!(
-            err.to_string().contains("name taken"),
-            "error should carry the daemon message, got: {err}"
-        );
+        let JobTermination::Failure(failure) = termination else {
+            panic!("a failed create must fail the Job")
+        };
+        assert!(failure.message.contains("name taken"));
         assert_eq!(
             execs.load(Ordering::SeqCst),
             0,
             "exec must not run after a failed create"
         );
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            0,
+            "a create conflict must never delete the pre-existing VM"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_job_fails_when_its_vm_cannot_be_cleaned_up() {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let (api_url, server) = serve_stub(lifecycle_stub(
+            0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            deletes.clone(),
+        ))
+        .await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["true".to_string()];
+        let secret_env = serde_json::Map::new();
+
+        let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
+
+        let JobTermination::Failure(failure) = termination else {
+            panic!("cleanup failure must fail an otherwise successful Job")
+        };
+        assert_eq!(failure.kind.as_deref(), Some("job_cleanup_failed"));
+        assert!(failure.message.contains("could not be destroyed"));
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_exit_code_wins_over_a_secondary_cleanup_failure() {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let (api_url, server) = serve_stub(lifecycle_stub(
+            23,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            deletes.clone(),
+        ))
+        .await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["false".to_string()];
+        let secret_env = serde_json::Map::new();
+
+        let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
+
+        assert!(matches!(termination, JobTermination::Exit(23)));
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keep_prevents_cleanup_after_success() {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let (api_url, server) =
+            serve_stub(lifecycle_stub(0, StatusCode::NO_CONTENT, deletes.clone())).await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["true".to_string()];
+        let secret_env = serde_json::Map::new();
+        let mut request = base_request(&client, &body, &command, &secret_env);
+        request.keep = true;
+
+        let termination = run_job(request).await;
+
+        assert!(matches!(termination, JobTermination::Success));
+        assert_eq!(deletes.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn already_absent_vm_counts_as_successful_cleanup() {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let (api_url, server) =
+            serve_stub(lifecycle_stub(0, StatusCode::NOT_FOUND, deletes.clone())).await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["true".to_string()];
+        let secret_env = serde_json::Map::new();
+
+        let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
+
+        assert!(matches!(termination, JobTermination::Success));
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interruption_after_acquisition_destroys_the_job_vm() {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let deletes_route = deletes.clone();
+        let exec_started = Arc::new(tokio::sync::Notify::new());
+        let exec_started_route = exec_started.clone();
+        let app = Router::new()
+            .route(
+                "/v1/vms",
+                post(|| async { (StatusCode::CREATED, Json(serde_json::json!({}))) }),
+            )
+            .route(
+                "/v1/vms/{name}",
+                get(|| async { Json(serde_json::json!({"boot_mode": "direct"})) }).delete(
+                    move || {
+                        let deletes = deletes_route.clone();
+                        async move {
+                            deletes.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/vms/{name}/ready",
+                get(|| async { Json(serde_json::json!({"ready": true})) }),
+            )
+            .route(
+                "/v1/vms/{name}/exec",
+                post(move || {
+                    let exec_started = exec_started_route.clone();
+                    async move {
+                        exec_started.notify_one();
+                        std::future::pending::<Json<serde_json::Value>>().await
+                    }
+                }),
+            );
+        let (api_url, server) = serve_stub(app).await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["sleep".to_string(), "forever".to_string()];
+        let secret_env = serde_json::Map::new();
+        let request = base_request(&client, &body, &command, &secret_env);
+
+        let termination = run_job_with_interrupt(request, exec_started.notified()).await;
+
+        assert!(matches!(termination, JobTermination::Exit(130)));
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
         server.abort();
     }
 
@@ -928,18 +1255,10 @@ mod tests {
 
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("big.bin")];
-        let client = reqwest::Client::new();
-        let retrieval = retrieve_outputs(
-            &client,
-            &api_url,
-            None,
-            "job-x",
-            dst.path(),
-            &requested,
-            &requested,
-        )
-        .await
-        .expect("the stub daemon is reachable");
+        let client = DaemonClient::new(&api_url, None);
+        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
+            .await
+            .expect("the stub daemon is reachable");
 
         assert!(
             retrieval.error.is_none(),
@@ -975,18 +1294,10 @@ mod tests {
 
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("dist/app")];
-        let client = reqwest::Client::new();
-        let retrieval = retrieve_outputs(
-            &client,
-            &api_url,
-            None,
-            "job-x",
-            dst.path(),
-            &requested,
-            &requested,
-        )
-        .await
-        .unwrap();
+        let client = DaemonClient::new(&api_url, None);
+        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
+            .await
+            .unwrap();
 
         let failure = retrieval
             .failure()
@@ -1027,18 +1338,10 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("src/main.rs"), PathBuf::from("dist/*.whl")];
         let out = vec![PathBuf::from("dist/*.whl")];
-        let client = reqwest::Client::new();
-        let retrieval = retrieve_outputs(
-            &client,
-            &api_url,
-            None,
-            "job-x",
-            dst.path(),
-            &requested,
-            &out,
-        )
-        .await
-        .unwrap();
+        let client = DaemonClient::new(&api_url, None);
+        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &out)
+            .await
+            .unwrap();
 
         assert_eq!(retrieval.unmatched_out, vec!["dist/*.whl".to_string()]);
         assert!(retrieval.unmatched_write_back.is_empty());
@@ -1077,11 +1380,9 @@ mod tests {
 
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("kept.txt"), PathBuf::from("removed.txt")];
-        let client = reqwest::Client::new();
+        let client = DaemonClient::new(&api_url, None);
         let retrieval = retrieve_outputs(
             &client,
-            &api_url,
-            None,
             "job-x",
             dst.path(),
             &requested,
@@ -1116,18 +1417,10 @@ mod tests {
 
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("a"), PathBuf::from("b")];
-        let client = reqwest::Client::new();
-        let retrieval = retrieve_outputs(
-            &client,
-            &api_url,
-            None,
-            "job-x",
-            dst.path(),
-            &requested,
-            &requested,
-        )
-        .await
-        .unwrap();
+        let client = DaemonClient::new(&api_url, None);
+        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
+            .await
+            .unwrap();
 
         // The stub has no archive: had one been requested, this would be an
         // error rather than a clean pair of unmatched patterns.
@@ -1149,18 +1442,10 @@ mod tests {
 
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("out/app")];
-        let client = reqwest::Client::new();
-        let retrieval = retrieve_outputs(
-            &client,
-            &api_url,
-            None,
-            "job-x",
-            dst.path(),
-            &requested,
-            &requested,
-        )
-        .await
-        .unwrap();
+        let client = DaemonClient::new(&api_url, None);
+        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
+            .await
+            .unwrap();
 
         let failure = retrieval
             .failure()

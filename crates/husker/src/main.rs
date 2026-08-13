@@ -1,7 +1,6 @@
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -14,15 +13,23 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 mod cli;
 mod config;
 mod daemon;
+mod daemon_client;
 mod guest_file;
 mod job;
 mod schema;
+mod vm_creation;
 
 use crate::cli::*;
 use crate::config::*;
 use crate::daemon::*;
+use crate::daemon_client::{ApiFailure, DaemonClient, DaemonUnreachable};
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::*;
+use crate::vm_creation::{
+    VmCreationIntent, VmRequestArgs, fetch_daemon_profiles, plan_vm_creation,
+};
+#[cfg(test)]
+use crate::vm_creation::{apply_profile, daemon_to_profile, profile_to_daemon};
 
 fn resolve_format(fmt: OutputFormat) -> OutputFormat {
     match fmt {
@@ -37,137 +44,12 @@ fn resolve_format(fmt: OutputFormat) -> OutputFormat {
     }
 }
 
-/// Convert a client-side `Profile` (PathBuf fields) into a `DaemonProfile`
-/// (String fields) suitable for storing in HuskerCore and serving via the API.
-///
-/// `ssh_keys` is not carried into `DaemonProfile` because the daemon cannot
-/// hand clients readable key files. Clients must supply SSH keys via a local
-/// profile or an explicit `--ssh-key` flag.
-fn profile_to_daemon(p: &Profile) -> husker_core::DaemonProfile {
-    husker_core::DaemonProfile {
-        cloud_image: p
-            .cloud_image
-            .as_ref()
-            .map(|b| b.to_string_lossy().into_owned()),
-        rootfs: p.rootfs.as_ref().map(|b| b.to_string_lossy().into_owned()),
-        kernel: p.kernel.as_ref().map(|b| b.to_string_lossy().into_owned()),
-        initrd: p.initrd.as_ref().map(|b| b.to_string_lossy().into_owned()),
-        cpus: p.cpus,
-        memory: p.memory,
-        disk_size: p.disk_size.clone(),
-        vmm: p.vmm.clone(),
-        env: p.env.clone(),
-        balloon: p.balloon,
-        idle_timeout_secs: p.idle_timeout_secs,
-        suspend_ttl_secs: p.suspend_ttl_secs,
-        auto_resume: p.auto_resume,
-        volume: p.volume.clone(),
-        mounts: p.mounts.clone(),
-        network: p.network.clone(),
-    }
-}
-
-/// Convert a `DaemonProfile` received from the daemon API into a client-side
-/// `Profile` for local use in `apply_profile`.
-///
-/// `ssh_keys` is left empty because `DaemonProfile` does not carry key paths
-/// (they exist on the daemon host, not the client). SSH keys for cloud-init
-/// must come from a local profile or an explicit `--ssh-key` flag.
-fn daemon_to_profile(d: husker_core::DaemonProfile) -> Profile {
-    Profile {
-        cloud_image: d.cloud_image.map(PathBuf::from),
-        rootfs: d.rootfs.map(PathBuf::from),
-        kernel: d.kernel.map(PathBuf::from),
-        initrd: d.initrd.map(PathBuf::from),
-        cpus: d.cpus,
-        memory: d.memory,
-        disk_size: d.disk_size,
-        ssh_keys: Vec::new(),
-        vmm: d.vmm,
-        env: d.env,
-        balloon: d.balloon,
-        idle_timeout_secs: d.idle_timeout_secs,
-        suspend_ttl_secs: d.suspend_ttl_secs,
-        auto_resume: d.auto_resume,
-        volume: d.volume,
-        mounts: d.mounts,
-        network: d.network,
-    }
-}
-
-/// Fetch the daemon's configured profiles from `GET /v1/profiles`.
-///
-/// Returns `Ok(None)` on recoverable non-errors where the caller should fall
-/// back to local profiles only: connection failures (daemon offline, DNS,
-/// timeout) and HTTP 404 (older daemon without the endpoint). This is distinct
-/// from `Ok(Some(empty map))`, which means the daemon IS reachable and simply
-/// has no profiles configured.
-///
-/// Returns `Ok(Some(map))` when the daemon responds successfully, even if the
-/// map is empty.
-///
-/// Returns `Err` for conditions where the daemon IS reachable but actively
-/// rejected or failed the request: HTTP 401/403 (auth failure) and 5xx (server
-/// error). These indicate a real misconfiguration and must be surfaced to the
-/// user rather than silently producing an empty profile list.
-async fn fetch_daemon_profiles(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
-) -> anyhow::Result<Option<std::collections::HashMap<String, Profile>>> {
-    let req = with_api_auth(client.get(format!("{api_url}/v1/profiles")), api_token);
-    let resp = match req.send().await {
-        Ok(r) => r,
-        // Connection-level failures (refused, DNS, timeout): daemon is offline
-        // or unreachable. Fall back to local profiles silently.
-        Err(_) => return Ok(None),
-    };
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        // HTTP 404: daemon is reachable but does not expose /v1/profiles
-        // (older version). Fall back to local profiles silently.
-        return Ok(None);
-    }
-    if status == reqwest::StatusCode::UNAUTHORIZED
-        || status == reqwest::StatusCode::FORBIDDEN
-        || status.is_server_error()
-    {
-        return Err(anyhow::anyhow!(
-            "daemon rejected profiles request: {status} - check your api_token and daemon configuration"
-        ));
-    }
-    if !status.is_success() {
-        return Err(anyhow::anyhow!(
-            "unexpected response from daemon profiles endpoint: {status}"
-        ));
-    }
-    let Ok(body) = resp.json::<serde_json::Value>().await else {
-        return Ok(None);
-    };
-    let Some(profiles_val) = body.get("profiles") else {
-        return Ok(None);
-    };
-    let Ok(daemon_map) = serde_json::from_value::<
-        std::collections::HashMap<String, husker_core::DaemonProfile>,
-    >(profiles_val.clone()) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        daemon_map
-            .into_iter()
-            .map(|(k, v)| (k, daemon_to_profile(v)))
-            .collect(),
-    ))
-}
-
 /// Fetch a diagnostics report from the daemon's `GET /v1/diagnostics` endpoint.
 async fn fetch_diagnostics(
-    api_url: &str,
-    client: &reqwest::Client,
+    daemon: &DaemonClient,
 ) -> anyhow::Result<husker_core::DiagnosticsReport> {
-    let resp = client
-        .get(format!("{api_url}/v1/diagnostics"))
-        .send()
+    let resp = daemon
+        .send(daemon.get("/v1/diagnostics"))
         .await?
         .error_for_status()?;
     Ok(resp.json().await?)
@@ -297,14 +179,9 @@ fn merge_env(env_files: &[PathBuf], env_flags: Vec<String>) -> anyhow::Result<Ve
 /// times out waiting for boot is diagnosable without the user knowing to reach
 /// for `husker logs`. Returns a string with a leading newline (or a shorter
 /// pointer if the console is empty or unreachable).
-pub(crate) async fn serial_boot_hint(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
-    name: &str,
-) -> String {
-    let url = format!("{api_url}/v1/vms/{name}/logs?source=serial&tail=20");
-    let body = match with_api_auth(client.get(&url), api_token).send().await {
+pub(crate) async fn serial_boot_hint(daemon: &DaemonClient, name: &str) -> String {
+    let path = format!("/v1/vms/{name}/logs?source=serial&tail=20");
+    let body = match daemon.try_send(daemon.get(path)).await {
         Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
         _ => String::new(),
     };
@@ -415,18 +292,14 @@ fn merge_etc_hosts(existing: &str, additions: &[(String, String)]) -> String {
 /// with `--dns` nameservers) and merging `--add-host` entries into `/etc/hosts`,
 /// both via the guest file API. Scoped to this VM only - no daemon-wide change.
 pub(crate) async fn apply_dns_hosts(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
+    daemon: &DaemonClient,
     name: &str,
     dns: &[String],
     add_host: &[(String, String)],
 ) -> anyhow::Result<()> {
     if !dns.is_empty() {
         write_guest_file(
-            client,
-            api_url,
-            api_token,
+            daemon,
             name,
             "/etc/resolv.conf",
             render_resolv_conf(dns).as_bytes(),
@@ -434,19 +307,11 @@ pub(crate) async fn apply_dns_hosts(
         .await?;
     }
     if !add_host.is_empty() {
-        let existing = read_guest_file_or_empty(client, api_url, api_token, name, "/etc/hosts")
+        let existing = read_guest_file_or_empty(daemon, name, "/etc/hosts")
             .await
             .unwrap_or_default();
         let merged = merge_etc_hosts(&existing, add_host);
-        write_guest_file(
-            client,
-            api_url,
-            api_token,
-            name,
-            "/etc/hosts",
-            merged.as_bytes(),
-        )
-        .await?;
+        write_guest_file(daemon, name, "/etc/hosts", merged.as_bytes()).await?;
     }
     Ok(())
 }
@@ -455,19 +320,17 @@ pub(crate) async fn apply_dns_hosts(
 /// Returns `Ok(true)` when ready, `Ok(false)` on timeout, and `Err` if the VM is
 /// gone or the daemon errors.
 async fn wait_for_vm_ready(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
+    daemon: &DaemonClient,
     name: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<bool> {
-    let ready_url = format!("{api_url}/v1/vms/{name}/ready");
+    let ready_path = format!("/v1/vms/{name}/ready");
     let deadline = std::time::Instant::now() + timeout;
     let mut backoff = std::time::Duration::from_millis(200);
     loop {
-        let resp = api_request(with_api_auth(client.get(&ready_url), api_token)).await?;
+        let resp = daemon.send(daemon.get(&ready_path)).await?;
         if !resp.status().is_success() {
-            let msg = api_error(resp, &format!("VM '{name}'")).await;
+            let msg = daemon.error(resp, &format!("VM '{name}'")).await;
             anyhow::bail!("{}", msg.message);
         }
         let rdy: serde_json::Value = resp.json().await?;
@@ -484,9 +347,7 @@ async fn wait_for_vm_ready(
 
 /// Write `data` to `path` inside a VM via the guest file API.
 async fn write_guest_file(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
+    daemon: &DaemonClient,
     name: &str,
     path: &str,
     data: &[u8],
@@ -495,16 +356,15 @@ async fn write_guest_file(
         "path": path,
         "data": husker_agent_proto::base64_encode(data),
     });
-    let resp = api_request(
-        with_api_auth(
-            client.post(format!("{api_url}/v1/vms/{name}/files/write")),
-            api_token,
+    let resp = daemon
+        .send(
+            daemon
+                .post(format!("/v1/vms/{name}/files/write"))
+                .json(&body),
         )
-        .json(&body),
-    )
-    .await?;
+        .await?;
     if !resp.status().is_success() {
-        let msg = api_error(resp, &format!("VM '{name}'")).await;
+        let msg = daemon.error(resp, &format!("VM '{name}'")).await;
         anyhow::bail!("writing {path}: {}", msg.message);
     }
     Ok(())
@@ -513,20 +373,17 @@ async fn write_guest_file(
 /// Read `path` from a VM via the guest file API, returning an empty string if the
 /// file does not exist yet (so a fresh `/etc/hosts` merges cleanly).
 async fn read_guest_file_or_empty(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
+    daemon: &DaemonClient,
     name: &str,
     path: &str,
 ) -> anyhow::Result<String> {
-    let resp = api_request(
-        with_api_auth(
-            client.post(format!("{api_url}/v1/vms/{name}/files/read")),
-            api_token,
+    let resp = daemon
+        .send(
+            daemon
+                .post(format!("/v1/vms/{name}/files/read"))
+                .json(&serde_json::json!({ "path": path })),
         )
-        .json(&serde_json::json!({ "path": path })),
-    )
-    .await?;
+        .await?;
     if !resp.status().is_success() {
         return Ok(String::new());
     }
@@ -535,184 +392,6 @@ async fn read_guest_file_or_empty(
     let bytes = husker_agent_proto::base64_decode(b64)
         .map_err(|e| anyhow::anyhow!("invalid base64 from server: {e}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Flags shared by `run` and `job` that describe the VM to create.
-#[derive(Debug, Default)]
-struct VmRequestArgs {
-    rootfs: Option<PathBuf>,
-    kernel: Option<PathBuf>,
-    initrd: Option<PathBuf>,
-    cpus: Option<u32>,
-    memory: Option<u32>,
-    vmm: Option<String>,
-    cloud_image: Option<PathBuf>,
-    disk_size: Option<String>,
-    ssh_key: Vec<PathBuf>,
-    env: Vec<String>,
-    balloon: bool,
-    idle: bool,
-    idle_timeout_secs: Option<u64>,
-    suspend_ttl_secs: Option<u64>,
-    auto_resume: Option<bool>,
-    volume: Option<String>,
-    mount: Vec<String>,
-    network: Option<String>,
-}
-
-/// Fill unset fields from a profile: explicit CLI values always win;
-/// list fields use the profile only when the CLI provided none.
-/// For bool fields (balloon), the profile fills only when the CLI flag is false
-/// (since false is the default/unset state; true is always an explicit opt-in).
-fn apply_profile(args: &mut VmRequestArgs, p: &Profile) {
-    args.cloud_image = args.cloud_image.take().or_else(|| p.cloud_image.clone());
-    args.rootfs = args.rootfs.take().or_else(|| p.rootfs.clone());
-    args.kernel = args.kernel.take().or_else(|| p.kernel.clone());
-    args.initrd = args.initrd.take().or_else(|| p.initrd.clone());
-    args.cpus = args.cpus.or(p.cpus);
-    args.memory = args.memory.or(p.memory);
-    args.disk_size = args.disk_size.take().or_else(|| p.disk_size.clone());
-    args.vmm = args.vmm.take().or_else(|| p.vmm.clone());
-    if args.ssh_key.is_empty() {
-        args.ssh_key = p.ssh_keys.iter().map(|k| expand_tilde(k)).collect();
-    }
-    if args.env.is_empty() {
-        args.env = p.env.clone();
-    }
-    if !args.balloon {
-        args.balloon = p.balloon.unwrap_or(false);
-    }
-    args.idle_timeout_secs = args.idle_timeout_secs.or(p.idle_timeout_secs);
-    args.suspend_ttl_secs = args.suspend_ttl_secs.or(p.suspend_ttl_secs);
-    args.auto_resume = args.auto_resume.or(p.auto_resume);
-    args.volume = args.volume.take().or_else(|| p.volume.clone());
-    if args.mount.is_empty() {
-        args.mount = p.mounts.clone();
-    }
-    args.network = args.network.take().or_else(|| p.network.clone());
-}
-
-/// A failure to surface to the user: a human-readable `message`, an optional
-/// machine-readable `kind` (the daemon's stable error identifier, matching the
-/// clispec error envelope), the process exit code to return, and an optional
-/// actionable hint. `String`/`&str` convert in as a generic error.
-#[derive(Debug, Clone)]
-pub(crate) struct ApiFailure {
-    pub(crate) message: String,
-    pub(crate) kind: Option<String>,
-    pub(crate) exit_code: i32,
-    pub(crate) hint: Option<String>,
-}
-
-impl From<String> for ApiFailure {
-    fn from(message: String) -> Self {
-        Self {
-            message,
-            kind: None,
-            exit_code: exit_code::GENERAL,
-            hint: None,
-        }
-    }
-}
-
-impl From<&str> for ApiFailure {
-    fn from(message: &str) -> Self {
-        message.to_string().into()
-    }
-}
-
-/// Marker attached to connection failures so the top-level handler can map them
-/// to `exit_code::DAEMON_UNREACHABLE`.
-#[derive(Debug)]
-struct DaemonUnreachable;
-
-impl std::fmt::Display for DaemonUnreachable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "daemon unreachable")
-    }
-}
-
-impl std::error::Error for DaemonUnreachable {}
-
-/// Build an `ApiFailure` from a non-success API response: derive the exit code
-/// from the HTTP status, capture the daemon's stable `kind`, and the message.
-pub(crate) async fn api_error(resp: reqwest::Response, subject: &str) -> ApiFailure {
-    let status = resp.status();
-    let exit_code = match status.as_u16() {
-        404 => exit_code::NOT_FOUND,
-        409 => exit_code::CONFLICT,
-        401 | 403 => exit_code::DENIED,
-        _ => exit_code::GENERAL,
-    };
-    let mut kind = None;
-    let message = match resp.text().await {
-        Ok(body) if !body.is_empty() => match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(json) => {
-                kind = json["kind"].as_str().map(String::from);
-                if let Some(msg) = json["message"].as_str() {
-                    match json["hint"].as_str() {
-                        Some(hint) => format!("{msg} (hint: {hint})"),
-                        None => msg.to_string(),
-                    }
-                } else if let Some(msg) = json["error"].as_str() {
-                    msg.to_string()
-                } else {
-                    body
-                }
-            }
-            Err(_) => body,
-        },
-        _ => match status.as_u16() {
-            404 => format!("{subject} not found"),
-            409 => format!("{subject} already exists"),
-            _ => format!("{subject}: {status}"),
-        },
-    };
-    ApiFailure {
-        message,
-        kind,
-        exit_code,
-        hint: None,
-    }
-}
-
-/// Stores the effective daemon URL for use in connection error messages.
-/// Set once at CLI startup so `api_request` can mention the URL without
-/// threading it through every call site.
-static DAEMON_URL: OnceLock<String> = OnceLock::new();
-
-fn set_daemon_url(url: &str) {
-    let _ = DAEMON_URL.set(url.to_string());
-}
-
-/// Send a request to the daemon API and return the response.
-///
-/// Wraps connection errors with a hint about whether the daemon is running,
-/// naming the URL so users running a daemon on a non-default port can
-/// correct their `--api-url`/`HUSKER_API_URL` setting.
-pub(crate) async fn api_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-    request.send().await.map_err(|e| {
-        if e.is_connect() {
-            let url = DAEMON_URL.get().map(String::as_str).unwrap_or("the daemon");
-            anyhow::Error::new(DaemonUnreachable).context(format!(
-                "cannot connect to daemon at {url}\n\
-                 hint: start it with `husker daemon`, or point at a running daemon via --api-url / HUSKER_API_URL"
-            ))
-        } else {
-            anyhow::anyhow!("{e}")
-        }
-    })
-}
-
-pub(crate) fn with_api_auth(
-    request: reqwest::RequestBuilder,
-    api_token: Option<&str>,
-) -> reqwest::RequestBuilder {
-    if let Some(token) = api_token {
-        request.bearer_auth(token)
-    } else {
-        request
-    }
 }
 
 fn resolve_api_token(cli_api_token: Option<String>, config_path: Option<&Path>) -> Option<String> {
@@ -886,219 +565,26 @@ fn oci_default_image_name(reference: &str) -> String {
     }
 }
 
-/// Resolve profile + defaults + guards into the create-VM JSON body.
-/// Shared by `run` and `job`. Exits the process (via exit_with_error) on
-/// user errors, matching the existing run-handler behavior.
-///
-/// `profiles` is the effective profile map (daemon profiles merged with local,
-/// local taking precedence). `origins` records whether each profile's winning
-/// entry is `Local` or `Daemon`; this drives whether path fields are resolved
-/// against the client filesystem. Pass `&config.profiles` with an empty origins
-/// map when no daemon fetch is performed or when offline (all paths resolve
-/// client-side as usual).
+/// Compatibility helper for focused body tests. Production commands use the
+/// complete intent-to-plan seam; this keeps the existing request assertions on
+/// the same resolver without recreating its policy in `main.rs`.
+#[cfg(test)]
 fn build_vm_request_body(
     name: &str,
-    mut args: VmRequestArgs,
+    args: VmRequestArgs,
     profile: Option<&str>,
     profiles: &std::collections::HashMap<String, Profile>,
     origins: &std::collections::HashMap<String, ProfileOrigin>,
     config: &Config,
     output: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
-    // Capture which path fields were set by the caller (CLI) before profile fills them.
-    // Used below to distinguish CLI-supplied rootfs (resolve) from daemon-profile
-    // rootfs (keep opaque so a bare catalog name reaches the daemon unchanged).
-    let cli_had_rootfs = args.rootfs.is_some();
-
-    if let Some(p) = profile {
-        match profiles.get(p) {
-            Some(prof) => apply_profile(&mut args, prof),
-            None => {
-                let mut names: Vec<&String> = profiles.keys().collect();
-                names.sort();
-                let list = if names.is_empty() {
-                    "none defined".to_string()
-                } else {
-                    names
-                        .iter()
-                        .map(|n| n.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                exit_with_error(output, format!("unknown profile '{p}' (available: {list})"));
-            }
-        }
+    let built =
+        crate::vm_creation::build_vm_request(name, args, profile, profiles, origins, config, true)?;
+    for diagnostic in &built.diagnostics {
+        diagnostic.report(output);
     }
-
-    if !args.ssh_key.is_empty() && args.cloud_image.is_none() {
-        exit_with_error(output, "--ssh-key requires --cloud-image".to_string());
-    }
-
-    let balloon = args.balloon;
-
-    let env_pairs: Vec<(String, String)> = args
-        .env
-        .iter()
-        .filter_map(|s| {
-            let (k, v) = s.split_once('=')?;
-            Some((k.to_string(), v.to_string()))
-        })
-        .collect();
-
-    let mut body = serde_json::json!({
-        "name": name,
-        "vcpu_count": args.cpus,
-        "mem_size_mib": args.memory,
-        "env": env_pairs,
-    });
-
-    if let Some(ref vmm_kind) = args.vmm {
-        body["vmm"] = serde_json::json!(vmm_kind);
-    }
-
-    // An explicit --disk-size applies to any image kind: cloud images grow via
-    // cloud-init on first boot, plain rootfs images are resized offline by the
-    // daemon. The config default_disk_size stays cloud-image-only so a config
-    // knob cannot silently start resizing every rootfs VM.
-    let effective_disk_size = args.disk_size.clone().or_else(|| {
-        args.cloud_image
-            .is_some()
-            .then(|| config.default_disk_size.clone())
-            .flatten()
-    });
-    if let Some(ref size) = effective_disk_size {
-        let disk_size_source = if args.disk_size.is_some() {
-            "--disk-size"
-        } else {
-            "config default_disk_size"
-        };
-        let bytes = husker::parse_disk_size(size)
-            .map_err(|e| anyhow::anyhow!("{disk_size_source}: {e}"))?;
-        body["disk_size"] = serde_json::json!(bytes);
-    }
-
-    if let Some(ref img) = args.cloud_image.clone() {
-        body["cloud_image"] = serde_json::json!(img);
-        if !args.ssh_key.is_empty() {
-            let mut keys: Vec<String> = Vec::new();
-            for path in &args.ssh_key {
-                let content = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading SSH public key {}", path.display()))?;
-                let parsed = husker::parse_ssh_public_keys(&content)
-                    .map_err(|e| anyhow::anyhow!("--ssh-key {}: {e}", path.display()))?;
-                keys.extend(parsed);
-            }
-            body["ssh_authorized_keys"] = serde_json::json!(keys);
-        }
-        if output == OutputFormat::Text {
-            eprintln!("Using: cloud-image={}", img.display());
-        }
-    } else {
-        // Only include kernel/rootfs/initrd in the request when the user explicitly
-        // provided them. When omitted, the daemon resolves defaults from its own
-        // config, ensuring the paths exist on the daemon host rather than the client.
-        //
-        // Rootfs resolution: CLI-supplied or local-profile rootfs values are run
-        // through resolve_rootfs_arg so a bare image name expands to the client's
-        // data_dir/images/<name>. Daemon-origin profile rootfs values must NOT be
-        // resolved this way: a bare catalog name like "alpine-x86_64.ext4" from the
-        // daemon must reach the daemon unchanged. A local profile that overrides a
-        // same-named daemon profile is LOCAL-origin and DOES get resolved.
-        let profile_rootfs_from_daemon = !cli_had_rootfs
-            && profile
-                .map(|p| origins.get(p) == Some(&ProfileOrigin::Daemon))
-                .unwrap_or(false);
-        let explicit_rootfs = args.rootfs.map(|path| {
-            if profile_rootfs_from_daemon {
-                path
-            } else {
-                husker::resolve_rootfs_arg(path, &config.data_dir)
-            }
-        });
-        let explicit_kernel = args.kernel;
-        let explicit_initrd = args.initrd;
-
-        // When paths are omitted and the local defaults don't exist, emit a hint
-        // so users on a fresh local install know to run `husker images pull`.
-        // This is advisory only; the daemon may have its own defaults even if the
-        // client's data dir is empty (e.g. a remote daemon over ssh://).
-        // Emitted unconditionally to stderr since it is always human-facing.
-        if explicit_kernel.is_none() && !config.default_kernel.exists() {
-            eprintln!(
-                "Default kernel not found at {}.\n\
-                 Run `husker images pull` to fetch it, or pass --kernel explicitly.",
-                config.default_kernel.display()
-            );
-        }
-        if explicit_rootfs.is_none() && !config.default_rootfs.exists() {
-            eprintln!(
-                "Default rootfs not found at {}.\n\
-                 Run `husker images pull` to fetch it, or pass a rootfs path explicitly.",
-                config.default_rootfs.display()
-            );
-        }
-
-        if output == OutputFormat::Text {
-            let kernel_str = explicit_kernel
-                .as_ref()
-                .map(|p: &std::path::PathBuf| p.display().to_string())
-                .unwrap_or_else(|| "(daemon default)".to_string());
-            let rootfs_str = explicit_rootfs
-                .as_ref()
-                .map(|p: &std::path::PathBuf| p.display().to_string())
-                .unwrap_or_else(|| "(daemon default)".to_string());
-            let initrd_str = explicit_initrd
-                .as_ref()
-                .map(|p: &std::path::PathBuf| p.display().to_string())
-                .unwrap_or_else(|| "(daemon default)".to_string());
-            eprintln!("Using: kernel={kernel_str} rootfs={rootfs_str} initrd={initrd_str}",);
-        }
-        if let Some(ref rootfs) = explicit_rootfs {
-            body["rootfs_path"] = serde_json::json!(rootfs);
-        }
-        if let Some(ref kernel) = explicit_kernel {
-            body["kernel_path"] = serde_json::json!(kernel);
-        }
-        if let Some(ref initrd) = explicit_initrd {
-            body["initrd_path"] = serde_json::json!(initrd);
-        }
-    }
-
-    if balloon {
-        body["balloon"] = serde_json::json!(true);
-    }
-
-    if let Some(idle) = args.idle.then_some(true) {
-        body["idle"] = serde_json::json!(idle);
-    }
-
-    if let Some(secs) = args.idle_timeout_secs {
-        body["idle_timeout_secs"] = serde_json::json!(secs);
-    }
-
-    if let Some(secs) = args.suspend_ttl_secs {
-        body["suspend_ttl_secs"] = serde_json::json!(secs);
-    }
-
-    if let Some(auto_resume) = args.auto_resume {
-        body["auto_resume"] = serde_json::json!(auto_resume);
-    }
-
-    if let Some(ref vol) = args.volume {
-        body["volume"] = serde_json::json!(vol);
-    }
-
-    if !args.mount.is_empty() {
-        body["mounts"] = serde_json::json!(args.mount);
-    }
-
-    if let Some(ref net) = args.network {
-        body["network"] = serde_json::json!(net);
-    }
-
-    Ok(body)
+    Ok(serde_json::to_value(built.body)?)
 }
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -1235,8 +721,6 @@ async fn run(cli: Cli) -> Result<()> {
     // Remote-over-ssh: the tunnel URL is localhost, so `is_local_api` would
     // misclassify it. This flag lets `is_local_target` treat it as remote.
     let via_ssh_tunnel = _ssh_tunnel.is_some();
-    set_daemon_url(&api_url);
-
     match command {
         Commands::Daemon {
             listen,
@@ -1290,112 +774,58 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|s| parse_add_host(s))
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
-            let client = reqwest::Client::new();
-            let resp = if let Some(pool) = pool {
-                // Draw a fresh VM from a hot pool: fork its template into `name`.
-                // The pool's template defines the image and resources, so the
-                // boot/config flags do not apply - reject them rather than
-                // silently ignore them.
-                if rootfs.is_some()
-                    || kernel.is_some()
-                    || initrd.is_some()
-                    || cpus.is_some()
-                    || memory.is_some()
-                    || vmm.is_some()
-                    || cloud_image.is_some()
-                    || disk_size.is_some()
-                    || volume.is_some()
-                    || net.is_some()
-                    || profile.is_some()
-                    || balloon
-                    || userdata.is_some()
-                    || !ssh_key.is_empty()
-                    || !env.is_empty()
-                    || !dns.is_empty()
-                    || !add_host.is_empty()
-                    || idle
-                    || idle_timeout.is_some()
-                    || suspend_ttl.is_some()
-                    || no_auto_resume
-                {
-                    exit_with_error(
-                        output,
-                        format!(
-                            "--pool cannot be combined with rootfs/boot/config/idle flags \
-                             (pool '{pool}' defines the VM); pass only --name"
-                        ),
-                    );
-                }
-                api_request(
-                    with_api_auth(
-                        client.post(format!("{api_url}/v1/pools/{pool}/checkout")),
-                        api_token.as_deref(),
-                    )
-                    .json(&serde_json::json!({ "vm_name": &name })),
-                )
-                .await?
-            } else {
-                let daemon_profiles =
-                    match fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await {
-                        Ok(opt) => opt.unwrap_or_default(),
-                        Err(e) => exit_with_error(output, e.to_string()),
-                    };
-                let (merged_profiles, profile_origins) =
-                    merge_profiles(daemon_profiles, &config.profiles);
-                let args = VmRequestArgs {
-                    rootfs,
-                    kernel,
-                    initrd,
-                    cpus,
-                    memory,
-                    vmm,
-                    cloud_image,
-                    disk_size,
-                    ssh_key,
-                    env,
-                    balloon,
-                    idle,
-                    idle_timeout_secs: idle_timeout,
-                    suspend_ttl_secs: suspend_ttl,
-                    auto_resume: if no_auto_resume { Some(false) } else { None },
-                    volume,
-                    mount,
-                    network: net,
-                };
-                let mut body = build_vm_request_body(
-                    &name,
-                    args,
-                    profile.as_deref(),
-                    &merged_profiles,
-                    &profile_origins,
-                    &config,
-                    output,
-                )?;
-
-                if let Some(ref userdata_path) = userdata {
-                    let script = std::fs::read_to_string(userdata_path).with_context(|| {
-                        format!("reading userdata script {}", userdata_path.display())
-                    })?;
-                    body["userdata"] = serde_json::json!(script);
-                }
-
-                #[cfg(all(target_os = "linux", feature = "linux-net"))]
-                if needs_firecracker_preflight(&body) {
-                    ensure_firecracker(&config).await?;
-                }
-
-                api_request(
-                    with_api_auth(
-                        client.post(format!("{api_url}/v1/vms")),
-                        api_token.as_deref(),
-                    )
-                    .json(&body),
-                )
-                .await?
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let userdata_queued = userdata.is_some();
+            let mut extra_pool_conflicts = Vec::new();
+            if !dns.is_empty() {
+                extra_pool_conflicts.push("--dns");
+            }
+            if !add_host.is_empty() {
+                extra_pool_conflicts.push("--add-host");
+            }
+            let plan = match plan_vm_creation(
+                &client,
+                &config,
+                VmCreationIntent {
+                    name: name.clone(),
+                    pool,
+                    profile,
+                    args: VmRequestArgs {
+                        rootfs,
+                        kernel,
+                        initrd,
+                        cpus,
+                        memory,
+                        vmm,
+                        cloud_image,
+                        disk_size,
+                        ssh_key,
+                        env,
+                        balloon,
+                        idle,
+                        idle_timeout_secs: idle_timeout,
+                        suspend_ttl_secs: suspend_ttl,
+                        auto_resume: if no_auto_resume { Some(false) } else { None },
+                        volume,
+                        mount,
+                        network: net,
+                    },
+                    userdata,
+                    extra_pool_conflicts,
+                },
+                is_local_target(&api_url, via_ssh_tunnel),
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(error) => exit_with_error(output, error.to_string()),
             };
+            plan.report_diagnostics(output);
+            let plan = plan.prepare(&config).await?;
+            let resp = plan.execute(&client).await?;
 
             if !resp.status().is_success() {
-                let mut full = api_error(resp, &format!("VM '{name}'")).await;
+                let mut full = client.error(resp, &format!("VM '{name}'")).await;
                 if full.message.contains("already exists") {
                     full.message.push_str(&format!(
                         " (hint: if it is suspended, resume it with `husker resume {name}`; otherwise stop or destroy it first with `husker destroy {name}`)"
@@ -1412,7 +842,7 @@ async fn run(cli: Cli) -> Result<()> {
                         "status": "ok",
                         "action": "run",
                         "vm": vm,
-                        "userdata_queued": userdata.is_some(),
+                        "userdata_queued": userdata_queued,
                     }),
                     "",
                 );
@@ -1423,7 +853,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("  CPUs:  {}", vm["vcpu_count"]);
                 println!("  RAM:   {} MiB", vm["mem_size_mib"]);
 
-                if userdata.is_some() {
+                if userdata_queued {
                     println!("  Userdata script queued (check status with `husker info {name}`)");
                 }
             }
@@ -1438,28 +868,17 @@ async fn run(cli: Cli) -> Result<()> {
                     .unwrap_or("direct");
                 let ready = wait_for_vm_ready(
                     &client,
-                    &api_url,
-                    api_token.as_deref(),
                     &name,
                     husker_core::default_ready_timeout(boot_mode),
                 )
                 .await?;
                 if !ready {
-                    let hint =
-                        serial_boot_hint(&client, &api_url, api_token.as_deref(), &name).await;
+                    let hint = serial_boot_hint(&client, &name).await;
                     anyhow::bail!(
                         "VM '{name}' did not become ready to apply --dns/--add-host{hint}"
                     );
                 }
-                apply_dns_hosts(
-                    &client,
-                    &api_url,
-                    api_token.as_deref(),
-                    &name,
-                    &dns,
-                    &add_host,
-                )
-                .await?;
+                apply_dns_hosts(&client, &name, &dns, &add_host).await?;
                 if output == OutputFormat::Text {
                     println!("  Applied per-VM DNS/host overrides");
                 }
@@ -1472,16 +891,15 @@ async fn run(cli: Cli) -> Result<()> {
             fields,
         } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
-            let mut url = format!("{api_url}/v1/vms?limit={limit}&offset={offset}");
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let mut url = format!("/v1/vms?limit={limit}&offset={offset}");
             if let Some(ref f) = fields {
                 url.push_str(&format!("&fields={}", f));
             }
             // When the daemon is unreachable, return an empty list so agents and
             // scripts get a valid, paginatable response instead of a hard error.
             // A diagnostic message goes to stderr.
-            let resp_result =
-                api_request(with_api_auth(client.get(&url), api_token.as_deref())).await;
+            let resp_result = client.send(client.get(&url)).await;
             let mut daemon_reachable = true;
             let vms: Vec<serde_json::Value> = match resp_result {
                 Err(ref e) if e.chain().any(|c| c.is::<DaemonUnreachable>()) => {
@@ -1494,7 +912,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Err(e) => return Err(e),
                 Ok(resp) => {
                     if !resp.status().is_success() {
-                        let msg = api_error(resp, "listing VMs").await;
+                        let msg = client.error(resp, "listing VMs").await;
                         exit_with_error(output, msg);
                     }
                     resp.json().await?
@@ -1555,15 +973,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Info { name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/vms/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                let msg = client.error(resp, &format!("VM '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -1613,12 +1027,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Stop { name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client.post(format!("{api_url}/v1/vms/{name}/stop")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client
+                .send(client.post(format!("/v1/vms/{name}/stop")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -1631,7 +1043,7 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Stopped VM: {name}"),
                 );
             } else {
-                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
+                let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
                     msg.message.push_str(" (hint: VM is already stopped)");
                 }
@@ -1641,12 +1053,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Pause { name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client.post(format!("{api_url}/v1/vms/{name}/pause")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client
+                .send(client.post(format!("/v1/vms/{name}/pause")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -1659,7 +1069,7 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Paused VM: {name}"),
                 );
             } else {
-                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
+                let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
                     msg.message
                         .push_str(" (hint: start the VM first with `husker run`)");
@@ -1670,12 +1080,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Resume { name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client.post(format!("{api_url}/v1/vms/{name}/resume")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client
+                .send(client.post(format!("/v1/vms/{name}/resume")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -1688,7 +1096,7 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Resumed VM: {name}"),
                 );
             } else {
-                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
+                let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
                     msg.message
                         .push_str(" (hint: start the VM first with `husker run`)");
@@ -1703,12 +1111,10 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Suspend { name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             preflight_capability(&api_url, api_token.as_deref(), "snapshot").await?;
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client.post(format!("{api_url}/v1/vms/{name}/suspend")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client
+                .send(client.post(format!("/v1/vms/{name}/suspend")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -1721,7 +1127,7 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Suspended VM: {name}"),
                 );
             } else {
-                let mut msg = api_error(resp, &format!("VM '{name}'")).await;
+                let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
                     msg.message
                         .push_str(" (hint: VM must be running to suspend)");
@@ -1733,14 +1139,14 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Fork { source, fork_name } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
             preflight_capability(&api_url, api_token.as_deref(), "fork").await?;
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client
-                    .post(format!("{api_url}/v1/vms/{source}/fork"))
-                    .json(&serde_json::json!({ "fork_name": fork_name })),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client
+                .send(
+                    client
+                        .post(format!("/v1/vms/{source}/fork"))
+                        .json(&serde_json::json!({ "fork_name": fork_name })),
+                )
+                .await?;
 
             if resp.status().is_success() {
                 let body: serde_json::Value = resp
@@ -1759,7 +1165,7 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Forked '{source}' -> '{fork_name}'"),
                 );
             } else {
-                let msg = api_error(resp, &format!("VM '{source}'")).await;
+                let msg = client.error(resp, &format!("VM '{source}'")).await;
                 exit_with_error(output, msg);
             }
             Ok(())
@@ -1768,12 +1174,10 @@ async fn run(cli: Cli) -> Result<()> {
             require_confirmation(&format!("Destroy VM '{name}'?"), yes, output);
 
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/vms/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client
+                .send(client.delete(format!("/v1/vms/{name}")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -1786,23 +1190,18 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Destroyed VM: {name}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                let msg = client.error(resp, &format!("VM '{name}'")).await;
                 exit_with_error(output, msg);
             }
             Ok(())
         }
         Commands::Balloon { name, amount_mib } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
+            let client = DaemonClient::new(&api_url, api_token.clone());
             let body = serde_json::json!({ "amount_mib": amount_mib });
-            let resp = api_request(
-                with_api_auth(
-                    client.put(format!("{api_url}/v1/vms/{name}/balloon")),
-                    api_token.as_deref(),
-                )
-                .json(&body),
-            )
-            .await?;
+            let resp = client
+                .send(client.put(format!("/v1/vms/{name}/balloon")).json(&body))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -1816,7 +1215,7 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Balloon set: {name} -> {amount_mib} MiB"),
                 );
             } else {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                let msg = client.error(resp, &format!("VM '{name}'")).await;
                 exit_with_error(output, msg);
             }
             Ok(())
@@ -1861,18 +1260,13 @@ async fn run(cli: Cli) -> Result<()> {
                 body["timeout_secs"] = serde_json::json!(secs);
             }
 
-            let client = reqwest::Client::new();
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/vms/{name}/exec")),
-                    api_token.as_deref(),
-                )
-                .json(&body),
-            )
-            .await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client
+                .send(client.post(format!("/v1/vms/{name}/exec")).json(&body))
+                .await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                let msg = client.error(resp, &format!("VM '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -1950,127 +1344,53 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|s| parse_add_host(s))
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
-            // An empty command runs the image's default entrypoint (resolved by
-            // the guest agent). That is meaningless with --sync-cwd, which wraps
-            // an explicit command to run in the synced tree - reject it before
-            // booting a VM.
-            if command.is_empty() && sync_cwd {
-                exit_with_error(
-                    output,
-                    "--sync-cwd needs a command after `--`; the image default is \
-                     only used without --sync-cwd",
-                );
-            }
-
-            // With --pool the job's VM is forked from the pool's template, so there
-            // is no create body and the image/boot flags do not apply (env/secret
-            // still go to the exec). Otherwise build the create body (env goes to
-            // the EXEC request, not the body; pass empty to the builder).
-            let body = if let Some(ref pool) = pool {
-                let conflicts = job::pool_conflicting_flags(&job::PoolFlags {
-                    rootfs: rootfs.is_some(),
-                    kernel: kernel.is_some(),
-                    initrd: initrd.is_some(),
-                    cpus: cpus.is_some(),
-                    memory: memory.is_some(),
-                    vmm: vmm.is_some(),
-                    cloud_image: cloud_image.is_some(),
-                    disk_size: disk_size.is_some(),
-                    volume: volume.is_some(),
-                    net: net.is_some(),
-                    profile: profile.is_some(),
-                    balloon,
-                    ssh_key: !ssh_key.is_empty(),
-                    idle,
-                    idle_timeout: idle_timeout.is_some(),
-                    suspend_ttl: suspend_ttl.is_some(),
-                    no_auto_resume,
-                });
-                if !conflicts.is_empty() {
-                    exit_with_error(
-                        output,
-                        format!(
-                            "--pool cannot be combined with {} (pool '{pool}' defines the VM \
-                             image); pass only --name and the command",
-                            conflicts.join(", ")
-                        ),
-                    );
-                }
-                None
-            } else {
-                let profile_client = reqwest::Client::new();
-                let daemon_profiles =
-                    match fetch_daemon_profiles(&profile_client, &api_url, api_token.as_deref())
-                        .await
-                    {
-                        Ok(opt) => opt.unwrap_or_default(),
-                        Err(e) => exit_with_error(output, e.to_string()),
-                    };
-                let (merged_profiles, profile_origins) =
-                    merge_profiles(daemon_profiles, &config.profiles);
-                let args = VmRequestArgs {
-                    rootfs,
-                    kernel,
-                    initrd,
-                    cpus,
-                    memory,
-                    vmm,
-                    cloud_image,
-                    disk_size,
-                    ssh_key,
-                    env: Vec::new(),
-                    balloon,
-                    idle,
-                    idle_timeout_secs: idle_timeout,
-                    suspend_ttl_secs: suspend_ttl,
-                    auto_resume: if no_auto_resume { Some(false) } else { None },
-                    volume,
-                    mount,
-                    network: net,
-                };
-                Some(build_vm_request_body(
-                    &name,
-                    args,
-                    profile.as_deref(),
-                    &merged_profiles,
-                    &profile_origins,
-                    &config,
-                    output,
-                )?)
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let plan = match plan_vm_creation(
+                &client,
+                &config,
+                VmCreationIntent {
+                    name: name.clone(),
+                    pool,
+                    profile,
+                    args: VmRequestArgs {
+                        rootfs,
+                        kernel,
+                        initrd,
+                        cpus,
+                        memory,
+                        vmm,
+                        cloud_image,
+                        disk_size,
+                        ssh_key,
+                        env: Vec::new(),
+                        balloon,
+                        idle,
+                        idle_timeout_secs: idle_timeout,
+                        suspend_ttl_secs: suspend_ttl,
+                        auto_resume: if no_auto_resume { Some(false) } else { None },
+                        volume,
+                        mount,
+                        network: net,
+                    },
+                    userdata: None,
+                    extra_pool_conflicts: Vec::new(),
+                },
+                is_local_target(&api_url, via_ssh_tunnel),
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(error) => exit_with_error(output, error.to_string()),
             };
+            plan.report_diagnostics(output);
+            let plan = plan.prepare(&config).await?;
 
-            let client = reqwest::Client::new();
-
-            // Best-effort cleanup: fire-and-forget DELETE so the VM is not left behind.
-            let do_cleanup = {
-                let client = client.clone();
-                let api_url = api_url.clone();
-                let api_token = api_token.clone();
-                let name = name.clone();
-                move || {
-                    let client = client.clone();
-                    let api_url = api_url.clone();
-                    let api_token = api_token.clone();
-                    let name = name.clone();
-                    async move {
-                        let _ = with_api_auth(
-                            client.delete(format!("{api_url}/v1/vms/{name}")),
-                            api_token.as_deref(),
-                        )
-                        .send()
-                        .await;
-                    }
-                }
-            };
-
-            let work = job::run_job(job::JobRequest {
-                client: &client,
-                api_url: &api_url,
-                api_token: api_token.as_deref(),
+            let termination = job::run_job(job::JobRequest {
+                daemon: &client,
                 output,
                 name: &name,
-                pool: pool.as_deref(),
-                body: body.as_ref(),
+                creation: plan,
+                keep,
                 timeout,
                 dns: &dns,
                 add_host: &add_host,
@@ -2080,102 +1400,13 @@ async fn run(cli: Cli) -> Result<()> {
                 command: &command,
                 env: &env,
                 secret_env: &secret_env,
-            });
+            })
+            .await;
 
-            // Ctrl-C destroys the VM (unless --keep) and exits 130.
-            let result = tokio::select! {
-                r = work => r,
-                _ = tokio::signal::ctrl_c() => {
-                    if !keep {
-                        eprintln!("[job] interrupted, destroying {name}");
-                        do_cleanup().await;
-                    } else {
-                        eprintln!("[job] interrupted, keeping {name}");
-                    }
-                    std::process::exit(130);
-                }
-            };
-
-            match result {
-                Ok(outcome) => {
-                    let exec = &outcome.exec;
-                    let exit_code = exec["exit_code"].as_i64().unwrap_or(1);
-                    // Outputs that were asked for and did not arrive fail the
-                    // job. Decided before printing so the JSON status agrees
-                    // with the exit code rather than reporting "ok" beside an
-                    // error envelope.
-                    let retrieval_failure =
-                        outcome.retrieval.as_ref().and_then(job::Retrieval::failure);
-                    if output == OutputFormat::Json {
-                        let mut payload = serde_json::json!({
-                            "status": if retrieval_failure.is_some() { "error" } else { "ok" },
-                            "action": "job",
-                            "vm": name,
-                            "exit_code": exit_code,
-                            "stdout": exec["stdout"],
-                            "stderr": exec["stderr"],
-                        });
-                        // Only when the job asked for outputs: absent means
-                        // none were requested, which an empty list would blur
-                        // into "requested and none came back".
-                        if let Some(retrieval) = &outcome.retrieval {
-                            payload["retrieval"] = retrieval.to_json();
-                        }
-                        print_output(output, &payload, "");
-                    } else {
-                        print!("{}", exec["stdout"].as_str().unwrap_or(""));
-                        eprint!("{}", exec["stderr"].as_str().unwrap_or(""));
-                    }
-                    if keep {
-                        if output == OutputFormat::Text {
-                            eprintln!(
-                                "[job] exit code {exit_code}, keeping {name} \
-                                 (husker shell {name} / husker destroy {name})"
-                            );
-                        }
-                    } else {
-                        if output == OutputFormat::Text {
-                            eprintln!("[job] exit code {exit_code}, destroying vm");
-                        }
-                        do_cleanup().await;
-                    }
-                    // Exit 127 in a synced sandbox almost always means the command
-                    // isn't in the (minimal) default image. Point at the fix.
-                    if sync_cwd && exit_code == 127 && output == OutputFormat::Text {
-                        eprintln!(
-                            "[job] hint: exit 127 usually means the command was not found in the \
-                             sandbox image. The default image is minimal (no language toolchains); \
-                             run against an image that includes your toolchain (pass a rootfs path \
-                             or --cloud-image, e.g. a Docker image brought in with \
-                             `husker image import-oci`)."
-                        );
-                    }
-                    // A command that failed keeps its own exit code: replacing
-                    // it with a retrieval failure would hide the reason the
-                    // outputs were never written. The retrieval failure is
-                    // still said out loud, because it is a second thing the
-                    // user needs to know.
-                    if exit_code != 0 {
-                        if let Some(failure) = &retrieval_failure
-                            && output == OutputFormat::Text
-                        {
-                            eprintln!("[job] note: {}", failure.message);
-                        }
-                        std::process::exit(exit_code.clamp(1, 255) as i32);
-                    }
-                    if let Some(failure) = retrieval_failure {
-                        exit_with_error(output, failure);
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    if keep {
-                        eprintln!("[job] failed, keeping {name}: {e}");
-                    } else {
-                        do_cleanup().await;
-                    }
-                    exit_with_error(output, e.to_string());
-                }
+            match termination {
+                job::JobTermination::Success => Ok(()),
+                job::JobTermination::Exit(code) => std::process::exit(code),
+                job::JobTermination::Failure(failure) => exit_with_error(output, failure),
             }
         }
         Commands::Cp { source, dest, mode } => {
@@ -2187,7 +1418,7 @@ async fn run(cli: Cli) -> Result<()> {
                 (CpPath::Local(local), CpPath::Vm { name, path }) => {
                     let data = std::fs::read(&local)
                         .with_context(|| format!("reading {}", local.display()))?;
-                    let client = reqwest::Client::new();
+                    let client = DaemonClient::new(&api_url, api_token.clone());
 
                     if data.len() > CP_CHUNK_BYTES {
                         // Large file: send it as a sequence of append-mode
@@ -2198,13 +1429,11 @@ async fn run(cli: Cli) -> Result<()> {
                         // on every write, which would silently corrupt the
                         // destination to only the final chunk while cp still
                         // reported success.
-                        let resp = api_request(with_api_auth(
-                            client.get(format!("{api_url}/v1/vms/{name}/guest-info")),
-                            api_token.as_deref(),
-                        ))
-                        .await?;
+                        let resp = client
+                            .send(client.get(format!("/v1/vms/{name}/guest-info")))
+                            .await?;
                         if !resp.status().is_success() {
-                            let msg = api_error(resp, &format!("VM '{name}'")).await;
+                            let msg = client.error(resp, &format!("VM '{name}'")).await;
                             exit_with_error(output, msg);
                         }
                         let info: serde_json::Value = resp.json().await?;
@@ -2229,17 +1458,16 @@ async fn run(cli: Cli) -> Result<()> {
                                 body["mode"] = serde_json::json!(m);
                             }
 
-                            let resp = api_request(
-                                with_api_auth(
-                                    client.post(format!("{api_url}/v1/vms/{name}/files/write")),
-                                    api_token.as_deref(),
+                            let resp = client
+                                .send(
+                                    client
+                                        .post(format!("/v1/vms/{name}/files/write"))
+                                        .json(&body),
                                 )
-                                .json(&body),
-                            )
-                            .await?;
+                                .await?;
 
                             if !resp.status().is_success() {
-                                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                                let msg = client.error(resp, &format!("VM '{name}'")).await;
                                 exit_with_error(output, msg);
                             }
                             let result: serde_json::Value = resp.json().await?;
@@ -2269,14 +1497,13 @@ async fn run(cli: Cli) -> Result<()> {
                             body["mode"] = serde_json::json!(m);
                         }
 
-                        let resp = api_request(
-                            with_api_auth(
-                                client.post(format!("{api_url}/v1/vms/{name}/files/write")),
-                                api_token.as_deref(),
+                        let resp = client
+                            .send(
+                                client
+                                    .post(format!("/v1/vms/{name}/files/write"))
+                                    .json(&body),
                             )
-                            .json(&body),
-                        )
-                        .await?;
+                            .await?;
 
                         if resp.status().is_success() {
                             let result: serde_json::Value = resp.json().await?;
@@ -2294,7 +1521,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 format!("{bytes} bytes copied to {name}:{path}"),
                             );
                         } else {
-                            let msg = api_error(resp, &format!("VM '{name}'")).await;
+                            let msg = client.error(resp, &format!("VM '{name}'")).await;
                             exit_with_error(output, msg);
                         }
                     }
@@ -2303,16 +1530,8 @@ async fn run(cli: Cli) -> Result<()> {
                     // Reads in chunks when the file is larger than one response
                     // can carry, so the size of an artifact is not a reason it
                     // cannot be copied out.
-                    let client = reqwest::Client::new();
-                    let data = match read_guest_file(
-                        &client,
-                        &api_url,
-                        api_token.as_deref(),
-                        &name,
-                        &path,
-                    )
-                    .await?
-                    {
+                    let client = DaemonClient::new(&api_url, api_token.clone());
+                    let data = match read_guest_file(&client, &name, &path).await? {
                         GuestFile::Read(data) => data,
                         GuestFile::Failed(failure) => exit_with_error(output, failure),
                     };
@@ -2399,7 +1618,7 @@ async fn run(cli: Cli) -> Result<()> {
             });
             // Only the live serial console is followable.
             let follow = follow && effective == "serial";
-            let mut url = format!("{api_url}/v1/vms/{name}/logs");
+            let mut url = format!("/v1/vms/{name}/logs");
             let mut params = Vec::new();
             params.push(format!("source={effective}"));
             if follow {
@@ -2413,11 +1632,11 @@ async fn run(cli: Cli) -> Result<()> {
                 url.push_str(&params.join("&"));
             }
 
-            let client = reqwest::Client::new();
-            let resp = api_request(with_api_auth(client.get(&url), api_token.as_deref())).await?;
+            let client = DaemonClient::new(&api_url, api_token.clone());
+            let resp = client.send(client.get(&url)).await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                let msg = client.error(resp, &format!("VM '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -2466,18 +1685,16 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Wait { name, timeout } => {
             let api_token = resolve_api_token(cli_api_token.clone(), config_path.as_deref());
-            let client = reqwest::Client::new();
+            let client = DaemonClient::new(&api_url, api_token.clone());
             let timeout = match timeout {
                 Some(t) => std::time::Duration::from_secs(t),
                 None => {
                     // Boot-mode-aware default: UEFI/EFI cloud VMs boot much slower
                     // than direct-kernel microVMs.
-                    let info_url = format!("{api_url}/v1/vms/{name}");
-                    let resp =
-                        api_request(with_api_auth(client.get(&info_url), api_token.as_deref()))
-                            .await?;
+                    let info_url = format!("/v1/vms/{name}");
+                    let resp = client.send(client.get(&info_url)).await?;
                     if !resp.status().is_success() {
-                        let msg = api_error(resp, &format!("VM '{name}'")).await;
+                        let msg = client.error(resp, &format!("VM '{name}'")).await;
                         exit_with_error(output, msg);
                     }
                     let vm: serde_json::Value = resp.json().await?;
@@ -2488,14 +1705,13 @@ async fn run(cli: Cli) -> Result<()> {
                     husker_core::default_ready_timeout(boot_mode)
                 }
             };
-            let url = format!("{api_url}/v1/vms/{name}/ready");
+            let url = format!("/v1/vms/{name}/ready");
             let deadline = std::time::Instant::now() + timeout;
             let mut backoff = std::time::Duration::from_millis(200);
             loop {
-                let resp =
-                    api_request(with_api_auth(client.get(&url), api_token.as_deref())).await?;
+                let resp = client.send(client.get(&url)).await?;
                 if !resp.status().is_success() {
-                    let msg = api_error(resp, &format!("VM '{name}'")).await;
+                    let msg = client.error(resp, &format!("VM '{name}'")).await;
                     exit_with_error(output, msg);
                 }
                 let body: serde_json::Value = resp.json().await?;
@@ -2533,10 +1749,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Version => {
             let mut daemon_info: Option<serde_json::Value> = None;
 
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()?;
-            if let Ok(resp) = client.get(format!("{api_url}/v1/health")).send().await
+            let client = DaemonClient::with_timeout(
+                &api_url,
+                resolve_api_token(cli_api_token.clone(), config_path.as_deref()),
+                std::time::Duration::from_secs(2),
+            )?;
+            if let Ok(resp) = client.try_send(client.get("/v1/health")).await
                 && resp.status().is_success()
                 && let Ok(health) = resp.json::<serde_json::Value>().await
             {
@@ -2589,14 +1807,15 @@ async fn run(cli: Cli) -> Result<()> {
             ProfileAction::List => {
                 let config = load_config(config_path.as_deref());
                 let api_token = cli_api_token.clone().or_else(|| config.api_token.clone());
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(3))
-                    .build()?;
-                let daemon_result =
-                    match fetch_daemon_profiles(&client, &api_url, api_token.as_deref()).await {
-                        Ok(o) => o,
-                        Err(e) => exit_with_error(output, e.to_string()),
-                    };
+                let client = DaemonClient::with_timeout(
+                    &api_url,
+                    api_token,
+                    std::time::Duration::from_secs(3),
+                )?;
+                let daemon_result = match fetch_daemon_profiles(&client).await {
+                    Ok(o) => o,
+                    Err(e) => exit_with_error(output, e.to_string()),
+                };
                 let daemon_offline = daemon_result.is_none();
                 let daemon_profiles = daemon_result.unwrap_or_default();
                 let (merged, profile_origins) = merge_profiles(daemon_profiles, &config.profiles);
@@ -2782,10 +2001,12 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Commands::Doctor => {
             let config = load_config(config_path.as_deref());
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(3))
-                .build()?;
-            let report = match fetch_diagnostics(&api_url, &client).await {
+            let client = DaemonClient::with_timeout(
+                &api_url,
+                cli_api_token.clone().or_else(|| config.api_token.clone()),
+                std::time::Duration::from_secs(3),
+            )?;
+            let report = match fetch_diagnostics(&client).await {
                 Ok(r) => r,
                 Err(_) if is_local_target(&api_url, via_ssh_tunnel) => {
                     // Daemon is not running locally: run the probe directly on the host.
@@ -2984,7 +2205,7 @@ async fn port_forward(
     action: PortForwardAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         PortForwardAction::Add {
             host_port,
@@ -2998,14 +2219,9 @@ async fn port_forward(
             if let Some(bind) = &bind {
                 payload["bind_addr"] = serde_json::json!(bind);
             }
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/vms/{name}/ports")),
-                    api_token.as_deref(),
-                )
-                .json(&payload),
-            )
-            .await?;
+            let resp = client
+                .send(client.post(format!("/v1/vms/{name}/ports")).json(&payload))
+                .await?;
             if resp.status().is_success() {
                 // Read the effective values from the response: the bound host
                 // port (the daemon may pick one when 0 is requested) and the
@@ -3034,16 +2250,14 @@ async fn port_forward(
                     format!("Port forward added: {target} -> {name}:{guest_port}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                let msg = client.error(resp, &format!("VM '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         PortForwardAction::Remove { host_port } => {
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/vms/{name}/ports/{host_port}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/vms/{name}/ports/{host_port}")))
+                .await?;
             if resp.status().is_success() {
                 print_output(
                     output,
@@ -3056,18 +2270,18 @@ async fn port_forward(
                     format!("Port forward removed: {host_port}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("port forward {host_port}")).await;
+                let msg = client
+                    .error(resp, &format!("port forward {host_port}"))
+                    .await;
                 exit_with_error(output, msg);
             }
         }
         PortForwardAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/vms/{name}/ports")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/vms/{name}/ports")))
+                .await?;
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("VM '{name}'")).await;
+                let msg = client.error(resp, &format!("VM '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -3111,7 +2325,7 @@ async fn host_group_command(
     action: HostGroupAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         HostGroupAction::Create { name, description } => {
             let mut body = serde_json::json!({
@@ -3121,14 +2335,9 @@ async fn host_group_command(
                 body["description"] = serde_json::json!(desc);
             }
 
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/host-groups")),
-                    api_token.as_deref(),
-                )
-                .json(&body),
-            )
-            .await?;
+            let resp = client
+                .send(client.post("/v1/host-groups").json(&body))
+                .await?;
 
             if resp.status().is_success() {
                 let group: serde_json::Value = resp.json().await?;
@@ -3145,19 +2354,15 @@ async fn host_group_command(
                     ),
                 );
             } else {
-                let msg = api_error(resp, &format!("host group '{name}'")).await;
+                let msg = client.error(resp, &format!("host group '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         HostGroupAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/host-groups")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get("/v1/host-groups")).await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, "listing host groups").await;
+                let msg = client.error(resp, "listing host groups").await;
                 exit_with_error(output, msg);
             }
 
@@ -3186,14 +2391,12 @@ async fn host_group_command(
             }
         }
         HostGroupAction::Get { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/host-groups/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/host-groups/{name}")))
+                .await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("host group '{name}'")).await;
+                let msg = client.error(resp, &format!("host group '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -3222,11 +2425,9 @@ async fn host_group_command(
         }
         HostGroupAction::Delete { name, yes } => {
             require_confirmation(&format!("Delete host group '{name}'?"), yes, output);
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/host-groups/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/host-groups/{name}")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -3239,7 +2440,7 @@ async fn host_group_command(
                     format!("Deleted host group: {name}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("host group '{name}'")).await;
+                let msg = client.error(resp, &format!("host group '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -3254,7 +2455,7 @@ async fn pool_command(
     output: OutputFormat,
     config: Config,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         PoolAction::Create {
             name,
@@ -3281,14 +2482,7 @@ async fn pool_command(
             if let Some(m) = memory {
                 body["mem_size_mib"] = serde_json::json!(m);
             }
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/pools")),
-                    api_token.as_deref(),
-                )
-                .json(&body),
-            )
-            .await?;
+            let resp = client.send(client.post("/v1/pools").json(&body)).await?;
             if resp.status().is_success() {
                 let pool: serde_json::Value = resp.json().await?;
                 if output == OutputFormat::Text {
@@ -3301,18 +2495,14 @@ async fn pool_command(
                     );
                 }
             } else {
-                let msg = api_error(resp, &format!("pool '{name}'")).await;
+                let msg = client.error(resp, &format!("pool '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         PoolAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/pools")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get("/v1/pools")).await?;
             if !resp.status().is_success() {
-                let msg = api_error(resp, "listing pools").await;
+                let msg = client.error(resp, "listing pools").await;
                 exit_with_error(output, msg);
             }
             let pools: Vec<serde_json::Value> = resp.json().await?;
@@ -3341,13 +2531,9 @@ async fn pool_command(
             }
         }
         PoolAction::Get { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/pools/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get(format!("/v1/pools/{name}"))).await?;
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("pool '{name}'")).await;
+                let msg = client.error(resp, &format!("pool '{name}'")).await;
                 exit_with_error(output, msg);
             }
             let pool: serde_json::Value = resp.json().await?;
@@ -3373,14 +2559,13 @@ async fn pool_command(
         }
         PoolAction::Checkout { name, vm_name } => {
             let body = serde_json::json!({ "vm_name": vm_name });
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/pools/{name}/checkout")),
-                    api_token.as_deref(),
+            let resp = client
+                .send(
+                    client
+                        .post(format!("/v1/pools/{name}/checkout"))
+                        .json(&body),
                 )
-                .json(&body),
-            )
-            .await?;
+                .await?;
             if resp.status().is_success() {
                 let vm: serde_json::Value = resp.json().await?;
                 if output == OutputFormat::Text {
@@ -3398,7 +2583,7 @@ async fn pool_command(
                     );
                 }
             } else {
-                let msg = api_error(resp, &format!("pool '{name}'")).await;
+                let msg = client.error(resp, &format!("pool '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -3408,11 +2593,9 @@ async fn pool_command(
                 yes,
                 output,
             );
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/pools/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/pools/{name}")))
+                .await?;
             if resp.status().is_success() {
                 if output == OutputFormat::Text {
                     println!("Deleted pool {name}");
@@ -3424,7 +2607,7 @@ async fn pool_command(
                     );
                 }
             } else {
-                let msg = api_error(resp, &format!("pool '{name}'")).await;
+                let msg = client.error(resp, &format!("pool '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -3439,7 +2622,7 @@ async fn service_command(
     output: OutputFormat,
     config: Config,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         ServiceAction::Create {
             name,
@@ -3541,14 +2724,7 @@ async fn service_command(
                 body["volume"] = serde_json::json!(vol);
             }
 
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/services")),
-                    api_token.as_deref(),
-                )
-                .json(&body),
-            )
-            .await?;
+            let resp = client.send(client.post("/v1/services").json(&body)).await?;
 
             if resp.status().is_success() {
                 let body: serde_json::Value = resp.json().await?;
@@ -3590,19 +2766,15 @@ async fn service_command(
                     );
                 }
             } else {
-                let msg = api_error(resp, &format!("service '{name}'")).await;
+                let msg = client.error(resp, &format!("service '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         ServiceAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/services")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get("/v1/services")).await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, "listing services").await;
+                let msg = client.error(resp, "listing services").await;
                 exit_with_error(output, msg);
             }
 
@@ -3644,14 +2816,12 @@ async fn service_command(
             }
         }
         ServiceAction::Get { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/services/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/services/{name}")))
+                .await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("service '{name}'")).await;
+                let msg = client.error(resp, &format!("service '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -3714,16 +2884,14 @@ async fn service_command(
             name,
             desired_instances,
         } => {
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/services/{name}/scale")),
-                    api_token.as_deref(),
-                )
-                .json(&serde_json::json!({
-                    "desired_instances": desired_instances,
-                })),
-            )
-            .await?;
+            let resp =
+                client
+                    .send(client.post(format!("/v1/services/{name}/scale")).json(
+                        &serde_json::json!({
+                            "desired_instances": desired_instances,
+                        }),
+                    ))
+                    .await?;
 
             if resp.status().is_success() {
                 let body: serde_json::Value = resp.json().await?;
@@ -3770,17 +2938,15 @@ async fn service_command(
                     );
                 }
             } else {
-                let msg = api_error(resp, &format!("service '{name}'")).await;
+                let msg = client.error(resp, &format!("service '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         ServiceAction::Delete { name, yes } => {
             require_confirmation(&format!("Delete service '{name}'?"), yes, output);
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/services/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/services/{name}")))
+                .await?;
 
             if resp.status().is_success() {
                 let body: serde_json::Value = resp.json().await?;
@@ -3806,7 +2972,7 @@ async fn service_command(
                     );
                 }
             } else {
-                let msg = api_error(resp, &format!("service '{name}'")).await;
+                let msg = client.error(resp, &format!("service '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -3820,20 +2986,15 @@ async fn snapshot_command(
     action: SnapshotAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         SnapshotAction::Create { name, vm } => {
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/snapshots")),
-                    api_token.as_deref(),
-                )
-                .json(&serde_json::json!({
+            let resp = client
+                .send(client.post("/v1/snapshots").json(&serde_json::json!({
                     "name": &name,
                     "vm": &vm,
-                })),
-            )
-            .await?;
+                })))
+                .await?;
 
             if resp.status().is_success() {
                 let snapshot: serde_json::Value = resp.json().await?;
@@ -3851,19 +3012,15 @@ async fn snapshot_command(
                     ),
                 );
             } else {
-                let msg = api_error(resp, &format!("snapshot '{name}'")).await;
+                let msg = client.error(resp, &format!("snapshot '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         SnapshotAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/snapshots")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get("/v1/snapshots")).await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, "listing snapshots").await;
+                let msg = client.error(resp, "listing snapshots").await;
                 exit_with_error(output, msg);
             }
 
@@ -3893,14 +3050,12 @@ async fn snapshot_command(
             }
         }
         SnapshotAction::Get { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/snapshots/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/snapshots/{name}")))
+                .await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("snapshot '{name}'")).await;
+                let msg = client.error(resp, &format!("snapshot '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -3949,14 +3104,13 @@ async fn snapshot_command(
                 body["initrd_path"] = serde_json::json!(initrd_path);
             }
 
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/snapshots/{snapshot}/restore")),
-                    api_token.as_deref(),
+            let resp = client
+                .send(
+                    client
+                        .post(format!("/v1/snapshots/{snapshot}/restore"))
+                        .json(&body),
                 )
-                .json(&body),
-            )
-            .await?;
+                .await?;
 
             if resp.status().is_success() {
                 let vm: serde_json::Value = resp.json().await?;
@@ -3975,17 +3129,15 @@ async fn snapshot_command(
                     ),
                 );
             } else {
-                let msg = api_error(resp, &format!("snapshot '{snapshot}'")).await;
+                let msg = client.error(resp, &format!("snapshot '{snapshot}'")).await;
                 exit_with_error(output, msg);
             }
         }
         SnapshotAction::Delete { name, yes } => {
             require_confirmation(&format!("Delete snapshot '{name}'?"), yes, output);
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/snapshots/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/snapshots/{name}")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -3998,7 +3150,7 @@ async fn snapshot_command(
                     format!("Deleted snapshot: {name}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("snapshot '{name}'")).await;
+                let msg = client.error(resp, &format!("snapshot '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -4012,7 +3164,7 @@ async fn image_command(
     action: ImageAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         ImageAction::Import {
             name,
@@ -4031,14 +3183,7 @@ async fn image_command(
                 body["kind"] = serde_json::json!(image_kind);
             }
 
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/images")),
-                    api_token.as_deref(),
-                )
-                .json(&body),
-            )
-            .await?;
+            let resp = client.send(client.post("/v1/images").json(&body)).await?;
 
             if resp.status().is_success() {
                 let image: serde_json::Value = resp.json().await?;
@@ -4052,21 +3197,20 @@ async fn image_command(
                     format!("Imported image: {}", image["name"].as_str().unwrap_or("-")),
                 );
             } else {
-                let msg = api_error(resp, &format!("image '{name}'")).await;
+                let msg = client.error(resp, &format!("image '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         ImageAction::ImportOci { reference, name } => {
             preflight_capability(&api_url, api_token.as_deref(), "oci_import").await?;
             let name = name.unwrap_or_else(|| oci_default_image_name(&reference));
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/images/import-oci")),
-                    api_token.as_deref(),
+            let resp = client
+                .send(
+                    client
+                        .post("/v1/images/import-oci")
+                        .json(&serde_json::json!({ "name": &name, "reference": &reference })),
                 )
-                .json(&serde_json::json!({ "name": &name, "reference": &reference })),
-            )
-            .await?;
+                .await?;
 
             if resp.status().is_success() {
                 let image: serde_json::Value = resp.json().await?;
@@ -4083,19 +3227,15 @@ async fn image_command(
                     ),
                 );
             } else {
-                let msg = api_error(resp, &format!("image '{reference}'")).await;
+                let msg = client.error(resp, &format!("image '{reference}'")).await;
                 exit_with_error(output, msg);
             }
         }
         ImageAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/images")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get("/v1/images")).await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, "listing images").await;
+                let msg = client.error(resp, "listing images").await;
                 exit_with_error(output, msg);
             }
 
@@ -4130,14 +3270,12 @@ async fn image_command(
             }
         }
         ImageAction::Get { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/images/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/images/{name}")))
+                .await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("image '{name}'")).await;
+                let msg = client.error(resp, &format!("image '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -4167,16 +3305,14 @@ async fn image_command(
             }
         }
         ImageAction::Export { name, destination } => {
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/images/{name}/export")),
-                    api_token.as_deref(),
-                )
-                .json(&serde_json::json!({
-                    "destination_path": &destination,
-                })),
-            )
-            .await?;
+            let resp =
+                client
+                    .send(client.post(format!("/v1/images/{name}/export")).json(
+                        &serde_json::json!({
+                            "destination_path": &destination,
+                        }),
+                    ))
+                    .await?;
 
             if resp.status().is_success() {
                 let exported: serde_json::Value = resp.json().await?;
@@ -4195,17 +3331,15 @@ async fn image_command(
                     ),
                 );
             } else {
-                let msg = api_error(resp, &format!("image '{name}'")).await;
+                let msg = client.error(resp, &format!("image '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         ImageAction::Delete { name, yes } => {
             require_confirmation(&format!("Delete image '{name}'?"), yes, output);
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/images/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/images/{name}")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -4218,7 +3352,7 @@ async fn image_command(
                     format!("Deleted image: {name}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("image '{name}'")).await;
+                let msg = client.error(resp, &format!("image '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -4295,7 +3429,7 @@ async fn volume_command(
     action: VolumeAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         VolumeAction::Create { name, size } => {
             let size_bytes =
@@ -4305,14 +3439,7 @@ async fn volume_command(
                 "size_bytes": size_bytes,
             });
 
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/volumes")),
-                    api_token.as_deref(),
-                )
-                .json(&body),
-            )
-            .await?;
+            let resp = client.send(client.post("/v1/volumes").json(&body)).await?;
 
             if resp.status().is_success() {
                 let volume: serde_json::Value = resp.json().await?;
@@ -4326,19 +3453,15 @@ async fn volume_command(
                     format!("Created volume: {}", volume["name"].as_str().unwrap_or("-")),
                 );
             } else {
-                let msg = api_error(resp, &format!("volume '{name}'")).await;
+                let msg = client.error(resp, &format!("volume '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         VolumeAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/volumes")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get("/v1/volumes")).await?;
 
             if !resp.status().is_success() {
-                let msg = api_error(resp, "listing volumes").await;
+                let msg = client.error(resp, "listing volumes").await;
                 exit_with_error(output, msg);
             }
 
@@ -4368,13 +3491,11 @@ async fn volume_command(
             }
         }
         VolumeAction::Get { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/volumes/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/volumes/{name}")))
+                .await?;
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("volume '{name}'")).await;
+                let msg = client.error(resp, &format!("volume '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -4402,11 +3523,9 @@ async fn volume_command(
                 yes,
                 output,
             );
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/volumes/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/volumes/{name}")))
+                .await?;
 
             if resp.status().is_success() {
                 print_output(
@@ -4419,7 +3538,7 @@ async fn volume_command(
                     format!("Deleted volume: {name}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("volume '{name}'")).await;
+                let msg = client.error(resp, &format!("volume '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -4433,20 +3552,15 @@ async fn secret_command(
     action: SecretAction,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = DaemonClient::new(&api_url, api_token.clone());
     match action {
         SecretAction::Create { name, value } => {
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/secrets")),
-                    api_token.as_deref(),
-                )
-                .json(&serde_json::json!({
+            let resp = client
+                .send(client.post("/v1/secrets").json(&serde_json::json!({
                     "name": &name,
                     "value": &value,
-                })),
-            )
-            .await?;
+                })))
+                .await?;
 
             if resp.status().is_success() {
                 let secret: serde_json::Value = resp.json().await?;
@@ -4460,18 +3574,14 @@ async fn secret_command(
                     format!("Created secret: {}", secret["name"].as_str().unwrap_or("-")),
                 );
             } else {
-                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                let msg = client.error(resp, &format!("secret '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         SecretAction::List => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/secrets")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client.send(client.get("/v1/secrets")).await?;
             if !resp.status().is_success() {
-                let msg = api_error(resp, "listing secrets").await;
+                let msg = client.error(resp, "listing secrets").await;
                 exit_with_error(output, msg);
             }
 
@@ -4500,13 +3610,11 @@ async fn secret_command(
             }
         }
         SecretAction::Get { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/secrets/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/secrets/{name}")))
+                .await?;
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                let msg = client.error(resp, &format!("secret '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -4528,13 +3636,11 @@ async fn secret_command(
             }
         }
         SecretAction::Reveal { name } => {
-            let resp = api_request(with_api_auth(
-                client.get(format!("{api_url}/v1/secrets/{name}/reveal")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.get(format!("/v1/secrets/{name}/reveal")))
+                .await?;
             if !resp.status().is_success() {
-                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                let msg = client.error(resp, &format!("secret '{name}'")).await;
                 exit_with_error(output, msg);
             }
 
@@ -4554,16 +3660,14 @@ async fn secret_command(
             }
         }
         SecretAction::Rotate { name, value } => {
-            let resp = api_request(
-                with_api_auth(
-                    client.post(format!("{api_url}/v1/secrets/{name}/rotate")),
-                    api_token.as_deref(),
-                )
-                .json(&serde_json::json!({
-                    "value": &value,
-                })),
-            )
-            .await?;
+            let resp =
+                client
+                    .send(client.post(format!("/v1/secrets/{name}/rotate")).json(
+                        &serde_json::json!({
+                            "value": &value,
+                        }),
+                    ))
+                    .await?;
             if resp.status().is_success() {
                 let secret: serde_json::Value = resp.json().await?;
                 print_output(
@@ -4576,17 +3680,15 @@ async fn secret_command(
                     format!("Rotated secret: {}", secret["name"].as_str().unwrap_or("-")),
                 );
             } else {
-                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                let msg = client.error(resp, &format!("secret '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
         SecretAction::Delete { name, yes } => {
             require_confirmation(&format!("Delete secret '{name}'?"), yes, output);
-            let resp = api_request(with_api_auth(
-                client.delete(format!("{api_url}/v1/secrets/{name}")),
-                api_token.as_deref(),
-            ))
-            .await?;
+            let resp = client
+                .send(client.delete(format!("/v1/secrets/{name}")))
+                .await?;
             if resp.status().is_success() {
                 print_output(
                     output,
@@ -4598,7 +3700,7 @@ async fn secret_command(
                     format!("Deleted secret: {name}"),
                 );
             } else {
-                let msg = api_error(resp, &format!("secret '{name}'")).await;
+                let msg = client.error(resp, &format!("secret '{name}'")).await;
                 exit_with_error(output, msg);
             }
         }
@@ -4625,15 +3727,11 @@ async fn run_shell(
     api_token: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
-    let resp = api_request(with_api_auth(
-        client.get(format!("{api_url}/v1/vms/{name}")),
-        api_token,
-    ))
-    .await?;
+    let client = DaemonClient::new(&api_url, api_token.map(str::to_owned));
+    let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
 
     if !resp.status().is_success() {
-        let err = api_error(resp, &format!("VM '{name}'")).await;
+        let err = client.error(resp, &format!("VM '{name}'")).await;
         exit_with_error(output, err);
     }
 
@@ -4703,14 +3801,10 @@ async fn run_shell_ws(
     output: OutputFormat,
 ) -> Result<()> {
     // Pre-check: verify VM is running before opening the WebSocket.
-    let client = reqwest::Client::new();
-    let resp = api_request(with_api_auth(
-        client.get(format!("{api_url}/v1/vms/{name}")),
-        api_token,
-    ))
-    .await?;
+    let client = DaemonClient::new(api_url, api_token.map(str::to_owned));
+    let resp = client.send(client.get(format!("/v1/vms/{name}"))).await?;
     if !resp.status().is_success() {
-        let err = api_error(resp, &format!("VM '{name}'")).await;
+        let err = client.error(resp, &format!("VM '{name}'")).await;
         exit_with_error(output, err);
     }
     let vm: serde_json::Value = resp.json().await?;
@@ -5925,14 +5019,14 @@ fn capability_gate(health: &serde_json::Value, cap: &str) -> Result<(), String> 
 /// or a daemon too old to advertise capabilities, falls through so the command
 /// proceeds (and the server rejects it if truly unsupported).
 async fn preflight_capability(api_url: &str, api_token: Option<&str>, cap: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-    let Ok(resp) = with_api_auth(client.get(format!("{api_url}/v1/health")), api_token)
-        .send()
-        .await
-    else {
+    let Ok(client) = DaemonClient::with_timeout(
+        api_url,
+        api_token.map(str::to_owned),
+        std::time::Duration::from_secs(5),
+    ) else {
+        return Ok(());
+    };
+    let Ok(resp) = client.try_send(client.get("/v1/health")).await else {
         return Ok(());
     };
     if !resp.status().is_success() {
@@ -6578,9 +5672,6 @@ mod tests {
         assert!(extracted.exists(), "writes nested file into the target dir");
         assert_eq!(std::fs::read(&extracted).unwrap(), b"hello");
     }
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
     fn env_mutex() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -6617,31 +5708,6 @@ mod tests {
             std::env::temp_dir().join(format!("husker-tests-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
-    }
-
-    async fn request_single_response(
-        status: &str,
-        content_type: &str,
-        body: &str,
-    ) -> reqwest::Response {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let status = status.to_string();
-        let content_type = content_type.to_string();
-        let body = body.to_string();
-        let body_len = body.len();
-
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut req = [0u8; 1024];
-            let _ = stream.read(&mut req).await;
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{body}"
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        reqwest::get(format!("http://{addr}/")).await.unwrap()
     }
 
     #[test]
@@ -7523,34 +6589,6 @@ mod tests {
     }
 
     #[test]
-    fn with_api_auth_sets_bearer_header() {
-        let request = with_api_auth(
-            reqwest::Client::new().get("http://example.invalid"),
-            Some("secret"),
-        )
-        .build()
-        .unwrap();
-        let auth = request
-            .headers()
-            .get(reqwest::header::AUTHORIZATION)
-            .unwrap();
-        assert_eq!(auth, "Bearer secret");
-    }
-
-    #[test]
-    fn with_api_auth_without_token_does_not_set_header() {
-        let request = with_api_auth(reqwest::Client::new().get("http://example.invalid"), None)
-            .build()
-            .unwrap();
-        assert!(
-            request
-                .headers()
-                .get(reqwest::header::AUTHORIZATION)
-                .is_none()
-        );
-    }
-
-    #[test]
     fn daemon_bind_loopback_allowed_without_flag() {
         let listen: SocketAddr = "127.0.0.1:7777".parse().unwrap();
         // Loopback needs neither --allow-remote nor a token.
@@ -7914,101 +6952,6 @@ default_auto_resume = false
         let mut cfg = Config::default();
         apply_env_overrides(&mut cfg);
         assert_eq!(cfg.idle_policy.poll_interval_secs, 42);
-    }
-
-    #[tokio::test]
-    async fn api_request_connect_error_has_actionable_hint() {
-        set_daemon_url("http://127.0.0.1:9");
-        let client = reqwest::Client::new();
-        let err = api_request(client.get("http://127.0.0.1:9"))
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cannot connect to daemon at http://127.0.0.1:9"),
-            "expected URL in error, got: {msg}"
-        );
-        assert!(
-            msg.contains("HUSKER_API_URL"),
-            "expected HUSKER_API_URL hint in error, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn api_error_prefers_message_and_hint_fields() {
-        let response = request_single_response(
-            "400 Bad Request",
-            "application/json",
-            r#"{"message":"nope","hint":"try again"}"#,
-        )
-        .await;
-        let message = api_error(response, "running VM").await.message;
-        assert_eq!(message, "nope (hint: try again)");
-    }
-
-    #[tokio::test]
-    async fn api_error_falls_back_to_error_field_for_json() {
-        let response = request_single_response(
-            "500 Internal Server Error",
-            "application/json",
-            r#"{"error":"backend exploded"}"#,
-        )
-        .await;
-        let message = api_error(response, "running VM").await.message;
-        assert_eq!(message, "backend exploded");
-    }
-
-    #[tokio::test]
-    async fn api_error_uses_plain_text_body_when_available() {
-        let response =
-            request_single_response("502 Bad Gateway", "text/plain", "gateway timeout").await;
-        let message = api_error(response, "running VM").await.message;
-        assert_eq!(message, "gateway timeout");
-    }
-
-    #[tokio::test]
-    async fn api_error_uses_subject_for_empty_404() {
-        let response = request_single_response("404 Not Found", "text/plain", "").await;
-        let failure = api_error(response, "VM 'demo'").await;
-        assert_eq!(failure.message, "VM 'demo' not found");
-        assert_eq!(failure.exit_code, exit_code::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn api_error_maps_status_and_kind_to_exit_code() {
-        let conflict = api_error(
-            request_single_response(
-                "409 Conflict",
-                "application/json",
-                r#"{"kind":"vm_exists"}"#,
-            )
-            .await,
-            "vm",
-        )
-        .await;
-        assert_eq!(conflict.exit_code, exit_code::CONFLICT);
-        assert_eq!(conflict.kind.as_deref(), Some("vm_exists"));
-
-        let denied = api_error(
-            request_single_response("403 Forbidden", "text/plain", "").await,
-            "vm",
-        )
-        .await;
-        assert_eq!(denied.exit_code, exit_code::DENIED);
-    }
-
-    #[tokio::test]
-    async fn api_error_uses_subject_for_empty_409() {
-        let response = request_single_response("409 Conflict", "text/plain", "").await;
-        let message = api_error(response, "VM 'demo'").await.message;
-        assert_eq!(message, "VM 'demo' already exists");
-    }
-
-    #[tokio::test]
-    async fn api_error_uses_status_for_other_empty_errors() {
-        let response = request_single_response("500 Internal Server Error", "text/plain", "").await;
-        let message = api_error(response, "creating VM").await.message;
-        assert_eq!(message, "creating VM: 500 Internal Server Error");
     }
 
     #[cfg(feature = "linux-net")]
@@ -8680,7 +7623,7 @@ default_auto_resume = false
     }
 
     #[test]
-    fn request_body_omits_mounts_when_empty() {
+    fn request_body_serializes_empty_mounts_from_typed_request() {
         let args = VmRequestArgs {
             mount: vec![],
             ..VmRequestArgs::default()
@@ -8695,7 +7638,7 @@ default_auto_resume = false
             OutputFormat::Json,
         )
         .unwrap();
-        assert!(body.get("mounts").is_none());
+        assert_eq!(body["mounts"], serde_json::json!([]));
     }
 
     // ── Feature 1: default resource resolution ─────────────────────────
@@ -9058,8 +8001,8 @@ default_auto_resume = false
     #[tokio::test]
     async fn fetch_daemon_profiles_surfaces_401_as_error() {
         let base_url = profiles_server("401 Unauthorized", "").await;
-        let client = reqwest::Client::new();
-        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        let client = DaemonClient::new(base_url, None);
+        let result = fetch_daemon_profiles(&client).await;
         assert!(
             result.is_err(),
             "401 from daemon profiles endpoint must surface as an error, not silent fallback"
@@ -9074,8 +8017,8 @@ default_auto_resume = false
     #[tokio::test]
     async fn fetch_daemon_profiles_surfaces_403_as_error() {
         let base_url = profiles_server("403 Forbidden", "").await;
-        let client = reqwest::Client::new();
-        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        let client = DaemonClient::new(base_url, None);
+        let result = fetch_daemon_profiles(&client).await;
         assert!(
             result.is_err(),
             "403 from daemon profiles endpoint must surface as an error, not silent fallback"
@@ -9085,8 +8028,8 @@ default_auto_resume = false
     #[tokio::test]
     async fn fetch_daemon_profiles_surfaces_500_as_error() {
         let base_url = profiles_server("500 Internal Server Error", "").await;
-        let client = reqwest::Client::new();
-        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        let client = DaemonClient::new(base_url, None);
+        let result = fetch_daemon_profiles(&client).await;
         assert!(
             result.is_err(),
             "5xx from daemon profiles endpoint must surface as an error, not silent fallback"
@@ -9096,8 +8039,8 @@ default_auto_resume = false
     #[tokio::test]
     async fn fetch_daemon_profiles_falls_back_silently_on_404() {
         let base_url = profiles_server("404 Not Found", "").await;
-        let client = reqwest::Client::new();
-        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        let client = DaemonClient::new(base_url, None);
+        let result = fetch_daemon_profiles(&client).await;
         assert!(
             result.is_ok(),
             "404 (old daemon without /v1/profiles) must fall back silently, not error"
@@ -9113,11 +8056,13 @@ default_auto_resume = false
         // Port 9 is the discard port; connections are refused on most systems.
         // The key property is that the address is not listening, so send() fails
         // at the connection layer rather than returning an HTTP response.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let result = fetch_daemon_profiles(&client, "http://127.0.0.1:9", None).await;
+        let client = DaemonClient::with_timeout(
+            "http://127.0.0.1:9",
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let result = fetch_daemon_profiles(&client).await;
         assert!(
             result.is_ok(),
             "connection-level failure must fall back silently, not error"
@@ -9134,8 +8079,8 @@ default_auto_resume = false
         // must produce Ok(Some(empty map)), not Ok(None). This distinguishes
         // "daemon online, zero profiles" from "daemon offline / fell back".
         let base_url = profiles_server("200 OK", r#"{"profiles":{}}"#).await;
-        let client = reqwest::Client::new();
-        let result = fetch_daemon_profiles(&client, &base_url, None).await;
+        let client = DaemonClient::new(base_url, None);
+        let result = fetch_daemon_profiles(&client).await;
         assert!(result.is_ok(), "200 with empty profiles map must not error");
         let opt = result.unwrap();
         assert!(

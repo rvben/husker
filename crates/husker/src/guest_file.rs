@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 
-use crate::{ApiFailure, api_error, api_request, with_api_auth};
+use crate::daemon_client::{ApiFailure, DaemonClient};
 
 /// Bytes requested per `files/read` request. The daemon rejects a response
 /// larger than `ApiPolicy::max_file_read_bytes` (1 MiB by default) and does not
@@ -70,9 +70,7 @@ pub(crate) enum GuestFile {
 /// completed correctly all come back as [`GuestFile::Failed`] carrying the
 /// reason, so no caller has to infer one.
 pub(crate) async fn read_guest_file(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
+    daemon: &DaemonClient,
     vm: &str,
     path: &str,
 ) -> Result<GuestFile> {
@@ -87,28 +85,27 @@ pub(crate) async fn read_guest_file(
 
     loop {
         let offset = buf.len() as u64;
-        let resp = api_request(
-            with_api_auth(
-                client.post(format!("{api_url}/v1/vms/{vm}/files/read")),
-                api_token,
+        let resp = daemon
+            .send(
+                daemon
+                    .post(format!("/v1/vms/{vm}/files/read"))
+                    .json(&serde_json::json!({
+                        "path": path,
+                        "offset": offset,
+                        "len": GUEST_READ_CHUNK_BYTES,
+                    })),
             )
-            .json(&serde_json::json!({
-                "path": path,
-                "offset": offset,
-                "len": GUEST_READ_CHUNK_BYTES,
-            })),
-        )
-        .await?;
+            .await?;
 
         if !resp.status().is_success() {
             let too_large = resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE;
-            let failure = api_error(resp, &format!("VM '{vm}'")).await;
+            let failure = daemon.error(resp, &format!("VM '{vm}'")).await;
             // A bounded request that came back "too large" means the range was
             // not applied. Ask the guest which of the two reasons it is, so the
             // user is told to rebuild a stale image or to raise a policy that
             // sits below one chunk, rather than being left to guess.
             let failure = if too_large && buf.is_empty() {
-                explain_oversized_read(client, api_url, api_token, vm, failure).await?
+                explain_oversized_read(daemon, vm, failure).await?
             } else {
                 failure
             };
@@ -194,17 +191,13 @@ pub(crate) async fn read_guest_file(
 /// honoured the range and the daemon's policy is set below a single chunk. The
 /// original failure is returned unchanged if the guest cannot be asked.
 async fn explain_oversized_read(
-    client: &reqwest::Client,
-    api_url: &str,
-    api_token: Option<&str>,
+    daemon: &DaemonClient,
     vm: &str,
     failure: ApiFailure,
 ) -> Result<ApiFailure> {
-    let resp = api_request(with_api_auth(
-        client.get(format!("{api_url}/v1/vms/{vm}/guest-info")),
-        api_token,
-    ))
-    .await?;
+    let resp = daemon
+        .send(daemon.get(format!("/v1/vms/{vm}/guest-info")))
+        .await?;
     if !resp.status().is_success() {
         return Ok(failure);
     }
@@ -293,8 +286,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (api_url, server) = serve_stub(ranged_file_route(content.clone(), calls.clone())).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/artifact.bin")
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/artifact.bin")
             .await
             .expect("the stub daemon is reachable");
 
@@ -316,8 +309,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (api_url, server) = serve_stub(ranged_file_route(content.clone(), calls.clone())).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/small.txt")
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/small.txt")
             .await
             .unwrap();
 
@@ -351,10 +344,8 @@ mod tests {
         );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/f")
-            .await
-            .unwrap();
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/f").await.unwrap();
 
         match got {
             GuestFile::Read(bytes) => assert_eq!(bytes, b"legacy contents"),
@@ -391,8 +382,8 @@ mod tests {
         );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/moving.bin")
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/moving.bin")
             .await
             .unwrap();
 
@@ -441,8 +432,8 @@ mod tests {
         );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/replaced.bin")
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/replaced.bin")
             .await
             .unwrap();
 
@@ -477,8 +468,8 @@ mod tests {
         );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/stalled.bin")
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/stalled.bin")
             .await
             .unwrap();
 
@@ -512,10 +503,8 @@ mod tests {
             );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/big.bin")
-            .await
-            .unwrap();
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/big.bin").await.unwrap();
 
         match got {
             GuestFile::Read(_) => panic!("a refused read must not report success"),
@@ -553,10 +542,8 @@ mod tests {
             );
         let (api_url, server) = serve_stub(app).await;
 
-        let client = reqwest::Client::new();
-        let got = read_guest_file(&client, &api_url, None, "vm-x", "/big.bin")
-            .await
-            .unwrap();
+        let client = DaemonClient::new(&api_url, None);
+        let got = read_guest_file(&client, "vm-x", "/big.bin").await.unwrap();
 
         match got {
             GuestFile::Read(_) => panic!("a refused read must not report success"),
