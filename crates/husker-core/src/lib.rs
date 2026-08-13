@@ -2658,6 +2658,23 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn shutdown_reclaim_clears_recent_service_vm_network_resources() {
+        let core = test_core().await;
+        let mut rec = abandoned_crashed_vm("shutdown-service");
+        rec.updated_at = chrono::Utc::now();
+        rec.service_id = Some(Uuid::new_v4());
+        core.state.insert_vm(&rec).unwrap();
+
+        assert_eq!(core.reclaim_shutdown_vms().await, 1);
+        let after = core.state.get_vm(rec.id).unwrap();
+        assert_eq!(after.state, "stopped");
+        assert!(after.tap_device.is_none());
+        assert!(after.host_ip.is_none());
+        assert!(after.guest_ip.is_none());
+    }
+
     /// Persist a `suspended`, `auto_resume` VM with `tap_device`/`guest_ip` set
     /// (required by `install_resume_listeners`) and one port forward, for
     /// startup-recovery tests that exercise `reconcile_port_forwards_from_state`

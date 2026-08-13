@@ -38,6 +38,19 @@ pub(crate) fn is_reclaimable_leak(vm: &VmRecord, now: DateTime<Utc>, grace: Dura
     terminal && standalone && not_suspended && holds_resources && stopped_long_enough
 }
 
+/// Whether a terminal VM still owns host resources that must be released before
+/// the daemon removes its Linux bridge. Unlike the periodic crash-reclaim
+/// policy, shutdown has no grace period and includes service instances because
+/// their reconciler has already stopped. Suspended VMs remain excluded: their
+/// network identity is part of the durable suspend slot contract.
+#[cfg(any(feature = "linux-net", test))]
+pub(crate) fn is_shutdown_reclaimable(vm: &VmRecord) -> bool {
+    let terminal = vm.state == "stopped" || vm.state == "failed";
+    let not_suspended = vm.state != "suspended" && vm.suspended_at.is_none();
+    let holds_resources = vm.tap_device.is_some() || vm.guest_ip.is_some() || vm.host_ip.is_some();
+    terminal && not_suspended && holds_resources
+}
+
 #[cfg(feature = "linux-net")]
 impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
     /// Release leaked host resources (TAP, nftables port forwards, /30 IP) for
@@ -49,22 +62,43 @@ impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
     /// the record cleanly (its cleared fields make the destroy-on-replace a
     /// no-op, so nothing is double-released).
     pub async fn reclaim_abandoned_vms(&self, grace_secs: u64) -> usize {
+        let grace = Duration::seconds(grace_secs as i64);
+        let now = Utc::now();
+        self.reclaim_vm_network_resources(
+            |vm| is_reclaimable_leak(vm, now, grace),
+            ReclaimReason::Abandoned,
+        )
+        .await
+    }
+
+    /// Release host networking retained by VMs that the shutdown drain just
+    /// stopped. Normal `stop` keeps network identity for a grace period; daemon
+    /// shutdown cannot, because the bridge is about to be removed. The VM rows
+    /// remain visible as stopped while their TAP/IP/forward fields are cleared.
+    pub async fn reclaim_shutdown_vms(&self) -> usize {
+        self.reclaim_vm_network_resources(is_shutdown_reclaimable, ReclaimReason::Shutdown)
+            .await
+    }
+
+    async fn reclaim_vm_network_resources(
+        &self,
+        eligible: impl Fn(&VmRecord) -> bool,
+        reason: ReclaimReason,
+    ) -> usize {
         use std::net::Ipv4Addr;
         use tracing::{info, warn};
 
-        let grace = Duration::seconds(grace_secs as i64);
-        let now = Utc::now();
         let vms = match self.state.list_vms() {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "reclaim sweep: failed to list VMs");
+                warn!(error = %e, "failed to list VMs for network resource reclamation");
                 return 0;
             }
         };
 
         let mut reclaimed = 0;
         for vm in vms {
-            if !is_reclaimable_leak(&vm, now, grace) {
+            if !eligible(&vm) {
                 continue;
             }
             // Hold the per-VM name lock so a concurrent create/destroy/replace of
@@ -76,7 +110,7 @@ impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if !is_reclaimable_leak(&current, now, grace) {
+            if !eligible(&current) {
                 continue;
             }
 
@@ -109,11 +143,25 @@ impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
                 warn!(name = %current.name, error = %e, "reclaim: clear network fields failed");
                 continue;
             }
-            info!(name = %current.name, "reclaimed host resources from abandoned crashed VM");
+            match reason {
+                ReclaimReason::Abandoned => {
+                    info!(name = %current.name, "reclaimed host resources from abandoned crashed VM");
+                }
+                ReclaimReason::Shutdown => {
+                    info!(name = %current.name, "released VM host resources during shutdown");
+                }
+            }
             reclaimed += 1;
         }
         reclaimed
     }
+}
+
+#[cfg(feature = "linux-net")]
+#[derive(Clone, Copy)]
+enum ReclaimReason {
+    Abandoned,
+    Shutdown,
 }
 
 #[cfg(test)]
@@ -214,6 +262,25 @@ mod tests {
         let mut vm = stopped_long_ago();
         vm.service_id = Some(Uuid::new_v4());
         assert!(!is_reclaimable_leak(&vm, Utc::now(), GRACE));
+    }
+
+    #[test]
+    fn shutdown_reclaims_recent_and_service_vm_resources() {
+        let mut vm = base_vm();
+        vm.service_id = Some(Uuid::new_v4());
+        assert!(is_shutdown_reclaimable(&vm));
+    }
+
+    #[test]
+    fn shutdown_does_not_reclaim_running_or_suspended_vm_resources() {
+        for state in ["running", "paused", "suspended"] {
+            let mut vm = base_vm();
+            vm.state = state.into();
+            if state == "suspended" {
+                vm.suspended_at = Some(Utc::now());
+            }
+            assert!(!is_shutdown_reclaimable(&vm), "state {state}");
+        }
     }
 
     #[test]

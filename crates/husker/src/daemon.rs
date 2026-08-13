@@ -973,6 +973,9 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     config: DaemonRuntimeConfig,
 ) -> Result<()> {
+    #[cfg(feature = "linux-net")]
+    let reclaim_network_on_shutdown = matches!(&config.mode, DaemonRuntimeMode::LinuxNet { .. });
+
     run_initial_service_reconcile(&core).await;
 
     match &config.mode {
@@ -1035,6 +1038,13 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
     let drain = async {
         core.quiesce_shutdown_ingress();
         drain_vms_on_shutdown(&core).await;
+        #[cfg(feature = "linux-net")]
+        if reclaim_network_on_shutdown {
+            let reclaimed = core.reclaim_shutdown_vms().await;
+            if reclaimed > 0 {
+                tracing::info!(reclaimed, "released drained VM host resources");
+            }
+        }
     };
     finish_daemon_runtime(workers, serve, drain).await
 }
