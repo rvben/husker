@@ -13,7 +13,8 @@ use husker_state::PortForwardRecord;
 use husker_state::{StateStore, VmRecord};
 use husker_storage::StorageConfig;
 use husker_vmm::{
-    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+    BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
+    VmmBackend, VmmError,
 };
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
@@ -57,6 +58,8 @@ struct PauseGate {
 #[derive(Clone)]
 struct MockVmm {
     inner: Arc<MockInner>,
+    creation_backend: BackendKind,
+    selection_backend: BackendKind,
 }
 
 impl MockVmm {
@@ -73,7 +76,14 @@ impl MockVmm {
                 #[cfg(not(feature = "linux-net"))]
                 last_config: Mutex::new(None),
             }),
+            creation_backend: BackendKind::AppleVz,
+            selection_backend: BackendKind::AppleVz,
         }
+    }
+
+    fn with_creation_backend(mut self, backend_kind: BackendKind) -> Self {
+        self.creation_backend = backend_kind;
+        self
     }
 
     async fn set_agent_socket(&self, socket_path: Option<PathBuf>) {
@@ -114,7 +124,7 @@ impl MockVmm {
 impl VmmBackend for MockVmm {
     type VsockStream = tokio::net::UnixStream;
 
-    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
         let id = Uuid::new_v4();
         let info = VmInfo {
             id,
@@ -133,7 +143,7 @@ impl VmmBackend for MockVmm {
         #[cfg(feature = "linux-net")]
         let _ = config;
         self.upsert_vm(info.clone()).await;
-        Ok(info)
+        Ok(CreatedVm::new(info, self.creation_backend))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
@@ -229,6 +239,10 @@ impl VmmBackend for MockVmm {
 
     async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
         Ok(())
+    }
+
+    fn backend_kind(&self) -> &'static str {
+        self.selection_backend.as_str()
     }
 }
 
@@ -2267,10 +2281,61 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
     assert!(matches!(err, CoreError::InvalidArgument(_)), "got {err:?}");
 }
 
-// The concurrent-create test drives the full create path to completion (VMM
-// create + state insert). The linux-net path requires real TAP device operations
-// that cannot run in a unit test environment, so this test is restricted to the
-// macOS/no-linux-net build where the VMM backend mock covers the full path.
+#[tokio::test]
+async fn create_vm_persists_the_backend_that_created_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let kernel = tmp.path().join("vmlinux");
+    let mut kernel_bytes = vec![0u8; 64];
+    kernel_bytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, kernel_bytes).unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"rootfs").unwrap();
+
+    let mock = MockVmm::new().with_creation_backend(BackendKind::Qemu);
+    let state = StateStore::open_memory().unwrap();
+    #[cfg(feature = "linux-net")]
+    let core = Arc::new(HuskerCore::new(
+        mock,
+        state,
+        husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+        StorageConfig {
+            data_dir: data_dir.clone(),
+            state_dir: data_dir.clone(),
+        },
+        "husker0".into(),
+        vec![],
+        runtime_dir,
+    ));
+    #[cfg(not(feature = "linux-net"))]
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+    // Daemon capability identity is deliberately different: persistence must
+    // follow the create result, not this coarse backend advertisement.
+    assert_eq!(core.backend_kind(), "apple_vz");
+    let created = core
+        .create_vm(CreateVmRequest {
+            name: "backend-authority".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            network: Some("none".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(created.vmm, "qemu");
+    assert_eq!(core.get_vm("backend-authority").unwrap().vmm, "qemu");
+}
+
+// The concurrent-create test drives the full create path to completion. The
+// Linux path normally provisions host networking, so this stays on the
+// backend-mocked no-linux-net configuration.
 #[cfg(not(feature = "linux-net"))]
 #[tokio::test]
 async fn concurrent_create_same_name_one_winner() {

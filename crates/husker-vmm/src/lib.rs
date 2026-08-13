@@ -104,6 +104,73 @@ pub struct VmInfo {
     pub vsock_cid: u32,
 }
 
+/// The concrete VMM implementation that owns a VM.
+///
+/// This is intentionally broader than [`VmmKind`]: Linux callers can request
+/// Firecracker or QEMU, while Apple VZ is selected by the platform backend.
+/// Creation returns this identity so callers persist what actually ran rather
+/// than trying to reproduce dispatch policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    Firecracker,
+    Qemu,
+    AppleVz,
+}
+
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Firecracker => "firecracker",
+            BackendKind::Qemu => "qemu",
+            BackendKind::AppleVz => "apple_vz",
+        }
+    }
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = VmmError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "firecracker" => Ok(BackendKind::Firecracker),
+            "qemu" => Ok(BackendKind::Qemu),
+            "apple_vz" => Ok(BackendKind::AppleVz),
+            other => Err(VmmError::InvalidConfig(format!(
+                "unknown backend kind '{other}'"
+            ))),
+        }
+    }
+}
+
+impl From<VmmKind> for BackendKind {
+    fn from(value: VmmKind) -> Self {
+        match value {
+            VmmKind::Firecracker => BackendKind::Firecracker,
+            VmmKind::Qemu => BackendKind::Qemu,
+        }
+    }
+}
+
+/// Result of creating a VM, including the authoritative backend identity.
+#[derive(Debug, Clone)]
+pub struct CreatedVm {
+    pub info: VmInfo,
+    pub backend: BackendKind,
+}
+
+impl CreatedVm {
+    pub fn new(info: VmInfo, backend: BackendKind) -> Self {
+        Self { info, backend }
+    }
+}
+
 /// Which VMM backend runs a VM. The canonical backend identity used by the
 /// per-VM dispatcher; the wire/persistence layer carries its lowercase string form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +178,22 @@ pub struct VmInfo {
 pub enum VmmKind {
     Firecracker,
     Qemu,
+}
+
+/// Inputs that affect backend routing before host resources are allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendRequirements {
+    pub requested: Option<VmmKind>,
+    pub boot: BootKind,
+    pub has_host_shares: bool,
+}
+
+/// Boot shape relevant to backend selection, without artifact paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootKind {
+    DirectKernel,
+    Uefi,
+    Efi,
 }
 
 impl std::fmt::Display for VmmKind {
@@ -198,6 +281,14 @@ impl BootMode {
             BootMode::DirectKernel => "direct",
             BootMode::Uefi { .. } => "uefi",
             BootMode::Efi { .. } => "efi",
+        }
+    }
+
+    pub fn kind(&self) -> BootKind {
+        match self {
+            BootMode::DirectKernel => BootKind::DirectKernel,
+            BootMode::Uefi { .. } => BootKind::Uefi,
+            BootMode::Efi { .. } => BootKind::Efi,
         }
     }
 }
@@ -363,7 +454,16 @@ pub trait VmmBackend: Send + Sync {
     fn create_vm(
         &self,
         config: VmConfig,
-    ) -> impl std::future::Future<Output = Result<VmInfo, VmmError>> + Send;
+    ) -> impl std::future::Future<Output = Result<CreatedVm, VmmError>> + Send;
+
+    /// Resolve the backend that would handle a create request.
+    ///
+    /// Dispatching backends override this so capability checks use the same
+    /// policy as `create_vm`. Single-backend implementations derive their
+    /// answer from `backend_kind`.
+    fn select_backend(&self, _requirements: BackendRequirements) -> Result<BackendKind, VmmError> {
+        self.backend_kind().parse()
+    }
 
     /// Stop a running VM gracefully.
     fn stop_vm(&self, id: Uuid) -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
@@ -455,7 +555,7 @@ pub trait VmmBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capabilities, VmmKind, tail_lines};
+    use super::{BackendKind, Capabilities, VmmKind, tail_lines};
     use std::io::Write;
 
     #[test]
@@ -470,6 +570,18 @@ mod tests {
         assert!(!Capabilities::for_backend("qemu").fork);
         assert!(!Capabilities::for_backend("apple_vz").snapshot);
         assert!(!Capabilities::for_backend("apple_vz").fork);
+    }
+
+    #[test]
+    fn backend_kind_has_stable_persistence_names() {
+        for (kind, name) in [
+            (BackendKind::Firecracker, "firecracker"),
+            (BackendKind::Qemu, "qemu"),
+            (BackendKind::AppleVz, "apple_vz"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(name.parse::<BackendKind>().unwrap(), kind);
+        }
     }
 
     #[test]

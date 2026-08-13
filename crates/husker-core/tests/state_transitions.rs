@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use husker_core::{CoreError, HuskerCore};
 use husker_vmm::{
-    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+    BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
+    VmmBackend, VmmError,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -33,7 +34,7 @@ impl MockVmm {
 impl VmmBackend for MockVmm {
     type VsockStream = tokio::net::UnixStream;
 
-    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
         let id = Uuid::new_v4();
         let info = VmInfo {
             id,
@@ -45,7 +46,12 @@ impl VmmBackend for MockVmm {
             vsock_cid: config.vsock_cid,
         };
         self.vms.lock().await.insert(id, info.clone());
-        Ok(info)
+        let backend = if cfg!(feature = "linux-net") {
+            BackendKind::Firecracker
+        } else {
+            BackendKind::AppleVz
+        };
+        Ok(CreatedVm::new(info, backend))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {

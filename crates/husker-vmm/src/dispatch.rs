@@ -17,7 +17,8 @@ use uuid::Uuid;
 use crate::firecracker::FirecrackerBackend;
 use crate::qemu::QemuKvmBackend;
 use crate::{
-    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmmBackend, VmmError, VmmKind,
+    BackendKind, BackendRequirements, BootKind, CreatedVm, RestoreTarget, SnapshotMeta,
+    SnapshotPaths, VmConfig, VmInfo, VmmBackend, VmmError, VmmKind,
 };
 
 /// Unified vsock stream over the two backends' concrete stream types. Both
@@ -161,15 +162,31 @@ impl LinuxDispatchBackend {
 
 /// Selects the VMM backend kind for a new VM.
 ///
-/// When no backend was explicitly requested and the VM has host shares,
-/// QEMU is chosen because Firecracker does not support virtiofs. An
-/// explicit `requested` value is always honored, even when shares are present,
-/// so Firecracker's own unsupported-feature error remains reachable.
-fn select_vmm_kind(requested: Option<VmmKind>, has_host_shares: bool, default: VmmKind) -> VmmKind {
-    if requested.is_none() && has_host_shares {
-        VmmKind::Qemu
+/// UEFI boots require QEMU. For direct-kernel boots with host shares, QEMU is
+/// selected when the caller did not pin a backend because Firecracker has no
+/// virtiofs support. An explicit Firecracker request with shares is preserved
+/// so its detailed unsupported-feature error remains reachable.
+fn select_vmm_kind(
+    requirements: BackendRequirements,
+    default: VmmKind,
+) -> Result<VmmKind, VmmError> {
+    if requirements.boot == BootKind::Uefi {
+        return match requirements.requested {
+            None | Some(VmmKind::Qemu) => Ok(VmmKind::Qemu),
+            Some(VmmKind::Firecracker) => Err(VmmError::InvalidConfig(
+                "UEFI boot requires the QEMU backend".into(),
+            )),
+        };
+    }
+    if requirements.boot == BootKind::Efi {
+        return Err(VmmError::InvalidConfig(
+            "EFI boot is not supported by the Linux VMM dispatcher".into(),
+        ));
+    }
+    if requirements.requested.is_none() && requirements.has_host_shares {
+        Ok(VmmKind::Qemu)
     } else {
-        requested.unwrap_or(default)
+        Ok(requirements.requested.unwrap_or(default))
     }
 }
 
@@ -182,18 +199,26 @@ impl VmmBackend for LinuxDispatchBackend {
         "firecracker"
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+    fn select_backend(&self, requirements: BackendRequirements) -> Result<BackendKind, VmmError> {
+        select_vmm_kind(requirements, self.default_kind).map(BackendKind::from)
+    }
+
+    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
         let kind = select_vmm_kind(
-            config.vmm,
-            !config.host_shares.is_empty(),
+            BackendRequirements {
+                requested: config.vmm,
+                boot: config.boot.kind(),
+                has_host_shares: !config.host_shares.is_empty(),
+            },
             self.default_kind,
-        );
-        let info = match kind {
+        )?;
+        let created = match kind {
             VmmKind::Firecracker => self.firecracker.create_vm(config).await?,
             VmmKind::Qemu => self.qemu.create_vm(config).await?,
         };
-        self.routes.lock().await.insert(info.id, kind);
-        Ok(info)
+        debug_assert_eq!(created.backend, BackendKind::from(kind));
+        self.routes.lock().await.insert(created.info.id, kind);
+        Ok(created)
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
@@ -312,21 +337,46 @@ mod tests {
 
     #[test]
     fn auto_selects_qemu_for_shares_when_vmm_unset() {
+        let direct = |requested, has_host_shares| BackendRequirements {
+            requested,
+            boot: BootKind::DirectKernel,
+            has_host_shares,
+        };
         assert_eq!(
-            select_vmm_kind(None, true, VmmKind::Firecracker),
-            VmmKind::Qemu
+            select_vmm_kind(direct(None, true), VmmKind::Firecracker).unwrap(),
+            VmmKind::Qemu,
         );
         assert_eq!(
-            select_vmm_kind(None, false, VmmKind::Firecracker),
-            VmmKind::Firecracker
+            select_vmm_kind(direct(None, false), VmmKind::Firecracker).unwrap(),
+            VmmKind::Firecracker,
         );
         assert_eq!(
-            select_vmm_kind(Some(VmmKind::Firecracker), true, VmmKind::Qemu),
-            VmmKind::Firecracker
+            select_vmm_kind(direct(Some(VmmKind::Firecracker), true), VmmKind::Qemu,).unwrap(),
+            VmmKind::Firecracker,
         );
         assert_eq!(
-            select_vmm_kind(Some(VmmKind::Qemu), false, VmmKind::Firecracker),
-            VmmKind::Qemu
+            select_vmm_kind(direct(Some(VmmKind::Qemu), false), VmmKind::Firecracker,).unwrap(),
+            VmmKind::Qemu,
+        );
+    }
+
+    #[test]
+    fn uefi_selection_is_qemu_only() {
+        let requirements = |requested| BackendRequirements {
+            requested,
+            boot: BootKind::Uefi,
+            has_host_shares: false,
+        };
+        assert_eq!(
+            select_vmm_kind(requirements(None), VmmKind::Firecracker).unwrap(),
+            VmmKind::Qemu,
+        );
+        assert!(
+            select_vmm_kind(
+                requirements(Some(VmmKind::Firecracker)),
+                VmmKind::Firecracker,
+            )
+            .is_err()
         );
     }
 

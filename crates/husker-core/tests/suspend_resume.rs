@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use husker_core::{CoreError, CreatePoolRequest, HuskerCore};
 use husker_vmm::{
-    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+    CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
+    VmmError,
 };
 use uuid::Uuid;
 
@@ -60,7 +61,7 @@ struct SharedRecordingVmm(Arc<RecordingVmm>);
 impl VmmBackend for SharedRecordingVmm {
     type VsockStream = tokio::net::UnixStream;
 
-    async fn create_vm(&self, _config: VmConfig) -> Result<VmInfo, VmmError> {
+    async fn create_vm(&self, _config: VmConfig) -> Result<CreatedVm, VmmError> {
         Err(VmmError::Unsupported("not used".into()))
     }
 

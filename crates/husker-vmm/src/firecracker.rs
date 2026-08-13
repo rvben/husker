@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend, VmmError,
+    BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
+    VmmBackend, VmmError,
 };
 
 /// Tracks a running Firecracker VM instance.
@@ -564,7 +565,7 @@ impl VmmBackend for FirecrackerBackend {
         "firecracker"
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
         if !config.host_shares.is_empty() {
             return Err(VmmError::Unsupported(
                 "host bind-mounts (--mount) are not supported on Firecracker; use --vmm qemu"
@@ -621,7 +622,7 @@ impl VmmBackend for FirecrackerBackend {
             )
             .await
         {
-            Ok(info) => Ok(info),
+            Ok(info) => Ok(CreatedVm::new(info, BackendKind::Firecracker)),
             Err(e) => {
                 // Capture diagnostics before removing the artifacts.
                 let serial_tail = crate::tail_lines(&serial_log_path, 20);

@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+use crate::{BackendKind, CreatedVm};
 use crate::{VmConfig, VmInfo, VmState, VmmError};
 
 /// A running QEMU VM tracked by the backend.
@@ -619,7 +621,7 @@ impl crate::VmmBackend for QemuKvmBackend {
         "qemu"
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
         if !std::path::Path::new("/dev/kvm").exists() {
             return Err(VmmError::InvalidConfig(
                 "/dev/kvm missing (KVM not available on this host)".into(),
@@ -630,7 +632,9 @@ impl crate::VmmBackend for QemuKvmBackend {
                 "/dev/vhost-vsock missing (load the vhost_vsock kernel module)".into(),
             ));
         }
-        self.create(config).await
+        self.create(config)
+            .await
+            .map(|info| CreatedVm::new(info, BackendKind::Qemu))
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {

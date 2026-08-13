@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::fd_stream::FdStream;
-use crate::{VmConfig, VmInfo, VmState, VmmBackend, VmmError};
+use crate::{BackendKind, CreatedVm, VmConfig, VmInfo, VmState, VmmBackend, VmmError};
 
 // ── Send/Sync wrappers ──────────────────────────────────────────────────
 
@@ -499,7 +499,7 @@ impl VmmBackend for AppleVzBackend {
         "apple_vz"
     }
 
-    async fn create_vm(&self, config: VmConfig) -> Result<VmInfo, VmmError> {
+    async fn create_vm(&self, config: VmConfig) -> Result<CreatedVm, VmmError> {
         {
             let instances = self.instances.lock().await;
             if instances.values().any(|i| i.info.name == config.name) {
@@ -555,7 +555,7 @@ impl VmmBackend for AppleVzBackend {
             },
         );
 
-        Ok(info)
+        Ok(CreatedVm::new(info, BackendKind::AppleVz))
     }
 
     /// Best-effort, asynchronous shutdown: requests a guest stop and marks the VM

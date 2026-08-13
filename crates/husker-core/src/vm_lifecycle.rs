@@ -159,16 +159,24 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
 
-        // Resolve the backend kind once and persist it, so the record reflects the
-        // backend the dispatcher actually runs (an omitted `--vmm` resolves to the
-        // daemon default, not a hardcoded Firecracker). Resolved before any host
-        // resource allocation so the idle-policy gate below fails fast.
-        let resolved_vmm_kind = resolve_vmm_kind(
-            req.vmm.as_deref(),
-            req.cloud_image.is_some(),
-            !req.mounts.is_empty(),
-            self.default_vmm_kind,
-        )?;
+        let requested_vmm_kind = req
+            .vmm
+            .as_deref()
+            .map(str::parse::<husker_vmm::VmmKind>)
+            .transpose()
+            .map_err(backend_selection_error)?;
+        let selected_backend = self
+            .vmm
+            .select_backend(husker_vmm::BackendRequirements {
+                requested: requested_vmm_kind,
+                boot: if req.cloud_image.is_some() {
+                    husker_vmm::BootKind::Uefi
+                } else {
+                    husker_vmm::BootKind::DirectKernel
+                },
+                has_host_shares: !req.mounts.is_empty(),
+            })
+            .map_err(backend_selection_error)?;
 
         // Resolve the idle policy: an explicit `idle_timeout_secs` wins; otherwise the
         // bare `--idle` flag opts in using the daemon default window. Resolved without
@@ -180,7 +188,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .then_some(self.idle_policy.default_idle_timeout_secs)
         });
         let idle_opted_in = idle_timeout_secs.is_some();
-        if idle_opted_in && resolved_vmm_kind != husker_vmm::VmmKind::Firecracker {
+        if idle_opted_in
+            && !husker_vmm::Capabilities::for_backend(selected_backend.as_str()).snapshot
+        {
             return Err(CoreError::InvalidArgument(
                 "idle policy requires a full-state snapshot backend (firecracker)".into(),
             ));
@@ -309,15 +319,6 @@ impl<B: VmmBackend> HuskerCore<B> {
                     PathBuf::from(rec.file_path)
                 }
             };
-            // Cloud-image boot is QEMU-only. Reject an explicit non-QEMU backend request.
-            if let Some(v) = req.vmm.as_deref() {
-                let kind = v.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm)?;
-                if kind != husker_vmm::VmmKind::Qemu {
-                    return Err(CoreError::InvalidArgument(
-                        "cloud-image boot requires the QEMU backend (--vmm qemu)".into(),
-                    ));
-                }
-            }
             // The seed delivers the guest agent; fail fast (before cloning) if the
             // daemon was built without one.
             if self.embedded_agent.is_empty() {
@@ -494,7 +495,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vsock_cid: cid,
             tap_device: has_host_networking.then(|| tap_name.clone()),
             guest_mac: has_host_networking.then_some(mac),
-            vmm: Some(resolved_vmm_kind),
+            vmm: requested_vmm_kind,
             boot,
             seed_path,
             balloon: req.balloon,
@@ -502,7 +503,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             host_shares,
         };
 
-        let info = self.vmm.create_vm(vm_config).await?;
+        let husker_vmm::CreatedVm { info, backend } = self.vmm.create_vm(vm_config).await?;
         resources.vm_id = Some(info.id);
 
         let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
@@ -539,7 +540,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: resolved_vmm_kind.to_string(),
+            vmm: backend.to_string(),
             boot_mode: if is_cloud {
                 "uefi".to_string()
             } else {
@@ -743,7 +744,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 host_shares: vec![],
             };
 
-            let info = self.vmm.create_vm(vm_config).await?;
+            let husker_vmm::CreatedVm { info, backend } = self.vmm.create_vm(vm_config).await?;
             resources.vm_id = Some(info.id);
 
             let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
@@ -772,7 +773,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 },
                 service_id: tags.map(|t| t.service_id),
                 service_ordinal: tags.map(|t| t.ordinal),
-                vmm: "apple_vz".to_string(),
+                vmm: backend.to_string(),
                 boot_mode: boot_mode_str,
                 balloon: req.balloon,
                 volume: None,
@@ -864,7 +865,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             host_shares: vec![],
         };
 
-        let info = self.vmm.create_vm(vm_config).await?;
+        let husker_vmm::CreatedVm { info, backend } = self.vmm.create_vm(vm_config).await?;
         resources.vm_id = Some(info.id);
 
         let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
@@ -893,7 +894,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
-            vmm: "apple_vz".to_string(),
+            vmm: backend.to_string(),
             boot_mode: "direct".to_string(),
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
@@ -1232,5 +1233,13 @@ impl<B: VmmBackend> HuskerCore<B> {
             husker_state::StateError::VmNotFoundByName(_) => CoreError::VmNotFound(name.into()),
             other => CoreError::State(other),
         })
+    }
+}
+
+#[cfg(feature = "linux-net")]
+fn backend_selection_error(error: husker_vmm::VmmError) -> CoreError {
+    match error {
+        husker_vmm::VmmError::InvalidConfig(message) => CoreError::InvalidArgument(message),
+        other => CoreError::Vmm(other),
     }
 }

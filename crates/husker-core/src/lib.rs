@@ -748,11 +748,6 @@ pub struct HuskerCore<B: VmmBackend> {
     /// misconfigured uplink (guests with no WAN/DNS) is caught by `husker doctor`.
     #[cfg(feature = "linux-net")]
     host_interface: String,
-    /// Backend kind to persist when a create request omits `--vmm`. Mirrors the
-    /// dispatcher's configured default so the record reflects the backend that
-    /// actually runs the VM. Defaults to Firecracker.
-    #[cfg(feature = "linux-net")]
-    default_vmm_kind: husker_vmm::VmmKind,
     /// Default kernel the daemon uses when a create request omits kernel_path.
     /// Wired from the daemon config so remote clients do not need to send
     /// client-local paths that cannot exist on the daemon host.
@@ -843,34 +838,6 @@ pub fn default_ready_timeout(boot_mode: &str) -> std::time::Duration {
         DEFAULT_READY_TIMEOUT_SECS
     };
     std::time::Duration::from_secs(secs)
-}
-
-/// Resolve the backend kind to persist for a new VM.
-///
-/// husker's Linux dispatcher resolves an omitted `--vmm` to the daemon's
-/// configured default, so the persisted `VmRecord.vmm` must reflect that same
-/// resolution rather than a hardcoded assumption. Otherwise capability gating
-/// (suspend) and restore backend-matching read the wrong kind for a VM created
-/// without `--vmm` on a QEMU-default daemon. Cloud-image boot is QEMU-only and
-/// overrides the default.
-#[cfg(feature = "linux-net")]
-fn resolve_vmm_kind(
-    req_vmm: Option<&str>,
-    is_cloud: bool,
-    has_host_shares: bool,
-    default: husker_vmm::VmmKind,
-) -> Result<husker_vmm::VmmKind, CoreError> {
-    if is_cloud {
-        return Ok(husker_vmm::VmmKind::Qemu);
-    }
-    match req_vmm {
-        Some(s) => s.parse::<husker_vmm::VmmKind>().map_err(CoreError::Vmm),
-        // Host bind-mounts use virtiofs, which only the QEMU backend supports.
-        // Auto-select it when the caller did not pin a backend, instead of
-        // resolving to the (Firecracker) default and failing on its guard.
-        None if has_host_shares => Ok(husker_vmm::VmmKind::Qemu),
-        None => Ok(default),
-    }
 }
 
 /// Build the base kernel cmdline for a direct-kernel (non-cloud) boot.
@@ -1016,7 +983,6 @@ impl<B: VmmBackend> HuskerCore<B> {
             lan_bridge: None,
             dns_servers,
             host_interface: String::new(),
-            default_vmm_kind: husker_vmm::VmmKind::Firecracker,
             default_kernel: None,
             default_rootfs: None,
             default_initrd: None,
@@ -1223,15 +1189,6 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Return the named VM presets stored in this daemon instance.
     pub fn profiles(&self) -> &std::collections::HashMap<String, DaemonProfile> {
         &self.profiles
-    }
-
-    /// Set the default backend kind used when a create request omits `--vmm`.
-    /// Wire this from the same daemon config value the dispatcher uses so the
-    /// persisted record matches the backend that runs the VM.
-    #[cfg(feature = "linux-net")]
-    pub fn with_default_vmm_kind(mut self, kind: husker_vmm::VmmKind) -> Self {
-        self.default_vmm_kind = kind;
-        self
     }
 
     /// Override the OVMF firmware paths used for UEFI/cloud-image boot.
@@ -2444,6 +2401,7 @@ mod tests {
         Arc::new(HuskerCore::new(
             AutoResumeMockVmm {
                 fail_vsock_connect: false,
+                backend_kind: husker_vmm::BackendKind::Firecracker,
             },
             husker_state::StateStore::open_memory().unwrap(),
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -2457,30 +2415,27 @@ mod tests {
         ))
     }
 
-    /// Like `test_core`, but with the daemon default backend set to QEMU
-    /// instead of the built-in Firecracker default, for tests that exercise
-    /// the idle-policy gate against a non-Firecracker default.
+    /// Like `test_core`, but with a QEMU-selecting backend for tests that
+    /// exercise the idle-policy gate against a non-snapshot implementation.
     #[cfg(feature = "linux-net")]
     async fn test_core_qemu() -> Arc<HuskerCore<AutoResumeMockVmm>> {
         let dir = std::env::temp_dir().join(format!("husker-core-test-{}", Uuid::new_v4()));
         let runtime_dir = dir.join("run");
-        Arc::new(
-            HuskerCore::new(
-                AutoResumeMockVmm {
-                    fail_vsock_connect: false,
-                },
-                husker_state::StateStore::open_memory().unwrap(),
-                husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
-                husker_storage::StorageConfig {
-                    data_dir: dir.clone(),
-                    state_dir: dir,
-                },
-                "husker0".into(),
-                vec![],
-                runtime_dir,
-            )
-            .with_default_vmm_kind(husker_vmm::VmmKind::Qemu),
-        )
+        Arc::new(HuskerCore::new(
+            AutoResumeMockVmm {
+                fail_vsock_connect: false,
+                backend_kind: husker_vmm::BackendKind::Qemu,
+            },
+            husker_state::StateStore::open_memory().unwrap(),
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            husker_storage::StorageConfig {
+                data_dir: dir.clone(),
+                state_dir: dir,
+            },
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        ))
     }
 
     /// An idle-policy opt-in must be rejected outright on a non-Firecracker
@@ -2713,6 +2668,7 @@ mod tests {
     #[cfg(feature = "linux-net")]
     struct AutoResumeMockVmm {
         fail_vsock_connect: bool,
+        backend_kind: husker_vmm::BackendKind,
     }
 
     #[cfg(feature = "linux-net")]
@@ -2722,10 +2678,14 @@ mod tests {
         async fn create_vm(
             &self,
             _config: husker_vmm::VmConfig,
-        ) -> Result<VmInfo, husker_vmm::VmmError> {
+        ) -> Result<husker_vmm::CreatedVm, husker_vmm::VmmError> {
             Err(husker_vmm::VmmError::Unsupported(
                 "not used by this test".into(),
             ))
+        }
+
+        fn backend_kind(&self) -> &'static str {
+            self.backend_kind.as_str()
         }
 
         async fn stop_vm(&self, _id: Uuid) -> Result<(), husker_vmm::VmmError> {
@@ -2827,7 +2787,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime_dir = tmp.path().join("run");
         let core = HuskerCore::new(
-            AutoResumeMockVmm { fail_vsock_connect },
+            AutoResumeMockVmm {
+                fail_vsock_connect,
+                backend_kind: husker_vmm::BackendKind::Firecracker,
+            },
             husker_state::StateStore::open_memory().unwrap(),
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
             husker_storage::StorageConfig {
@@ -3121,7 +3084,7 @@ mod tests {
         async fn create_vm(
             &self,
             _config: husker_vmm::VmConfig,
-        ) -> Result<VmInfo, husker_vmm::VmmError> {
+        ) -> Result<husker_vmm::CreatedVm, husker_vmm::VmmError> {
             Err(husker_vmm::VmmError::Unsupported(
                 "not used by this test".into(),
             ))
@@ -3560,64 +3523,6 @@ mod tests {
         assert!(!looks_like_path("myimg"));
         assert!(!looks_like_path("python:3.12-alpine"));
         assert!(!looks_like_path("ghcr.io/o/r:v1"));
-    }
-
-    #[cfg(feature = "linux-net")]
-    #[test]
-    fn resolve_vmm_kind_uses_daemon_default_when_unspecified() {
-        use husker_vmm::VmmKind;
-        // No explicit --vmm: a QEMU-default daemon must resolve to QEMU, so the
-        // persisted record matches the backend the dispatcher actually runs.
-        // (Previously this was hardcoded to Firecracker, mislabeling the VM.)
-        assert_eq!(
-            resolve_vmm_kind(None, false, false, VmmKind::Qemu).unwrap(),
-            VmmKind::Qemu
-        );
-        assert_eq!(
-            resolve_vmm_kind(None, false, false, VmmKind::Firecracker).unwrap(),
-            VmmKind::Firecracker
-        );
-    }
-
-    #[cfg(feature = "linux-net")]
-    #[test]
-    fn resolve_vmm_kind_explicit_request_overrides_default() {
-        use husker_vmm::VmmKind;
-        assert_eq!(
-            resolve_vmm_kind(Some("firecracker"), false, false, VmmKind::Qemu).unwrap(),
-            VmmKind::Firecracker
-        );
-        // An unparseable backend string is rejected, not silently defaulted.
-        assert!(resolve_vmm_kind(Some("xen"), false, false, VmmKind::Qemu).is_err());
-    }
-
-    #[cfg(feature = "linux-net")]
-    #[test]
-    fn resolve_vmm_kind_auto_selects_qemu_for_host_shares() {
-        use husker_vmm::VmmKind;
-        // No --vmm but host bind-mounts present: must resolve to QEMU (virtiofs),
-        // not the Firecracker default whose guard rejects shares.
-        assert_eq!(
-            resolve_vmm_kind(None, false, true, VmmKind::Firecracker).unwrap(),
-            VmmKind::Qemu
-        );
-        // An explicit backend still wins even with shares (the FC guard then
-        // surfaces a clear error rather than being silently overridden).
-        assert_eq!(
-            resolve_vmm_kind(Some("firecracker"), false, true, VmmKind::Qemu).unwrap(),
-            VmmKind::Firecracker
-        );
-    }
-
-    #[cfg(feature = "linux-net")]
-    #[test]
-    fn resolve_vmm_kind_cloud_is_always_qemu() {
-        use husker_vmm::VmmKind;
-        // Cloud-image boot is QEMU-only regardless of the daemon default.
-        assert_eq!(
-            resolve_vmm_kind(None, true, false, VmmKind::Firecracker).unwrap(),
-            VmmKind::Qemu
-        );
     }
 
     #[cfg(feature = "linux-net")]

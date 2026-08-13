@@ -574,7 +574,6 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
                     .with_host_interface(uplink.effective.clone())
                     .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
                     .with_lan_bridge(config.lan_bridge.clone())
-                    .with_default_vmm_kind(default_kind)
                     .with_default_images(
                         Some(config.default_kernel.clone()),
                         Some(config.default_rootfs.clone()),
