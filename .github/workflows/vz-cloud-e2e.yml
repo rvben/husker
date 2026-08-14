@@ -27,10 +27,10 @@ jobs:
     name: VZ Cloud-Image E2E (mac-mini)
     runs-on: [self-hosted, macOS, ARM64]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # The self-hosted runner user has no uv on PATH; install it (same as release.yml).
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.0.1
 
       # zig + cargo-zigbuild (via a uv venv, mirroring release.yml) to
       # cross-build the aarch64-musl guest agent the cloud-image path embeds.

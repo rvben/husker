@@ -21,7 +21,7 @@ jobs:
     name: E2E Gated (self-hosted, KVM)
     runs-on: [self-hosted, husker, linux]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # husker-net bridge primitives: root + nftables only, no images or daemon.
       - name: Bridge net e2e

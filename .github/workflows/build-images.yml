@@ -62,7 +62,7 @@ jobs:
       # have moved past the release. Build from the commit the Release ran on so
       # the baked agent is exactly the one that daemon release ships. Empty on
       # every other trigger, where the default ref is already correct.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
@@ -144,7 +144,7 @@ jobs:
       # have moved past the release. Build from the commit the Release ran on so
       # the baked agent is exactly the one that daemon release ships. Empty on
       # every other trigger, where the default ref is already correct.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 

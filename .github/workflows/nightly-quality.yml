@@ -18,7 +18,7 @@ jobs:
       HUSKER_RUN_IGNORED_E2E: ${{ vars.HUSKER_RUN_IGNORED_E2E_NIGHTLY }}
       HUSKER_RUN_NET_E2E: ${{ vars.HUSKER_RUN_NET_E2E_NIGHTLY }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-mutants --locked

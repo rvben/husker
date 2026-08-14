@@ -17,7 +17,7 @@ jobs:
     name: QEMU E2E (self-hosted, KVM)
     runs-on: [self-hosted, husker, linux]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The gated targets use cargo-nextest; ensure it exists for root (which
       # runs the e2e via sudo). Idempotent, survives a runner wipe.
