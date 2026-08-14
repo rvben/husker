@@ -641,6 +641,24 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'unknown userdata status');
          END;",
     ),
+    (
+        11,
+        "CREATE TRIGGER vm_userdata_status_transition_must_be_valid
+         BEFORE UPDATE OF userdata_status ON vms
+         WHEN NEW.userdata_status IS NOT OLD.userdata_status
+              AND (NEW.userdata_status IS NULL
+                   OR NEW.userdata_status IN ('pending', 'running', 'completed', 'failed'))
+              AND (OLD.userdata_status IS NULL
+                   OR OLD.userdata_status IN ('pending', 'running', 'completed', 'failed'))
+              AND NOT (
+                  (OLD.userdata_status = 'pending' AND NEW.userdata_status = 'running')
+                  OR (OLD.userdata_status = 'running'
+                      AND NEW.userdata_status IN ('pending', 'completed', 'failed'))
+              )
+         BEGIN
+             SELECT RAISE(ABORT, 'invalid userdata status transition');
+         END;",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -2311,21 +2329,40 @@ impl StateStore {
         Ok(records)
     }
 
-    /// Update the userdata execution status for a VM.
-    pub fn update_userdata_status(
+    /// Atomically transition userdata execution state when the persisted state
+    /// still matches `expected`.
+    ///
+    /// Returns `false` for a known VM whose state was changed or claimed by a
+    /// concurrent worker. Missing VMs remain an error so teardown cannot be
+    /// mistaken for transition contention.
+    pub fn transition_userdata_status(
         &self,
         id: Uuid,
-        status: UserdataStatus,
-    ) -> Result<(), StateError> {
+        expected: UserdataStatus,
+        next: UserdataStatus,
+    ) -> Result<bool, StateError> {
         let conn = self.lock()?;
         let updated = conn.execute(
-            "UPDATE vms SET userdata_status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status.as_str(), Utc::now().to_rfc3339(), id.to_string()],
+            "UPDATE vms SET userdata_status = ?1, updated_at = ?2
+             WHERE id = ?3 AND userdata_status = ?4",
+            params![
+                next.as_str(),
+                Utc::now().to_rfc3339(),
+                id.to_string(),
+                expected.as_str()
+            ],
         )?;
         if updated == 0 {
-            return Err(StateError::VmNotFound(id));
+            let exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM vms WHERE id = ?1)",
+                params![id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(StateError::VmNotFound(id));
+            }
         }
-        Ok(())
+        Ok(updated == 1)
     }
 
     /// Mark all VMs in transient states (`running`, `creating`, `paused`) as `stopped`.
@@ -3779,7 +3816,7 @@ mod tests {
     }
 
     #[test]
-    fn update_userdata_status() {
+    fn userdata_status_transition_is_atomic() {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("ud-status");
         rec.userdata = Some("#!/bin/sh".into());
@@ -3787,7 +3824,7 @@ mod tests {
         store.insert_vm(&rec).unwrap();
 
         store
-            .update_userdata_status(rec.id, UserdataStatus::Running)
+            .transition_userdata_status(rec.id, UserdataStatus::Pending, UserdataStatus::Running)
             .unwrap();
         assert_eq!(
             store.get_vm(rec.id).unwrap().userdata_status,
@@ -3795,7 +3832,7 @@ mod tests {
         );
 
         store
-            .update_userdata_status(rec.id, UserdataStatus::Completed)
+            .transition_userdata_status(rec.id, UserdataStatus::Running, UserdataStatus::Completed)
             .unwrap();
         assert_eq!(
             store.get_vm(rec.id).unwrap().userdata_status,
@@ -3804,9 +3841,84 @@ mod tests {
     }
 
     #[test]
-    fn update_userdata_status_nonexistent_vm() {
+    fn userdata_status_transition_conflict_preserves_the_winner() {
         let store = StateStore::open_memory().unwrap();
-        let result = store.update_userdata_status(Uuid::new_v4(), UserdataStatus::Running);
+        let mut rec = make_record("ud-status-conflict");
+        rec.userdata = Some("#!/bin/sh".into());
+        rec.userdata_status = Some(UserdataStatus::Pending);
+        store.insert_vm(&rec).unwrap();
+
+        assert!(
+            store
+                .transition_userdata_status(
+                    rec.id,
+                    UserdataStatus::Pending,
+                    UserdataStatus::Running,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .transition_userdata_status(
+                    rec.id,
+                    UserdataStatus::Pending,
+                    UserdataStatus::Running,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_vm(rec.id).unwrap().userdata_status,
+            Some(UserdataStatus::Running)
+        );
+    }
+
+    #[test]
+    fn concurrent_userdata_claim_has_exactly_one_winner() {
+        let store = std::sync::Arc::new(StateStore::open_memory().unwrap());
+        let mut rec = make_record("ud-concurrent-claim");
+        rec.userdata = Some("#!/bin/sh".into());
+        rec.userdata_status = Some(UserdataStatus::Pending);
+        store.insert_vm(&rec).unwrap();
+        let vm_id = rec.id;
+
+        let contenders = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+        let mut threads = Vec::new();
+        for _ in 0..contenders {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .transition_userdata_status(
+                        vm_id,
+                        UserdataStatus::Pending,
+                        UserdataStatus::Running,
+                    )
+                    .unwrap()
+            }));
+        }
+
+        let winners = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        assert_eq!(
+            store.get_vm(vm_id).unwrap().userdata_status,
+            Some(UserdataStatus::Running)
+        );
+    }
+
+    #[test]
+    fn transition_userdata_status_nonexistent_vm() {
+        let store = StateStore::open_memory().unwrap();
+        let result = store.transition_userdata_status(
+            Uuid::new_v4(),
+            UserdataStatus::Pending,
+            UserdataStatus::Running,
+        );
         assert!(matches!(result, Err(StateError::VmNotFound(_))));
     }
 
@@ -5181,6 +5293,33 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("unknown userdata status"));
+        assert_eq!(
+            store.get_vm(record.id).unwrap().userdata_status,
+            Some(UserdataStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn database_rejects_invalid_userdata_status_transitions() {
+        let store = StateStore::open_memory().unwrap();
+        let mut record = make_record("guarded-userdata-transition");
+        record.userdata = Some("#!/bin/sh".into());
+        record.userdata_status = Some(UserdataStatus::Pending);
+        store.insert_vm(&record).unwrap();
+
+        let error = store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE vms SET userdata_status = 'completed' WHERE id = ?1",
+                params![record.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid userdata status transition")
+        );
         assert_eq!(
             store.get_vm(record.id).unwrap().userdata_status,
             Some(UserdataStatus::Pending)

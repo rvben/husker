@@ -369,7 +369,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await
         {
             Ok(record) => {
-                self.spawn_userdata(&record);
+                self.spawn_userdata(&record).await;
                 outcome.created.push(name);
             }
             Err(e) => outcome.failed.push((name, e.to_string())),

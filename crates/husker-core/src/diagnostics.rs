@@ -45,6 +45,11 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Returns the number of VMs that were drained. Errors on individual VMs
     /// are logged but do not abort the drain.
     pub async fn drain_vms(&self) -> usize {
+        // Close the job registry before taking the VM snapshot: this prevents
+        // a late create/reconcile from registering new guest work while the
+        // shutdown drain is already stopping VMMs.
+        self.shutdown_userdata_jobs().await;
+
         let vms = match self.list_vms() {
             Ok(vms) => vms,
             Err(e) => {

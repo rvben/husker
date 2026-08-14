@@ -10,7 +10,7 @@ use husker_core::{
 };
 #[cfg(feature = "linux-net")]
 use husker_state::PortForwardRecord;
-use husker_state::{StateStore, VmRecord};
+use husker_state::{StateStore, VmLifecycleState, VmRecord};
 use husker_storage::StorageConfig;
 use husker_vmm::{
     BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
@@ -1055,6 +1055,132 @@ async fn run_userdata_without_script_is_noop() {
     core.run_userdata("vm-no-userdata").await.unwrap();
     let vm = core.get_vm("vm-no-userdata").unwrap();
     assert!(vm.userdata_status.is_none());
+}
+
+#[tokio::test]
+async fn stop_cancels_and_joins_awaited_userdata_before_stopping_vm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    let vm_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            vm_id,
+            "vm-cancel-userdata",
+            "running",
+            Some("exit 0".into()),
+            Some(UserdataStatus::Pending),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "vm-cancel-userdata".into(),
+        state: VmState::Running,
+        pid: Some(8),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 14,
+    })
+    .await;
+
+    // No agent socket is configured, so the owned job stays in its readiness
+    // loop until lifecycle cancellation arrives.
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+    let running_core = Arc::clone(&core);
+    let run = tokio::spawn(async move { running_core.run_userdata("vm-cancel-userdata").await });
+
+    for _ in 0..100 {
+        if core.get_vm("vm-cancel-userdata").unwrap().userdata_status
+            == Some(UserdataStatus::Running)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        core.get_vm("vm-cancel-userdata").unwrap().userdata_status,
+        Some(UserdataStatus::Running)
+    );
+
+    core.stop_vm("vm-cancel-userdata").await.unwrap();
+    let error = run.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, CoreError::UserdataCancelled(ref name) if name == "vm-cancel-userdata")
+    );
+
+    let vm = core.get_vm("vm-cancel-userdata").unwrap();
+    assert_eq!(vm.state, VmLifecycleState::Stopped);
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Pending));
+    assert!(
+        !core.spawn_userdata(&vm).await,
+        "a delayed automatic spawn must not start after the VM has stopped"
+    );
+    assert_eq!(
+        core.get_vm("vm-cancel-userdata").unwrap().userdata_status,
+        Some(UserdataStatus::Pending)
+    );
+}
+
+#[tokio::test]
+async fn shutdown_drain_cancels_userdata_and_refuses_late_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    let vm_id = Uuid::new_v4();
+    let record = vm_record(
+        vm_id,
+        "vm-drain-userdata",
+        "running",
+        Some("exit 0".into()),
+        Some(UserdataStatus::Pending),
+        None,
+        None,
+        None,
+    );
+    state.insert_vm(&record).unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "vm-drain-userdata".into(),
+        state: VmState::Running,
+        pid: Some(9),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 15,
+    })
+    .await;
+
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+    assert!(core.spawn_userdata(&record).await);
+    assert!(
+        !core.spawn_userdata(&record).await,
+        "the atomic pending-to-running claim must reject duplicate execution"
+    );
+
+    assert_eq!(core.drain_vms().await, 1);
+    let vm = core.get_vm("vm-drain-userdata").unwrap();
+    assert_eq!(vm.state, VmLifecycleState::Stopped);
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Pending));
+    assert!(
+        !core.spawn_userdata(&vm).await,
+        "a quiesced shutdown registry must reject late jobs"
+    );
+    assert_eq!(
+        core.get_vm("vm-drain-userdata").unwrap().userdata_status,
+        Some(UserdataStatus::Pending)
+    );
 }
 
 #[tokio::test]
@@ -2743,7 +2869,11 @@ async fn run_userdata_spawn_userdata_drives_to_completed() {
     .await;
 
     let core = build_core(mock, state, &data_dir, &runtime_dir);
-    core.spawn_userdata(&record);
+    assert!(core.spawn_userdata(&record).await);
+    assert!(
+        !core.spawn_userdata(&record).await,
+        "a duplicate spawn must not execute the script twice"
+    );
 
     let mut status = None;
     for _ in 0..100 {
@@ -2757,6 +2887,10 @@ async fn run_userdata_spawn_userdata_drives_to_completed() {
         status,
         Some(UserdataStatus::Completed),
         "spawn_userdata should drive userdata_status to completed"
+    );
+    assert!(
+        !core.spawn_userdata(&record).await,
+        "a terminal userdata job must never be restarted"
     );
 }
 

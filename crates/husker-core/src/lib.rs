@@ -109,6 +109,8 @@ pub enum CoreError {
     PortForwardDenied(u16),
     #[error("I/O error: {0}")]
     Io(String),
+    #[error("userdata execution for VM '{0}' was cancelled")]
+    UserdataCancelled(String),
     #[error("service operation failed: {0}")]
     ServiceOperationFailed(String),
     #[error("VMM error: {0}")]
@@ -805,6 +807,9 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Named VM presets exposed to clients via GET /v1/profiles.
     profiles: std::collections::HashMap<String, DaemonProfile>,
     runtime_dir: PathBuf,
+    /// Every background userdata execution owned by this core. Lifecycle
+    /// operations cancel and join the matching job before mutating its VM.
+    userdata_jobs: Arc<agent_ops::UserdataJobs>,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks:
         parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -961,6 +966,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_cpus: None,
             profiles: std::collections::HashMap::new(),
             runtime_dir,
+            userdata_jobs: Arc::new(agent_ops::UserdataJobs::default()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -1005,6 +1011,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             default_cpus: None,
             profiles: std::collections::HashMap::new(),
             runtime_dir,
+            userdata_jobs: Arc::new(agent_ops::UserdataJobs::default()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),

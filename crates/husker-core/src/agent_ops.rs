@@ -1,5 +1,147 @@
 use super::*;
 
+struct UserdataJob {
+    token: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct UserdataJobState {
+    accepting: bool,
+    jobs: std::collections::HashMap<Uuid, UserdataJob>,
+}
+
+/// Ownership boundary for background userdata execution.
+///
+/// A job is inserted before it is allowed to begin, which closes the tiny
+/// spawn-before-registration race that otherwise lets shutdown miss a task.
+/// Tokens prevent an old task's completion from removing a newer job for the
+/// same VM generation.
+pub(crate) struct UserdataJobs {
+    next_token: std::sync::atomic::AtomicU64,
+    state: parking_lot::Mutex<UserdataJobState>,
+}
+
+impl Default for UserdataJobs {
+    fn default() -> Self {
+        Self {
+            next_token: std::sync::atomic::AtomicU64::new(1),
+            state: parking_lot::Mutex::new(UserdataJobState {
+                accepting: true,
+                jobs: std::collections::HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl UserdataJobs {
+    fn next_token(&self) -> u64 {
+        self.next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn claim_and_insert(
+        &self,
+        store: &husker_state::StateStore,
+        vm_id: Uuid,
+        spawn: impl FnOnce(u64) -> tokio::task::JoinHandle<()>,
+    ) -> Result<Option<u64>, CoreError> {
+        let mut state = self.state.lock();
+        if !state.accepting || state.jobs.contains_key(&vm_id) {
+            return Ok(None);
+        }
+
+        // Keep the ownership mutex across the durable claim and registration.
+        // Shutdown and per-VM cancellation can therefore never observe a
+        // `running` status without also finding its owned task.
+        if !store.transition_userdata_status(
+            vm_id,
+            UserdataStatus::Pending,
+            UserdataStatus::Running,
+        )? {
+            return Ok(None);
+        }
+
+        let token = self.next_token();
+        let handle = spawn(token);
+        state.jobs.insert(vm_id, UserdataJob { token, handle });
+        Ok(Some(token))
+    }
+
+    fn remove_if_current(&self, vm_id: Uuid, token: u64) -> Option<tokio::task::JoinHandle<()>> {
+        let mut state = self.state.lock();
+        if state.jobs.get(&vm_id).is_some_and(|job| job.token == token) {
+            state.jobs.remove(&vm_id).map(|job| job.handle)
+        } else {
+            None
+        }
+    }
+
+    fn take(&self, vm_id: Uuid) -> Option<tokio::task::JoinHandle<()>> {
+        self.state.lock().jobs.remove(&vm_id).map(|job| job.handle)
+    }
+
+    fn close_and_take_all(&self) -> Vec<(Uuid, tokio::task::JoinHandle<()>)> {
+        let mut state = self.state.lock();
+        state.accepting = false;
+        state
+            .jobs
+            .drain()
+            .map(|(vm_id, job)| (vm_id, job.handle))
+            .collect()
+    }
+}
+
+struct UserdataRunGuard<'a> {
+    state: &'a husker_state::StateStore,
+    vm_id: Uuid,
+    armed: bool,
+}
+
+impl<'a> UserdataRunGuard<'a> {
+    fn new(state: &'a husker_state::StateStore, vm_id: Uuid) -> Self {
+        Self {
+            state,
+            vm_id,
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self, status: UserdataStatus) -> Result<(), CoreError> {
+        match self
+            .state
+            .transition_userdata_status(self.vm_id, UserdataStatus::Running, status)?
+        {
+            true => {
+                self.armed = false;
+                Ok(())
+            }
+            false => {
+                self.armed = false;
+                Err(CoreError::Io(format!(
+                    "userdata status for VM {} changed while execution was active",
+                    self.vm_id
+                )))
+            }
+        }
+    }
+}
+
+impl Drop for UserdataRunGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.state.transition_userdata_status(
+            self.vm_id,
+            UserdataStatus::Running,
+            UserdataStatus::Pending,
+        ) && !matches!(error, husker_state::StateError::VmNotFound(_))
+        {
+            warn!(vm_id = %self.vm_id, %error, "failed to restore interrupted userdata to pending");
+        }
+    }
+}
+
 impl<B: VmmBackend> HuskerCore<B> {
     /// Connect to the guest agent for a running VM.
     ///
@@ -187,16 +329,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// boot-mode-aware default readiness timeout), writes the script to
     /// `/tmp/husker-userdata.sh`, executes it via `sh`, and updates
     /// `userdata_status` to `completed` or `failed`.
-    pub async fn run_userdata(&self, name: &str) -> Result<(), CoreError> {
-        let record = self.lookup_vm(name)?;
-        let script = match record.userdata {
-            Some(ref s) => s.clone(),
-            None => return Ok(()),
-        };
-
-        self.state
-            .update_userdata_status(record.id, UserdataStatus::Running)?;
-
+    async fn execute_claimed_userdata(
+        &self,
+        record: VmRecord,
+        script: String,
+    ) -> Result<(), CoreError> {
+        let name = record.name.as_str();
+        let mut run_guard = UserdataRunGuard::new(&self.state, record.id);
         let result: Result<(), CoreError> = async {
             let mut conn = self
                 .agent_connect_ready(name, default_ready_timeout(record.boot_mode))
@@ -242,8 +381,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
 
             if exec_result.exit_code == 0 {
-                self.state
-                    .update_userdata_status(record.id, UserdataStatus::Completed)?;
+                run_guard.finish(UserdataStatus::Completed)?;
             } else {
                 warn!(
                     %name,
@@ -251,8 +389,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                     stderr = %exec_result.stderr,
                     "userdata script failed"
                 );
-                self.state
-                    .update_userdata_status(record.id, UserdataStatus::Failed)?;
+                run_guard.finish(UserdataStatus::Failed)?;
             }
             Ok(())
         }
@@ -260,10 +397,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         if let Err(ref e) = result {
             warn!(%name, error = %e, "userdata execution error");
-            if let Err(status_err) = self
-                .state
-                .update_userdata_status(record.id, UserdataStatus::Failed)
-            {
+            if let Err(status_err) = run_guard.finish(UserdataStatus::Failed) {
                 warn!(%name, error = %status_err, "failed to update userdata status to failed");
             }
         }
@@ -271,21 +405,147 @@ impl<B: VmmBackend> HuskerCore<B> {
         result
     }
 
-    /// Spawn background userdata execution for a freshly created VM, if it has any.
-    /// Fire-and-forget: returns immediately; `run_userdata` updates `userdata_status`.
-    pub fn spawn_userdata(self: &Arc<Self>, record: &VmRecord)
+    async fn start_userdata_job(
+        self: &Arc<Self>,
+        record: VmRecord,
+        require_running: bool,
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<Result<(), CoreError>>>, CoreError>
     where
         B: 'static,
     {
-        if record.userdata.is_none() {
-            return;
+        // Serialize registration with stop/pause/suspend/destroy and refresh
+        // the record after taking the lock. A delayed spawn for an old VM
+        // generation must not start against its same-name replacement.
+        let _name_guard = self.vm_name_lock(&record.name).lock_owned().await;
+        let current = self.lookup_vm(&record.name)?;
+        if current.id != record.id {
+            return Ok(None);
         }
+        if require_running && current.state != VmLifecycleState::Running {
+            return Ok(None);
+        }
+        let Some(script) = current.userdata.clone() else {
+            return Ok(None);
+        };
+
+        let vm_id = current.id;
+        let name = current.name.clone();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let core = Arc::clone(self);
-        let name = record.name.clone();
-        tokio::spawn(async move {
-            if let Err(e) = core.run_userdata(&name).await {
-                warn!(%name, error = %e, "userdata execution failed");
+        let jobs = Arc::clone(&self.userdata_jobs);
+        let token = self
+            .userdata_jobs
+            .claim_and_insert(&self.state, vm_id, move |token| {
+                tokio::spawn(async move {
+                    if start_rx.await.is_err() {
+                        return;
+                    }
+                    let result = core.execute_claimed_userdata(current, script).await;
+                    if let Err(error) = &result {
+                        warn!(%name, %error, "userdata execution failed");
+                    }
+                    let _ = result_tx.send(result);
+                    jobs.remove_if_current(vm_id, token);
+                })
+            })?;
+        let Some(token) = token else {
+            return Ok(None);
+        };
+
+        if start_tx.send(()).is_err() {
+            if let Some(handle) = self.userdata_jobs.remove_if_current(vm_id, token) {
+                handle.abort();
             }
-        });
+            let _ = self.state.transition_userdata_status(
+                vm_id,
+                UserdataStatus::Running,
+                UserdataStatus::Pending,
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(result_rx))
+    }
+
+    /// Execute userdata once, waiting for the tracked job's result.
+    ///
+    /// A concurrent caller that finds the script already claimed or terminal
+    /// returns successfully without executing it again.
+    pub async fn run_userdata(self: &Arc<Self>, name: &str) -> Result<(), CoreError>
+    where
+        B: 'static,
+    {
+        let record = self.lookup_vm(name)?;
+        let Some(result) = self.start_userdata_job(record, false).await? else {
+            return Ok(());
+        };
+        result
+            .await
+            .map_err(|_| CoreError::UserdataCancelled(name.to_string()))?
+    }
+
+    /// Start owned background userdata execution for a freshly created VM.
+    ///
+    /// Returns whether this call atomically claimed and registered a job. A
+    /// duplicate call, a terminal status, or a shutting-down core returns
+    /// `false` without executing the script.
+    pub async fn spawn_userdata(self: &Arc<Self>, record: &VmRecord) -> bool
+    where
+        B: 'static,
+    {
+        match self.start_userdata_job(record.clone(), true).await {
+            Ok(Some(result)) => {
+                drop(result);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                warn!(name = %record.name, %error, "failed to start userdata execution");
+                false
+            }
+        }
+    }
+
+    pub(crate) async fn cancel_userdata_job(&self, vm_id: Uuid) -> bool {
+        let Some(handle) = self.userdata_jobs.take(vm_id) else {
+            return false;
+        };
+        handle.abort();
+        if let Err(error) = handle.await
+            && !error.is_cancelled()
+        {
+            warn!(%vm_id, %error, "userdata job failed while cancelling");
+        }
+        let _ = self.state.transition_userdata_status(
+            vm_id,
+            UserdataStatus::Running,
+            UserdataStatus::Pending,
+        );
+        true
+    }
+
+    pub(crate) async fn shutdown_userdata_jobs(&self) -> usize {
+        let handles = self.userdata_jobs.close_and_take_all();
+        let count = handles.len();
+        for (_, handle) in &handles {
+            handle.abort();
+        }
+        for (vm_id, handle) in handles {
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                warn!(%vm_id, %error, "userdata job failed during shutdown");
+            }
+            let _ = self.state.transition_userdata_status(
+                vm_id,
+                UserdataStatus::Running,
+                UserdataStatus::Pending,
+            );
+        }
+        if count > 0 {
+            info!(count, "cancelled userdata jobs for shutdown");
+        }
+        count
     }
 }

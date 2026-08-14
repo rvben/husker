@@ -1129,7 +1129,7 @@ pub(crate) async fn create_vm<B: VmmBackend + 'static>(
 
     let record = core.create_vm(req).await.map_err(map_error)?;
 
-    core.spawn_userdata(&record);
+    core.spawn_userdata(&record).await;
 
     Ok((StatusCode::CREATED, Json(record_to_response(record))))
 }

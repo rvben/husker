@@ -2260,6 +2260,10 @@ mod tests {
         let (status, _) = map_error(CoreError::Agent(AgentError::UnexpectedResponse));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
+        let (status, body) = map_error(CoreError::UserdataCancelled("vm".into()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.kind, "userdata_cancelled");
+
         let (status, _) = map_error(CoreError::SecretCrypto("decrypt failed".into()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 

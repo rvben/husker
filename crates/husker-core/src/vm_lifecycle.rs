@@ -992,6 +992,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             VmLifecycleState::Suspended => {
                 // The process is already gone; discard the slot and mark stopped.
+                self.cancel_userdata_job(record.id).await;
                 let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(record.id)).await;
                 self.state.mark_vm_stopped(record.id)?;
                 return Ok(());
@@ -1004,6 +1005,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 });
             }
         }
+        self.cancel_userdata_job(record.id).await;
         self.vmm.stop_vm(record.id).await?;
         self.state.mark_vm_stopped(record.id)?;
         // macOS userspace forwards are bound to the running instance: tear them
@@ -1038,6 +1040,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 });
             }
         }
+        self.cancel_userdata_job(record.id).await;
         self.vmm.pause_vm(record.id).await?;
         self.state
             .update_vm_state(record.id, VmLifecycleState::Paused)?;
@@ -1145,6 +1148,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         info!(%name, "destroying VM");
+
+        // Userdata owns an agent session and may still be writing its log or
+        // terminal status. Cancel and join it before the VMM, files, or state
+        // record disappear so its cancellation guard can restore `pending`.
+        self.cancel_userdata_job(record.id).await;
 
         match self.vmm.destroy_vm(record.id).await {
             Ok(()) => {}

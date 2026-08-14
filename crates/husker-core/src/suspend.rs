@@ -67,6 +67,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             ))));
         }
 
+        // A manual suspend can race startup execution even though the idle
+        // policy is shielded by the agent session. End that session before
+        // snapshotting so no guest command straddles the suspend boundary.
+        self.cancel_userdata_job(record.id).await;
+
         let paused_by_us = record.state == VmLifecycleState::Running;
         let original_state = record.state;
 

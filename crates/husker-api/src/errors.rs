@@ -79,6 +79,11 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "service_operation_failed",
             err.to_string(),
         ),
+        CoreError::UserdataCancelled(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "userdata_cancelled",
+            err.to_string(),
+        ),
         CoreError::VmAlreadyExists(_) => {
             (StatusCode::CONFLICT, "vm_already_exists", err.to_string())
         }

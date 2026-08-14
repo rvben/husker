@@ -181,7 +181,7 @@ async fn idle_suspend_then_resume_on_connect_roundtrip() {
     let vm_id = record.id;
     assert_eq!(record.state, "running");
 
-    core.spawn_userdata(&record);
+    core.spawn_userdata(&record).await;
 
     // Wait for the userdata script to finish starting the echo listener.
     let deadline = Instant::now() + Duration::from_secs(60);
