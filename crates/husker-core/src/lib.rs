@@ -38,8 +38,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub use husker_state::{
-    BackendKind, BootKind, HostGroupRecord, ImageRecord, NetworkMode, PoolRecord, SecretRecord,
-    ServiceRecord, SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
+    BackendKind, BootKind, HostGroupRecord, ImageKind, ImageRecord, NetworkMode, PoolRecord,
+    SecretRecord, ServiceRecord, SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 
@@ -1456,14 +1456,13 @@ pub fn validate_network_mode(value: Option<&str>) -> Result<NetworkMode, CoreErr
 }
 
 /// Validate and default an image-import kind ("rootfs" when unset).
-fn validate_image_kind(kind: Option<&str>) -> Result<String, CoreError> {
-    match kind {
-        None | Some("rootfs") => Ok("rootfs".to_string()),
-        Some("cloud-image") => Ok("cloud-image".to_string()),
-        Some(other) => Err(CoreError::InvalidArgument(format!(
-            "unknown image kind '{other}' (expected 'rootfs' or 'cloud-image')"
-        ))),
-    }
+fn validate_image_kind(value: Option<&str>) -> Result<ImageKind, CoreError> {
+    value
+        .unwrap_or(ImageKind::Rootfs.as_str())
+        .parse::<ImageKind>()
+        .map_err(|error| {
+            CoreError::InvalidArgument(format!("{error} (expected 'rootfs' or 'cloud-image')"))
+        })
 }
 
 /// Serial log files exceeding this size are eligible for rotation.
@@ -3689,7 +3688,7 @@ mod tests {
                 source_path: "oci://x".into(),
                 file_path: "/var/lib/husker/images/catalog/myimg.ext4".into(),
                 format: "ext4".into(),
-                kind: "rootfs".into(),
+                kind: ImageKind::Rootfs,
                 boot_init: Some("/usr/local/bin/husker-agent".into()),
                 size_bytes: 1,
                 created_at: chrono::Utc::now(),
@@ -4379,12 +4378,15 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[test]
     fn import_image_kind_validation() {
-        assert_eq!(validate_image_kind(None).unwrap(), "rootfs");
+        assert_eq!(validate_image_kind(None).unwrap(), ImageKind::Rootfs);
         assert_eq!(
             validate_image_kind(Some("cloud-image")).unwrap(),
-            "cloud-image"
+            ImageKind::CloudImage
         );
-        assert_eq!(validate_image_kind(Some("rootfs")).unwrap(), "rootfs");
+        assert_eq!(
+            validate_image_kind(Some("rootfs")).unwrap(),
+            ImageKind::Rootfs
+        );
         assert!(validate_image_kind(Some("bogus")).is_err());
     }
 

@@ -526,6 +526,7 @@ async fn image_endpoints_roundtrip() {
     let image = response_json(response).await;
     assert_eq!(image["name"], "ubuntu-base");
     assert_eq!(image["format"], "ext4");
+    assert_eq!(image["kind"], "rootfs");
 
     let response = app
         .clone()

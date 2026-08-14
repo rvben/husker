@@ -12,10 +12,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             Err(other) => return Err(CoreError::State(other)),
         }
 
-        if kind == "cloud-image" {
-            husker_storage::validate_cloud_image(&req.source_path)?;
-        } else {
-            husker_storage::validate_rootfs(&req.source_path)?;
+        match kind {
+            ImageKind::Rootfs => husker_storage::validate_rootfs(&req.source_path)?,
+            ImageKind::CloudImage => husker_storage::validate_cloud_image(&req.source_path)?,
         }
 
         let catalog_dir = self.storage.images_dir().join("catalog");
@@ -36,11 +35,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         let metadata = tokio::fs::metadata(&image_path)
             .await
             .map_err(husker_storage::StorageError::Io)?;
-        let format = if kind == "cloud-image" && req.format.is_none() {
-            "qcow2".to_string()
-        } else {
-            req.format
-                .unwrap_or_else(|| infer_image_format(&req.source_path))
+        let format = match (kind, req.format) {
+            (ImageKind::CloudImage, None) => "qcow2".to_string(),
+            (_, Some(format)) => format,
+            (ImageKind::Rootfs, None) => infer_image_format(&req.source_path),
         };
         let record = ImageRecord {
             id: Uuid::new_v4(),
@@ -118,7 +116,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             source_path: oci_source_path(reference),
             file_path: image_path.to_string_lossy().into_owned(),
             format: "ext4".into(),
-            kind: "rootfs".into(),
+            kind: ImageKind::Rootfs,
             // Boot imported OCI images via the guest agent as PID 1 (the agent
             // supervisor does mounts/network/reaping), since they carry no
             // busybox init. The injected agent lives at this path.

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
-pub use husker_types::{BackendKind, BootKind, NetworkMode};
+pub use husker_types::{BackendKind, BootKind, ImageKind, NetworkMode};
 
 /// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
 /// every call site that used the old `MutexGuard<Connection>` is unchanged.
@@ -353,9 +353,8 @@ pub struct ImageRecord {
     pub source_path: String,
     pub file_path: String,
     pub format: String,
-    /// Image kind: "rootfs" (raw ext4 for direct-kernel boot, the default)
-    /// or "cloud-image" (qcow2 booted via UEFI/OVMF).
-    pub kind: String,
+    /// Artifact shape and corresponding guest boot path.
+    pub kind: ImageKind,
     /// Kernel `init=` to boot this image with. Set by `import-oci` to the guest
     /// agent (agent-supervisor mode); `None` uses the default boot path.
     pub boot_init: Option<String>,
@@ -606,6 +605,22 @@ const MIGRATIONS: &[(u32, &str)] = &[
          WHEN NEW.boot_mode NOT IN ('direct', 'uefi', 'efi')
          BEGIN
              SELECT RAISE(ABORT, 'unknown VM boot kind');
+         END;",
+    ),
+    (
+        9,
+        "CREATE TRIGGER image_kind_must_be_known_on_insert
+         BEFORE INSERT ON images
+         WHEN NEW.kind NOT IN ('rootfs', 'cloud-image')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown image kind');
+         END;
+
+         CREATE TRIGGER image_kind_must_be_known_on_update
+         BEFORE UPDATE OF kind ON images
+         WHEN NEW.kind NOT IN ('rootfs', 'cloud-image')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown image kind');
          END;",
     ),
 ];
@@ -1790,7 +1805,7 @@ impl StateStore {
                 record.source_path,
                 record.file_path,
                 record.format,
-                record.kind,
+                record.kind.as_str(),
                 size_bytes_i64,
                 record.created_at.to_rfc3339(),
                 record.boot_init,
@@ -2712,7 +2727,18 @@ fn row_to_image_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord>
         source_path: row.get(2)?,
         file_path: row.get(3)?,
         format: row.get(4)?,
-        kind: row.get(5)?,
+        kind: {
+            let value: String = row.get(5)?;
+            value
+                .parse()
+                .map_err(|error: husker_types::InvalidImageKind| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?
+        },
         boot_init: row.get(8)?,
         size_bytes,
         created_at: parse_datetime(&created_str)?,
@@ -2885,7 +2911,7 @@ mod tests {
             source_path: format!("/tmp/source/{name}.ext4"),
             file_path: format!("/tmp/husker-images/{name}.ext4"),
             format: "ext4".into(),
-            kind: "rootfs".into(),
+            kind: ImageKind::Rootfs,
             boot_init: None,
             size_bytes: 1024,
             created_at: Utc::now(),
@@ -4219,7 +4245,20 @@ mod tests {
             .unwrap();
         }
         let fetched = store.get_image_by_name("legacy").unwrap();
-        assert_eq!(fetched.kind, "rootfs");
+        assert_eq!(fetched.kind, ImageKind::Rootfs);
+    }
+
+    #[test]
+    fn cloud_image_kind_round_trips() {
+        let store = StateStore::open_memory().unwrap();
+        let mut image = make_image("cloud");
+        image.kind = ImageKind::CloudImage;
+        store.insert_image(&image).unwrap();
+
+        assert_eq!(
+            store.get_image_by_name("cloud").unwrap().kind,
+            ImageKind::CloudImage
+        );
     }
 
     #[test]
@@ -5086,6 +5125,46 @@ mod tests {
     }
 
     #[test]
+    fn database_rejects_unknown_image_kinds() {
+        let store = StateStore::open_memory().unwrap();
+        let image = make_image("guarded-image-kind");
+        store.insert_image(&image).unwrap();
+
+        let error = store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE images SET kind = 'disk' WHERE id = ?1",
+                params![image.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown image kind"));
+        assert_eq!(store.get_image(image.id).unwrap().kind, ImageKind::Rootfs);
+    }
+
+    #[test]
+    fn row_decoder_surfaces_corrupt_image_kind() {
+        let store = StateStore::open_memory().unwrap();
+        let image = make_image("corrupt-image-kind");
+        store.insert_image(&image).unwrap();
+
+        // Simulate an external database corruption. Catalog reads must fail
+        // before an unknown artifact shape reaches validation or VM creation.
+        let conn = store.lock().unwrap();
+        conn.execute_batch("DROP TRIGGER image_kind_must_be_known_on_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE images SET kind = 'disk' WHERE id = ?1",
+            params![image.id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store.get_image(image.id).unwrap_err();
+        assert!(error.to_string().contains("unknown image kind 'disk'"));
+    }
+
+    #[test]
     fn volume_invariant_migration_repairs_legacy_dangling_and_duplicate_attachments() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -5158,7 +5237,10 @@ mod tests {
         )
         .unwrap();
 
-        apply_migrations(&conn, BASELINE_SCHEMA_VERSION, MIGRATIONS).unwrap();
+        // This intentionally minimal legacy schema contains only the tables
+        // migration 4 owns. Do not couple the pool repair test to later,
+        // unrelated table-specific migrations.
+        apply_migrations(&conn, BASELINE_SCHEMA_VERSION, &MIGRATIONS[..3]).unwrap();
 
         let pools = conn
             .prepare("SELECT name, template_vm_id FROM pools ORDER BY name")
@@ -5184,7 +5266,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            MIGRATIONS.last().unwrap().0
+            4
         );
     }
 

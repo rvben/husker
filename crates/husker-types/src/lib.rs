@@ -104,6 +104,48 @@ impl std::str::FromStr for BootKind {
     }
 }
 
+/// The artifact shape stored in the managed image catalog.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageKind {
+    #[default]
+    Rootfs,
+    CloudImage,
+}
+
+impl ImageKind {
+    pub const ALL: [Self; 2] = [Self::Rootfs, Self::CloudImage];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rootfs => "rootfs",
+            Self::CloudImage => "cloud-image",
+        }
+    }
+}
+
+impl std::fmt::Display for ImageKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown image kind '{0}'")]
+pub struct InvalidImageKind(String);
+
+impl std::str::FromStr for ImageKind {
+    type Err = InvalidImageKind;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "rootfs" => Ok(Self::Rootfs),
+            "cloud-image" => Ok(Self::CloudImage),
+            other => Err(InvalidImageKind(other.to_string())),
+        }
+    }
+}
+
 /// The host networking topology assigned to a VM.
 ///
 /// The stable wire value for [`NetworkMode::Isolated`] is `"none"`, matching
@@ -215,5 +257,25 @@ mod tests {
 
         assert!("Direct".parse::<BootKind>().is_err());
         assert!("bios".parse::<BootKind>().is_err());
+    }
+
+    #[test]
+    fn image_kind_has_a_stable_round_trip_for_every_value() {
+        for kind in ImageKind::ALL {
+            let wire_value = kind.as_str();
+            assert_eq!(wire_value.parse::<ImageKind>().unwrap(), kind);
+            assert_eq!(kind.to_string(), wire_value);
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{wire_value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ImageKind>(&format!("\"{wire_value}\"")).unwrap(),
+                kind
+            );
+        }
+
+        assert!("cloud_image".parse::<ImageKind>().is_err());
+        assert!("disk".parse::<ImageKind>().is_err());
     }
 }

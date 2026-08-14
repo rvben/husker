@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use husker_core::{BootKind, DaemonProfile};
+use husker_core::{BootKind, DaemonProfile, ImageKind};
 
 // ── Response Types ────────────────────────────────────────────────────
 
@@ -168,7 +168,8 @@ pub struct ImageResponse {
     pub file_path: String,
     pub format: String,
     /// Image kind: "rootfs" (direct-kernel boot) or "cloud-image" (UEFI/OVMF boot).
-    pub kind: String,
+    #[schema(value_type = String, example = "rootfs")]
+    pub kind: ImageKind,
     pub size_bytes: u64,
     pub created_at: String,
 }

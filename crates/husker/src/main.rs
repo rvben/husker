@@ -3088,7 +3088,7 @@ async fn image_command(
             let resp = client.send(client.post("/v1/images").json(&body)).await?;
 
             if resp.status().is_success() {
-                let image: serde_json::Value = resp.json().await?;
+                let image: husker_api::ImageResponse = resp.json().await?;
                 print_output(
                     output,
                     &serde_json::json!({
@@ -3096,7 +3096,7 @@ async fn image_command(
                         "action": "image-import",
                         "image": image,
                     }),
-                    format!("Imported image: {}", image["name"].as_str().unwrap_or("-")),
+                    format!("Imported image: {}", image.name),
                 );
             } else {
                 let msg = client.error(resp, &format!("image '{name}'")).await;
@@ -3115,7 +3115,7 @@ async fn image_command(
                 .await?;
 
             if resp.status().is_success() {
-                let image: serde_json::Value = resp.json().await?;
+                let image: husker_api::ImageResponse = resp.json().await?;
                 print_output(
                     output,
                     &serde_json::json!({
@@ -3123,10 +3123,7 @@ async fn image_command(
                         "action": "image-import-oci",
                         "image": image,
                     }),
-                    format!(
-                        "Imported OCI image '{reference}' as '{}'",
-                        image["name"].as_str().unwrap_or(&name)
-                    ),
+                    format!("Imported OCI image '{reference}' as '{}'", image.name),
                 );
             } else {
                 let msg = client.error(resp, &format!("image '{reference}'")).await;
@@ -3141,7 +3138,7 @@ async fn image_command(
                 exit_with_error(output, msg);
             }
 
-            let images: Vec<serde_json::Value> = resp.json().await?;
+            let images: Vec<husker_api::ImageResponse> = resp.json().await?;
             if output == OutputFormat::Json {
                 print_output(
                     output,
@@ -3162,11 +3159,7 @@ async fn image_command(
                 for image in &images {
                     println!(
                         "{:<20} {:<12} {:<8} {:>10}   {}",
-                        image["name"].as_str().unwrap_or("-"),
-                        image["kind"].as_str().unwrap_or("rootfs"),
-                        image["format"].as_str().unwrap_or("-"),
-                        image["size_bytes"].as_u64().unwrap_or(0),
-                        image["file_path"].as_str().unwrap_or("-"),
+                        image.name, image.kind, image.format, image.size_bytes, image.file_path,
                     );
                 }
             }
@@ -3181,7 +3174,7 @@ async fn image_command(
                 exit_with_error(output, msg);
             }
 
-            let image: serde_json::Value = resp.json().await?;
+            let image: husker_api::ImageResponse = resp.json().await?;
             if output == OutputFormat::Json {
                 print_output(
                     output,
@@ -3193,17 +3186,13 @@ async fn image_command(
                     "",
                 );
             } else {
-                let s = |key: &str| image[key].as_str().unwrap_or("-");
-                println!("Name:        {}", s("name"));
-                println!(
-                    "Kind:        {}",
-                    image["kind"].as_str().unwrap_or("rootfs")
-                );
-                println!("Format:      {}", s("format"));
-                println!("Size bytes:  {}", image["size_bytes"].as_u64().unwrap_or(0));
-                println!("Source path: {}", s("source_path"));
-                println!("File path:   {}", s("file_path"));
-                println!("Created:     {}", s("created_at"));
+                println!("Name:        {}", image.name);
+                println!("Kind:        {}", image.kind);
+                println!("Format:      {}", image.format);
+                println!("Size bytes:  {}", image.size_bytes);
+                println!("Source path: {}", image.source_path);
+                println!("File path:   {}", image.file_path);
+                println!("Created:     {}", image.created_at);
             }
         }
         ImageAction::Export { name, destination } => {

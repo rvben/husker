@@ -319,7 +319,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                         }
                         other => CoreError::State(other),
                     })?;
-                    if rec.kind != "cloud-image" {
+                    if rec.kind != ImageKind::CloudImage {
                         return Err(CoreError::InvalidArgument(format!(
                             "catalog image '{image}' has kind '{}', not 'cloud-image'",
                             rec.kind
@@ -665,7 +665,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                         }
                         other => CoreError::State(other),
                     })?;
-                    if rec.kind != "cloud-image" {
+                    if rec.kind != ImageKind::CloudImage {
                         return Err(CoreError::InvalidArgument(format!(
                             "catalog image '{image}' has kind '{}', not 'cloud-image'",
                             rec.kind
