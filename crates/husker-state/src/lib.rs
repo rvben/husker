@@ -659,6 +659,50 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'invalid userdata status transition');
          END;",
     ),
+    (
+        12,
+        "DROP TRIGGER vm_userdata_status_must_be_known_on_insert;
+         DROP TRIGGER vm_userdata_status_must_be_known_on_update;
+         DROP TRIGGER vm_userdata_status_transition_must_be_valid;
+
+         CREATE TRIGGER vm_userdata_status_must_be_known_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.userdata_status IS NOT NULL
+              AND NEW.userdata_status NOT IN
+                  ('pending', 'running', 'completed', 'failed', 'interrupted')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown userdata status');
+         END;
+
+         CREATE TRIGGER vm_userdata_status_must_be_known_on_update
+         BEFORE UPDATE OF userdata_status ON vms
+         WHEN NEW.userdata_status IS NOT NULL
+              AND NEW.userdata_status NOT IN
+                  ('pending', 'running', 'completed', 'failed', 'interrupted')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown userdata status');
+         END;
+
+         CREATE TRIGGER vm_userdata_status_transition_must_be_valid
+         BEFORE UPDATE OF userdata_status ON vms
+         WHEN NEW.userdata_status IS NOT OLD.userdata_status
+              AND (NEW.userdata_status IS NULL
+                   OR NEW.userdata_status IN
+                       ('pending', 'running', 'completed', 'failed', 'interrupted'))
+              AND (OLD.userdata_status IS NULL
+                   OR OLD.userdata_status IN
+                       ('pending', 'running', 'completed', 'failed', 'interrupted'))
+              AND NOT (
+                  (OLD.userdata_status = 'pending'
+                   AND NEW.userdata_status IN ('running', 'interrupted'))
+                  OR (OLD.userdata_status = 'running'
+                      AND NEW.userdata_status IN
+                          ('pending', 'completed', 'failed', 'interrupted'))
+              )
+         BEGIN
+             SELECT RAISE(ABORT, 'invalid userdata status transition');
+         END;",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -2371,8 +2415,9 @@ impl StateStore {
     /// VMs cannot survive a daemon restart, so any that claim to be running
     /// or paused are stale. Returns the number of VMs that were transitioned.
     ///
-    /// Also resets any `userdata_status = 'running'` to `'pending'` so that
-    /// userdata interrupted by a daemon crash will be retried.
+    /// Also records scripts that cannot survive the daemon as `interrupted`.
+    /// A standalone VM cannot be resumed after this reconciliation, so leaving
+    /// its script `pending` would promise a retry that can never happen.
     pub fn mark_stale_vms_stopped(&self) -> Result<usize, StateError> {
         let conn = self.lock()?;
         let now = Utc::now().to_rfc3339();
@@ -2391,8 +2436,9 @@ impl StateStore {
             [],
         )?;
         conn.execute(
-            "UPDATE vms SET userdata_status = 'pending', updated_at = ?1
-             WHERE userdata_status = 'running'",
+            "UPDATE vms SET userdata_status = 'interrupted', updated_at = ?1
+             WHERE userdata_status = 'running'
+                OR (userdata_status = 'pending' AND state IN ('stopped', 'failed'))",
             params![now],
         )?;
         Ok(count)
@@ -3923,7 +3969,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_stale_resets_running_userdata() {
+    fn mark_stale_interrupts_running_userdata() {
         let store = StateStore::open_memory().unwrap();
 
         let mut rec = make_record("ud-stale");
@@ -3935,7 +3981,7 @@ mod tests {
 
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.state, "stopped");
-        assert_eq!(fetched.userdata_status, Some(UserdataStatus::Pending));
+        assert_eq!(fetched.userdata_status, Some(UserdataStatus::Interrupted));
     }
 
     #[test]

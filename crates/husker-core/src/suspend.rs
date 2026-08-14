@@ -70,7 +70,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // A manual suspend can race startup execution even though the idle
         // policy is shielded by the agent session. End that session before
         // snapshotting so no guest command straddles the suspend boundary.
-        self.cancel_userdata_job(record.id).await;
+        let interrupted = self.cancel_userdata_job(record.id).await;
 
         let paused_by_us = record.state == VmLifecycleState::Running;
         let original_state = record.state;
@@ -81,8 +81,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         // on-disk slot (a complete slot -> "suspended", an incomplete one ->
         // "stopped"), instead of a "running"/"paused" row that startup downgrades
         // to "stopped" even though a complete, resumable slot exists on disk.
-        self.state
-            .update_vm_state(record.id, VmLifecycleState::Suspending)?;
+        if let Err(error) = self
+            .state
+            .update_vm_state(record.id, VmLifecycleState::Suspending)
+        {
+            self.recover_userdata_after_lifecycle_failure_locked(record, interrupted)
+                .await;
+            return Err(error.into());
+        }
 
         let slot = self.suspend_slot_dir(record.id);
         let paths = SnapshotPaths::in_dir(&slot);
@@ -121,6 +127,8 @@ impl<B: VmmBackend> HuskerCore<B> {
                 let _ = self.vmm.resume_vm(record.id).await;
             }
             let _ = self.state.update_vm_state(record.id, original_state);
+            self.recover_userdata_after_lifecycle_failure_locked(record, interrupted)
+                .await;
             return Err(e);
         }
 
@@ -129,9 +137,24 @@ impl<B: VmmBackend> HuskerCore<B> {
         // This is the backend process kill (`self.vmm.destroy_vm`), not core's
         // public `destroy_vm`, which also takes `vm_name_lock` and would deadlock
         // re-entering it here.
-        self.vmm.destroy_vm(record.id).await?;
-        self.state
-            .update_vm_runtime(record.id, VmLifecycleState::Suspended, None)?;
+        if let Err(error) = self.vmm.destroy_vm(record.id).await {
+            let _ = tokio::fs::remove_dir_all(&slot).await;
+            if paused_by_us {
+                let _ = self.vmm.resume_vm(record.id).await;
+            }
+            let _ = self.state.update_vm_state(record.id, original_state);
+            self.recover_userdata_after_lifecycle_failure_locked(record, interrupted)
+                .await;
+            return Err(error.into());
+        }
+        if let Err(error) =
+            self.state
+                .update_vm_runtime(record.id, VmLifecycleState::Suspended, None)
+        {
+            self.finish_userdata_interruption(record.id);
+            return Err(error.into());
+        }
+        self.finish_userdata_interruption(record.id);
 
         // Stamp the reap anchor before the network transition, so a crash mid
         // transition still leaves a suspended VM whose TTL clock is running.

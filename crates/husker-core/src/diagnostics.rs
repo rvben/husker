@@ -70,6 +70,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             if let Err(e) = self.state.mark_vm_stopped(vm.id) {
                 warn!(name = %vm.name, error = %e, "failed to update state during drain");
             }
+            self.finish_userdata_interruption(vm.id);
             count += 1;
         }
         count

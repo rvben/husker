@@ -376,9 +376,16 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
     }
 
-    async fn destroy_instance(&self, vm: &VmRecord, outcome: &mut ReconcileOutcome) -> bool {
+    async fn destroy_instance(
+        self: &Arc<Self>,
+        vm: &VmRecord,
+        outcome: &mut ReconcileOutcome,
+    ) -> bool
+    where
+        B: 'static,
+    {
         let _name_guard = self.vm_name_lock(&vm.name).lock_owned().await;
-        match self.destroy_vm_locked(vm).await {
+        match self.destroy_vm_recoverable_locked(vm).await {
             Ok(()) => {
                 outcome.destroyed.push(vm.name.clone());
                 true

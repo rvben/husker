@@ -150,7 +150,8 @@ impl std::str::FromStr for ImageKind {
 ///
 /// `None` on a VM record means no userdata was supplied. A supplied script
 /// starts pending, becomes running while the guest agent executes it, and
-/// finishes in one of the two terminal states.
+/// finishes in a terminal state. `Interrupted` means host lifecycle action or
+/// daemon loss ended execution before the script produced an exit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UserdataStatus {
@@ -158,10 +159,17 @@ pub enum UserdataStatus {
     Running,
     Completed,
     Failed,
+    Interrupted,
 }
 
 impl UserdataStatus {
-    pub const ALL: [Self; 4] = [Self::Pending, Self::Running, Self::Completed, Self::Failed];
+    pub const ALL: [Self; 5] = [
+        Self::Pending,
+        Self::Running,
+        Self::Completed,
+        Self::Failed,
+        Self::Interrupted,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -169,6 +177,7 @@ impl UserdataStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -192,6 +201,7 @@ impl std::str::FromStr for UserdataStatus {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
             other => Err(InvalidUserdataStatus(other.to_string())),
         }
     }

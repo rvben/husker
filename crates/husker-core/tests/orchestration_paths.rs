@@ -104,6 +104,10 @@ impl MockVmm {
         self.inner.stop_failures.lock().await.insert(id);
     }
 
+    async fn clear_stop_failure(&self, id: Uuid) {
+        self.inner.stop_failures.lock().await.remove(&id);
+    }
+
     async fn stop_call_count(&self) -> usize {
         self.inner.stop_calls.lock().await.len()
     }
@@ -1118,15 +1122,125 @@ async fn stop_cancels_and_joins_awaited_userdata_before_stopping_vm() {
 
     let vm = core.get_vm("vm-cancel-userdata").unwrap();
     assert_eq!(vm.state, VmLifecycleState::Stopped);
-    assert_eq!(vm.userdata_status, Some(UserdataStatus::Pending));
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Interrupted));
     assert!(
         !core.spawn_userdata(&vm).await,
         "a delayed automatic spawn must not start after the VM has stopped"
     );
     assert_eq!(
         core.get_vm("vm-cancel-userdata").unwrap().userdata_status,
-        Some(UserdataStatus::Pending)
+        Some(UserdataStatus::Interrupted)
     );
+}
+
+#[tokio::test]
+async fn stop_marks_unregistered_pending_userdata_interrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    let vm_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            vm_id,
+            "vm-pending-before-spawn",
+            "running",
+            Some("exit 0".into()),
+            Some(UserdataStatus::Pending),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "vm-pending-before-spawn".into(),
+        state: VmState::Running,
+        pid: Some(11),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 17,
+    })
+    .await;
+
+    let core = build_core(mock, state, &data_dir, &runtime_dir);
+    core.stop_vm("vm-pending-before-spawn").await.unwrap();
+    let vm = core.get_vm("vm-pending-before-spawn").unwrap();
+    assert_eq!(vm.state, VmLifecycleState::Stopped);
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Interrupted));
+    assert!(!core.spawn_userdata(&vm).await);
+}
+
+#[tokio::test]
+async fn stop_failure_restarts_interrupted_userdata_on_the_live_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    let vm_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            vm_id,
+            "vm-userdata-stop-rollback",
+            "running",
+            Some("exit 0".into()),
+            Some(UserdataStatus::Pending),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "vm-userdata-stop-rollback".into(),
+        state: VmState::Running,
+        pid: Some(10),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 16,
+    })
+    .await;
+    mock.mark_stop_failure(vm_id).await;
+
+    let core = build_core(mock.clone(), state, &data_dir, &runtime_dir);
+    assert!(
+        core.spawn_userdata(
+            &core
+                .get_vm("vm-userdata-stop-rollback")
+                .expect("inserted VM")
+        )
+        .await
+    );
+    assert_eq!(
+        core.get_vm("vm-userdata-stop-rollback")
+            .unwrap()
+            .userdata_status,
+        Some(UserdataStatus::Running)
+    );
+
+    let error = core.stop_vm("vm-userdata-stop-rollback").await.unwrap_err();
+    assert!(matches!(error, CoreError::Vmm(VmmError::ProcessError(_))));
+    let vm = core.get_vm("vm-userdata-stop-rollback").unwrap();
+    assert_eq!(vm.state, VmLifecycleState::Running);
+    assert_eq!(
+        vm.userdata_status,
+        Some(UserdataStatus::Running),
+        "the rollback must durably re-claim the restarted job"
+    );
+
+    mock.clear_stop_failure(vm_id).await;
+    core.stop_vm("vm-userdata-stop-rollback").await.unwrap();
+    let vm = core.get_vm("vm-userdata-stop-rollback").unwrap();
+    assert_eq!(vm.state, VmLifecycleState::Stopped);
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Interrupted));
 }
 
 #[tokio::test]
@@ -1172,14 +1286,14 @@ async fn shutdown_drain_cancels_userdata_and_refuses_late_jobs() {
     assert_eq!(core.drain_vms().await, 1);
     let vm = core.get_vm("vm-drain-userdata").unwrap();
     assert_eq!(vm.state, VmLifecycleState::Stopped);
-    assert_eq!(vm.userdata_status, Some(UserdataStatus::Pending));
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Interrupted));
     assert!(
         !core.spawn_userdata(&vm).await,
         "a quiesced shutdown registry must reject late jobs"
     );
     assert_eq!(
         core.get_vm("vm-drain-userdata").unwrap().userdata_status,
-        Some(UserdataStatus::Pending)
+        Some(UserdataStatus::Interrupted)
     );
 }
 

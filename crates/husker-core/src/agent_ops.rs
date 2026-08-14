@@ -417,6 +417,18 @@ impl<B: VmmBackend> HuskerCore<B> {
         // the record after taking the lock. A delayed spawn for an old VM
         // generation must not start against its same-name replacement.
         let _name_guard = self.vm_name_lock(&record.name).lock_owned().await;
+        self.start_userdata_job_locked(record, require_running)
+    }
+
+    /// Register a job while the caller holds this VM name's mutation lock.
+    fn start_userdata_job_locked(
+        self: &Arc<Self>,
+        record: VmRecord,
+        require_running: bool,
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<Result<(), CoreError>>>, CoreError>
+    where
+        B: 'static,
+    {
         let current = self.lookup_vm(&record.name)?;
         if current.id != record.id {
             return Ok(None);
@@ -525,6 +537,69 @@ impl<B: VmmBackend> HuskerCore<B> {
         true
     }
 
+    /// Consume an interrupted job's retryable `pending` state after a lifecycle
+    /// operation has made continued execution impossible.
+    pub(crate) fn finish_userdata_interruption(&self, vm_id: Uuid) {
+        for expected in [UserdataStatus::Running, UserdataStatus::Pending] {
+            match self.state.transition_userdata_status(
+                vm_id,
+                expected,
+                UserdataStatus::Interrupted,
+            ) {
+                Ok(true) => return,
+                Ok(false) | Err(husker_state::StateError::VmNotFound(_)) => {}
+                Err(error) => {
+                    warn!(%vm_id, %error, "failed to persist interrupted userdata status");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Roll an interruption back only when the exact VM generation is still
+    /// durably running and the backend confirms its guest process is usable.
+    /// The caller must hold this VM name's mutation lock.
+    pub(crate) async fn recover_userdata_after_lifecycle_failure_locked(
+        self: &Arc<Self>,
+        record: &VmRecord,
+        interrupted: bool,
+    ) where
+        B: 'static,
+    {
+        let current = self.state.get_vm_by_name(&record.name);
+        let backend = self.vmm.vm_info(record.id).await;
+        let still_running = matches!(
+            (&current, &backend),
+            (Ok(vm), Ok(info))
+                if vm.id == record.id
+                    && vm.state == VmLifecycleState::Running
+                    && info.state == husker_vmm::VmState::Running
+        );
+        if still_running {
+            // A pending job that had not registered before the lifecycle call
+            // still has its original starter; only replace a task we owned and
+            // cancelled here.
+            if !interrupted {
+                return;
+            }
+            match self.start_userdata_job_locked(record.clone(), true) {
+                Ok(Some(result)) => {
+                    drop(result);
+                    info!(vm = %record.name, "restarted userdata after lifecycle rollback");
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(vm = %record.name, %error, "failed to restart interrupted userdata");
+                }
+            }
+        }
+
+        // The lifecycle mutation either made the guest unusable or shutdown
+        // closed the registry. Do not leave a durable retry promise behind.
+        self.finish_userdata_interruption(record.id);
+    }
+
     pub(crate) async fn shutdown_userdata_jobs(&self) -> usize {
         let handles = self.userdata_jobs.close_and_take_all();
         let count = handles.len();
@@ -537,11 +612,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             {
                 warn!(%vm_id, %error, "userdata job failed during shutdown");
             }
-            let _ = self.state.transition_userdata_status(
-                vm_id,
-                UserdataStatus::Running,
-                UserdataStatus::Pending,
-            );
+            self.finish_userdata_interruption(vm_id);
         }
         if count > 0 {
             info!(count, "cancelled userdata jobs for shutdown");

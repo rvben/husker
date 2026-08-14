@@ -976,7 +976,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Stop a running or paused VM.
     ///
     /// Idempotent: stopping an already stopped VM is a no-op.
-    pub async fn stop_vm(&self, name: &str) -> Result<(), CoreError> {
+    pub async fn stop_vm(self: &Arc<Self>, name: &str) -> Result<(), CoreError>
+    where
+        B: 'static,
+    {
         info!(%name, "stopping VM");
         // Stop competes with suspend/resume/destroy and port-forward mutation
         // on every platform, so resolve the generation only after holding the
@@ -995,6 +998,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 self.cancel_userdata_job(record.id).await;
                 let _ = tokio::fs::remove_dir_all(self.suspend_slot_dir(record.id)).await;
                 self.state.mark_vm_stopped(record.id)?;
+                self.finish_userdata_interruption(record.id);
                 return Ok(());
             }
             _ => {
@@ -1005,9 +1009,17 @@ impl<B: VmmBackend> HuskerCore<B> {
                 });
             }
         }
-        self.cancel_userdata_job(record.id).await;
-        self.vmm.stop_vm(record.id).await?;
-        self.state.mark_vm_stopped(record.id)?;
+        let interrupted = self.cancel_userdata_job(record.id).await;
+        if let Err(error) = self.vmm.stop_vm(record.id).await {
+            self.recover_userdata_after_lifecycle_failure_locked(&record, interrupted)
+                .await;
+            return Err(error.into());
+        }
+        if let Err(error) = self.state.mark_vm_stopped(record.id) {
+            self.finish_userdata_interruption(record.id);
+            return Err(error.into());
+        }
+        self.finish_userdata_interruption(record.id);
         // macOS userspace forwards are bound to the running instance: tear them
         // down on stop. The name lock acquired above is still held.
         #[cfg(not(feature = "linux-net"))]
@@ -1021,7 +1033,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Pause a running VM.
     ///
     /// Idempotent: pausing an already paused VM is a no-op.
-    pub async fn pause_vm(&self, name: &str) -> Result<(), CoreError> {
+    pub async fn pause_vm(self: &Arc<Self>, name: &str) -> Result<(), CoreError>
+    where
+        B: 'static,
+    {
         info!(%name, "pausing VM");
         let _pause_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
@@ -1040,10 +1055,24 @@ impl<B: VmmBackend> HuskerCore<B> {
                 });
             }
         }
-        self.cancel_userdata_job(record.id).await;
-        self.vmm.pause_vm(record.id).await?;
-        self.state
-            .update_vm_state(record.id, VmLifecycleState::Paused)?;
+        let interrupted = self.cancel_userdata_job(record.id).await;
+        if let Err(error) = self.vmm.pause_vm(record.id).await {
+            self.recover_userdata_after_lifecycle_failure_locked(&record, interrupted)
+                .await;
+            return Err(error.into());
+        }
+        if let Err(error) = self
+            .state
+            .update_vm_state(record.id, VmLifecycleState::Paused)
+        {
+            // The durable transition failed after the backend paused. Restore
+            // the original live guest before deciding whether userdata can run.
+            let _ = self.vmm.resume_vm(record.id).await;
+            self.recover_userdata_after_lifecycle_failure_locked(&record, interrupted)
+                .await;
+            return Err(error.into());
+        }
+        self.finish_userdata_interruption(record.id);
         Ok(())
     }
 
@@ -1052,10 +1081,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// If the VM is already stopped or the VMM backend no longer tracks it
     /// (e.g. after a daemon restart), the VMM destroy step is skipped and
     /// only state/storage cleanup is performed.
-    pub async fn destroy_vm(&self, name: &str) -> Result<(), CoreError> {
+    pub async fn destroy_vm(self: &Arc<Self>, name: &str) -> Result<(), CoreError>
+    where
+        B: 'static,
+    {
         let record = self.lookup_vm(name)?;
         let _name_guard = self.vm_name_lock(name).lock_owned().await;
-        self.destroy_vm_locked(&record).await
+        self.destroy_vm_recoverable_locked(&record).await
     }
 
     /// Destroy a VM without acquiring the name lock.
@@ -1069,7 +1101,29 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// If that generation was retired while the caller waited for the name
     /// lock, its destroy is already complete and must not touch the replacement.
     pub(crate) async fn destroy_vm_locked(&self, record: &VmRecord) -> Result<(), CoreError> {
-        self.destroy_vm_generation_locked(record, None).await
+        let mut interrupted = false;
+        self.destroy_vm_generation_locked(record, None, &mut interrupted)
+            .await
+    }
+
+    /// Destroy a live generation while preserving an interrupted userdata job
+    /// if cleanup fails before the guest is actually retired.
+    pub(crate) async fn destroy_vm_recoverable_locked(
+        self: &Arc<Self>,
+        record: &VmRecord,
+    ) -> Result<(), CoreError>
+    where
+        B: 'static,
+    {
+        let mut interrupted = false;
+        let result = self
+            .destroy_vm_generation_locked(record, None, &mut interrupted)
+            .await;
+        if result.is_err() {
+            self.recover_userdata_after_lifecycle_failure_locked(record, interrupted)
+                .await;
+        }
+        result
     }
 
     /// Destroy the exact template generation owned by `pool` and retire both
@@ -1079,13 +1133,16 @@ impl<B: VmmBackend> HuskerCore<B> {
         record: &VmRecord,
         pool: &PoolRecord,
     ) -> Result<(), CoreError> {
-        self.destroy_vm_generation_locked(record, Some(pool)).await
+        let mut interrupted = false;
+        self.destroy_vm_generation_locked(record, Some(pool), &mut interrupted)
+            .await
     }
 
     async fn destroy_vm_generation_locked(
         &self,
         record: &VmRecord,
         owning_pool: Option<&PoolRecord>,
+        interrupted: &mut bool,
     ) -> Result<(), CoreError> {
         let name = record.name.as_str();
 
@@ -1151,8 +1208,9 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         // Userdata owns an agent session and may still be writing its log or
         // terminal status. Cancel and join it before the VMM, files, or state
-        // record disappear so its cancellation guard can restore `pending`.
-        self.cancel_userdata_job(record.id).await;
+        // record disappear. The interruption flag lets recoverable callers
+        // restart the job if destruction fails while the guest remains live.
+        *interrupted = self.cancel_userdata_job(record.id).await;
 
         match self.vmm.destroy_vm(record.id).await {
             Ok(()) => {}

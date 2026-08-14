@@ -234,7 +234,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                             self.state.count_live_forks_of(fresh.id).unwrap_or(0) > 0,
                         );
                         if matches!(re, PolicyAction::Reap) {
-                            match self.destroy_vm_locked(&fresh).await {
+                            match self.destroy_vm_recoverable_locked(&fresh).await {
                                 Ok(_) => {
                                     self.idle_metrics
                                         .reaped_total

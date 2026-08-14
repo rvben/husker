@@ -5300,7 +5300,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         state.insert_vm(&running_nat_vm("pf-td")).unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
         // Reserve a concrete free port, then release it so the proxy can bind it.
         let host_port = {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
