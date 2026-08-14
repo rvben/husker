@@ -49,7 +49,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Warm to agent-ready, then suspend = the pool template. Roll back the
         // half-built template on any failure so the pool name stays reusable.
         let warm_and_suspend = async {
-            self.agent_connect_ready(&req.name, default_ready_timeout("direct"))
+            self.agent_connect_ready(&req.name, default_ready_timeout(BootKind::DirectKernel))
                 .await?;
             self.suspend_vm(&req.name).await
         };

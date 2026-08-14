@@ -17,7 +17,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use husker_api::{VmResponse, metrics_router, router};
-use husker_core::{BackendKind, HuskerCore, NetworkMode};
+use husker_core::{BackendKind, BootKind, HuskerCore, NetworkMode};
 use husker_state::VmLifecycleState;
 
 fn make_core(
@@ -121,7 +121,7 @@ async fn health_counts_vms_correctly() {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -418,7 +418,7 @@ async fn snapshot_endpoints_roundtrip() {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -946,7 +946,7 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1108,7 +1108,7 @@ async fn vm_response_json_structure() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1169,7 +1169,7 @@ async fn vm_response_json_structure() {
     let vm: VmResponse = serde_json::from_value(json).unwrap();
     assert_eq!(vm.name, "shape-test");
     assert_eq!(vm.vcpu_count, 2);
-    assert_eq!(vm.boot_mode, "direct");
+    assert_eq!(vm.boot_mode, BootKind::DirectKernel);
     assert_eq!(vm.network, "nat");
 }
 
@@ -1202,7 +1202,7 @@ async fn list_vms_returns_all_records() {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -1443,7 +1443,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1506,7 +1506,7 @@ async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::AppleVz,
-        boot_mode: "efi".into(),
+        boot_mode: BootKind::Efi,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1569,7 +1569,7 @@ async fn vm_response_with_null_optional_fields() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1651,7 +1651,7 @@ async fn logs_returns_serial_output() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1717,7 +1717,7 @@ async fn logs_tail_returns_last_n_lines() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1783,7 +1783,7 @@ async fn logs_no_serial_file_returns_404() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -1851,7 +1851,7 @@ fn logs_test_core(
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -2100,7 +2100,7 @@ async fn logs_large_file_is_truncated() {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,

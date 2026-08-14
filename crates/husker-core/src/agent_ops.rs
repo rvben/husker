@@ -198,7 +198,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let result: Result<(), CoreError> = async {
             let mut conn = self
-                .agent_connect_ready(name, default_ready_timeout(&record.boot_mode))
+                .agent_connect_ready(name, default_ready_timeout(record.boot_mode))
                 .await?;
 
             conn.write_file(

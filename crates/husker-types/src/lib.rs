@@ -50,6 +50,60 @@ impl std::str::FromStr for BackendKind {
     }
 }
 
+/// The guest boot mechanism, without backend-specific artifact paths.
+///
+/// This identity is used for backend selection, persistence, readiness policy,
+/// and API serialization. The stable wire values remain `direct`, `uefi`, and
+/// `efi`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootKind {
+    #[default]
+    #[serde(rename = "direct")]
+    DirectKernel,
+    Uefi,
+    Efi,
+}
+
+impl BootKind {
+    pub const ALL: [Self; 3] = [Self::DirectKernel, Self::Uefi, Self::Efi];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectKernel => "direct",
+            Self::Uefi => "uefi",
+            Self::Efi => "efi",
+        }
+    }
+
+    pub const fn uses_firmware(self) -> bool {
+        matches!(self, Self::Uefi | Self::Efi)
+    }
+}
+
+impl std::fmt::Display for BootKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown boot kind '{0}'")]
+pub struct InvalidBootKind(String);
+
+impl std::str::FromStr for BootKind {
+    type Err = InvalidBootKind;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "direct" => Ok(Self::DirectKernel),
+            "uefi" => Ok(Self::Uefi),
+            "efi" => Ok(Self::Efi),
+            other => Err(InvalidBootKind(other.to_string())),
+        }
+    }
+}
+
 /// The host networking topology assigned to a VM.
 ///
 /// The stable wire value for [`NetworkMode::Isolated`] is `"none"`, matching
@@ -141,5 +195,25 @@ mod tests {
 
         assert!("NAT".parse::<NetworkMode>().is_err());
         assert!("unknown".parse::<NetworkMode>().is_err());
+    }
+
+    #[test]
+    fn boot_kind_has_a_stable_round_trip_for_every_value() {
+        for kind in BootKind::ALL {
+            let wire_value = kind.as_str();
+            assert_eq!(wire_value.parse::<BootKind>().unwrap(), kind);
+            assert_eq!(kind.to_string(), wire_value);
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{wire_value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<BootKind>(&format!("\"{wire_value}\"")).unwrap(),
+                kind
+            );
+        }
+
+        assert!("Direct".parse::<BootKind>().is_err());
+        assert!("bios".parse::<BootKind>().is_err());
     }
 }

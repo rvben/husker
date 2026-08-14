@@ -10,9 +10,12 @@ impl<B: VmmBackend> HuskerCore<B> {
     ///
     /// Boot mode "efi" is used exclusively by macOS/VZ cloud-image VMs, where
     /// the guest IP is DHCP-assigned and not known at creation time. On Linux,
-    /// boot_mode is always "direct" or "uefi", so this function is a no-op.
+    /// boot mode is always direct or UEFI, so this function is a no-op.
     pub(crate) async fn discover_guest_ip(&self, vm: &mut VmRecord) {
-        if vm.guest_ip.is_some() || vm.state != VmLifecycleState::Running || vm.boot_mode != "efi" {
+        if vm.guest_ip.is_some()
+            || vm.state != VmLifecycleState::Running
+            || vm.boot_mode != BootKind::Efi
+        {
             return;
         }
 

@@ -636,7 +636,7 @@ mod tests {
         let vm = client.vm("demo").await.unwrap();
 
         assert_eq!(vm.name, "demo");
-        assert_eq!(vm.boot_mode, "direct");
+        assert_eq!(vm.boot_mode, husker_core::BootKind::DirectKernel);
         task.abort();
     }
 

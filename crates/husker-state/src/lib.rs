@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
-pub use husker_types::{BackendKind, NetworkMode};
+pub use husker_types::{BackendKind, BootKind, NetworkMode};
 
 /// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
 /// every call site that used the old `MutexGuard<Connection>` is unchanged.
@@ -223,8 +223,8 @@ pub struct VmRecord {
     pub service_ordinal: Option<u32>,
     /// VMM backend that owns this VM.
     pub vmm: BackendKind,
-    /// How the VM boots: "direct" (host kernel) or "uefi" (OVMF + cloud image).
-    pub boot_mode: String,
+    /// Guest boot mechanism, independent of backend-specific firmware paths.
+    pub boot_mode: BootKind,
     /// Whether a virtio memory balloon device was installed at boot.
     pub balloon: bool,
     /// Name of the persistent volume attached to this VM, or None.
@@ -592,6 +592,22 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'unknown VM network mode');
          END;",
     ),
+    (
+        8,
+        "CREATE TRIGGER vm_boot_kind_must_be_known_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.boot_mode NOT IN ('direct', 'uefi', 'efi')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM boot kind');
+         END;
+
+         CREATE TRIGGER vm_boot_kind_must_be_known_on_update
+         BEFORE UPDATE OF boot_mode ON vms
+         WHEN NEW.boot_mode NOT IN ('direct', 'uefi', 'efi')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM boot kind');
+         END;",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -685,7 +701,7 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.service_id.map(|id| id.to_string()),
             record.service_ordinal,
             record.vmm.as_str(),
-            record.boot_mode,
+            record.boot_mode.as_str(),
             record.balloon as i64,
             record.volume,
             record.network.as_str(),
@@ -2511,6 +2527,12 @@ fn parse_network_mode(s: &str) -> rusqlite::Result<NetworkMode> {
         })
 }
 
+fn parse_boot_kind(s: &str) -> rusqlite::Result<BootKind> {
+    s.parse().map_err(|error: husker_types::InvalidBootKind| {
+        rusqlite::Error::FromSqlConversionFailure(20, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
 fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
     let id_str: String = row.get(0)?;
     let created_str: String = row.get(12)?;
@@ -2556,7 +2578,10 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
             let value: String = row.get(19)?;
             parse_backend_kind(&value)?
         },
-        boot_mode: row.get(20)?,
+        boot_mode: {
+            let value: String = row.get(20)?;
+            parse_boot_kind(&value)?
+        },
         balloon: {
             let raw: i64 = row.get(21)?;
             raw != 0
@@ -2797,7 +2822,7 @@ mod tests {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -4172,7 +4197,7 @@ mod tests {
             .unwrap();
         }
         let rec = store.get_vm_by_name("legacy").unwrap();
-        assert_eq!(rec.boot_mode, "direct");
+        assert_eq!(rec.boot_mode, BootKind::DirectKernel);
     }
 
     // ── images.kind field ─────────────────────────────────────────────
@@ -4201,9 +4226,12 @@ mod tests {
     fn insert_and_read_uefi_boot_mode() {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("uefi-vm");
-        rec.boot_mode = "uefi".to_string();
+        rec.boot_mode = BootKind::Uefi;
         store.insert_vm(&rec).unwrap();
-        assert_eq!(store.get_vm_by_name("uefi-vm").unwrap().boot_mode, "uefi");
+        assert_eq!(
+            store.get_vm_by_name("uefi-vm").unwrap().boot_mode,
+            BootKind::Uefi
+        );
     }
 
     // ── cloud-image service columns ───────────────────────────────────
@@ -4856,7 +4884,7 @@ mod tests {
         assert_eq!(vm.guest_ip.as_deref(), Some("192.0.2.50"));
         // New columns backfilled with their schema-correct defaults.
         assert_eq!(vm.vmm, BackendKind::Firecracker);
-        assert_eq!(vm.boot_mode, "direct");
+        assert_eq!(vm.boot_mode, BootKind::DirectKernel);
         assert_eq!(vm.network, NetworkMode::Nat);
         assert!(vm.auto_resume, "auto_resume defaults to enabled");
         assert!(!vm.balloon, "balloon defaults to off");
@@ -4970,6 +4998,50 @@ mod tests {
 
         let error = store.get_vm(record.id).unwrap_err();
         assert!(error.to_string().contains("unknown backend kind 'xen'"));
+    }
+
+    #[test]
+    fn database_rejects_unknown_vm_boot_kinds() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("guarded-boot");
+        store.insert_vm(&record).unwrap();
+
+        let error = store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE vms SET boot_mode = 'bios' WHERE id = ?1",
+                params![record.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown VM boot kind"));
+        assert_eq!(
+            store.get_vm(record.id).unwrap().boot_mode,
+            BootKind::DirectKernel
+        );
+    }
+
+    #[test]
+    fn row_decoder_surfaces_corrupt_vm_boot_kind() {
+        let store = StateStore::open_memory().unwrap();
+        let record = make_record("corrupt-boot");
+        store.insert_vm(&record).unwrap();
+
+        // Simulate a database corrupted outside Husker by removing the guard.
+        // The typed row boundary must reject the value instead of silently
+        // assigning direct-kernel readiness or restoration policy.
+        let conn = store.lock().unwrap();
+        conn.execute_batch("DROP TRIGGER vm_boot_kind_must_be_known_on_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE vms SET boot_mode = 'bios' WHERE id = ?1",
+            params![record.id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store.get_vm(record.id).unwrap_err();
+        assert!(error.to_string().contains("unknown boot kind 'bios'"));
     }
 
     #[test]

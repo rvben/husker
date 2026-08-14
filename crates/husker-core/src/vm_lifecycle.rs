@@ -552,9 +552,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_ordinal: tags.map(|t| t.ordinal),
             vmm: backend,
             boot_mode: if is_cloud {
-                "uefi".to_string()
+                BootKind::Uefi
             } else {
-                "direct".to_string()
+                BootKind::DirectKernel
             },
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
@@ -725,7 +725,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             let boot = husker_vmm::BootMode::Efi {
                 variable_store: vm_dir.join("nvram.bin"),
             };
-            let boot_mode_str = boot.as_str().to_string();
+            let boot_kind = boot.kind();
 
             // For cloud VMs: kernel_path is unused by EFI boot; record it as empty
             // (mirrors the Linux cloud path). rootfs_path records the source image
@@ -787,7 +787,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 service_id: tags.map(|t| t.service_id),
                 service_ordinal: tags.map(|t| t.ordinal),
                 vmm: backend,
-                boot_mode: boot_mode_str,
+                boot_mode: boot_kind,
                 balloon: req.balloon,
                 volume: None,
                 network: network_mode,
@@ -901,7 +901,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_id: tags.map(|t| t.service_id),
             service_ordinal: tags.map(|t| t.ordinal),
             vmm: backend,
-            boot_mode: "direct".to_string(),
+            boot_mode: BootKind::DirectKernel,
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
             network: network_mode,

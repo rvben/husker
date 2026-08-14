@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use husker_core::DaemonProfile;
+use husker_core::{BootKind, DaemonProfile};
 
 // ── Response Types ────────────────────────────────────────────────────
 
@@ -25,7 +25,8 @@ pub struct VmResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub userdata_status: Option<String>,
     pub vmm: String,
-    pub boot_mode: String,
+    #[schema(value_type = String, example = "direct")]
+    pub boot_mode: BootKind,
     /// Source rootfs (direct boot) or cloud image (UEFI boot) this VM was
     /// created from. Empty when unknown.
     pub rootfs_path: String,

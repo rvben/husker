@@ -20,7 +20,7 @@ use chrono::{DateTime, Duration, Utc};
 #[cfg(any(feature = "linux-net", test))]
 use husker_state::VmRecord;
 #[cfg(test)]
-use husker_state::{BackendKind, NetworkMode, VmLifecycleState};
+use husker_state::{BackendKind, BootKind, NetworkMode, VmLifecycleState};
 
 /// Whether a VM is a reclaimable resource leak: a genuinely-abandoned stopped
 /// VM still holding host network resources.
@@ -189,7 +189,7 @@ mod tests {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,

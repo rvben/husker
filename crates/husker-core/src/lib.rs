@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub use husker_state::{
-    BackendKind, HostGroupRecord, ImageRecord, NetworkMode, PoolRecord, SecretRecord,
+    BackendKind, BootKind, HostGroupRecord, ImageRecord, NetworkMode, PoolRecord, SecretRecord,
     ServiceRecord, SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
@@ -869,13 +869,11 @@ pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 120;
 /// installing and starting the agent).
 pub const UEFI_READY_TIMEOUT_SECS: u64 = 180;
 
-/// Boot-mode-aware default readiness timeout. `boot_mode` is the persisted
-/// `VmRecord.boot_mode` value ("direct", "uefi", or "efi"); unknown values
-/// use the direct-kernel default. Both "uefi" (Linux/QEMU cloud-image) and
-/// "efi" (macOS/VZ cloud-image) run full cloud-init on first boot and need
-/// the extended timeout.
-pub fn default_ready_timeout(boot_mode: &str) -> std::time::Duration {
-    let secs = if boot_mode == "uefi" || boot_mode == "efi" {
+/// Boot-mode-aware default readiness timeout. Both UEFI (Linux/QEMU cloud
+/// image) and EFI (macOS/VZ cloud image) run full cloud-init on first boot and
+/// need the extended timeout.
+pub fn default_ready_timeout(boot_kind: BootKind) -> std::time::Duration {
+    let secs = if boot_kind.uses_firmware() {
         UEFI_READY_TIMEOUT_SECS
     } else {
         DEFAULT_READY_TIMEOUT_SECS
@@ -2600,7 +2598,7 @@ mod tests {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -4191,7 +4189,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             service_id: None,
             service_ordinal: None,
             vmm: vmm.parse().expect("test backend kind must be valid"),
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -4393,23 +4391,18 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     #[test]
     fn ready_timeout_is_boot_mode_aware() {
         assert_eq!(
-            default_ready_timeout("direct"),
+            default_ready_timeout(BootKind::DirectKernel),
             std::time::Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS)
         );
         assert_eq!(
-            default_ready_timeout("uefi"),
+            default_ready_timeout(BootKind::Uefi),
             std::time::Duration::from_secs(UEFI_READY_TIMEOUT_SECS)
         );
         // "efi" (Apple VZ cloud-image path) runs full cloud-init and needs the
         // same extended timeout as "uefi".
         assert_eq!(
-            default_ready_timeout("efi"),
+            default_ready_timeout(BootKind::Efi),
             std::time::Duration::from_secs(UEFI_READY_TIMEOUT_SECS)
-        );
-        // Unknown values fall back to the conservative direct-kernel default.
-        assert_eq!(
-            default_ready_timeout("something-else"),
-            std::time::Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS)
         );
     }
 
@@ -4482,7 +4475,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::AppleVz,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: Some("mydata".into()),
             network: NetworkMode::Nat,
@@ -5092,7 +5085,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Qemu,
-            boot_mode: "uefi".into(),
+            boot_mode: BootKind::Uefi,
             balloon: false,
             volume: None,
             network: NetworkMode::Bridged,
@@ -5242,7 +5235,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::AppleVz,
-            boot_mode: "efi".into(),
+            boot_mode: BootKind::Efi,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -6157,7 +6150,7 @@ mod idle_policy_tests {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,

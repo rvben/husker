@@ -316,7 +316,7 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
 
     // 2. Boot-mode-aware readiness wait (mirrors Commands::Wait logic).
     let vm = daemon.vm(name).await?;
-    let deadline = std::time::Instant::now() + husker_core::default_ready_timeout(&vm.boot_mode);
+    let deadline = std::time::Instant::now() + husker_core::default_ready_timeout(vm.boot_mode);
     let mut backoff = std::time::Duration::from_millis(200);
     loop {
         if daemon.ready(name).await?.ready {

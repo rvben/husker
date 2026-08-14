@@ -36,7 +36,7 @@ use axum::http::StatusCode;
 #[cfg(test)]
 use errors::{map_agent_connect_error, map_error};
 #[cfg(test)]
-use husker_core::{BackendKind, CoreError, NetworkMode, VmLifecycleState, VmRecord};
+use husker_core::{BackendKind, BootKind, CoreError, NetworkMode, VmLifecycleState, VmRecord};
 #[cfg(test)]
 use router::{is_protected_route, is_rate_limited_route};
 #[cfg(test)]
@@ -455,7 +455,7 @@ mod tests {
                 service_id: Some(svc_id),
                 service_ordinal: Some(0),
                 vmm: BackendKind::Firecracker,
-                boot_mode: "direct".into(),
+                boot_mode: BootKind::DirectKernel,
                 balloon: false,
                 volume: None,
                 network: NetworkMode::Nat,
@@ -491,7 +491,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: BackendKind::Firecracker,
-                boot_mode: "direct".into(),
+                boot_mode: BootKind::DirectKernel,
                 balloon: false,
                 volume: None,
                 network: NetworkMode::Nat,
@@ -830,7 +830,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: BackendKind::Firecracker,
-                boot_mode: "direct".into(),
+                boot_mode: BootKind::DirectKernel,
                 balloon: false,
                 volume: None,
                 network: NetworkMode::Nat,
@@ -1174,7 +1174,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: BackendKind::Firecracker,
-                boot_mode: "direct".into(),
+                boot_mode: BootKind::DirectKernel,
                 balloon: false,
                 volume: None,
                 network: NetworkMode::Nat,
@@ -1294,7 +1294,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: BackendKind::Firecracker,
-                boot_mode: "direct".into(),
+                boot_mode: BootKind::DirectKernel,
                 balloon: false,
                 volume: None,
                 network: NetworkMode::Nat,
@@ -1427,7 +1427,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: BackendKind::Firecracker,
-                boot_mode: "direct".into(),
+                boot_mode: BootKind::DirectKernel,
                 balloon: false,
                 volume: None,
                 network: NetworkMode::Nat,
@@ -1665,7 +1665,7 @@ mod tests {
             service_id: None,
             service_ordinal: None,
             vmm: BackendKind::Firecracker,
-            boot_mode: "direct".into(),
+            boot_mode: BootKind::DirectKernel,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
@@ -1967,37 +1967,37 @@ mod tests {
     #[test]
     fn exec_connect_timeout_defaults_and_clamps() {
         assert_eq!(
-            resolve_exec_connect_timeout(None, "direct"),
+            resolve_exec_connect_timeout(None, BootKind::DirectKernel),
             Duration::from_secs(DEFAULT_EXEC_CONNECT_TIMEOUT_SECS)
         );
         assert_eq!(
-            resolve_exec_connect_timeout(None, "uefi"),
+            resolve_exec_connect_timeout(None, BootKind::Uefi),
             Duration::from_secs(husker_core::UEFI_READY_TIMEOUT_SECS)
         );
         // EFI (macOS/VZ cloud-image) needs the same extended timeout as UEFI.
         assert_eq!(
-            resolve_exec_connect_timeout(None, "efi"),
+            resolve_exec_connect_timeout(None, BootKind::Efi),
             Duration::from_secs(husker_core::UEFI_READY_TIMEOUT_SECS)
         );
         assert_eq!(
-            resolve_exec_connect_timeout(Some(5), "direct"),
+            resolve_exec_connect_timeout(Some(5), BootKind::DirectKernel),
             Duration::from_secs(5)
         );
         // An explicit timeout wins regardless of boot mode.
         assert_eq!(
-            resolve_exec_connect_timeout(Some(5), "uefi"),
+            resolve_exec_connect_timeout(Some(5), BootKind::Uefi),
             Duration::from_secs(5)
         );
         assert_eq!(
-            resolve_exec_connect_timeout(Some(5), "efi"),
+            resolve_exec_connect_timeout(Some(5), BootKind::Efi),
             Duration::from_secs(5)
         );
         assert_eq!(
-            resolve_exec_connect_timeout(Some(0), "direct"),
+            resolve_exec_connect_timeout(Some(0), BootKind::DirectKernel),
             Duration::from_secs(1)
         );
         assert_eq!(
-            resolve_exec_connect_timeout(Some(u64::MAX), "direct"),
+            resolve_exec_connect_timeout(Some(u64::MAX), BootKind::DirectKernel),
             Duration::from_secs(MAX_EXEC_CONNECT_TIMEOUT_SECS)
         );
     }
@@ -2491,7 +2491,7 @@ mod tests {
                 service_id: None,
                 service_ordinal: None,
                 vmm: BackendKind::Firecracker,
-                boot_mode: "direct".into(),
+                boot_mode: BootKind::DirectKernel,
                 balloon: false,
                 volume: Some("data".into()),
                 network: NetworkMode::Nat,

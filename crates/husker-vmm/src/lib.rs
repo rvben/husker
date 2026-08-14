@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-pub use husker_types::{BackendKind, InvalidBackendKind};
+pub use husker_types::{BackendKind, BootKind, InvalidBackendKind, InvalidBootKind};
 
 /// Kernel parameters that suppress probes for legacy hardware no direct-kernel
 /// guest can have.
@@ -220,14 +220,6 @@ impl BackendSelection {
     }
 }
 
-/// Boot shape relevant to backend selection, without artifact paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootKind {
-    DirectKernel,
-    Uefi,
-    Efi,
-}
-
 impl std::fmt::Display for VmmKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -316,11 +308,7 @@ pub enum BootMode {
 impl BootMode {
     /// Stable lowercase tag for persistence/display (`"direct"` / `"uefi"` / `"efi"`).
     pub fn as_str(&self) -> &'static str {
-        match self {
-            BootMode::DirectKernel => "direct",
-            BootMode::Uefi { .. } => "uefi",
-            BootMode::Efi { .. } => "efi",
-        }
+        self.kind().as_str()
     }
 
     pub fn kind(&self) -> BootKind {

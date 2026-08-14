@@ -213,7 +213,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             service_id: None,
             service_ordinal: None,
             vmm: source.vmm,
-            boot_mode: source.boot_mode.clone(),
+            boot_mode: source.boot_mode,
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,

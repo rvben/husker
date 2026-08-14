@@ -27,7 +27,7 @@ fn make_record(name: &str) -> VmRecord {
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: husker_state::BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,

@@ -154,7 +154,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: husker_core::BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,

@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use tracing::{debug, info, warn};
 
 use husker_core::{
-    CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest, CreateServiceRequest,
+    BootKind, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest, CreateServiceRequest,
     CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest, DiagnosticsReport,
     ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
     ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
@@ -40,8 +40,11 @@ pub(crate) const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
 ///
 /// Both "uefi" (Linux/QEMU cloud-image) and "efi" (macOS/VZ cloud-image) need
 /// the extended timeout because both run cloud-init on first boot.
-pub(crate) fn resolve_exec_connect_timeout(requested: Option<u64>, boot_mode: &str) -> Duration {
-    let default = if boot_mode == "uefi" || boot_mode == "efi" {
+pub(crate) fn resolve_exec_connect_timeout(
+    requested: Option<u64>,
+    boot_kind: BootKind,
+) -> Duration {
+    let default = if boot_kind.uses_firmware() {
         husker_core::UEFI_READY_TIMEOUT_SECS
     } else {
         DEFAULT_EXEC_CONNECT_TIMEOUT_SECS
@@ -1354,7 +1357,7 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
     let mut conn = core
         .agent_connect_ready(
             &name,
-            resolve_exec_connect_timeout(req.connect_timeout_secs, &record.boot_mode),
+            resolve_exec_connect_timeout(req.connect_timeout_secs, record.boot_mode),
         )
         .await
         .map_err(map_agent_connect_error)?;

@@ -940,7 +940,9 @@ async fn run(cli: Cli) -> Result<()> {
                 let boot_mode = vm
                     .get("boot_mode")
                     .and_then(|b| b.as_str())
-                    .unwrap_or("direct");
+                    .unwrap_or("direct")
+                    .parse::<husker_core::BootKind>()
+                    .map_err(|error| anyhow::anyhow!("daemon returned {error}"))?;
                 let ready = wait_for_vm_ready(
                     &client,
                     &name,
@@ -1675,7 +1677,7 @@ async fn run(cli: Cli) -> Result<()> {
                     // Boot-mode-aware default: UEFI/EFI cloud VMs boot much slower
                     // than direct-kernel microVMs.
                     let vm = client.vm(&name).await?;
-                    husker_core::default_ready_timeout(&vm.boot_mode)
+                    husker_core::default_ready_timeout(vm.boot_mode)
                 }
             };
             let deadline = std::time::Instant::now() + timeout;

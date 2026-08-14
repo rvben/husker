@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use husker_core::{
-    CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
+    BootKind, CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
     CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskerCore, ImportImageRequest,
     NetworkMode, RestoreSnapshotRequest, RotateSecretRequest,
 };
@@ -311,7 +311,7 @@ fn vm_record(
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::Firecracker,
-        boot_mode: "direct".into(),
+        boot_mode: BootKind::DirectKernel,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,

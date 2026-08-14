@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use husker_core::HuskerCore;
-use husker_state::{BackendKind, NetworkMode, StateStore, VmRecord};
+use husker_state::{BackendKind, BootKind, NetworkMode, StateStore, VmRecord};
 use husker_storage::StorageConfig;
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
@@ -116,7 +116,7 @@ fn make_vm_record(
     id: Uuid,
     name: &str,
     state: &str,
-    boot_mode: &str,
+    boot_mode: BootKind,
     guest_ip: Option<String>,
 ) -> VmRecord {
     let now = Utc::now();
@@ -141,7 +141,7 @@ fn make_vm_record(
         service_id: None,
         service_ordinal: None,
         vmm: BackendKind::AppleVz,
-        boot_mode: boot_mode.into(),
+        boot_mode,
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
@@ -190,7 +190,7 @@ async fn discover_skips_non_efi_boot_mode() {
     let vmm = UnreachableVsockVmm::new();
 
     let id = Uuid::new_v4();
-    let record = make_vm_record(id, "direct-vm", "running", "direct", None);
+    let record = make_vm_record(id, "direct-vm", "running", BootKind::DirectKernel, None);
     state.insert_vm(&record).unwrap();
     vmm.upsert_vm(VmInfo {
         id,
@@ -227,7 +227,7 @@ async fn discover_skips_stopped_efi_vm() {
     let vmm = UnreachableVsockVmm::new();
 
     let id = Uuid::new_v4();
-    let record = make_vm_record(id, "stopped-efi", "stopped", "efi", None);
+    let record = make_vm_record(id, "stopped-efi", "stopped", BootKind::Efi, None);
     state.insert_vm(&record).unwrap();
     // No entry in VMM — it's stopped, so vm_info would return VmNotFound.
 
@@ -249,7 +249,13 @@ async fn discover_skips_vm_with_existing_ip() {
     let vmm = UnreachableVsockVmm::new();
 
     let id = Uuid::new_v4();
-    let record = make_vm_record(id, "has-ip", "running", "efi", Some("192.0.2.5".into()));
+    let record = make_vm_record(
+        id,
+        "has-ip",
+        "running",
+        BootKind::Efi,
+        Some("192.0.2.5".into()),
+    );
     state.insert_vm(&record).unwrap();
     vmm.upsert_vm(VmInfo {
         id,
@@ -282,7 +288,7 @@ async fn discover_times_out_cleanly_for_unreachable_agent() {
     let vmm = UnreachableVsockVmm::new();
 
     let id = Uuid::new_v4();
-    let record = make_vm_record(id, "efi-no-agent", "running", "efi", None);
+    let record = make_vm_record(id, "efi-no-agent", "running", BootKind::Efi, None);
     state.insert_vm(&record).unwrap();
     vmm.upsert_vm(VmInfo {
         id,
