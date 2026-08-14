@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use husker_core::{BootKind, DaemonProfile, ImageKind};
+use husker_core::{BootKind, DaemonProfile, ImageKind, UserdataStatus};
 
 // ── Response Types ────────────────────────────────────────────────────
 
@@ -23,7 +23,8 @@ pub struct VmResponse {
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub userdata_status: Option<String>,
+    #[schema(value_type = Option<String>, example = "pending")]
+    pub userdata_status: Option<UserdataStatus>,
     pub vmm: String,
     #[schema(value_type = String, example = "direct")]
     pub boot_mode: BootKind,

@@ -146,6 +146,57 @@ impl std::str::FromStr for ImageKind {
     }
 }
 
+/// The durable execution state of a VM's userdata script.
+///
+/// `None` on a VM record means no userdata was supplied. A supplied script
+/// starts pending, becomes running while the guest agent executes it, and
+/// finishes in one of the two terminal states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserdataStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl UserdataStatus {
+    pub const ALL: [Self; 4] = [Self::Pending, Self::Running, Self::Completed, Self::Failed];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for UserdataStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown userdata status '{0}'")]
+pub struct InvalidUserdataStatus(String);
+
+impl std::str::FromStr for UserdataStatus {
+    type Err = InvalidUserdataStatus;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            other => Err(InvalidUserdataStatus(other.to_string())),
+        }
+    }
+}
+
 /// The host networking topology assigned to a VM.
 ///
 /// The stable wire value for [`NetworkMode::Isolated`] is `"none"`, matching
@@ -277,5 +328,25 @@ mod tests {
 
         assert!("cloud_image".parse::<ImageKind>().is_err());
         assert!("disk".parse::<ImageKind>().is_err());
+    }
+
+    #[test]
+    fn userdata_status_has_a_stable_round_trip_for_every_value() {
+        for status in UserdataStatus::ALL {
+            let wire_value = status.as_str();
+            assert_eq!(wire_value.parse::<UserdataStatus>().unwrap(), status);
+            assert_eq!(status.to_string(), wire_value);
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire_value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<UserdataStatus>(&format!("\"{wire_value}\"")).unwrap(),
+                status
+            );
+        }
+
+        assert!("Pending".parse::<UserdataStatus>().is_err());
+        assert!("cancelled".parse::<UserdataStatus>().is_err());
     }
 }

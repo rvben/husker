@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use husker_core::{CreateVmRequest, HuskerCore};
+use husker_core::{CreateVmRequest, HuskerCore, UserdataStatus};
 use husker_vmm::cgroup::CgroupSupervisor;
 use husker_vmm::firecracker::FirecrackerBackend;
 use uuid::Uuid;
@@ -187,9 +187,11 @@ async fn idle_suspend_then_resume_on_connect_roundtrip() {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let vm = find_vm(&core, vm_id).await;
-        match vm.userdata_status.as_deref() {
-            Some("completed") => break,
-            Some("failed") => panic!("userdata script failed to start the echo listener"),
+        match vm.userdata_status {
+            Some(UserdataStatus::Completed) => break,
+            Some(UserdataStatus::Failed) => {
+                panic!("userdata script failed to start the echo listener")
+            }
             _ => {}
         }
         assert!(

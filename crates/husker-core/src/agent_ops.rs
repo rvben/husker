@@ -194,7 +194,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             None => return Ok(()),
         };
 
-        self.state.update_userdata_status(record.id, "running")?;
+        self.state
+            .update_userdata_status(record.id, UserdataStatus::Running)?;
 
         let result: Result<(), CoreError> = async {
             let mut conn = self
@@ -241,7 +242,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
 
             if exec_result.exit_code == 0 {
-                self.state.update_userdata_status(record.id, "completed")?;
+                self.state
+                    .update_userdata_status(record.id, UserdataStatus::Completed)?;
             } else {
                 warn!(
                     %name,
@@ -249,7 +251,8 @@ impl<B: VmmBackend> HuskerCore<B> {
                     stderr = %exec_result.stderr,
                     "userdata script failed"
                 );
-                self.state.update_userdata_status(record.id, "failed")?;
+                self.state
+                    .update_userdata_status(record.id, UserdataStatus::Failed)?;
             }
             Ok(())
         }
@@ -257,7 +260,10 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         if let Err(ref e) = result {
             warn!(%name, error = %e, "userdata execution error");
-            if let Err(status_err) = self.state.update_userdata_status(record.id, "failed") {
+            if let Err(status_err) = self
+                .state
+                .update_userdata_status(record.id, UserdataStatus::Failed)
+            {
                 warn!(%name, error = %status_err, "failed to update userdata status to failed");
             }
         }

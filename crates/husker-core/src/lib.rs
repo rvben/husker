@@ -39,7 +39,8 @@ use uuid::Uuid;
 
 pub use husker_state::{
     BackendKind, BootKind, HostGroupRecord, ImageKind, ImageRecord, NetworkMode, PoolRecord,
-    SecretRecord, ServiceRecord, SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
+    SecretRecord, ServiceRecord, SnapshotRecord, UserdataStatus, VmLifecycleState, VmRecord,
+    VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 

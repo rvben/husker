@@ -17,7 +17,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use husker_api::{VmResponse, metrics_router, router};
-use husker_core::{BackendKind, BootKind, HuskerCore, NetworkMode};
+use husker_core::{BackendKind, BootKind, HuskerCore, NetworkMode, UserdataStatus};
 use husker_state::VmLifecycleState;
 
 fn make_core(
@@ -1103,8 +1103,8 @@ async fn vm_response_json_structure() {
         rootfs_path: "/images/rootfs.ext4".into(),
         created_at: now,
         updated_at: now,
-        userdata: None,
-        userdata_status: None,
+        userdata: Some("#!/bin/sh\nexit 0".into()),
+        userdata_status: Some(UserdataStatus::Completed),
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
@@ -1166,12 +1166,16 @@ async fn vm_response_json_structure() {
     // network mode is surfaced in the response
     assert_eq!(json["network"].as_str().unwrap(), "nat");
 
+    // The typed execution state preserves the existing lowercase JSON wire value.
+    assert_eq!(json["userdata_status"].as_str().unwrap(), "completed");
+
     // Verify JSON can be deserialized to VmResponse
     let vm: VmResponse = serde_json::from_value(json).unwrap();
     assert_eq!(vm.name, "shape-test");
     assert_eq!(vm.vcpu_count, 2);
     assert_eq!(vm.boot_mode, BootKind::DirectKernel);
     assert_eq!(vm.network, "nat");
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Completed));
 }
 
 // ── List with Pre-populated State ────────────────────────────────────

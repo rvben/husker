@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
-pub use husker_types::{BackendKind, BootKind, ImageKind, NetworkMode};
+pub use husker_types::{BackendKind, BootKind, ImageKind, NetworkMode, UserdataStatus};
 
 /// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
 /// every call site that used the old `MutexGuard<Connection>` is unchanged.
@@ -214,7 +214,7 @@ pub struct VmRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub userdata: Option<String>,
-    pub userdata_status: Option<String>,
+    pub userdata_status: Option<UserdataStatus>,
     /// JSON-serialized environment variables for userdata script.
     pub userdata_env: Option<String>,
     /// UUID of the owning service, or None for a standalone VM.
@@ -623,6 +623,24 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'unknown image kind');
          END;",
     ),
+    (
+        10,
+        "CREATE TRIGGER vm_userdata_status_must_be_known_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.userdata_status IS NOT NULL
+              AND NEW.userdata_status NOT IN ('pending', 'running', 'completed', 'failed')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown userdata status');
+         END;
+
+         CREATE TRIGGER vm_userdata_status_must_be_known_on_update
+         BEFORE UPDATE OF userdata_status ON vms
+         WHEN NEW.userdata_status IS NOT NULL
+              AND NEW.userdata_status NOT IN ('pending', 'running', 'completed', 'failed')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown userdata status');
+         END;",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -711,7 +729,7 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.created_at.to_rfc3339(),
             record.updated_at.to_rfc3339(),
             record.userdata,
-            record.userdata_status,
+            record.userdata_status.map(UserdataStatus::as_str),
             record.userdata_env,
             record.service_id.map(|id| id.to_string()),
             record.service_ordinal,
@@ -2294,11 +2312,15 @@ impl StateStore {
     }
 
     /// Update the userdata execution status for a VM.
-    pub fn update_userdata_status(&self, id: Uuid, status: &str) -> Result<(), StateError> {
+    pub fn update_userdata_status(
+        &self,
+        id: Uuid,
+        status: UserdataStatus,
+    ) -> Result<(), StateError> {
         let conn = self.lock()?;
         let updated = conn.execute(
             "UPDATE vms SET userdata_status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status, Utc::now().to_rfc3339(), id.to_string()],
+            params![status.as_str(), Utc::now().to_rfc3339(), id.to_string()],
         )?;
         if updated == 0 {
             return Err(StateError::VmNotFound(id));
@@ -2548,6 +2570,17 @@ fn parse_boot_kind(s: &str) -> rusqlite::Result<BootKind> {
     })
 }
 
+fn parse_userdata_status(s: &str) -> rusqlite::Result<UserdataStatus> {
+    s.parse()
+        .map_err(|error: husker_types::InvalidUserdataStatus| {
+            rusqlite::Error::FromSqlConversionFailure(
+                15,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
 fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
     let id_str: String = row.get(0)?;
     let created_str: String = row.get(12)?;
@@ -2570,7 +2603,10 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
         created_at: created,
         updated_at: parse_datetime(&updated_str)?,
         userdata: row.get(14)?,
-        userdata_status: row.get(15)?,
+        userdata_status: {
+            let status: Option<String> = row.get(15)?;
+            status.as_deref().map(parse_userdata_status).transpose()?
+        },
         userdata_env: row.get(16)?,
         service_id: {
             let s: Option<String> = row.get(17)?;
@@ -3723,12 +3759,12 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("ud-vm");
         rec.userdata = Some("#!/bin/sh\necho hello".into());
-        rec.userdata_status = Some("pending".into());
+        rec.userdata_status = Some(UserdataStatus::Pending);
         store.insert_vm(&rec).unwrap();
 
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.userdata.as_deref(), Some("#!/bin/sh\necho hello"));
-        assert_eq!(fetched.userdata_status.as_deref(), Some("pending"));
+        assert_eq!(fetched.userdata_status, Some(UserdataStatus::Pending));
     }
 
     #[test]
@@ -3747,26 +3783,30 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let mut rec = make_record("ud-status");
         rec.userdata = Some("#!/bin/sh".into());
-        rec.userdata_status = Some("pending".into());
+        rec.userdata_status = Some(UserdataStatus::Pending);
         store.insert_vm(&rec).unwrap();
 
-        store.update_userdata_status(rec.id, "running").unwrap();
+        store
+            .update_userdata_status(rec.id, UserdataStatus::Running)
+            .unwrap();
         assert_eq!(
-            store.get_vm(rec.id).unwrap().userdata_status.as_deref(),
-            Some("running")
+            store.get_vm(rec.id).unwrap().userdata_status,
+            Some(UserdataStatus::Running)
         );
 
-        store.update_userdata_status(rec.id, "completed").unwrap();
+        store
+            .update_userdata_status(rec.id, UserdataStatus::Completed)
+            .unwrap();
         assert_eq!(
-            store.get_vm(rec.id).unwrap().userdata_status.as_deref(),
-            Some("completed")
+            store.get_vm(rec.id).unwrap().userdata_status,
+            Some(UserdataStatus::Completed)
         );
     }
 
     #[test]
     fn update_userdata_status_nonexistent_vm() {
         let store = StateStore::open_memory().unwrap();
-        let result = store.update_userdata_status(Uuid::new_v4(), "running");
+        let result = store.update_userdata_status(Uuid::new_v4(), UserdataStatus::Running);
         assert!(matches!(result, Err(StateError::VmNotFound(_))));
     }
 
@@ -3776,14 +3816,14 @@ mod tests {
 
         let mut rec = make_record("ud-stale");
         rec.userdata = Some("#!/bin/sh".into());
-        rec.userdata_status = Some("running".into());
+        rec.userdata_status = Some(UserdataStatus::Running);
         store.insert_vm(&rec).unwrap();
 
         store.mark_stale_vms_stopped().unwrap();
 
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.state, "stopped");
-        assert_eq!(fetched.userdata_status.as_deref(), Some("pending"));
+        assert_eq!(fetched.userdata_status, Some(UserdataStatus::Pending));
     }
 
     #[test]
@@ -3792,13 +3832,13 @@ mod tests {
 
         let mut rec = make_record("ud-complete");
         rec.userdata = Some("#!/bin/sh".into());
-        rec.userdata_status = Some("completed".into());
+        rec.userdata_status = Some(UserdataStatus::Completed);
         store.insert_vm(&rec).unwrap();
 
         store.mark_stale_vms_stopped().unwrap();
 
         let fetched = store.get_vm(rec.id).unwrap();
-        assert_eq!(fetched.userdata_status.as_deref(), Some("completed"));
+        assert_eq!(fetched.userdata_status, Some(UserdataStatus::Completed));
     }
 
     // ── Host Groups ───────────────────────────────────────────────────
@@ -5122,6 +5162,58 @@ mod tests {
 
         let error = store.get_vm(record.id).unwrap_err();
         assert!(error.to_string().contains("unknown network mode 'host'"));
+    }
+
+    #[test]
+    fn database_rejects_unknown_userdata_statuses() {
+        let store = StateStore::open_memory().unwrap();
+        let mut record = make_record("guarded-userdata-status");
+        record.userdata = Some("#!/bin/sh".into());
+        record.userdata_status = Some(UserdataStatus::Pending);
+        store.insert_vm(&record).unwrap();
+
+        let error = store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE vms SET userdata_status = 'cancelled' WHERE id = ?1",
+                params![record.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown userdata status"));
+        assert_eq!(
+            store.get_vm(record.id).unwrap().userdata_status,
+            Some(UserdataStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn row_decoder_surfaces_corrupt_userdata_status() {
+        let store = StateStore::open_memory().unwrap();
+        let mut record = make_record("corrupt-userdata-status");
+        record.userdata = Some("#!/bin/sh".into());
+        record.userdata_status = Some(UserdataStatus::Pending);
+        store.insert_vm(&record).unwrap();
+
+        // Simulate external database corruption. Unknown execution states
+        // must fail at the typed row boundary instead of reaching retry or UI
+        // policy as an unrecognized string.
+        let conn = store.lock().unwrap();
+        conn.execute_batch("DROP TRIGGER vm_userdata_status_must_be_known_on_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE vms SET userdata_status = 'cancelled' WHERE id = ?1",
+            params![record.id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store.get_vm(record.id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown userdata status 'cancelled'")
+        );
     }
 
     #[test]

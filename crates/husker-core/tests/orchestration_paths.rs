@@ -6,7 +6,7 @@ use chrono::Utc;
 use husker_core::{
     BootKind, CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
     CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskerCore, ImportImageRequest,
-    NetworkMode, RestoreSnapshotRequest, RotateSecretRequest,
+    NetworkMode, RestoreSnapshotRequest, RotateSecretRequest, UserdataStatus,
 };
 #[cfg(feature = "linux-net")]
 use husker_state::PortForwardRecord;
@@ -284,7 +284,7 @@ fn vm_record(
     name: &str,
     state: &str,
     userdata: Option<String>,
-    userdata_status: Option<String>,
+    userdata_status: Option<UserdataStatus>,
     userdata_env: Option<String>,
     guest_ip: Option<String>,
     tap_device: Option<String>,
@@ -887,7 +887,7 @@ async fn run_userdata_marks_completed_on_success() {
             "vm-userdata-ok",
             "running",
             Some("exit 0".into()),
-            Some("pending".into()),
+            Some(UserdataStatus::Pending),
             Some(serde_json::to_string(&vec![("GREETING", "hello")]).unwrap()),
             None,
             None,
@@ -907,7 +907,7 @@ async fn run_userdata_marks_completed_on_success() {
     let core = build_core(mock, state, &data_dir, &runtime_dir);
     core.run_userdata("vm-userdata-ok").await.unwrap();
     let vm = core.get_vm("vm-userdata-ok").unwrap();
-    assert_eq!(vm.userdata_status.as_deref(), Some("completed"));
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Completed));
 }
 
 #[tokio::test]
@@ -932,7 +932,7 @@ async fn run_userdata_captures_output_to_log() {
             "vm-userdata-log",
             "running",
             Some("echo husker-marker-9f3 >&2; echo on-stdout".into()),
-            Some("pending".into()),
+            Some(UserdataStatus::Pending),
             None,
             None,
             None,
@@ -992,7 +992,7 @@ async fn run_userdata_marks_failed_on_nonzero_exit() {
             "vm-userdata-fail",
             "running",
             Some("exit 37".into()),
-            Some("pending".into()),
+            Some(UserdataStatus::Pending),
             None,
             None,
             None,
@@ -1012,7 +1012,7 @@ async fn run_userdata_marks_failed_on_nonzero_exit() {
     let core = build_core(mock, state, &data_dir, &runtime_dir);
     core.run_userdata("vm-userdata-fail").await.unwrap();
     let vm = core.get_vm("vm-userdata-fail").unwrap();
-    assert_eq!(vm.userdata_status.as_deref(), Some("failed"));
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Failed));
 }
 
 #[tokio::test]
@@ -1076,7 +1076,7 @@ async fn run_userdata_on_non_running_vm_marks_failed_and_returns_error() {
             "vm-paused-userdata",
             "paused",
             Some("exit 0".into()),
-            Some("pending".into()),
+            Some(UserdataStatus::Pending),
             None,
             None,
             None,
@@ -1104,7 +1104,7 @@ async fn run_userdata_on_non_running_vm_marks_failed_and_returns_error() {
         "unexpected run_userdata error: {err}"
     );
     let vm = core.get_vm("vm-paused-userdata").unwrap();
-    assert_eq!(vm.userdata_status.as_deref(), Some("failed"));
+    assert_eq!(vm.userdata_status, Some(UserdataStatus::Failed));
 }
 
 #[tokio::test]
@@ -2725,7 +2725,7 @@ async fn run_userdata_spawn_userdata_drives_to_completed() {
         "vm-spawn-userdata",
         "running",
         Some("exit 0".into()),
-        Some("pending".into()),
+        Some(UserdataStatus::Pending),
         None,
         None,
         None,
@@ -2749,13 +2749,13 @@ async fn run_userdata_spawn_userdata_drives_to_completed() {
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         status = core.get_vm(&record.name).unwrap().userdata_status;
-        if status.as_deref() == Some("completed") {
+        if status == Some(UserdataStatus::Completed) {
             break;
         }
     }
     assert_eq!(
-        status.as_deref(),
-        Some("completed"),
+        status,
+        Some(UserdataStatus::Completed),
         "spawn_userdata should drive userdata_status to completed"
     );
 }

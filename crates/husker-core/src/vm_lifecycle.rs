@@ -516,7 +516,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let info = created.info;
         resources.vm_id = Some(info.id);
 
-        let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
+        let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
         let now = chrono::Utc::now();
 
         // NAT: persist the allocated IP and gateway; bridged: both stay None (DHCP-assigned).
@@ -760,7 +760,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             let info = created.info;
             resources.vm_id = Some(info.id);
 
-            let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
+            let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
             let now = chrono::Utc::now();
             let record = VmRecord {
                 id: info.id,
@@ -874,7 +874,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let info = created.info;
         resources.vm_id = Some(info.id);
 
-        let userdata_status = req.userdata.as_ref().map(|_| "pending".to_string());
+        let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
         let now = chrono::Utc::now();
         let record = VmRecord {
             id: info.id,
