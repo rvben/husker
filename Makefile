@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill test-linux-shutdown-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill test-linux-shutdown-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -13,6 +13,7 @@ ALPINE_VERSION ?= 3.21
 # install is updated, e.g. to roll the new version out to your own hosts. Empty
 # by default, so a plain clone releases exactly as before; set it in Makefile.local.
 POST_RELEASE ?=
+HUSKER_DEV_HOST ?= ubuntu@husker-dev.am8.nl
 
 all: lint test
 
@@ -94,7 +95,7 @@ test-unit:
 	cargo nextest run --workspace --lib 2>/dev/null || cargo test --workspace --lib
 
 # Lint
-lint: fmt-check clippy clippy-macos
+lint: fmt-check clippy clippy-macos check-deploy-script
 
 # Check formatting
 fmt-check:
@@ -124,6 +125,16 @@ ifeq ($(shell uname -s),Darwin)
 else
 	@echo "clippy-macos: SKIPPED on $(shell uname -s) (macOS-only configuration; CI covers it on its macOS runners)"
 endif
+
+# Validate the guarded Linux deployment entrypoint without contacting a host.
+check-deploy-script:
+	bash -n scripts/deploy-linux.sh
+	@scripts/deploy-linux.sh --help >/dev/null
+
+# Deploy the current committed snapshot to the development daemon host. Override
+# HUSKER_DEV_HOST for another SSH destination with the same systemd layout.
+deploy-husker-dev:
+	scripts/deploy-linux.sh --host "$(HUSKER_DEV_HOST)"
 
 # Type check without building
 check:
