@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.44](https://github.com/rvben/husker/compare/v0.4.43...v0.4.44) - 2026-08-15
+
+### Added
+
+- **deploy**: add transactional Linux rollout ([dd59b9d](https://github.com/rvben/husker/commit/dd59b9d4c670820c36358bf072ba6ded123f46da))
+- **cli**: expose embedded agent capability ([1cc1b4c](https://github.com/rvben/husker/commit/1cc1b4c01114da41b28bc6c98626e3d123a7c56b))
+- **cli**: adopt clispec v0.3 ([03435a0](https://github.com/rvben/husker/commit/03435a090d9851ba35b2c60b09c4dbb212097174))
+- **cli**: enforce machine-readable output contract ([24b2c7f](https://github.com/rvben/husker/commit/24b2c7f2bdce60ddf32d265865026d8b6a4b3f59))
+
+### Fixed
+
+- **job**: chunk large workspace uploads ([0081444](https://github.com/rvben/husker/commit/0081444ae38114d097339964f872564b9800c5d3))
+- **cli**: preserve enriched offline introspection ([83d8dd1](https://github.com/rvben/husker/commit/83d8dd1f3403ad8ea0b61af6682268fdfbe8a2d2))
+- **userdata**: complete interruption recovery ([87e2d3f](https://github.com/rvben/husker/commit/87e2d3f2bedc0b30723e0cfa0143a90908365037))
+- **userdata**: own execution lifecycle ([48edafb](https://github.com/rvben/husker/commit/48edafb418351f87fca3d1ca37faa4afe07e771b))
+- **userdata**: enforce persisted execution statuses ([d977a51](https://github.com/rvben/husker/commit/d977a51da1a38fefec38cb5767970f5c570bc92a))
+- **images**: enforce catalog image kinds ([14df808](https://github.com/rvben/husker/commit/14df808d482e8a80bba71f29549d3fd5522316d2))
+- **boot**: enforce persisted boot kinds ([1b4395f](https://github.com/rvben/husker/commit/1b4395fe945065866497a0684ed1064445cc63ba))
+- **network**: enforce persisted topology modes ([26407a7](https://github.com/rvben/husker/commit/26407a715fe8bd0a52be5c68ad10899f168fc2c3))
+- **core**: enforce pool template ownership ([2eff529](https://github.com/rvben/husker/commit/2eff52989809a2b5150e06792c9eebbda004789a))
+- **core**: make volume attachment atomic ([fe7b813](https://github.com/rvben/husker/commit/fe7b81361ca3a51639d119a9bcf4ec7c4a52c994))
+- **core**: make host resource ownership durable ([07b8870](https://github.com/rvben/husker/commit/07b8870f5b6b816e6a0e4851e548b2ac5865a1ee))
+- **core**: enforce VM generation invariants ([a0dc745](https://github.com/rvben/husker/commit/a0dc745a415a8ef051d3d988c27479ea9284bc10))
+- **daemon**: reattach suspended VM networks ([18ac864](https://github.com/rvben/husker/commit/18ac864aae5787c2e0c1cca10c5130f51ead0eb5))
+- **core**: persist VMM identity across suspend ([de46c02](https://github.com/rvben/husker/commit/de46c0238108757c0c79fbd083cc7a4573807670))
+- **daemon**: reclaim VM networking on shutdown ([d5467ef](https://github.com/rvben/husker/commit/d5467ef4ad9503410d841af7befd0a990233cdb4))
+- **vmm**: wait for Firecracker exit on stop ([3c2288a](https://github.com/rvben/husker/commit/3c2288a585b4367eebedc7941c45e5d9e153d2d2))
+- **cli**: preserve auto text for streaming commands ([0577eb6](https://github.com/rvben/husker/commit/0577eb63efdf56e6359803ff46b7bc304dc812fa))
+- **daemon**: supervise runtime shutdown ([cc37e53](https://github.com/rvben/husker/commit/cc37e53a78168cda8505a779619518ad92302764))
+
+### Documentation
+
+- Add a measured two-host homelab case study covering build offload, ephemeral CI, scheduled automation, boot performance, and network isolation ([bca48a8](https://github.com/rvben/husker/commit/bca48a8fa534203ce152f4ec3b2280324d819c14))
+
+## [0.4.43](https://github.com/rvben/husker/compare/v0.4.42...v0.4.43) - 2026-08-13
+
+### Added
+
+- **cli**: adopt clispec v0.3 ([0861a21](https://github.com/rvben/husker/commit/0861a2120bf59f4fb6acaac66c3e5a776863c250))
+
+### Fixed
+
+- **images**: page through releases when resolving the images tag ([f1b39e7](https://github.com/rvben/husker/commit/f1b39e74e0295c707f7dcfa4ef4c1b454d4fc646))
+- **images**: trigger image publication from the completed release workflow ([47bc944](https://github.com/rvben/husker/commit/47bc9449637f45aaa491382e6d7817697644e43d))
+- **core**: compile without the Linux networking feature ([9e38cc0](https://github.com/rvben/husker/commit/9e38cc0673b31a44df747e40456df9efefae3885))
+
 ## [0.4.42](https://github.com/rvben/husker/compare/v0.4.41...v0.4.42) - 2026-08-05
 
 ### Fixed
