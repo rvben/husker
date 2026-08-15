@@ -20,6 +20,26 @@ Pre-1.0. The core feature set works and has test coverage, but:
 
 Useful for experimentation, local development, and CI. Not recommended for production.
 
+## Where Husker is useful
+
+Husker works best as an execution plane beside your long-lived infrastructure:
+
+- disposable sandboxes for risky agent or dependency-heavy commands;
+- memory-isolated build offload with explicit artifact return;
+- single-use CI runners replaced from a clean image after every job;
+- scheduled scripts that need secrets and network access but no permanent host;
+- trusted integration VMs that can reach private registries and test services;
+- warm pools for repeated short tasks where cold-start latency dominates.
+
+Keep databases, ingress, monitoring, and other durable services on the platform
+already responsible for their state. Separate untrusted internet-only jobs from
+trusted jobs that need private-network access instead of weakening one shared
+boundary.
+
+The [two-host homelab case study](docs/case-studies/homelab.md) documents these
+patterns with observed build, runner, scheduler, boot, storage, and network
+isolation evidence from a real deployment.
+
 ## Quick Start
 
 ### Install
