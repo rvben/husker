@@ -437,10 +437,12 @@ release-major:
 	$(MAKE) post-release
 
 # Wait for the published artifacts, update the local install, then run the
-# optional rollout hook. Safe to re-run: every step is idempotent.
+# optional rollout hook. Poll the tiny checksum sidecar: it is created with the
+# archive but avoids downloading the full release binary on every retry. Safe
+# to re-run: every step is idempotent.
 post-release:
 	@v=$$(git describe --tags --abbrev=0); \
-	url="https://github.com/rvben/husker/releases/download/$$v/husker-$$v-x86_64-unknown-linux-gnu.tar.gz"; \
+	url="https://github.com/rvben/husker/releases/download/$$v/husker-$$v-x86_64-unknown-linux-gnu.tar.gz.sha256"; \
 	echo "==> waiting for the $$v release artifacts"; \
 	tarry http "$$url" --timeout 20m
 	vership update-local
