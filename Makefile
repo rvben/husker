@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill test-linux-shutdown-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -129,6 +129,7 @@ endif
 # Validate the guarded Linux deployment entrypoint without contacting a host.
 check-deploy-script:
 	bash -n scripts/deploy-linux.sh
+	bash -n scripts/ci/deploy_rollback_drill.sh
 	@scripts/deploy-linux.sh --help >/dev/null
 
 # Deploy the current committed snapshot to the development daemon host. Override
@@ -297,6 +298,16 @@ test-linux-shutdown-drill-gated:
 		scripts/ci/linux_shutdown_drill.sh; \
 	else \
 		echo "Skipping Linux shutdown drill (set HUSKER_RUN_LINUX_SHUTDOWN_DRILL=1; needs Linux/root/CAP_NET_ADMIN)"; \
+	fi
+
+# Exercise the production deployment transaction against a disposable systemd
+# unit and intentionally unhealthy candidate. The live Husker unit is observed
+# only to prove that its PID remains untouched.
+test-deploy-rollback-drill-gated:
+	@if [ "$$HUSKER_RUN_DEPLOY_ROLLBACK_DRILL" = "1" ]; then \
+		scripts/ci/deploy_rollback_drill.sh; \
+	else \
+		echo "Skipping deployment rollback drill (set HUSKER_RUN_DEPLOY_ROLLBACK_DRILL=1; needs Linux/root/systemd)"; \
 	fi
 
 # Chaos/restart drill (force-kill and restart path)
