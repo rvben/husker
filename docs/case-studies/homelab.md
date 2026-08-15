@@ -52,6 +52,21 @@ For smaller trees, `husker job --sync-cwd --out ...` provides the same clean-roo
 shape without a host mount. Large workspace archives are uploaded in chunks, so
 the file API no longer imposes a roughly 1 MiB practical ceiling on this path.
 
+That large-workspace path was exercised against the released fleet, not only in
+unit tests. After deploying `v0.4.44`, a temporary Git repository containing one
+tracked 3 MiB random file was synced from the Mac to `husker01`. A reference gzip
+archive of the payload was 3,146,884 bytes, forcing multiple 512 KiB writes. The
+guest's SHA-256 matched the host exactly:
+
+```text
+36cf91cd38e93717947e3d86ea6b69751a553525c6791163c28b5dcf5b178ab3
+```
+
+The ephemeral job exited `0` in 2.48 seconds wall time, and the subsequent VM
+list contained zero items. At the time of the proof, both hosts' installed
+`husker 0.4.44` binary matched the release artifact SHA-256
+`60a8df575832f18a08a133c54109b9bcdc07a17eb0dbc4d7461029fa1b675930`.
+
 ### 2. A self-replacing CI runner
 
 `husker-dev` runs a reconciler-managed service with desired size one. Its guest
