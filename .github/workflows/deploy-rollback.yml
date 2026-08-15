@@ -1,0 +1,65 @@
+name: Deployment Rollback Drill
+
+# This job executes repository code as root. Keep its triggers restricted to
+# trusted refs: scheduled runs use the default branch and manual dispatch is
+# limited by repository write access. Do not add pull_request as a trigger.
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs after the other nightly jobs on the single Husker Linux runner.
+    - cron: "30 8 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-rollback-drill-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Transactional Rollback (self-hosted, systemd)
+    runs-on: [self-hosted, husker, linux]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify privileged runner contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          test -d /run/systemd/system
+          sudo --non-interactive true
+          system_state="$(systemctl is-system-running 2>/dev/null || true)"
+          case "$system_state" in
+            running | degraded) ;;
+            *)
+              echo "systemd is not ready: ${system_state:-unknown}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Force and verify transactional rollback
+        shell: bash
+        run: |
+          sudo --non-interactive env \
+            HOME=/root \
+            PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            HUSKER_RUN_DEPLOY_ROLLBACK_DRILL=1 \
+            make test-deploy-rollback-drill-gated
+
+      - name: Verify disposable unit cleanup
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          leaked="$(sudo find /run/systemd/system -maxdepth 1 \
+            -type f -name 'husker-deploy-rollback-drill-*.service' -print)"
+          if [[ -n "$leaked" ]]; then
+            echo "rollback drill leaked transient unit files:" >&2
+            echo "$leaked" >&2
+            exit 1
+          fi

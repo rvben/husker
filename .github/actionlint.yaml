@@ -1,3 +1,5 @@
 self-hosted-runner:
   labels:
     - husker
+
+config-variables: null
