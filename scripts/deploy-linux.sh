@@ -8,9 +8,13 @@ HEALTH_URL="${HUSKER_DEPLOY_HEALTH_URL:-http://127.0.0.1:7777/v1/health}"
 INSTALL_PATH="${HUSKER_DEPLOY_INSTALL_PATH:-/usr/local/bin/husker}"
 STATE_DB="${HUSKER_DEPLOY_STATE_DB:-/var/lib/husker/husker.db}"
 BACKUP_ROOT="${HUSKER_DEPLOY_BACKUP_ROOT:-/var/lib/husker/deploy-backups}"
+HEALTH_ATTEMPTS="${HUSKER_DEPLOY_HEALTH_ATTEMPTS:-30}"
+AGENT_LOG_ATTEMPTS="${HUSKER_DEPLOY_AGENT_LOG_ATTEMPTS:-10}"
+STABILITY_SECONDS="${HUSKER_DEPLOY_STABILITY_SECONDS:-3}"
 KEEP_STAGING=0
 COMMIT=""
 SOURCE_DIR=""
+ARTIFACT=""
 LOCAL_TEMP_DIR=""
 
 usage() {
@@ -36,6 +40,10 @@ Environment overrides:
   HUSKER_DEPLOY_INSTALL_PATH  daemon binary (default: /usr/local/bin/husker)
   HUSKER_DEPLOY_STATE_DB      SQLite database (default: /var/lib/husker/husker.db)
   HUSKER_DEPLOY_BACKUP_ROOT   retained rollback root (default: /var/lib/husker/deploy-backups)
+
+Internal test/build entrypoints:
+  --remote-install             build and cut over a staged committed snapshot
+  --remote-cutover             cut over a prebuilt artifact using the same transaction
 EOF
 }
 
@@ -91,12 +99,20 @@ while [[ $# -gt 0 ]]; do
             MODE="remote"
             shift
             ;;
+        --remote-cutover)
+            MODE="cutover"
+            shift
+            ;;
         --commit)
             COMMIT="${2:?--commit requires a Git object ID}"
             shift 2
             ;;
         --source-dir)
             SOURCE_DIR="${2:?--source-dir requires a path}"
+            shift 2
+            ;;
+        --artifact)
+            ARTIFACT="${2:?--artifact requires a path}"
             shift 2
             ;;
         --service)
@@ -138,6 +154,12 @@ validate_configuration() {
     [[ "$INSTALL_PATH" == /* ]] || fail "install path must be absolute"
     [[ "$STATE_DB" == /* ]] || fail "state database must be absolute"
     [[ "$BACKUP_ROOT" == /* ]] || fail "backup root must be absolute"
+    [[ "$HEALTH_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] ||
+        fail "HUSKER_DEPLOY_HEALTH_ATTEMPTS must be a positive integer"
+    [[ "$AGENT_LOG_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] ||
+        fail "HUSKER_DEPLOY_AGENT_LOG_ATTEMPTS must be a positive integer"
+    [[ "$STABILITY_SECONDS" =~ ^[0-9]+$ ]] ||
+        fail "HUSKER_DEPLOY_STABILITY_SECONDS must be a non-negative integer"
 }
 
 cleanup_remote_staging() {
@@ -235,7 +257,7 @@ wait_for_health() {
     local expected_version="$1"
     local response=""
     local _attempt
-    for _attempt in $(seq 1 30); do
+    for _attempt in $(seq 1 "$HEALTH_ATTEMPTS"); do
         if response="$(curl --fail --silent --show-error "$HEALTH_URL" 2>/dev/null)" &&
             [[ "$response" == *"\"version\":\"${expected_version}\""* ]] &&
             [[ "$response" == *'"status":"ok"'* ]]; then
@@ -250,7 +272,7 @@ wait_for_health() {
 wait_for_agent_log() {
     local pid="$1"
     local _attempt
-    for _attempt in $(seq 1 10); do
+    for _attempt in $(seq 1 "$AGENT_LOG_ATTEMPTS"); do
         if journalctl -u "$SERVICE" "_PID=$pid" --no-pager --output=cat |
             grep -Fq 'cloud-image support enabled (guest agent embedded)'; then
             return 0
@@ -274,6 +296,7 @@ copy_state_snapshot() {
 
 ROLLBACK_ARMED=0
 ROLLBACK_DIR=""
+ROLLBACK_NEXT_PATH=""
 
 rollback() {
     local status="${1:-1}"
@@ -283,6 +306,9 @@ rollback() {
     if [[ "$ROLLBACK_ARMED" -eq 1 ]]; then
         log "verification failed; restoring the previous binary and SQLite snapshot"
         systemctl stop "$SERVICE"
+        if [[ -n "$ROLLBACK_NEXT_PATH" && -e "$ROLLBACK_NEXT_PATH" ]]; then
+            rm -f -- "$ROLLBACK_NEXT_PATH"
+        fi
         install -m 0755 "$ROLLBACK_DIR/husker" "$INSTALL_PATH"
         install -d -m 0700 "$ROLLBACK_DIR/failed-state"
         local suffix current saved
@@ -298,7 +324,7 @@ rollback() {
         done
         systemctl start "$SERVICE"
         local rollback_healthy=0 _attempt
-        for _attempt in $(seq 1 30); do
+        for _attempt in $(seq 1 "$HEALTH_ATTEMPTS"); do
             if curl --fail --silent --show-error "$HEALTH_URL" >/dev/null 2>&1; then
                 rollback_healthy=1
                 break
@@ -314,44 +340,33 @@ rollback() {
     exit "$status"
 }
 
-remote_install() {
-    [[ "$EUID" -eq 0 ]] || fail "--remote-install must run as root"
-    [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "--remote-install requires a full commit ID"
-    [[ -n "$SOURCE_DIR" ]] || fail "--remote-install requires --source-dir"
+prepare_remote_runtime() {
+    local entrypoint="$1"
+    [[ "$EUID" -eq 0 ]] || fail "$entrypoint must run as root"
+    [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "$entrypoint requires a full commit ID"
     validate_configuration
     export PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    require_command cargo
     require_command curl
     require_command journalctl
-    require_command make
     require_command mktemp
     require_command realpath
     require_command sha256sum
     require_command systemctl
+}
 
-    local short expected_source artifact artifact_hash installed_hash version
-    short="${COMMIT:0:12}"
-    expected_source="/tmp/husker-deploy-${short}/src"
-    SOURCE_DIR="$(realpath "$SOURCE_DIR")"
-    [[ "$SOURCE_DIR" == "$expected_source" ]] ||
-        fail "source path does not match the commit-scoped staging directory"
-    [[ ! -L "$SOURCE_DIR" ]] || fail "source staging directory must not be a symlink"
-    cd "$SOURCE_DIR"
+cutover_artifact() {
+    local artifact="$1"
+    local short artifact_hash installed_hash version
 
-    log "running target-native state and type tests"
-    cargo test -p husker-types -p husker-state --all-targets
-    log "running target-native userdata orchestration tests"
-    cargo test -p husker-core --test orchestration_paths userdata -- --test-threads=1
-    log "building release daemon with the guest agent embedded"
-    make build-release-with-agent
-
-    artifact="$SOURCE_DIR/target/release/husker"
-    [[ -x "$artifact" ]] || fail "release build did not produce $artifact"
+    [[ "$artifact" == /* ]] || fail "artifact path must be absolute"
+    [[ -x "$artifact" ]] || fail "deployment artifact is not executable: $artifact"
+    [[ ! -L "$artifact" ]] || fail "deployment artifact must not be a symlink"
     artifact_has_embedded_agent "$artifact" ||
         fail "release artifact reports that its guest agent is not embedded"
     version="$("$artifact" --version | awk '{print $2}')"
     [[ -n "$version" ]] || fail "could not determine staged Husker version"
     artifact_hash="$(sha256_file "$artifact")"
+    short="${COMMIT:0:12}"
 
     [[ -x "$INSTALL_PATH" ]] || fail "installed daemon not found: $INSTALL_PATH"
     [[ -f "$STATE_DB" ]] || fail "state database not found: $STATE_DB"
@@ -396,6 +411,7 @@ remote_install() {
     chmod 0600 "$manifest"
 
     ROLLBACK_DIR="$backup_dir"
+    ROLLBACK_NEXT_PATH="$next_path"
     ROLLBACK_ARMED=1
     trap 'rollback $?' ERR
     trap 'rollback 130' INT
@@ -412,7 +428,7 @@ remote_install() {
     pid="$(systemctl show "$SERVICE" -p MainPID --value)"
     [[ "$pid" =~ ^[1-9][0-9]*$ ]]
     wait_for_agent_log "$pid"
-    sleep 3
+    sleep "$STABILITY_SECONDS"
     systemctl is-active --quiet "$SERVICE"
     [[ "$(sha256_file "$INSTALL_PATH")" == "$artifact_hash" ]]
     artifact_has_embedded_agent "$INSTALL_PATH"
@@ -423,6 +439,7 @@ remote_install() {
     [[ "$error_count" -eq 0 ]]
 
     ROLLBACK_ARMED=0
+    ROLLBACK_NEXT_PATH=""
     trap - ERR INT TERM
     log "health=$health"
     log "installed_sha256=$artifact_hash"
@@ -430,8 +447,41 @@ remote_install() {
     log "embedded_agent=true pid=$pid restarts=$restart_count error_logs=$error_count"
 }
 
-if [[ "$MODE" == "remote" ]]; then
-    remote_install
-else
-    local_deploy
-fi
+remote_install() {
+    prepare_remote_runtime "--remote-install"
+    [[ -n "$SOURCE_DIR" ]] || fail "--remote-install requires --source-dir"
+    require_command cargo
+    require_command make
+
+    local short expected_source artifact
+    short="${COMMIT:0:12}"
+    expected_source="/tmp/husker-deploy-${short}/src"
+    SOURCE_DIR="$(realpath "$SOURCE_DIR")"
+    [[ "$SOURCE_DIR" == "$expected_source" ]] ||
+        fail "source path does not match the commit-scoped staging directory"
+    [[ ! -L "$SOURCE_DIR" ]] || fail "source staging directory must not be a symlink"
+    cd "$SOURCE_DIR"
+
+    log "running target-native state and type tests"
+    cargo test -p husker-types -p husker-state --all-targets
+    log "running target-native userdata orchestration tests"
+    cargo test -p husker-core --test orchestration_paths userdata -- --test-threads=1
+    log "building release daemon with the guest agent embedded"
+    make build-release-with-agent
+
+    artifact="$SOURCE_DIR/target/release/husker"
+    [[ -x "$artifact" ]] || fail "release build did not produce $artifact"
+    cutover_artifact "$artifact"
+}
+
+remote_cutover() {
+    prepare_remote_runtime "--remote-cutover"
+    [[ -n "$ARTIFACT" ]] || fail "--remote-cutover requires --artifact"
+    cutover_artifact "$ARTIFACT"
+}
+
+case "$MODE" in
+    remote) remote_install ;;
+    cutover) remote_cutover ;;
+    *) local_deploy ;;
+esac
