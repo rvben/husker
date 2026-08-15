@@ -10,7 +10,7 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use husker_api::{ExecRequest, ExecResponse, WriteFileRequest};
+use husker_api::{ExecRequest, ExecResponse};
 
 use crate::cli::OutputFormat;
 use crate::cli_contract::structured_output;
@@ -345,17 +345,8 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
             eprintln!("[job] syncing working tree from {}", cwd.display());
         }
         let archive = build_sync_archive(&cwd)?;
-        let encoded = husker_agent_proto::base64_encode(&archive);
         daemon
-            .write_file(
-                name,
-                &WriteFileRequest {
-                    path: SYNC_ARCHIVE_GUEST_PATH.to_string(),
-                    data: encoded,
-                    mode: None,
-                    append: false,
-                },
-            )
+            .write_file_bytes(name, SYNC_ARCHIVE_GUEST_PATH, &archive, None)
             .await?;
         // --write-back returns the synced files as the command left them
         // (modifications only; new build artifacts are never pulled back).

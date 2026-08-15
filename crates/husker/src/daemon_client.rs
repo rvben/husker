@@ -20,6 +20,11 @@ use husker_api::{
 
 use crate::schema::exit_code;
 
+/// Conservative decoded payload size for one guest-file write. The daemon's
+/// default policy accepts up to 1 MiB, but that configured limit is not yet
+/// exposed to clients, so uploads stay comfortably below the default.
+pub(crate) const FILE_WRITE_CHUNK_BYTES: usize = 512 * 1024;
+
 /// A failure returned by the daemon and suitable for the CLI error envelope.
 #[derive(Debug, Clone)]
 pub(crate) struct ApiFailure {
@@ -266,6 +271,58 @@ impl DaemonClient {
         Ok(response)
     }
 
+    /// Write a complete byte buffer, splitting large files into append-mode
+    /// requests after verifying that the guest agent supports them.
+    pub(crate) async fn write_file_bytes(
+        &self,
+        name: &str,
+        path: &str,
+        data: &[u8],
+        mode: Option<u32>,
+    ) -> Result<u64> {
+        if data.len() <= FILE_WRITE_CHUNK_BYTES {
+            return Ok(self
+                .write_file(
+                    name,
+                    &WriteFileRequest {
+                        path: path.to_string(),
+                        data: husker_agent_proto::base64_encode(data),
+                        mode,
+                        append: false,
+                    },
+                )
+                .await?
+                .bytes_written);
+        }
+
+        let protocol_version = self.guest_info(name).await?.protocol_version;
+        let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND;
+        anyhow::ensure!(
+            protocol_version >= required,
+            "cannot write a file larger than {FILE_WRITE_CHUNK_BYTES} bytes to VM '{name}': \
+             the guest agent reports protocol version {protocol_version}, but chunked writes \
+             require version {required} or newer. The VM image predates append support; \
+             rebuild or re-import it with a current husker-agent"
+        );
+
+        let mut bytes_written = 0u64;
+        for (index, chunk) in data.chunks(FILE_WRITE_CHUNK_BYTES).enumerate() {
+            bytes_written += self
+                .write_file(
+                    name,
+                    &WriteFileRequest {
+                        path: path.to_string(),
+                        data: husker_agent_proto::base64_encode(chunk),
+                        mode,
+                        append: index > 0,
+                    },
+                )
+                .await?
+                .bytes_written;
+        }
+        Ok(bytes_written)
+    }
+
     /// Add a host-to-guest port mapping and return the daemon's effective bind.
     /// A requested host port of zero is intentionally not a usable fallback:
     /// only the daemon knows which port it actually bound.
@@ -420,6 +477,8 @@ fn normalize_base_url(mut base_url: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use axum::Json;
     use axum::extract::Json as ExtractJson;
     use axum::http::StatusCode;
@@ -756,6 +815,94 @@ mod tests {
         let error = client.write_file("demo", &request).await.unwrap_err();
 
         assert!(format!("{error:#}").contains("reported writing 2 of 5 bytes"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn complete_file_write_chunks_large_payloads_in_order() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&writes);
+        let app = axum::Router::new()
+            .route(
+                "/v1/vms/demo/guest-info",
+                get(|| async {
+                    Json(json!({
+                        "ipv4": [],
+                        "protocol_version": husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND,
+                    }))
+                }),
+            )
+            .route(
+                "/v1/vms/demo/files/write",
+                axum::routing::post(
+                    move |ExtractJson(request): ExtractJson<serde_json::Value>| {
+                        let captured = Arc::clone(&captured);
+                        async move {
+                            let len = husker_agent_proto::base64_decode(
+                                request["data"].as_str().unwrap(),
+                            )
+                            .unwrap()
+                            .len();
+                            captured.lock().unwrap().push(request);
+                            Json(json!({ "bytes_written": len }))
+                        }
+                    },
+                ),
+            );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let data = vec![0x5a; FILE_WRITE_CHUNK_BYTES + 17];
+
+        let bytes = client
+            .write_file_bytes("demo", "/tmp/archive.tar.gz", &data, Some(0o600))
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, data.len() as u64);
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0]["path"], "/tmp/archive.tar.gz");
+        assert_eq!(writes[0]["append"], false);
+        assert_eq!(writes[1]["append"], true);
+        assert_eq!(writes[0]["mode"], 0o600);
+        assert_eq!(
+            husker_agent_proto::base64_decode(writes[0]["data"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            FILE_WRITE_CHUNK_BYTES
+        );
+        assert_eq!(
+            husker_agent_proto::base64_decode(writes[1]["data"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            17
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn complete_file_write_refuses_large_payload_for_legacy_agent() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/guest-info",
+            get(|| async {
+                Json(json!({
+                    "ipv4": [],
+                    "protocol_version": husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND - 1,
+                }))
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let data = vec![0; FILE_WRITE_CHUNK_BYTES + 1];
+
+        let error = client
+            .write_file_bytes("demo", "/tmp/archive.tar.gz", &data, None)
+            .await
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("protocol version"));
+        assert!(message.contains("predates append support"));
         task.abort();
     }
 

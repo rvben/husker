@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use husker_api::{ExecRequest, WriteFileRequest};
+use husker_api::ExecRequest;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite;
@@ -363,15 +363,7 @@ async fn write_guest_file(
     data: &[u8],
 ) -> anyhow::Result<()> {
     daemon
-        .write_file(
-            name,
-            &WriteFileRequest {
-                path: path.to_string(),
-                data: husker_agent_proto::base64_encode(data),
-                mode: None,
-                append: false,
-            },
-        )
+        .write_file_bytes(name, path, data, None)
         .await
         .with_context(|| format!("writing {path}"))?;
     Ok(())
@@ -1433,80 +1425,19 @@ async fn run(cli: Cli) -> Result<()> {
                         .with_context(|| format!("reading {}", local.display()))?;
                     let client = target.daemon().clone();
 
-                    if data.len() > CP_CHUNK_BYTES {
-                        // Large file: send it as a sequence of append-mode
-                        // chunks instead of one request the daemon would
-                        // reject outright. Before sending any chunk, confirm
-                        // the connected guest agent is new enough to honor
-                        // `append` - an older agent ignores it and truncates
-                        // on every write, which would silently corrupt the
-                        // destination to only the final chunk while cp still
-                        // reported success.
-                        let info = client.guest_info(&name).await?;
-                        if let Err(msg) = check_append_capable(info.protocol_version) {
-                            exit_with_error(output, msg);
-                        }
-
-                        let mut bytes_copied = 0u64;
-                        for (i, (start, end)) in cp_chunk_ranges(data.len(), CP_CHUNK_BYTES)
-                            .into_iter()
-                            .enumerate()
-                        {
-                            let chunk = &data[start..end];
-                            let result = client
-                                .write_file(
-                                    &name,
-                                    &WriteFileRequest {
-                                        path: path.clone(),
-                                        data: husker_agent_proto::base64_encode(chunk),
-                                        mode,
-                                        append: i > 0,
-                                    },
-                                )
-                                .await?;
-                            bytes_copied += result.bytes_written;
-                        }
-
-                        print_output(
-                            output,
-                            &serde_json::json!({
-                                "status": "ok",
-                                "action": "cp",
-                                "direction": "to_vm",
-                                "vm": name,
-                                "path": path,
-                                "bytes": bytes_copied,
-                            }),
-                            format!("{bytes_copied} bytes copied to {name}:{path}"),
-                        );
-                    } else {
-                        let encoded = husker_agent_proto::base64_encode(&data);
-
-                        let result = client
-                            .write_file(
-                                &name,
-                                &WriteFileRequest {
-                                    path: path.clone(),
-                                    data: encoded,
-                                    mode,
-                                    append: false,
-                                },
-                            )
-                            .await?;
-                        let bytes = result.bytes_written;
-                        print_output(
-                            output,
-                            &serde_json::json!({
-                                "status": "ok",
-                                "action": "cp",
-                                "direction": "to_vm",
-                                "vm": name,
-                                "path": path,
-                                "bytes": bytes,
-                            }),
-                            format!("{bytes} bytes copied to {name}:{path}"),
-                        );
-                    }
+                    let bytes = client.write_file_bytes(&name, &path, &data, mode).await?;
+                    print_output(
+                        output,
+                        &serde_json::json!({
+                            "status": "ok",
+                            "action": "cp",
+                            "direction": "to_vm",
+                            "vm": name,
+                            "path": path,
+                            "bytes": bytes,
+                        }),
+                        format!("{bytes} bytes copied to {name}:{path}"),
+                    );
                 }
                 (CpPath::Vm { name, path }, CpPath::Local(local)) => {
                     // Reads in chunks when the file is larger than one response
@@ -3823,61 +3754,6 @@ async fn run_shell_ws_bridge(
     }
 }
 
-/// Bytes per chunk when `cp` splits a local file for upload to a VM. The
-/// daemon rejects a single write-file request whose decoded payload exceeds
-/// `ApiPolicy::max_file_write_bytes` (1 MiB by default); that limit is not
-/// currently exposed to clients through any endpoint or response, so this is
-/// a fixed, conservative size comfortably under the default rather than a
-/// value probed from the daemon. A file at or under this size is still sent
-/// in a single request, unchanged from before chunking existed.
-const CP_CHUNK_BYTES: usize = 512 * 1024;
-
-/// Confirm a connected guest agent's reported protocol version supports
-/// append-mode writes, which chunked `cp` relies on to send a large file as a
-/// sequence of requests instead of one. An agent older than
-/// [`husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND`] has no code path
-/// for append at all and always truncates on every write, so sending it a
-/// chunked transfer would silently keep only the last chunk while the
-/// command still reports success. Fail loudly instead: name the guest's
-/// reported version and the version chunking requires, and say plainly that
-/// the VM's image predates append support.
-fn check_append_capable(guest_protocol_version: u32) -> Result<(), String> {
-    let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND;
-    if guest_protocol_version >= required {
-        Ok(())
-    } else {
-        Err(format!(
-            "cannot copy a file larger than {CP_CHUNK_BYTES} bytes to this VM: \
-             the guest agent reports protocol version {guest_protocol_version}, \
-             but chunked copy requires version {required} or newer. \
-             The VM's image predates append support in husker-agent; \
-             rebuild or re-import the image with a current husker-agent, \
-             or copy a file at or under {CP_CHUNK_BYTES} bytes."
-        ))
-    }
-}
-
-/// Split a file of `total_len` bytes into `(start, end)` byte ranges of at
-/// most `chunk_size` bytes each, covering the whole file with no gaps or
-/// overlap. `chunk_size` must be greater than zero. A zero-length file
-/// yields a single empty range `(0, 0)`, so a caller that always sends one
-/// request per range still issues exactly one (empty) write for an empty
-/// file, matching the non-chunked path.
-fn cp_chunk_ranges(total_len: usize, chunk_size: usize) -> Vec<(usize, usize)> {
-    debug_assert!(chunk_size > 0, "chunk_size must be greater than zero");
-    if total_len == 0 {
-        return vec![(0, 0)];
-    }
-    let mut ranges = Vec::with_capacity(total_len.div_ceil(chunk_size));
-    let mut start = 0;
-    while start < total_len {
-        let end = (start + chunk_size).min(total_len);
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
 enum CpPath {
     Local(PathBuf),
     Vm { name: String, path: String },
@@ -5353,80 +5229,6 @@ mod tests {
     #[test]
     fn parse_cp_path_empty_path_is_local() {
         assert!(matches!(parse_cp_path("vmname:"), CpPath::Local(_)));
-    }
-
-    #[test]
-    fn check_append_capable_accepts_current_and_newer_versions() {
-        let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND;
-        assert!(check_append_capable(required).is_ok());
-        assert!(check_append_capable(required + 1).is_ok());
-    }
-
-    #[test]
-    fn check_append_capable_refuses_legacy_agent_naming_both_versions() {
-        let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND;
-        let legacy_version = required.saturating_sub(1);
-        let err = check_append_capable(legacy_version).unwrap_err();
-        assert!(
-            err.contains(&legacy_version.to_string()),
-            "error must name the guest's reported version, got: {err}"
-        );
-        assert!(
-            err.contains(&required.to_string()),
-            "error must name the required version, got: {err}"
-        );
-        assert!(
-            err.to_lowercase().contains("predates"),
-            "error must say the image predates append support, got: {err}"
-        );
-    }
-
-    #[test]
-    fn check_append_capable_refuses_unversioned_legacy_agent() {
-        // An agent built before protocol versioning existed reports 0
-        // (`#[serde(default)]` on GuestInfoResponse.protocol_version).
-        let err = check_append_capable(0).unwrap_err();
-        assert!(
-            err.contains('0'),
-            "error must name reported version 0: {err}"
-        );
-    }
-
-    #[test]
-    fn cp_chunk_ranges_covers_whole_file_with_no_gaps_or_overlap() {
-        let total_len = 25;
-        let chunk_size = 7;
-        let ranges = cp_chunk_ranges(total_len, chunk_size);
-
-        // Boundary case: 25 is not an exact multiple of 7, so the last
-        // range must be short rather than out of bounds or padded.
-        assert_eq!(ranges, vec![(0, 7), (7, 14), (14, 21), (21, 25)]);
-
-        // Every byte covered exactly once.
-        let mut covered = vec![false; total_len];
-        for (start, end) in &ranges {
-            for b in covered.iter_mut().take(*end).skip(*start) {
-                assert!(!*b, "byte covered more than once");
-                *b = true;
-            }
-        }
-        assert!(covered.iter().all(|&b| b), "every byte must be covered");
-    }
-
-    #[test]
-    fn cp_chunk_ranges_exact_multiple_has_no_trailing_short_chunk() {
-        let ranges = cp_chunk_ranges(21, 7);
-        assert_eq!(ranges, vec![(0, 7), (7, 14), (14, 21)]);
-    }
-
-    #[test]
-    fn cp_chunk_ranges_smaller_than_chunk_size_is_one_range() {
-        assert_eq!(cp_chunk_ranges(3, 7), vec![(0, 3)]);
-    }
-
-    #[test]
-    fn cp_chunk_ranges_empty_file_yields_one_empty_range() {
-        assert_eq!(cp_chunk_ranges(0, 7), vec![(0, 0)]);
     }
 
     #[test]
