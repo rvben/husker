@@ -672,35 +672,6 @@ async fn run(cli: Cli) -> Result<()> {
     // account before downstream branches compare the selected format.
     let output = resolve_command_format(raw_output, &command);
 
-    if matches!(&command, Commands::Schema) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&build_cli_schema()).expect("schema serializes")
-        );
-        return Ok(());
-    }
-    if matches!(&command, Commands::Capabilities) {
-        let capabilities = serde_json::json!({
-            "name": "husker",
-            "version": env!("CARGO_PKG_VERSION"),
-            "clispec": "0.3",
-            "output": ["text", "json"],
-            "features": ["schema", "pagination", "field selection", "offline introspection"]
-        });
-        if output == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&capabilities).expect("capabilities serialize")
-            );
-        } else {
-            println!(
-                "husker {} - clispec 0.3; text/json output, pagination, field selection",
-                env!("CARGO_PKG_VERSION")
-            );
-        }
-        return Ok(());
-    }
-
     // Context management is local-only; handle it before resolving a daemon URL.
     if let Commands::Context { action } = command {
         return context_command(action, output);
