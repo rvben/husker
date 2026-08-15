@@ -752,7 +752,8 @@ async fn run(cli: Cli) -> Result<()> {
             "version": env!("CARGO_PKG_VERSION"),
             "clispec": "0.3",
             "output": ["text", "json"],
-            "features": ["schema", "pagination", "field selection", "read-only introspection"]
+            "features": ["schema", "pagination", "field selection", "read-only introspection"],
+            "embedded_agent": husker::agent_embedded(),
         });
         if output == OutputFormat::Json {
             println!(
@@ -761,8 +762,13 @@ async fn run(cli: Cli) -> Result<()> {
             );
         } else {
             println!(
-                "husker {} - clispec 0.3; text/json output, pagination, field selection",
-                env!("CARGO_PKG_VERSION")
+                "husker {} - clispec 0.3; text/json output, pagination, field selection; embedded agent: {}",
+                env!("CARGO_PKG_VERSION"),
+                if husker::agent_embedded() {
+                    "yes"
+                } else {
+                    "no"
+                },
             );
         }
         return Ok(());

@@ -1176,6 +1176,7 @@ const CAPABILITIES_OUTPUT: &[F] = &[
     F::required("clispec", T::String),
     F::required("output", T::Array),
     F::required("features", T::Array),
+    F::required("embedded_agent", T::Boolean),
 ];
 const PF_ADD: &[F] = &[
     F::required("status", T::String),
