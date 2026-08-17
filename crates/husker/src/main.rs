@@ -4015,7 +4015,7 @@ fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
         ),
     }
 
-    #[cfg(feature = "linux-net")]
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
     {
         match find_in_path(&config.firecracker_bin) {
             Some(path) => report.push("firecracker_bin", "ok", path.display().to_string()),
@@ -4364,7 +4364,7 @@ fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()
         Err(err) => println!("  images_base_url ({url}) ... FAIL ({err}){base_url_env_hint}"),
     }
 
-    #[cfg(feature = "linux-net")]
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
     {
         let fc_from_env = std::env::var("HUSKER_FIRECRACKER_BIN").is_ok();
         let iface_from_env = std::env::var("HUSKER_HOST_INTERFACE").is_ok();

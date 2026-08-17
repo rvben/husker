@@ -1,7 +1,5 @@
 use std::net::SocketAddr;
 use std::path::Path;
-#[cfg(not(all(not(feature = "linux-net"), target_os = "macos")))]
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -92,7 +90,7 @@ pub(crate) fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
 /// when `HUSKER_AUTO_INSTALL_FIRECRACKER=1` is set, prompt interactively on a
 /// TTY, or bail with a hint otherwise.
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
-pub(crate) async fn ensure_firecracker(config: &Config) -> anyhow::Result<PathBuf> {
+pub(crate) async fn ensure_firecracker(config: &Config) -> anyhow::Result<std::path::PathBuf> {
     if let Some(p) = find_in_path(&config.firecracker_bin) {
         return Ok(p);
     }
@@ -198,8 +196,8 @@ mod auto_install_tests {
 }
 
 /// Check if a binary name can be found in PATH.
-#[cfg(feature = "linux-net")]
-pub(crate) fn find_in_path(name: &Path) -> Option<PathBuf> {
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+pub(crate) fn find_in_path(name: &Path) -> Option<std::path::PathBuf> {
     if name.is_absolute() {
         return name.is_file().then(|| name.to_path_buf());
     }
@@ -680,7 +678,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         // The API server can still run; VM operations will fail at create time
         // because no networking is configured. Primarily used by CI drills.
         let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
-            PathBuf::from("firecracker"),
+            std::path::PathBuf::from("firecracker"),
             &runtime_dir,
             std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
         );
