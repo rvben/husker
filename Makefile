@@ -55,9 +55,9 @@ build-release-with-agent: build-agent
 	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/x86_64-unknown-linux-musl/agent/husker-agent" \
 		cargo build --release -p husker
 
-# Optimized deployment build with faster ThinLTO. The transactional deployment
-# script copies this immutable artifact out of the shared build cache before
-# cutover, so concurrent rollouts cannot replace the candidate being verified.
+# Optimized, stripped deployment build without release LTO. The transactional
+# deployment script copies this immutable artifact out of the shared build cache
+# before cutover, so concurrent rollouts cannot replace the candidate verified.
 build-deploy-with-agent: build-agent
 	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/x86_64-unknown-linux-musl/agent/husker-agent" \
 		cargo build --profile deploy -p husker
