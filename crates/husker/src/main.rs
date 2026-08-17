@@ -1276,9 +1276,8 @@ async fn run(cli: Cli) -> Result<()> {
                 timeout_secs: timeout,
             };
 
-            let client = target.daemon().clone();
-            let result = client.exec(&name, &request).await?;
             if output == OutputFormat::Json {
+                let result = target.daemon().exec(&name, &request).await?;
                 print_output(
                     output,
                     &serde_json::json!({
@@ -1289,7 +1288,16 @@ async fn run(cli: Cli) -> Result<()> {
                     }),
                     "",
                 );
+                if result.exit_code != 0 {
+                    std::process::exit(result.exit_code);
+                }
+            } else if let Some(exit_code) = run_exec_ws(&target, &name, &request).await? {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
             } else {
+                // Compatibility with daemons that predate the streaming route.
+                let result = target.daemon().exec(&name, &request).await?;
                 let stdout = &result.stdout;
                 let stderr = &result.stderr;
                 if !stdout.is_empty() {
@@ -1298,10 +1306,9 @@ async fn run(cli: Cli) -> Result<()> {
                 if !stderr.is_empty() {
                     eprint!("{stderr}");
                 }
-            }
-            let exit_code = result.exit_code;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+                if result.exit_code != 0 {
+                    std::process::exit(result.exit_code);
+                }
             }
             Ok(())
         }
@@ -3503,10 +3510,90 @@ async fn secret_command(
     Ok(())
 }
 
-use husker_api::{WsShellInput, WsShellOutput};
+use husker_api::{WsExecInput, WsExecOutput, WsShellInput, WsShellOutput};
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Stream one non-interactive command over the daemon WebSocket. `None` means
+/// the selected daemon predates the route and the caller should use buffered
+/// exec. Errors after a successful upgrade are never retried, preventing an
+/// interrupted command from being executed twice.
+async fn run_exec_ws(
+    target: &DaemonTarget,
+    name: &str,
+    request: &ExecRequest,
+) -> Result<Option<i32>> {
+    let ws_url = target
+        .api_url()
+        .replacen("http://", "ws://", 1)
+        .replacen("https://", "wss://", 1);
+    let url = format!("{ws_url}/v1/vms/{name}/exec/stream");
+    let mut ws_request = url
+        .into_client_request()
+        .context("building exec websocket request")?;
+    if let Some(token) = target.api_token() {
+        let header = tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("invalid API token for websocket auth header")?;
+        ws_request
+            .headers_mut()
+            .insert(tungstenite::http::header::AUTHORIZATION, header);
+    }
+    let (mut ws, _) = match tokio_tungstenite::connect_async(ws_request).await {
+        Ok(value) => value,
+        Err(tungstenite::Error::Http(response))
+            if matches!(
+                response.status(),
+                tungstenite::http::StatusCode::NOT_FOUND
+                    | tungstenite::http::StatusCode::METHOD_NOT_ALLOWED
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("connecting to exec WebSocket"),
+    };
+    let start = serde_json::to_string(&WsExecInput::Start {
+        request: ExecRequest {
+            command: request.command.clone(),
+            args: request.args.clone(),
+            working_dir: request.working_dir.clone(),
+            env: request.env.clone(),
+            secret_env: request.secret_env.clone(),
+            connect_timeout_secs: request.connect_timeout_secs,
+            timeout_secs: request.timeout_secs,
+        },
+    })?;
+    ws.send(tungstenite::Message::Text(start.into())).await?;
+
+    while let Some(message) = ws.next().await {
+        match message? {
+            tungstenite::Message::Text(text) => {
+                match serde_json::from_str::<WsExecOutput>(&text)? {
+                    WsExecOutput::Started => {}
+                    WsExecOutput::Stdout { data } => {
+                        let bytes = husker_agent_proto::base64_decode(&data)
+                            .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
+                        use std::io::Write;
+                        std::io::stdout().write_all(&bytes)?;
+                        std::io::stdout().flush()?;
+                    }
+                    WsExecOutput::Stderr { data } => {
+                        let bytes = husker_agent_proto::base64_decode(&data)
+                            .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
+                        use std::io::Write;
+                        std::io::stderr().write_all(&bytes)?;
+                        std::io::stderr().flush()?;
+                    }
+                    WsExecOutput::Exit { exit_code } => return Ok(Some(exit_code)),
+                    WsExecOutput::Error { message } => anyhow::bail!("exec failed: {message}"),
+                }
+            }
+            tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    anyhow::bail!("exec stream closed before an exit status")
+}
 
 /// Run an interactive shell session inside a VM.
 ///

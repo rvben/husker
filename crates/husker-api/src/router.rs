@@ -28,6 +28,9 @@ pub(crate) fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'sta
     if *method == Method::POST && path.ends_with("/exec") {
         return Some("exec");
     }
+    if *method == Method::GET && path.ends_with("/exec/stream") {
+        return Some("exec");
+    }
     if *method == Method::POST && path.ends_with("/files/read") {
         return Some("file_read");
     }
@@ -123,6 +126,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms/{name}/suspend", post(suspend_vm::<B>))
         .route("/v1/vms/{name}/fork", post(fork_vm::<B>))
         .route("/v1/vms/{name}/exec", post(exec_vm::<B>))
+        .route("/v1/vms/{name}/exec/stream", get(exec_ws::<B>))
         .route("/v1/vms/{name}/files/read", post(read_file_handler::<B>))
         .route("/v1/vms/{name}/files/write", post(write_file_handler::<B>))
         .route("/v1/vms/{name}/shell", get(shell_ws::<B>))

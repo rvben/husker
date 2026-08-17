@@ -44,7 +44,9 @@ pub use husker_state::{
 };
 pub use husker_vmm::{VmInfo, VmState};
 
-pub use agent_client::{AgentClient, AgentConnection, AgentError, ExecResult, ShellEvent};
+pub use agent_client::{
+    AgentClient, AgentConnection, AgentError, ExecResult, ExecStreamEvent, ShellEvent,
+};
 #[cfg(feature = "linux-net")]
 pub use oci_materializer::{
     LocalOciImageMaterializer, MaterializedOciImage, OciImageMaterializer, OciMaterializationError,

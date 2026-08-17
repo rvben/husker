@@ -275,6 +275,24 @@ pub struct ExecResponse {
     pub stderr: String,
 }
 
+/// Initial message sent over the streamed-exec WebSocket.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsExecInput {
+    Start { request: ExecRequest },
+}
+
+/// Binary-safe events returned by the streamed-exec WebSocket.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsExecOutput {
+    Started,
+    Stdout { data: String },
+    Stderr { data: String },
+    Exit { exit_code: i32 },
+    Error { message: String },
+}
+
 // ── File Types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

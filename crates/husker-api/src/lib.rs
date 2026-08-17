@@ -223,6 +223,7 @@ pub(crate) fn max_vms() -> Option<usize> {
         destroy_vm,
         set_balloon,
         exec_vm,
+        exec_ws,
         read_file_handler,
         write_file_handler,
         shell_ws,
@@ -270,6 +271,8 @@ pub(crate) fn max_vms() -> Option<usize> {
         LogsQuery,
         WsShellInput,
         WsShellOutput,
+        WsExecInput,
+        WsExecOutput,
         CreateHostGroupRequest,
         CreateServiceRequest,
         CreateSnapshotRequest,
@@ -1731,6 +1734,7 @@ mod tests {
         assert!(is_protected_route("/v1/vms/example/stop"));
         assert!(is_protected_route("/v1/vms/example"));
         assert!(is_protected_route("/v1/vms/example/shell"));
+        assert!(is_protected_route("/v1/vms/example/exec/stream"));
         assert!(is_protected_route("/v1/vms/example/logs"));
         assert!(is_protected_route("/v1/vms/example/ready"));
         assert!(is_protected_route("/v1/volumes/data"));
@@ -2066,6 +2070,10 @@ mod tests {
     fn rate_limited_route_classification() {
         assert_eq!(
             is_rate_limited_route(&Method::POST, "/v1/vms/test/exec"),
+            Some("exec")
+        );
+        assert_eq!(
+            is_rate_limited_route(&Method::GET, "/v1/vms/test/exec/stream"),
             Some("exec")
         );
         assert_eq!(

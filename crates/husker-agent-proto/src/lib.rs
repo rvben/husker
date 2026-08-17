@@ -12,6 +12,9 @@ pub enum AgentRequest {
     /// Execute a command inside the VM.
     Exec(ExecRequest),
 
+    /// Execute a command and return stdout/stderr as bounded chunks while it runs.
+    ExecStream(ExecRequest),
+
     /// Read a file from the guest filesystem.
     ReadFile(ReadFileRequest),
 
@@ -52,6 +55,18 @@ pub enum AgentRequest {
 pub enum AgentResponse {
     /// Result of a command execution.
     Exec(ExecResponse),
+
+    /// A streamed command was spawned successfully.
+    ExecStarted,
+
+    /// One binary-safe stdout chunk from a streamed command.
+    ExecStdout(ExecStreamData),
+
+    /// One binary-safe stderr chunk from a streamed command.
+    ExecStderr(ExecStreamData),
+
+    /// A streamed command exited and no more chunks will follow.
+    ExecExit(ExecStreamExit),
 
     /// Contents of a file read from the guest.
     ReadFile(ReadFileResponse),
@@ -145,6 +160,17 @@ pub struct ExecResponse {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecStreamData {
+    /// Base64-encoded bytes. Exec output is not required to be UTF-8.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecStreamExit {
+    pub exit_code: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,7 +368,7 @@ pub const AGENT_VSOCK_PORT: u32 = 52;
 /// Bump this whenever the framed message contract changes in a way that a peer
 /// must be aware of. The agent reports it via [`GuestInfoResponse`], and the
 /// host warns when a connected guest reports a different (non-zero) version.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Minimum [`PROTOCOL_VERSION`] an agent must report for `WriteFileRequest.append`
 /// to be honoured. An agent older than this always truncates on every write, so
@@ -360,6 +386,10 @@ pub const MIN_PROTOCOL_VERSION_FOR_APPEND: u32 = 2;
 /// a read must check the guest's reported version against this constant and
 /// fail loudly instead.
 pub const MIN_PROTOCOL_VERSION_FOR_RANGED_READ: u32 = 3;
+
+/// Minimum protocol version supporting [`AgentRequest::ExecStream`]. Hosts
+/// must fall back to buffered [`AgentRequest::Exec`] for older guest images.
+pub const MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM: u32 = 4;
 
 /// Default wall-clock deadline for receiving a single framed payload once
 /// the length prefix has been read. Callers who need a different bound can
@@ -641,7 +671,42 @@ mod tests {
             }
             other => panic!("expected GuestInfo, got {other:?}"),
         }
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM, 4);
+    }
+
+    #[test]
+    fn streamed_exec_messages_round_trip_binary_data_and_exit() {
+        let req = AgentRequest::ExecStream(ExecRequest {
+            command: "build".into(),
+            args: vec!["--verbose".into()],
+            working_dir: Some("/work".into()),
+            env: vec![("HOME".into(), "/root".into())],
+            timeout_secs: Some(60),
+        });
+        let bytes = serde_json::to_vec(&req).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<AgentRequest>(&bytes).unwrap(),
+            AgentRequest::ExecStream(_)
+        ));
+
+        let bytes = serde_json::to_vec(&AgentResponse::ExecStdout(ExecStreamData {
+            data: base64_encode(&[0, 0xff, b'\n']),
+        }))
+        .unwrap();
+        match serde_json::from_slice::<AgentResponse>(&bytes).unwrap() {
+            AgentResponse::ExecStdout(chunk) => {
+                assert_eq!(base64_decode(&chunk.data).unwrap(), [0, 0xff, b'\n']);
+            }
+            other => panic!("expected stdout chunk, got {other:?}"),
+        }
+
+        let exit = AgentResponse::ExecExit(ExecStreamExit { exit_code: 42 });
+        let bytes = serde_json::to_vec(&exit).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<AgentResponse>(&bytes).unwrap(),
+            AgentResponse::ExecExit(ExecStreamExit { exit_code: 42 })
+        ));
     }
 
     #[test]

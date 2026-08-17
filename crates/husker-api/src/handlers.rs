@@ -16,9 +16,10 @@ use tracing::{debug, info, warn};
 use husker_core::{
     BootKind, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest, CreateServiceRequest,
     CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest, DiagnosticsReport,
-    ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
-    ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
-    ServiceRecord, ShellEvent, SnapshotRecord, VmLifecycleState, VmRecord, VolumeRecord,
+    ExecStreamEvent, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore,
+    ImageRecord, ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest,
+    SecretMetadata, ServiceRecord, ShellEvent, SnapshotRecord, VmLifecycleState, VmRecord,
+    VolumeRecord,
 };
 use husker_vmm::VmmBackend;
 
@@ -1312,35 +1313,8 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<ErrorResponse>)> {
     let policy = current_policy();
-    if !exec_command_allowed(&req.command, &policy) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            error_response_with_hint(
-                "policy_exec_command_denied",
-                format!("command '{}' is blocked by execution policy", req.command),
-                "adjust exec allow/deny policy",
-            ),
-        ));
-    }
-    // Resolve secret references to plaintext inside the daemon (it holds the
-    // key), so only secret NAMES are ever sent by the client - the value never
-    // appears in argv, the process table, or shell history. A secret overrides
-    // `env` on a key clash.
-    let mut resolved_env = req.env.clone();
-    for (env_key, secret_name) in &req.secret_env {
-        let revealed = core.reveal_secret(secret_name).map_err(map_error)?;
-        resolved_env.insert(env_key.clone(), revealed.value);
-    }
-    if !exec_env_allowed(&resolved_env, &policy) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            error_response_with_hint(
-                "policy_exec_env_denied",
-                "one or more environment keys are not allowed",
-                "adjust exec env allowlist policy",
-            ),
-        ));
-    }
+    let resolved_env =
+        resolve_exec_environment(core.as_ref(), &req, &policy).map_err(|error| *error)?;
     info!(
         audit = "exec_request",
         vm = %name,
@@ -1408,6 +1382,286 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
         stdout: result.stdout,
         stderr: result.stderr,
     }))
+}
+
+/// Apply execution policy and resolve secret references without duplicating
+/// security-sensitive logic between buffered and streaming transports.
+type BoxedHandlerError = Box<(StatusCode, Json<ErrorResponse>)>;
+
+fn resolve_exec_environment<B: VmmBackend + 'static>(
+    core: &HuskerCore<B>,
+    req: &ExecRequest,
+    policy: &ApiPolicy,
+) -> Result<HashMap<String, String>, BoxedHandlerError> {
+    if !exec_command_allowed(&req.command, policy) {
+        return Err(Box::new((
+            StatusCode::FORBIDDEN,
+            error_response_with_hint(
+                "policy_exec_command_denied",
+                format!("command '{}' is blocked by execution policy", req.command),
+                "adjust exec allow/deny policy",
+            ),
+        )));
+    }
+    let mut resolved_env = req.env.clone();
+    for (env_key, secret_name) in &req.secret_env {
+        let revealed = core
+            .reveal_secret(secret_name)
+            .map_err(map_error)
+            .map_err(Box::new)?;
+        resolved_env.insert(env_key.clone(), revealed.value);
+    }
+    if !exec_env_allowed(&resolved_env, policy) {
+        return Err(Box::new((
+            StatusCode::FORBIDDEN,
+            error_response_with_hint(
+                "policy_exec_env_denied",
+                "one or more environment keys are not allowed",
+                "adjust exec env allowlist policy",
+            ),
+        )));
+    }
+    Ok(resolved_env)
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/vms/{name}/exec/stream",
+    tag = "exec",
+    params(("name" = String, Path, description = "VM name")),
+    responses(
+        (status = 101, description = "WebSocket upgrade for streamed command execution"),
+        (status = 404, description = "VM not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn exec_ws<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(name): Path<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    info!(audit = "exec_stream_upgrade", vm = %name);
+    ws.on_upgrade(move |socket| exec_ws_session(core, name, socket))
+}
+
+async fn exec_ws_session<B: VmmBackend + 'static>(
+    core: Arc<HuskerCore<B>>,
+    name: String,
+    mut ws: WebSocket,
+) {
+    let req = match ws.recv().await {
+        Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsExecInput>(&text) {
+            Ok(WsExecInput::Start { request }) => request,
+            Err(e) => {
+                let _ = send_exec_ws_output(
+                    &mut ws,
+                    &WsExecOutput::Error {
+                        message: format!("invalid start message: {e}"),
+                    },
+                )
+                .await;
+                return;
+            }
+        },
+        _ => return,
+    };
+    let policy = current_policy();
+    let resolved_env = match resolve_exec_environment(core.as_ref(), &req, &policy) {
+        Ok(env) => env,
+        Err(error) => {
+            let (_, error) = *error;
+            let _ = send_exec_ws_output(
+                &mut ws,
+                &WsExecOutput::Error {
+                    message: error.message.clone(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let record = match core.get_vm(&name).map_err(map_error) {
+        Ok(record) => record,
+        Err((_, error)) => {
+            let _ = send_exec_ws_output(
+                &mut ws,
+                &WsExecOutput::Error {
+                    message: error.message.clone(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let mut conn = match core
+        .agent_connect_ready(
+            &name,
+            resolve_exec_connect_timeout(req.connect_timeout_secs, record.boot_mode),
+        )
+        .await
+    {
+        Ok(conn) => conn,
+        Err(error) => {
+            let _ = send_exec_ws_output(
+                &mut ws,
+                &WsExecOutput::Error {
+                    message: error.to_string(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let args: Vec<&str> = req.args.iter().map(String::as_str).collect();
+    let env: Vec<(&str, &str)> = resolved_env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let run_timeout = resolve_exec_run_timeout(req.timeout_secs, &policy);
+    let guest_version = match conn.guest_info().await {
+        Ok(info) => info.protocol_version,
+        Err(error) => {
+            let _ = send_exec_ws_output(
+                &mut ws,
+                &WsExecOutput::Error {
+                    message: format!("guest capability check failed: {error}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    if guest_version < husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM {
+        // Compatibility for VMs created from older images: the transport still
+        // works, but output arrives as two final chunks after completion.
+        if send_exec_ws_output(&mut ws, &WsExecOutput::Started)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let result = conn
+            .exec_with_timeout(
+                &req.command,
+                &args,
+                req.working_dir.as_deref(),
+                &env,
+                Some(run_timeout.as_secs()),
+            )
+            .await;
+        match result {
+            Ok(result) => {
+                if !result.stdout.is_empty() {
+                    let _ = send_exec_ws_output(
+                        &mut ws,
+                        &WsExecOutput::Stdout {
+                            data: husker_agent_proto::base64_encode(result.stdout.as_bytes()),
+                        },
+                    )
+                    .await;
+                }
+                if !result.stderr.is_empty() {
+                    let _ = send_exec_ws_output(
+                        &mut ws,
+                        &WsExecOutput::Stderr {
+                            data: husker_agent_proto::base64_encode(result.stderr.as_bytes()),
+                        },
+                    )
+                    .await;
+                }
+                let _ = send_exec_ws_output(
+                    &mut ws,
+                    &WsExecOutput::Exit {
+                        exit_code: result.exit_code,
+                    },
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = send_exec_ws_output(
+                    &mut ws,
+                    &WsExecOutput::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+        return;
+    }
+
+    if let Err(error) = conn
+        .exec_stream_start(
+            &req.command,
+            &args,
+            req.working_dir.as_deref(),
+            &env,
+            Some(run_timeout.as_secs()),
+        )
+        .await
+    {
+        let _ = send_exec_ws_output(
+            &mut ws,
+            &WsExecOutput::Error {
+                message: error.to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+    if send_exec_ws_output(&mut ws, &WsExecOutput::Started)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let grace = run_timeout + Duration::from_secs(30);
+    let bridge = async {
+        loop {
+            let output = match conn.exec_stream_recv().await {
+                Ok(ExecStreamEvent::Stdout(data)) => WsExecOutput::Stdout {
+                    data: husker_agent_proto::base64_encode(&data),
+                },
+                Ok(ExecStreamEvent::Stderr(data)) => WsExecOutput::Stderr {
+                    data: husker_agent_proto::base64_encode(&data),
+                },
+                Ok(ExecStreamEvent::Exit(exit_code)) => {
+                    send_exec_ws_output(&mut ws, &WsExecOutput::Exit { exit_code }).await?;
+                    return Ok::<i32, axum::Error>(exit_code);
+                }
+                Err(error) => {
+                    let output = WsExecOutput::Error {
+                        message: error.to_string(),
+                    };
+                    send_exec_ws_output(&mut ws, &output).await?;
+                    return Ok(-1);
+                }
+            };
+            send_exec_ws_output(&mut ws, &output).await?;
+        }
+    };
+    match tokio::time::timeout(grace, bridge).await {
+        Ok(Ok(exit_code)) => {
+            metrics().exec_total.fetch_add(1, Ordering::Relaxed);
+            info!(audit = "exec_stream_result", vm = %name, exit_code);
+        }
+        Ok(Err(_)) => {}
+        Err(_) => {
+            let _ = send_exec_ws_output(
+                &mut ws,
+                &WsExecOutput::Error {
+                    message: "command execution timed out and the agent did not respond".into(),
+                },
+            )
+            .await;
+        }
+    }
+    let _ = ws.send(Message::Close(None)).await;
+}
+
+async fn send_exec_ws_output(ws: &mut WebSocket, output: &WsExecOutput) -> Result<(), axum::Error> {
+    let text = serde_json::to_string(output).expect("WsExecOutput serializes");
+    ws.send(Message::Text(text.into())).await
 }
 
 #[utoipa::path(

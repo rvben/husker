@@ -128,6 +128,68 @@ async fn exec_has_a_default_home() {
 }
 
 #[tokio::test]
+async fn exec_stream_delivers_output_before_exit_and_keeps_stderr_separate() {
+    let mut stream = spawn_agent().await;
+    let request = AgentRequest::ExecStream(ExecRequest {
+        command: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "printf early; sleep 1; printf late; printf error >&2; exit 7".into(),
+        ],
+        working_dir: None,
+        env: vec![],
+        timeout_secs: Some(5),
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    assert!(matches!(
+        read_message::<AgentResponse, _>(&mut stream)
+            .await
+            .unwrap()
+            .unwrap(),
+        AgentResponse::ExecStarted
+    ));
+    let first = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_message::<AgentResponse, _>(&mut stream),
+    )
+    .await
+    .expect("first chunk must arrive while the command is still sleeping")
+    .unwrap()
+    .unwrap();
+    match first {
+        AgentResponse::ExecStdout(chunk) => {
+            assert_eq!(base64_decode(&chunk.data).unwrap(), b"early");
+        }
+        other => panic!("expected early stdout, got {other:?}"),
+    }
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    loop {
+        match read_message::<AgentResponse, _>(&mut stream)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentResponse::ExecStdout(chunk) => {
+                stdout.extend(base64_decode(&chunk.data).unwrap());
+            }
+            AgentResponse::ExecStderr(chunk) => {
+                stderr.extend(base64_decode(&chunk.data).unwrap());
+            }
+            AgentResponse::ExecExit(exit) => {
+                assert_eq!(exit.exit_code, 7);
+                break;
+            }
+            other => panic!("unexpected streamed response: {other:?}"),
+        }
+    }
+    assert_eq!(stdout, b"late");
+    assert_eq!(stderr, b"error");
+}
+
+#[tokio::test]
 async fn exec_times_out_on_long_running_command() {
     // Safety: test is serialized by `serial_test`-free convention here because
     // no other test reads this env var, and they all use commands that finish

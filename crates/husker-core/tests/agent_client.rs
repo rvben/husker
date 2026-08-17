@@ -146,6 +146,34 @@ async fn client_exec_failure() {
 }
 
 #[tokio::test]
+async fn client_exec_stream_preserves_binary_chunks_and_exit_status() {
+    let (_dir, path) = spawn_agent().await;
+    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    conn.exec_stream_start(
+        "sh",
+        &["-c", "printf '\\001\\377'; printf err >&2; exit 9"],
+        None,
+        &[],
+        Some(5),
+    )
+    .await
+    .unwrap();
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = loop {
+        match conn.exec_stream_recv().await.unwrap() {
+            husker_core::ExecStreamEvent::Stdout(data) => stdout.extend(data),
+            husker_core::ExecStreamEvent::Stderr(data) => stderr.extend(data),
+            husker_core::ExecStreamEvent::Exit(code) => break code,
+        }
+    };
+    assert_eq!(stdout, [1, 0xff]);
+    assert_eq!(stderr, b"err");
+    assert_eq!(exit, 9);
+}
+
+#[tokio::test]
 async fn client_write_and_read_file() {
     let (_dir, path) = spawn_agent().await;
 

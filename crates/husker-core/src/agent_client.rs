@@ -298,6 +298,57 @@ where
         }
     }
 
+    /// Start a binary-safe, backpressured non-interactive exec stream.
+    /// The connection is dedicated to this command until [`Self::exec_stream_recv`]
+    /// returns [`ExecStreamEvent::Exit`]. Callers must first confirm the guest
+    /// protocol supports streamed exec.
+    pub async fn exec_stream_start(
+        &mut self,
+        command: &str,
+        args: &[&str],
+        working_dir: Option<&str>,
+        env: &[(&str, &str)],
+        timeout_secs: Option<u64>,
+    ) -> Result<(), AgentError> {
+        let request = AgentRequest::ExecStream(ExecRequest {
+            command: command.into(),
+            args: args.iter().map(|s| (*s).into()).collect(),
+            working_dir: working_dir.map(Into::into),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+            timeout_secs,
+        });
+        write_message(&mut self.stream, &request).await?;
+        match read_message::<AgentResponse, _>(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?
+        {
+            AgentResponse::ExecStarted => Ok(()),
+            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    /// Receive the next stdout, stderr, or exit event from a streamed exec.
+    pub async fn exec_stream_recv(&mut self) -> Result<ExecStreamEvent, AgentError> {
+        match read_message::<AgentResponse, _>(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?
+        {
+            AgentResponse::ExecStdout(chunk) => base64_decode(&chunk.data)
+                .map(ExecStreamEvent::Stdout)
+                .map_err(|e| AgentError::Agent(format!("base64 decode failed: {e}"))),
+            AgentResponse::ExecStderr(chunk) => base64_decode(&chunk.data)
+                .map(ExecStreamEvent::Stderr)
+                .map_err(|e| AgentError::Agent(format!("base64 decode failed: {e}"))),
+            AgentResponse::ExecExit(exit) => Ok(ExecStreamEvent::Exit(exit.exit_code)),
+            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
     /// Read a file from the guest filesystem in full, subject to the agent's
     /// own single-response ceiling.
     pub async fn read_file(&mut self, path: &str) -> Result<Vec<u8>, AgentError> {
@@ -460,6 +511,14 @@ pub struct ExecResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Events received during a non-interactive exec stream.
+#[derive(Debug)]
+pub enum ExecStreamEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(i32),
 }
 
 /// Events received during a shell session.

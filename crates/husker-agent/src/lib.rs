@@ -18,10 +18,11 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ExecResponse, GuestInfoResponse,
-    OCI_CONFIG_PATH, OciRuntimeConfig, ReadFileResponse, ReconfigureNetworkRequest,
-    ReconfigureNetworkResponse, ShellDataResponse, ShellExitResponse, ShellStartRequest,
-    WriteFileResponse, base64_decode, base64_encode, read_message, write_message,
+    AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ExecResponse, ExecStreamData,
+    ExecStreamExit, GuestInfoResponse, OCI_CONFIG_PATH, OciRuntimeConfig, ReadFileResponse,
+    ReconfigureNetworkRequest, ReconfigureNetworkResponse, ShellDataResponse, ShellExitResponse,
+    ShellStartRequest, WriteFileResponse, base64_decode, base64_encode, read_message,
+    write_message,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
@@ -41,6 +42,10 @@ where
         };
 
         match request {
+            AgentRequest::ExecStream(req) => {
+                // Streaming exec owns the connection until the command exits.
+                return handle_exec_stream(&mut stream, req).await;
+            }
             AgentRequest::ShellStart(req) => {
                 // Shell takes over the connection — no more request/response loop
                 return handle_shell(&mut stream, req).await;
@@ -51,6 +56,110 @@ where
             }
         }
     }
+}
+
+/// Run a non-interactive command while forwarding stdout and stderr as bounded,
+/// binary-safe frames. Each write is awaited, so a slow host naturally applies
+/// backpressure without unbounded guest memory growth.
+async fn handle_exec_stream<S>(stream: &mut S, req: ExecRequest) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut cmd, timeout) = match build_exec_command(&req) {
+        Ok(value) => value,
+        Err(error) => {
+            write_message(stream, &AgentResponse::Error(error)).await?;
+            return Ok(());
+        }
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            write_message(
+                stream,
+                &AgentResponse::Error(ErrorResponse {
+                    message: format!("exec failed: {e}"),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    write_message(stream, &AgentResponse::ExecStarted).await?;
+
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut exit_code = None;
+    let mut drain_deadline = None;
+    let timeout_sleep = tokio::time::sleep(timeout);
+    tokio::pin!(timeout_sleep);
+    let mut stdout_buf = [0u8; 8192];
+    let mut stderr_buf = [0u8; 8192];
+
+    loop {
+        if exit_code.is_some() && !stdout_open && !stderr_open {
+            break;
+        }
+        tokio::select! {
+            read = stdout.read(&mut stdout_buf), if stdout_open => {
+                match read {
+                    Ok(0) | Err(_) => stdout_open = false,
+                    Ok(n) => {
+                        write_message(stream, &AgentResponse::ExecStdout(ExecStreamData {
+                            data: base64_encode(&stdout_buf[..n]),
+                        })).await?;
+                    }
+                }
+            }
+            read = stderr.read(&mut stderr_buf), if stderr_open => {
+                match read {
+                    Ok(0) | Err(_) => stderr_open = false,
+                    Ok(n) => {
+                        write_message(stream, &AgentResponse::ExecStderr(ExecStreamData {
+                            data: base64_encode(&stderr_buf[..n]),
+                        })).await?;
+                    }
+                }
+            }
+            status = child.wait(), if exit_code.is_none() => {
+                exit_code = Some(status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1));
+                drain_deadline = Some(tokio::time::Instant::now() + EXEC_DRAIN_GRACE);
+            }
+            _ = &mut timeout_sleep, if exit_code.is_none() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                exit_code = Some(124);
+                let note = format!(
+                    "[husker: exec timed out after {}s; output above is partial]",
+                    timeout.as_secs()
+                );
+                write_message(stream, &AgentResponse::ExecStderr(ExecStreamData {
+                    data: base64_encode(note.as_bytes()),
+                })).await?;
+                drain_deadline = Some(tokio::time::Instant::now() + EXEC_DRAIN_GRACE);
+            }
+            _ = async {
+                match drain_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if exit_code.is_some() => break,
+        }
+    }
+
+    write_message(
+        stream,
+        &AgentResponse::ExecExit(ExecStreamExit {
+            exit_code: exit_code.unwrap_or(-1),
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn handle_shell<S>(stream: &mut S, req: ShellStartRequest) -> Result<()>
@@ -606,6 +715,30 @@ fn resolve_command_env(
     }
 }
 
+/// Build the child process shared by buffered and streaming exec paths.
+fn build_exec_command(
+    req: &ExecRequest,
+) -> Result<(tokio::process::Command, std::time::Duration), ErrorResponse> {
+    let timeout = resolve_exec_timeout(req.timeout_secs);
+    let plan = plan_exec(req, oci_runtime_config()).map_err(|message| ErrorResponse { message })?;
+    let mut cmd = tokio::process::Command::new(&plan.program);
+    cmd.args(&plan.args)
+        .current_dir(&plan.current_dir)
+        .kill_on_drop(true);
+    if plan.clear_env {
+        cmd.env_clear();
+    }
+    cmd.envs(plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    // Safety: pre_exec runs after fork() but before exec() in the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            escape_agent_cgroup();
+            Ok(())
+        });
+    }
+    Ok((cmd, timeout))
+}
+
 async fn handle_request(request: AgentRequest) -> AgentResponse {
     match request {
         AgentRequest::Ping => AgentResponse::Pong,
@@ -630,29 +763,10 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
         },
 
         AgentRequest::Exec(req) => {
-            let timeout = resolve_exec_timeout(req.timeout_secs);
-            let plan = match plan_exec(&req, oci_runtime_config()) {
-                Ok(plan) => plan,
-                Err(message) => return AgentResponse::Error(ErrorResponse { message }),
+            let (cmd, timeout) = match build_exec_command(&req) {
+                Ok(value) => value,
+                Err(error) => return AgentResponse::Error(error),
             };
-            let mut cmd = tokio::process::Command::new(&plan.program);
-            cmd.args(&plan.args)
-                .current_dir(&plan.current_dir)
-                .kill_on_drop(true);
-            if plan.clear_env {
-                cmd.env_clear();
-            }
-            cmd.envs(plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-            // Safety: pre_exec runs after fork() but before exec() in the child.
-            // escape_agent_cgroup() moves the child to the root cgroup so it does
-            // not inherit the agent's memory.high throttle. The write is
-            // best-effort: on hosts without /sys/fs/cgroup it fails silently.
-            unsafe {
-                cmd.pre_exec(|| {
-                    escape_agent_cgroup();
-                    Ok(())
-                });
-            }
             run_exec_with_capture(cmd, timeout).await
         }
 
@@ -826,11 +940,12 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
 
         // ShellStart is handled in handle_connection before reaching here.
         // ShellData and ShellResize are only valid during an active shell session.
-        AgentRequest::ShellStart(_) | AgentRequest::ShellData(_) | AgentRequest::ShellResize(_) => {
-            AgentResponse::Error(ErrorResponse {
-                message: "shell messages are not valid outside a shell session".into(),
-            })
-        }
+        AgentRequest::ExecStream(_)
+        | AgentRequest::ShellStart(_)
+        | AgentRequest::ShellData(_)
+        | AgentRequest::ShellResize(_) => AgentResponse::Error(ErrorResponse {
+            message: "shell messages are not valid outside a shell session".into(),
+        }),
     }
 }
 
