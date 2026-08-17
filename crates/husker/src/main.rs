@@ -690,15 +690,7 @@ async fn run(cli: Cli) -> Result<()> {
     // validate a remote URL, or establish an SSH tunnel.
     if let Commands::Config { action } = command {
         return match action {
-            ConfigAction::Check => {
-                if output == OutputFormat::Json {
-                    exit_with_error(
-                        output,
-                        "`husker config check` does not yet support --output json",
-                    );
-                }
-                check_config(config_path.as_deref())
-            }
+            ConfigAction::Check => check_config(config_path.as_deref(), output),
         };
     }
     if matches!(command, Commands::Schema) {
@@ -3910,12 +3902,321 @@ async fn run_shell_bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
     }
 }
 
+#[derive(Serialize)]
+struct ConfigCheckItem {
+    name: String,
+    status: &'static str,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ConfigCheckReport {
+    status: &'static str,
+    config_file: Option<String>,
+    source: &'static str,
+    checks: Vec<ConfigCheckItem>,
+}
+
+impl ConfigCheckReport {
+    fn push(&mut self, name: impl Into<String>, status: &'static str, message: impl Into<String>) {
+        self.checks.push(ConfigCheckItem {
+            name: name.into(),
+            status,
+            message: message.into(),
+        });
+    }
+
+    fn finish(&mut self) {
+        self.status = if self.checks.iter().any(|check| check.status == "fail") {
+            "error"
+        } else {
+            "ok"
+        };
+    }
+}
+
+fn check_regular_file(report: &mut ConfigCheckReport, name: &str, path: &Path) {
+    let message = path.display().to_string();
+    if path.is_file() {
+        report.push(name, "ok", message);
+    } else if path.exists() {
+        report.push(name, "fail", format!("{message}: not a regular file"));
+    } else {
+        report.push(name, "fail", format!("{message}: not found"));
+    }
+}
+
+/// Machine-readable config validation. It validates the same effective values
+/// the daemon uses, including environment overrides, and never mixes prose into
+/// stdout before its one JSON document.
+fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
+    let path = resolve_config_path(explicit_path);
+    let mut report = ConfigCheckReport {
+        status: "ok",
+        config_file: Some(path.display().to_string()),
+        source: "file",
+        checks: Vec::new(),
+    };
+    let mut config = match std::fs::read_to_string(&path) {
+        Ok(contents) => match toml::from_str::<Config>(&contents) {
+            Ok(config) => {
+                report.push("config_file", "ok", "parsed successfully");
+                config
+            }
+            Err(error) => {
+                report.push("config_file", "fail", format!("parse error: {error}"));
+                report.finish();
+                print_config_check_json(&report)?;
+                std::process::exit(exit_code::GENERAL);
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit_path.is_none() => {
+            report.config_file = None;
+            report.source = "defaults";
+            report.push("config_file", "ok", "using defaults; no config file found");
+            Config::default()
+        }
+        Err(error) => {
+            report.push("config_file", "fail", error.to_string());
+            report.finish();
+            print_config_check_json(&report)?;
+            std::process::exit(exit_code::GENERAL);
+        }
+    };
+    apply_env_overrides(&mut config);
+
+    if config.data_dir.exists() {
+        report.push("data_dir", "ok", config.data_dir.display().to_string());
+    } else {
+        match std::fs::create_dir_all(&config.data_dir) {
+            Ok(()) => report.push(
+                "data_dir",
+                "ok",
+                format!("{}: created", config.data_dir.display()),
+            ),
+            Err(error) => report.push(
+                "data_dir",
+                "fail",
+                format!("{}: {error}", config.data_dir.display()),
+            ),
+        }
+    }
+    check_regular_file(&mut report, "default_kernel", &config.default_kernel);
+    check_regular_file(&mut report, "default_rootfs", &config.default_rootfs);
+    if let Some(initrd) = &config.default_initrd {
+        check_regular_file(&mut report, "default_initrd", initrd);
+    }
+    match reqwest::Url::parse(&config.images_base_url) {
+        Ok(_) => report.push("images_base_url", "ok", &config.images_base_url),
+        Err(error) => report.push(
+            "images_base_url",
+            "fail",
+            format!("{}: {error}", config.images_base_url),
+        ),
+    }
+
+    #[cfg(feature = "linux-net")]
+    {
+        match find_in_path(&config.firecracker_bin) {
+            Some(path) => report.push("firecracker_bin", "ok", path.display().to_string()),
+            None => report.push(
+                "firecracker_bin",
+                "fail",
+                format!("{}: not found", config.firecracker_bin.display()),
+            ),
+        }
+        match parse_cidr(&config.bridge_subnet) {
+            Ok(_) => report.push("bridge_subnet", "ok", &config.bridge_subnet),
+            Err(error) => report.push(
+                "bridge_subnet",
+                "fail",
+                format!("{}: {error}", config.bridge_subnet),
+            ),
+        }
+        let uplink = husker_net::resolve_host_interface(&config.host_interface);
+        if uplink.warnings.is_empty() {
+            report.push("host_interface", "ok", uplink.effective);
+        } else {
+            report.push("host_interface", "fail", uplink.warnings.join("; "));
+        }
+        #[cfg(target_os = "linux")]
+        if config.vmm == VmmSelection::Qemu {
+            match find_in_path(&config.qemu_bin) {
+                Some(path) => report.push("qemu_bin", "ok", path.display().to_string()),
+                None => report.push(
+                    "qemu_bin",
+                    "fail",
+                    format!("{}: not found", config.qemu_bin.display()),
+                ),
+            }
+            for device in ["/dev/kvm", "/dev/vhost-vsock"] {
+                let status = if Path::new(device).exists() {
+                    "ok"
+                } else {
+                    "fail"
+                };
+                report.push(
+                    device,
+                    status,
+                    if status == "ok" { "present" } else { "missing" },
+                );
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(bridge) = &config.lan_bridge {
+            let found = std::process::Command::new("ip")
+                .args(["link", "show", bridge])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            report.push(
+                "lan_bridge",
+                if found { "ok" } else { "fail" },
+                if found {
+                    bridge.clone()
+                } else {
+                    format!("{bridge}: not found")
+                },
+            );
+        }
+    }
+
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
+    for (name, available, message) in [
+        (
+            "ovmf_code",
+            config.ovmf_code.exists(),
+            config.ovmf_code.display().to_string(),
+        ),
+        (
+            "ovmf_vars",
+            config.ovmf_vars.exists(),
+            config.ovmf_vars.display().to_string(),
+        ),
+        (
+            "qemu-img",
+            command_available("qemu-img"),
+            "cloud-image disk resize".into(),
+        ),
+        (
+            "mkfs.ext4",
+            command_available("mkfs.ext4"),
+            "volume creation".into(),
+        ),
+    ] {
+        report.push(name, if available { "ok" } else { "warn" }, message);
+    }
+    #[cfg(target_os = "macos")]
+    report.push(
+        "qemu-img",
+        if command_available("qemu-img") {
+            "ok"
+        } else {
+            "warn"
+        },
+        "cloud-image conversion",
+    );
+
+    if let Some(size) = &config.default_disk_size {
+        match husker::parse_disk_size(size) {
+            Ok(_) => report.push("default_disk_size", "ok", size),
+            Err(error) => report.push("default_disk_size", "fail", error.to_string()),
+        }
+    }
+    if config.exec_timeout_max_secs < config.exec_timeout_secs {
+        report.push(
+            "exec_timeout_max_secs",
+            "fail",
+            format!(
+                "{} must be >= exec_timeout_secs ({})",
+                config.exec_timeout_max_secs, config.exec_timeout_secs
+            ),
+        );
+    } else {
+        report.push(
+            "exec_timeout_max_secs",
+            "ok",
+            config.exec_timeout_max_secs.to_string(),
+        );
+    }
+    let mut profile_names: Vec<&String> = config.profiles.keys().collect();
+    profile_names.sort();
+    for name in profile_names {
+        let profile = &config.profiles[name.as_str()];
+        let mut problems = Vec::new();
+        for key in &profile.ssh_keys {
+            let path = expand_tilde(key);
+            if !path.exists() {
+                problems.push(format!("ssh key {} not found", path.display()));
+            }
+        }
+        for path in [&profile.rootfs, &profile.kernel, &profile.initrd]
+            .into_iter()
+            .flatten()
+        {
+            if !path.exists() {
+                problems.push(format!("{} not found", path.display()));
+            }
+        }
+        if let Some(size) = &profile.disk_size
+            && let Err(error) = husker::parse_disk_size(size)
+        {
+            problems.push(format!("disk_size: {error}"));
+        }
+        if let Some(vmm) = &profile.vmm
+            && !["firecracker", "qemu"].contains(&vmm.as_str())
+        {
+            problems.push(format!("unknown vmm '{vmm}'"));
+        }
+        for entry in &profile.env {
+            if !entry.contains('=') {
+                problems.push(format!("env entry '{entry}' is not KEY=VALUE"));
+            }
+        }
+        report.push(
+            format!("profile.{name}"),
+            if problems.is_empty() { "ok" } else { "fail" },
+            if problems.is_empty() {
+                "valid".into()
+            } else {
+                problems.join("; ")
+            },
+        );
+    }
+
+    report.finish();
+    print_config_check_json(&report)?;
+    if report.status == "error" {
+        std::process::exit(exit_code::GENERAL);
+    }
+    Ok(())
+}
+
+fn command_available(command: &str) -> bool {
+    std::process::Command::new(command)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn print_config_check_json(report: &ConfigCheckReport) -> Result<()> {
+    let value = structured_output("config check", report)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 /// Validate the configuration file and report results.
-fn check_config(explicit_path: Option<&Path>) -> Result<()> {
+fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()> {
+    if output == OutputFormat::Json {
+        return check_config_json(explicit_path);
+    }
     let path = resolve_config_path(explicit_path);
     let mut all_ok = true;
 
-    let config = match std::fs::read_to_string(&path) {
+    let mut config = match std::fs::read_to_string(&path) {
         Ok(contents) => {
             println!("Config: {}", path.display());
             match toml::from_str::<Config>(&contents) {
@@ -3942,6 +4243,8 @@ fn check_config(explicit_path: Option<&Path>) -> Result<()> {
             std::process::exit(1);
         }
     };
+
+    apply_env_overrides(&mut config);
 
     let dd_from_env = std::env::var("HUSKER_DATA_DIR").is_ok();
     let kernel_from_env = std::env::var("HUSKER_DEFAULT_KERNEL").is_ok();

@@ -1148,6 +1148,12 @@ const VERSION_OUTPUT: &[F] = &[
     F::required("client_version", T::String),
     F::required("daemon", T::NullableObject),
 ];
+const CONFIG_CHECK_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("config_file", T::NullableString),
+    F::required("source", T::String),
+    F::required("checks", T::Array),
+];
 const PROFILE_LIST: &[F] = &[
     F::required("status", T::String),
     F::required("action", T::String),
@@ -1468,7 +1474,7 @@ pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
     CommandContract::object("logs", false, LOGS_OUTPUT),
     CommandContract::object("wait", false, WAIT_OUTPUT),
     CommandContract::object("version", false, VERSION_OUTPUT),
-    CommandContract::unsupported("config check", false),
+    CommandContract::object("config check", false, CONFIG_CHECK_OUTPUT),
     CommandContract::object("profile list", false, PROFILE_LIST),
     CommandContract::object("context add", true, CONTEXT_ADD),
     CommandContract::list(

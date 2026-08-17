@@ -300,7 +300,7 @@ fn enrich_v0_3(schema: &mut serde_json::Value) {
 
         if matches!(
             name.as_str(),
-            "daemon" | "shell" | "config check" | "setup storage" | "completions"
+            "daemon" | "shell" | "setup storage" | "completions"
         ) {
             object.insert("output_kind".into(), serde_json::json!("opaque"));
             object.insert("media_type".into(), serde_json::json!("text/plain"));
