@@ -89,6 +89,11 @@ husker logs hello -f
 husker destroy hello
 ```
 
+`husker exec` returns stdout and stderr when the command finishes; it does not
+stream build logs yet. For a command whose live output matters, use
+`husker shell <vm>` and run it interactively. Streamed non-interactive exec is
+tracked as protocol work in the technical-debt register.
+
 On Linux, `husker run` needs `firecracker` on `PATH`. If it's missing, husker prompts to download a pinned release into the data directory. For non-interactive use (CI, scripts), set `HUSKER_AUTO_INSTALL_FIRECRACKER=1` to skip the prompt.
 
 `husker images pull` fetches the latest image set from the `images-*`

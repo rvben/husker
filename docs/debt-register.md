@@ -13,6 +13,7 @@
 | DEBT-005 | Protocol | Low | Agent | 2026-09-30 | No libFuzzer lane yet for agent framing | Add `cargo-fuzz` target in nightly pipeline |
 | DEBT-006 | Images | Low | VMM | 2026-07-31 | Default image's `hvc0` getty (for Apple VZ virtio-console) spams `can't open /dev/hvc0` under serial-console backends (QEMU and Firecracker) | Gate the `hvc0` getty to the VZ image variant, or have backends expose a matching virtio-console |
 | DEBT-007 | Runtime | Low | VMM | 2026-07-31 | A daemon SIGKILL orphans the live VMM process (QEMU/Firecracker); `mark_stale_vms_stopped` updates DB state but does not reap the process | Add pidfile-based orphan reaping on daemon startup (QEMU already writes a pidfile) |
+| DEBT-008 | Protocol | Medium | Agent | 2026-09-30 | Non-interactive `exec` buffers stdout/stderr until the command exits, leaving long builds opaque | Add chunked exec frames and a streaming HTTP transport; use interactive `shell` when live output is required |
 
 ## Status review (2026-07-03)
 
@@ -37,3 +38,8 @@
 - **DEBT-007** - Largely addressed: `reap_vmm_if_orphaned` reaps orphaned VMM
   processes from a prior daemon on startup (logs "reaped orphaned VMM process
   from a prior daemon"). Owner to confirm this covers the SIGKILL case and close.
+- **DEBT-008** - Confirmed during a cold CacheFerret build in Husker: the agent
+  drains output incrementally and caps it safely, but the request/response wire
+  format delivers it only when the command exits. True streaming requires a
+  protocol and API transport addition; `husker shell` is the current live-output
+  path.
