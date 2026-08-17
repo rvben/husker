@@ -1,0 +1,29 @@
+[package]
+name = "husker-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+husker-agent-proto = { path = "../crates/husker-agent-proto" }
+
+[[bin]]
+name = "protocol_frames"
+path = "fuzz_targets/protocol_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "base64_input"
+path = "fuzz_targets/base64_input.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

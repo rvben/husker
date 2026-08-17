@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -284,6 +284,15 @@ coverage-ci:
 # documented equivalent/flaky exclusions).
 mutation-gate:
 	cargo mutants --package husker-agent-proto -j 4
+
+# Compile every fuzz target without running an unbounded campaign.
+fuzz-check:
+	cargo +nightly fuzz check
+
+# Short local/CI confidence run; the scheduled workflow runs longer campaigns.
+fuzz-smoke:
+	cargo +nightly fuzz run protocol_frames -- -runs=10000 -timeout=10
+	cargo +nightly fuzz run base64_input -- -runs=10000 -timeout=10
 
 # Graceful shutdown drill (SIGTERM path)
 graceful-shutdown-drill:

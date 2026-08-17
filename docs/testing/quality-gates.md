@@ -11,6 +11,7 @@
 - Perf baseline regression test
 - Coverage threshold gate (`cargo llvm-cov`)
 - Mutation smoke gate (`cargo mutants --list --package husker-agent-proto`)
+- Scheduled libFuzzer campaigns for protocol frames and base64 input
 - Dependency security/policy (`cargo audit`, `cargo deny`)
 
 ## Gated suites
@@ -44,4 +45,11 @@
 ## Mutation policy
 
 - CI enforces mutation-tooling viability via `make mutation-gate`.
-- Scope is currently focused on protocol crate discovery and is tracked for expansion (`DEBT-005`).
+- Scope is focused on protocol semantics and complements the fuzz lane.
+
+## Fuzzing policy
+
+- `make fuzz-check` compiles all fuzz targets with nightly Rust.
+- `make fuzz-smoke` runs bounded local campaigns.
+- `.github/workflows/protocol-fuzz.yml` runs independent three-minute scheduled
+  campaigns and preserves any crash artifacts for reproduction.
