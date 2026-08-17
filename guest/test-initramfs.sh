@@ -7,7 +7,8 @@
 #   2. Module load order in inittab respects known dependencies.
 #   3. af_packet.ko is loaded before husker-net.sh (PF_PACKET needed for
 #      udhcpc, which husker-net.sh may invoke as a fallback).
-#   4. husker-net.sh wiring: inittab invokes /usr/local/sbin/husker-net.sh,
+#   4. Optional console gettys are device-gated to avoid respawn loops.
+#   5. husker-net.sh wiring: inittab invokes /usr/local/sbin/husker-net.sh,
 #      build-rootfs.sh installs it, and the script contains ip= parsing and
 #      a udhcpc fallback.
 #
@@ -105,7 +106,21 @@ else
     fail "af_packet.ko (line $AF_PACKET_LINE) must load before husker-net.sh (line $HUSKER_NET_LINE)"
 fi
 
-# ── 4. husker-net.sh wiring ──
+# ── 4. Optional console guards ──
+
+echo ""
+echo "--- Optional console guards ---"
+
+HVC0_LINE=$(grep -E '^hvc0::respawn:' "$INITTAB" || true)
+if [ -z "$HVC0_LINE" ]; then
+    fail "hvc0 getty entry is missing"
+elif [[ "$HVC0_LINE" == *"[ -c /dev/hvc0 ]"* ]] && [[ "$HVC0_LINE" == *"exec sleep"* ]]; then
+    pass "hvc0 getty is device-gated with a non-respawning fallback"
+else
+    fail "hvc0 getty must test /dev/hvc0 and sleep when the device is absent"
+fi
+
+# ── 5. husker-net.sh wiring ──
 
 echo ""
 echo "--- husker-net.sh wiring ---"
