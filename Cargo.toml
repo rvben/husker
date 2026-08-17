@@ -83,7 +83,9 @@ tower = { version = "0.5", features = ["util"] }
 
 # OpenAPI documentation
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
+# Keep builds reproducible and offline-capable. Without `vendored`, this crate's
+# build script downloads Swagger UI from GitHub during every fresh profile.
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 
 # Internal crates
 husker-core = { path = "crates/husker-core", default-features = false }
