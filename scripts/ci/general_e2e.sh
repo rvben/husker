@@ -104,13 +104,17 @@ PID=$!
 for _ in {1..50}; do curl -fsS "${BASE}/v1/health" >/dev/null 2>&1 && break; sleep 0.2; done
 curl -fsS "${BASE}/v1/health" >/dev/null || { echo "daemon did not become healthy" >&2; cat "${LOG}" >&2; exit 1; }
 
-# 4. Run the general e2e suite against the isolated daemon.
+# 4. Run the general e2e suite against the isolated daemon. Keep the embedded
+# agent input identical to the daemon build above: crates/husker/build.rs tracks
+# this variable, so dropping it here would invalidate and rebuild the workspace
+# immediately before the tests despite using the same source and target dir.
 log "running the general husker e2e suite against ${BASE}"
 HUSKER_RUN_IGNORED_E2E=1 \
 HUSKER_E2E_API_URL="${BASE}" \
 HUSKER_E2E_KERNEL="${KERNEL}" \
 HUSKER_E2E_ROOTFS="${ROOTFS_COPY}" \
 HUSKER_E2E_INITRD="${INITRD}" \
+HUSKER_EMBED_AGENT_BIN="${AGENT}" \
   cargo test --package husker --test e2e -- --ignored --test-threads=1
 
 log "PASS: general husker e2e suite green against the isolated daemon"
