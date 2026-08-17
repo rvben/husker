@@ -72,14 +72,22 @@ if [[ -z "${KERNEL}" ]]; then
 fi
 
 # 2. Build the x86_64-musl agent and the daemon embedding it.
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+if [[ "${TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${PWD}/${TARGET_DIR}"
+fi
+AGENT="${TARGET_DIR}/x86_64-unknown-linux-musl/agent/husker-agent"
 log "building x86_64-musl guest agent"
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${X86_64_MUSL_LINKER:-musl-gcc}" \
   cargo build --quiet --package husker-agent --profile agent --target x86_64-unknown-linux-musl
 log "building daemon (re-embeds the agent)"
-cargo build --quiet --package husker
-TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+HUSKER_EMBED_AGENT_BIN="${AGENT}" cargo build --quiet --package husker
 H="${TARGET_DIR}/debug/husker"
 [[ -x "${H}" ]] || { echo "expected ${H} after build" >&2; exit 1; }
+"${H}" --output json capabilities | grep -Eq '"embedded_agent"[[:space:]]*:[[:space:]]*true' || {
+  echo "${H} does not report an embedded guest agent" >&2
+  exit 1
+}
 
 # 3. Start an isolated daemon (own bridge/subnet/CID range, temp data dir + port),
 #    so it never collides with any production daemon on this host.
