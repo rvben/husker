@@ -105,6 +105,29 @@ async fn exec_with_env() {
 }
 
 #[tokio::test]
+async fn exec_has_a_default_home() {
+    let mut stream = spawn_agent().await;
+
+    let request = AgentRequest::Exec(ExecRequest {
+        command: "sh".into(),
+        args: vec!["-c".into(), "printf %s \"$HOME\"".into()],
+        working_dir: None,
+        env: vec![],
+        timeout_secs: None,
+    });
+    write_message(&mut stream, &request).await.unwrap();
+
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    match response {
+        AgentResponse::Exec(r) => {
+            assert_eq!(r.exit_code, 0);
+            assert_eq!(r.stdout, "/root");
+        }
+        other => panic!("expected Exec response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn exec_times_out_on_long_running_command() {
     // Safety: test is serialized by `serial_test`-free convention here because
     // no other test reads this env var, and they all use commands that finish

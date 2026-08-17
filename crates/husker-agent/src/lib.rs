@@ -439,6 +439,10 @@ fn max_read_bytes() -> u64 {
 /// common container-runtime behaviour so bare command names still resolve.
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Guest workloads currently run as root. Supply the conventional home even
+/// when the init/supervisor starts the agent with a sparse environment.
+const DEFAULT_HOME: &str = "/root";
+
 /// The imported OCI runtime config, loaded once from [`OCI_CONFIG_PATH`].
 /// `None` when the rootfs is not an imported OCI image (e.g. the baseline
 /// alpine rootfs), in which case exec keeps its inherited-environment behaviour.
@@ -461,6 +465,13 @@ fn upsert_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
     }
 }
 
+/// Add the conventional root home unless the image or request chose one.
+fn ensure_default_home(env: &mut Vec<(String, String)>) {
+    if !env.iter().any(|(key, _)| key == "HOME") {
+        env.push(("HOME".to_string(), DEFAULT_HOME.to_string()));
+    }
+}
+
 /// Merge the image's `Env` (`KEY=VALUE` strings) with per-request `env`
 /// overrides. Request entries win per key; image order is preserved and new
 /// request keys are appended. A `PATH` is always present (falling back to
@@ -478,6 +489,7 @@ fn merge_exec_env(image_env: &[String], req_env: &[(String, String)]) -> Vec<(St
     if !merged.iter().any(|(k, _)| k == "PATH") {
         merged.push(("PATH".to_string(), DEFAULT_PATH.to_string()));
     }
+    ensure_default_home(&mut merged);
     merged
 }
 
@@ -586,7 +598,11 @@ fn resolve_command_env(
                 .map(|(_, v)| v.as_str());
             (resolve_program(command, path), env, true)
         }
-        None => (command.to_string(), req_env.to_vec(), false),
+        None => {
+            let mut env = req_env.to_vec();
+            ensure_default_home(&mut env);
+            (command.to_string(), env, false)
+        }
     }
 }
 
@@ -958,12 +974,22 @@ mod tests {
                 ("PATH".to_string(), "/opt/bin".to_string()),
                 ("LANG".to_string(), "C".to_string()),
                 ("EXTRA".to_string(), "1".to_string()),
+                ("HOME".to_string(), DEFAULT_HOME.to_string()),
             ]
         );
 
         // No PATH anywhere -> a default PATH is injected so bare names resolve.
         let merged = merge_exec_env(&["FOO=bar".to_string()], &[]);
         assert!(merged.iter().any(|(k, v)| k == "PATH" && v == DEFAULT_PATH));
+        assert!(merged.iter().any(|(k, v)| k == "HOME" && v == DEFAULT_HOME));
+
+        // An image or request may deliberately choose a different home.
+        let merged = merge_exec_env(
+            &["HOME=/home/app".to_string()],
+            &[("HOME".to_string(), "/workspace".to_string())],
+        );
+        assert!(merged.iter().any(|(k, v)| k == "HOME" && v == "/workspace"));
+        assert!(!merged.iter().any(|(k, v)| k == "HOME" && v == DEFAULT_HOME));
 
         // Malformed image entries (no '=') are skipped, not panicked on.
         let merged = merge_exec_env(&["NOTANENTRY".to_string()], &[]);
@@ -1151,7 +1177,13 @@ mod tests {
         assert_eq!(plan.program, "echo", "no PATH resolution without an image");
         assert_eq!(plan.args, vec!["hi".to_string()]);
         assert_eq!(plan.current_dir, "/tmp");
-        assert_eq!(plan.env, vec![("FOO".to_string(), "bar".to_string())]);
+        assert_eq!(
+            plan.env,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("HOME".to_string(), DEFAULT_HOME.to_string()),
+            ]
+        );
     }
 
     #[test]
