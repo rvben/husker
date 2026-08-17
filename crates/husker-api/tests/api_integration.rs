@@ -969,7 +969,8 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
 
     let body = serde_json::json!({
         "command": "echo",
-        "args": ["hello"]
+        "args": ["hello"],
+        "connect_timeout_secs": 1
     });
     let response = app
         .oneshot(
