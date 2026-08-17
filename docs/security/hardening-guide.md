@@ -14,6 +14,9 @@
 - Configure a high-entropy bearer token:
   - `api_token = "<long-random-secret>"`
 - Rotate token on incident response or operator turnover.
+- Treat one daemon and its token as one trust domain. A token holder has full
+  control of every VM, volume, and secret on that daemon.
+- Use separate daemon instances for mutually distrusting callers.
 
 ## 3. Least privilege policy
 
@@ -43,7 +46,14 @@
 ## 6. Network topology recommendations
 
 - Preferred: local daemon behind SSH tunnel or private service mesh.
-- Remote control plane: terminate TLS at reverse proxy, enforce authn/authz before forwarding to husker.
+- Remote control plane: terminate TLS at a reverse proxy, optionally require
+  client certificates or workload identities there, and forward only over
+  loopback to Husker. Configure the proxy to inject Husker's bearer token after
+  it authenticates the caller rather than exposing that token to callers.
+- Bind the upstream daemon to `127.0.0.1`; the public listener belongs to the
+  TLS proxy. Preserve WebSocket upgrades for `exec/stream` and `shell`.
+- Restrict direct access to the daemon port with the host firewall so callers
+  cannot bypass proxy identity policy.
 - Avoid exposing daemon directly on public interfaces.
 
 ## 7. Logging and monitoring

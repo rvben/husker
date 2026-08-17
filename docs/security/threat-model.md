@@ -1,6 +1,6 @@
 # Threat Model (STRIDE)
 
-Last updated: 2026-07-02
+Last updated: 2026-08-17
 
 ## Scope
 
@@ -31,7 +31,10 @@ Last updated: 2026-07-02
 
 ## Residual risk
 
-- Bearer token auth is single-factor; mTLS is not implemented yet.
+- Application authentication is a shared bearer token. Transport TLS and
+  optional client-certificate authentication are deliberately delegated to a
+  loopback-connected reverse proxy or private service mesh (ADR-0002); never
+  send the token over plaintext across an untrusted network.
 - **No multi-tenancy.** The daemon has a single shared bearer token, not
   per-caller principals. Every authenticated caller has full, unrestricted
   access to every VM, secret, and volume on the daemon, regardless of who
