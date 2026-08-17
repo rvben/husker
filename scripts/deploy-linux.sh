@@ -461,11 +461,13 @@ remote_install() {
     prepare_remote_runtime "--remote-install"
     [[ -n "$SOURCE_DIR" ]] || fail "--remote-install requires --source-dir"
     require_command cargo
+    require_command diff
     require_command flock
     require_command make
+    require_command rsync
     require_command stat
 
-    local short expected_source artifact
+    local short expected_source artifact build_source
     short="${COMMIT:0:12}"
     expected_source="/tmp/husker-deploy-${short}/src"
     SOURCE_DIR="$(realpath "$SOURCE_DIR")"
@@ -488,6 +490,24 @@ remote_install() {
     exec 9>"$BUILD_CACHE_ROOT/deploy.lock"
     flock 9
     export CARGO_TARGET_DIR="$BUILD_CACHE_ROOT/target"
+
+    # Keep Cargo's workspace path stable across commit-scoped deployment stages.
+    # Checksums avoid touching unchanged files, so Cargo recompiles only crates
+    # whose inputs actually changed. The lock makes --delete safe, and the
+    # comparison proves the root-owned mirror is byte-for-byte the staged commit
+    # before any committed build script executes.
+    build_source="$BUILD_CACHE_ROOT/source"
+    [[ ! -L "$build_source" ]] || fail "build source cache must not be a symlink"
+    install -d -m 0700 "$build_source"
+    [[ "$(realpath "$build_source")" == "$build_source" ]] ||
+        fail "build source cache must resolve to itself"
+    [[ "$(stat -c '%u' "$build_source")" == "0" ]] ||
+        fail "build source cache must be owned by root"
+    chmod 0700 "$build_source"
+    rsync --archive --checksum --delete --no-times --omit-dir-times \
+        --no-owner --no-group "$SOURCE_DIR/" "$build_source/"
+    diff --brief --recursive --no-dereference "$SOURCE_DIR" "$build_source"
+    cd "$build_source"
 
     log "running target-native state and type tests"
     cargo test -p husker-types -p husker-state --all-targets
