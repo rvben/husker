@@ -1282,6 +1282,167 @@ async fn logs_serial_output() {
     assert_eq!(resp.status(), 404);
 }
 
+/// Hardware-backed regression baseline for the latency-sensitive runtime paths.
+///
+/// The ceilings deliberately describe catastrophic regressions, not benchmark
+/// records: this suite runs on shared self-hosted hardware. It also verifies the
+/// semantic property that made long builds painful in practice: the first exec
+/// bytes must arrive while the command is still running.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn runtime_performance_baseline() {
+    require_e2e!();
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    fn p95(mut samples: Vec<Duration>) -> Duration {
+        samples.sort_unstable();
+        samples[(samples.len() - 1) * 95 / 100]
+    }
+
+    let client = reqwest::Client::new();
+    let base = api_base();
+    let name = "e2e-runtime-perf";
+
+    let started = Instant::now();
+    create_and_wait_for_vm(&client, base, name).await;
+    let boot = started.elapsed();
+    assert!(
+        boot < Duration::from_secs(30),
+        "boot exceeded SLO: {boot:?}"
+    );
+
+    let mut exec_samples = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let started = Instant::now();
+        let response = client
+            .post(format!("{base}/v1/vms/{name}/exec"))
+            .json(&serde_json::json!({"command": "true", "args": []}))
+            .send()
+            .await
+            .expect("exec request should reach daemon");
+        assert_eq!(response.status(), 200);
+        exec_samples.push(started.elapsed());
+    }
+    let exec_p95 = p95(exec_samples);
+    assert!(
+        exec_p95 < Duration::from_secs(5),
+        "exec p95 exceeded SLO: {exec_p95:?}"
+    );
+
+    // The text CLI must deliver output before process exit. JSON intentionally
+    // remains atomic, so use the default text mode here.
+    let bin = env!("CARGO_BIN_EXE_husker");
+    let mut exec = Command::new(bin)
+        .args([
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "printf HUSKER_EARLY; sleep 2; printf HUSKER_LATE",
+        ])
+        .env("HUSKER_API_URL", base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("streaming exec CLI should start");
+    let mut exec_stdout = exec.stdout.take().unwrap();
+    let early = read_until_match(&mut exec_stdout, "HUSKER_EARLY", 5).await;
+    assert!(
+        early.contains("HUSKER_EARLY"),
+        "missing early exec output: {early}"
+    );
+    assert!(
+        exec.try_wait()
+            .expect("query streaming exec state")
+            .is_none(),
+        "exec output was buffered until the command exited"
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), exec.wait())
+        .await
+        .expect("streaming exec did not finish")
+        .expect("wait for streaming exec");
+    assert!(status.success(), "streaming exec failed: {status}");
+
+    let shell_started = Instant::now();
+    let mut shell = spawn_shell_with_pty(name);
+    let mut shell_stdin = shell.stdin.take().unwrap();
+    let mut shell_stdout = shell.stdout.take().unwrap();
+    let prompt = read_until_match(&mut shell_stdout, "#", 5).await;
+    assert!(
+        prompt.contains('#'),
+        "shell prompt did not arrive: {prompt}"
+    );
+    let shell_ready = shell_started.elapsed();
+    assert!(
+        shell_ready < Duration::from_secs(5),
+        "shell startup exceeded SLO: {shell_ready:?}"
+    );
+    shell_stdin.write_all(b"exit\n").await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(5), shell.wait())
+        .await
+        .expect("shell did not exit")
+        .expect("wait for shell");
+    assert!(status.success(), "shell failed: {status}");
+
+    // Put a known payload on the serial console, then time the complete logs
+    // response. This covers guest -> VMM capture -> API body transfer.
+    let response = client
+        .post(format!("{base}/v1/vms/{name}/exec"))
+        .json(&serde_json::json!({
+            "command": "sh",
+            "args": ["-c", "yes HUSKER_PERF_LOG | head -c 65536 > /dev/console"]
+        }))
+        .send()
+        .await
+        .expect("serial payload command should reach daemon");
+    assert_eq!(response.status(), 200);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let logs_started = Instant::now();
+    let response = client
+        .get(format!("{base}/v1/vms/{name}/logs"))
+        .send()
+        .await
+        .expect("logs request should reach daemon");
+    assert_eq!(response.status(), 200);
+    let logs = response.bytes().await.expect("read complete logs response");
+    let logs_elapsed = logs_started.elapsed();
+    assert!(
+        logs.windows(b"HUSKER_PERF_LOG".len())
+            .any(|w| w == b"HUSKER_PERF_LOG"),
+        "serial payload missing from {}-byte logs response",
+        logs.len()
+    );
+    assert!(
+        logs_elapsed < Duration::from_secs(5),
+        "logs transfer exceeded SLO: {logs_elapsed:?} for {} bytes",
+        logs.len()
+    );
+
+    let destroy_started = Instant::now();
+    let response = client
+        .delete(format!("{base}/v1/vms/{name}"))
+        .send()
+        .await
+        .expect("destroy request should reach daemon");
+    assert_eq!(response.status(), 204);
+    let destroy = destroy_started.elapsed();
+    assert!(
+        destroy < Duration::from_secs(10),
+        "destroy exceeded SLO: {destroy:?}"
+    );
+
+    println!(
+        "runtime perf: boot={boot:?}, exec_p95={exec_p95:?}, \
+         shell_ready={shell_ready:?}, logs={} bytes/{logs_elapsed:?}, destroy={destroy:?}",
+        logs.len()
+    );
+}
+
 /// macOS equivalent of `logs_serial_output`, using Apple VZ paths.
 ///
 /// Requires:

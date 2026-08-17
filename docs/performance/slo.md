@@ -3,6 +3,9 @@
 ## Baseline test
 
 - Test: `cargo test -p husker-api --test perf_baseline -- --nocapture`
+- Hardware-backed test: `runtime_performance_baseline` in
+  `crates/husker/tests/e2e.rs`; it runs nightly through the isolated privileged
+  E2E workflow.
 - Current sample (microseconds):
   - health p95: 89
   - health p99: 121
@@ -17,6 +20,22 @@
 - list p99 <= 125,000 us
 
 These thresholds are intentionally conservative for hosted CI stability and intended to catch large regressions.
+
+## Runtime SLO thresholds
+
+The hardware-backed baseline boots a real Firecracker guest and covers the
+entire lifecycle, agent, WebSocket, PTY, serial-capture, and HTTP paths:
+
+- cold create through agent readiness < 30 s
+- exec p95 over 10 samples < 5 s
+- streamed exec produces bytes before the command exits
+- interactive shell prompt < 5 s
+- serial-log response containing a 64 KiB guest payload < 5 s
+- VM destroy < 10 s
+
+These are broad regression ceilings for shared runners. The test prints the
+observed values on every run so trends can be tightened separately without
+turning normal host variance into flakes.
 
 ## Boot latency
 
@@ -53,8 +72,6 @@ Both fail if the suppression tokens are dropped from a cmdline builder.
 ## Expansion backlog
 
 - Automate the boot-latency sample above (currently measured by hand on husker01).
-- Add exec latency benchmarks.
-- Add shell relay throughput baseline.
 - Add multi-VM soak and contention profiling lane.
 - Investigate the remaining ~0.56s of kernel boot: the guest kernel still compiles
   in `CONFIG_SERIO_I8042`, `e100`, `e1000`, `e1000e`, `sky2`, `agpgart` and 9p,
