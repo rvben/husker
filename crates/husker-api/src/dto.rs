@@ -244,7 +244,7 @@ pub struct ImportOciRequest {
 
 // ── Exec Types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExecRequest {
     pub command: String,
     #[serde(default)]
@@ -286,11 +286,28 @@ pub enum WsExecInput {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsExecOutput {
-    Started,
-    Stdout { data: String },
-    Stderr { data: String },
-    Exit { exit_code: i32 },
-    Error { message: String },
+    Started {
+        /// Whether command output will arrive incrementally. `None` preserves
+        /// compatibility with daemons that emitted the original fieldless
+        /// `started` event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streaming: Option<bool>,
+        /// Guest protocol reported during capability negotiation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest_protocol_version: Option<u32>,
+    },
+    Stdout {
+        data: String,
+    },
+    Stderr {
+        data: String,
+    },
+    Exit {
+        exit_code: i32,
+    },
+    Error {
+        message: String,
+    },
 }
 
 // ── File Types ────────────────────────────────────────────────────────
@@ -490,4 +507,35 @@ pub struct DaemonCapabilities {
     pub port_forward: bool,
     /// `--net bridged` (attach VMs to the LAN bridge). linux-net builds only.
     pub bridged_net: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyWsExecOutput {
+        Started,
+    }
+
+    #[test]
+    fn exec_started_event_is_backward_compatible_in_both_directions() {
+        let from_legacy: WsExecOutput = serde_json::from_str(r#"{"type":"started"}"#).unwrap();
+        assert!(matches!(
+            from_legacy,
+            WsExecOutput::Started {
+                streaming: None,
+                guest_protocol_version: None,
+            }
+        ));
+
+        let current = serde_json::to_string(&WsExecOutput::Started {
+            streaming: Some(false),
+            guest_protocol_version: Some(3),
+        })
+        .unwrap();
+        let legacy: LegacyWsExecOutput = serde_json::from_str(&current).unwrap();
+        assert!(matches!(legacy, LegacyWsExecOutput::Started));
+    }
 }

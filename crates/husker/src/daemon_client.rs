@@ -10,12 +10,15 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use husker_api::{
     AddPortForwardRequest, ErrorResponse, ExecRequest, ExecResponse, GuestInfoResponse,
     PortForwardResponse, ProfilesResponse, ReadFileRequest, ReadFileResponse, ReadyResponse,
-    VmResponse, WriteFileRequest, WriteFileResponse,
+    VmResponse, WriteFileRequest, WriteFileResponse, WsExecInput, WsExecOutput,
 };
 
 use crate::schema::exit_code;
@@ -129,6 +132,39 @@ pub(crate) enum ProfilesOutcome {
     Unavailable,
 }
 
+/// One presentation-neutral event from a streamed command.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DaemonExecEvent {
+    Started {
+        streaming: Option<bool>,
+        guest_protocol_version: Option<u32>,
+    },
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+impl DaemonExecEvent {
+    /// Explain why a WebSocket command is not producing incremental output.
+    /// Legacy fieldless `started` events remain silent because their daemon did
+    /// not communicate enough capability information to make that claim.
+    pub(crate) fn compatibility_warning(&self) -> Option<String> {
+        let Self::Started {
+            streaming: Some(false),
+            guest_protocol_version,
+        } = self
+        else {
+            return None;
+        };
+        let version = guest_protocol_version
+            .map(|version| format!(" v{version}"))
+            .unwrap_or_default();
+        Some(format!(
+            "guest agent protocol{version} predates streamed exec (v{}); output will appear when the command exits. Refresh this guest image to restore live output.",
+            husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM
+        ))
+    }
+}
+
 impl DaemonClient {
     pub(crate) fn new(base_url: impl Into<String>, api_token: Option<String>) -> Self {
         Self {
@@ -183,6 +219,86 @@ impl DaemonClient {
             &format!("VM '{name}'"),
         )
         .await
+    }
+
+    /// Execute through the daemon's binary-safe WebSocket transport.
+    ///
+    /// `Ok(None)` means the selected daemon predates the streaming route; the
+    /// caller may safely issue one buffered HTTP exec because no command was
+    /// accepted. Once the upgrade succeeds, every error is terminal so a
+    /// partially executed command is never retried.
+    pub(crate) async fn exec_stream<F>(
+        &self,
+        name: &str,
+        request: &ExecRequest,
+        mut on_event: F,
+    ) -> Result<Option<i32>>
+    where
+        F: FnMut(DaemonExecEvent) -> Result<()>,
+    {
+        let ws_url = self
+            .base_url
+            .replacen("http://", "ws://", 1)
+            .replacen("https://", "wss://", 1);
+        let url = format!("{ws_url}/v1/vms/{name}/exec/stream");
+        let mut ws_request = url
+            .into_client_request()
+            .context("building exec websocket request")?;
+        if let Some(token) = &self.api_token {
+            let header = tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("invalid API token for websocket auth header")?;
+            ws_request
+                .headers_mut()
+                .insert(tungstenite::http::header::AUTHORIZATION, header);
+        }
+        let (mut ws, _) = match tokio_tungstenite::connect_async(ws_request).await {
+            Ok(value) => value,
+            Err(tungstenite::Error::Http(response))
+                if matches!(
+                    response.status(),
+                    tungstenite::http::StatusCode::NOT_FOUND
+                        | tungstenite::http::StatusCode::METHOD_NOT_ALLOWED
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error).context("connecting to exec WebSocket"),
+        };
+        let start = serde_json::to_string(&WsExecInput::Start {
+            request: request.clone(),
+        })?;
+        ws.send(tungstenite::Message::Text(start.into())).await?;
+
+        while let Some(message) = ws.next().await {
+            match message? {
+                tungstenite::Message::Text(text) => {
+                    match serde_json::from_str::<WsExecOutput>(&text)? {
+                        WsExecOutput::Started {
+                            streaming,
+                            guest_protocol_version,
+                        } => on_event(DaemonExecEvent::Started {
+                            streaming,
+                            guest_protocol_version,
+                        })?,
+                        WsExecOutput::Stdout { data } => {
+                            let bytes = husker_agent_proto::base64_decode(&data)
+                                .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
+                            on_event(DaemonExecEvent::Stdout(bytes))?;
+                        }
+                        WsExecOutput::Stderr { data } => {
+                            let bytes = husker_agent_proto::base64_decode(&data)
+                                .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
+                            on_event(DaemonExecEvent::Stderr(bytes))?;
+                        }
+                        WsExecOutput::Exit { exit_code } => return Ok(Some(exit_code)),
+                        WsExecOutput::Error { message } => anyhow::bail!("exec failed: {message}"),
+                    }
+                }
+                tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        anyhow::bail!("exec stream closed before an exit status")
     }
 
     /// Read one byte range from a guest file through the shared API contract.
@@ -481,6 +597,7 @@ mod tests {
 
     use axum::Json;
     use axum::extract::Json as ExtractJson;
+    use axum::extract::ws::{Message, WebSocketUpgrade};
     use axum::http::StatusCode;
     use axum::routing::get;
     use serde_json::json;
@@ -518,6 +635,28 @@ mod tests {
             !request
                 .headers()
                 .contains_key(reqwest::header::AUTHORIZATION)
+        );
+    }
+
+    #[test]
+    fn exec_compatibility_warning_requires_an_explicit_buffered_mode() {
+        let buffered = DaemonExecEvent::Started {
+            streaming: Some(false),
+            guest_protocol_version: Some(3),
+        };
+        assert_eq!(
+            buffered.compatibility_warning().as_deref(),
+            Some(
+                "guest agent protocol v3 predates streamed exec (v4); output will appear when the command exits. Refresh this guest image to restore live output."
+            )
+        );
+        assert!(
+            DaemonExecEvent::Started {
+                streaming: None,
+                guest_protocol_version: None,
+            }
+            .compatibility_warning()
+            .is_none()
         );
     }
 
@@ -794,6 +933,108 @@ mod tests {
         let error = client.exec("demo", &request).await.unwrap_err();
 
         assert!(format!("{error:#}").contains("invalid response for VM 'demo'"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_stream_delivers_capability_and_binary_events_in_order() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/exec/stream",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(|mut socket| async move {
+                    let start = socket.recv().await.unwrap().unwrap();
+                    let Message::Text(start) = start else {
+                        panic!("expected text start event");
+                    };
+                    let start: WsExecInput = serde_json::from_str(&start).unwrap();
+                    assert!(matches!(start, WsExecInput::Start { .. }));
+
+                    for output in [
+                        WsExecOutput::Started {
+                            streaming: Some(false),
+                            guest_protocol_version: Some(3),
+                        },
+                        WsExecOutput::Stdout {
+                            data: husker_agent_proto::base64_encode(&[0, 0xff, b'\n']),
+                        },
+                        WsExecOutput::Stderr {
+                            data: husker_agent_proto::base64_encode(b"warning"),
+                        },
+                        WsExecOutput::Exit { exit_code: 7 },
+                    ] {
+                        socket
+                            .send(Message::Text(
+                                serde_json::to_string(&output).unwrap().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                })
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let request = ExecRequest {
+            command: "demo".into(),
+            args: Vec::new(),
+            working_dir: None,
+            env: std::collections::HashMap::new(),
+            secret_env: std::collections::HashMap::new(),
+            connect_timeout_secs: None,
+            timeout_secs: Some(30),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+
+        let exit = client
+            .exec_stream("demo", &request, move |event| {
+                captured.lock().unwrap().push(event);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(exit, Some(7));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                DaemonExecEvent::Started {
+                    streaming: Some(false),
+                    guest_protocol_version: Some(3),
+                },
+                DaemonExecEvent::Stdout(vec![0, 0xff, b'\n']),
+                DaemonExecEvent::Stderr(b"warning".to_vec()),
+            ]
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_exec_stream_route_falls_back_before_command_submission() {
+        let app = axum::Router::new();
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let request = ExecRequest {
+            command: "must-run-once".into(),
+            args: Vec::new(),
+            working_dir: None,
+            env: std::collections::HashMap::new(),
+            secret_env: std::collections::HashMap::new(),
+            connect_timeout_secs: None,
+            timeout_secs: None,
+        };
+        let mut delivered = false;
+
+        let exit = client
+            .exec_stream("demo", &request, |_| {
+                delivered = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(exit, None);
+        assert!(!delivered);
         task.abort();
     }
 

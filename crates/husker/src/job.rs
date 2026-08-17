@@ -14,7 +14,7 @@ use husker_api::{ExecRequest, ExecResponse};
 
 use crate::cli::OutputFormat;
 use crate::cli_contract::structured_output;
-use crate::daemon_client::{ApiFailure, DaemonClient};
+use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent};
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::exit_code;
 use crate::vm_creation::PreparedVmCreationPlan;
@@ -188,6 +188,8 @@ pub(crate) enum JobTermination {
 #[derive(Debug)]
 struct JobOutcome {
     exec: ExecResponse,
+    /// Text output was already emitted incrementally by the WebSocket path.
+    streamed: bool,
     /// The outcome of `--out`/`--write-back`, or `None` when the job requested
     /// no outputs. `None` and an empty [`Retrieval`] are different: nothing was
     /// asked for, versus nothing came back.
@@ -378,20 +380,33 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
         eprintln!("[job] running command");
     }
     let env_map = parse_env_map(req.env);
-    let exec = daemon
-        .exec(
-            name,
-            &ExecRequest {
-                command: exec_command,
-                args: exec_args,
-                working_dir: None,
-                env: env_map,
-                secret_env: req.secret_env.clone(),
-                connect_timeout_secs: None,
-                timeout_secs: Some(req.timeout),
-            },
-        )
-        .await?;
+    let exec_request = ExecRequest {
+        command: exec_command,
+        args: exec_args,
+        working_dir: None,
+        env: env_map,
+        secret_env: req.secret_env.clone(),
+        connect_timeout_secs: None,
+        timeout_secs: Some(req.timeout),
+    };
+    let (exec, streamed) = if output == OutputFormat::Text {
+        match daemon
+            .exec_stream(name, &exec_request, render_job_exec_event)
+            .await?
+        {
+            Some(exit_code) => (
+                ExecResponse {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                true,
+            ),
+            None => (daemon.exec(name, &exec_request).await?, false),
+        }
+    } else {
+        (daemon.exec(name, &exec_request).await?, false)
+    };
 
     // 3.5 Pull requested results back to the host (--out / --write-back).
     let mut retrieval = None;
@@ -401,7 +416,31 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
         let r = retrieve_outputs(daemon, name, cwd, &retrieve_paths, req.out).await?;
         retrieval = Some(r);
     }
-    Ok(JobOutcome { exec, retrieval })
+    Ok(JobOutcome {
+        exec,
+        streamed,
+        retrieval,
+    })
+}
+
+fn render_job_exec_event(event: DaemonExecEvent) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(warning) = event.compatibility_warning() {
+        eprintln!("[job] warning: {warning}");
+    }
+    match event {
+        DaemonExecEvent::Started { .. } => {}
+        DaemonExecEvent::Stdout(bytes) => {
+            std::io::stdout().write_all(&bytes)?;
+            std::io::stdout().flush()?;
+        }
+        DaemonExecEvent::Stderr(bytes) => {
+            std::io::stderr().write_all(&bytes)?;
+            std::io::stderr().flush()?;
+        }
+    }
+    Ok(())
 }
 
 async fn finish_job(req: &JobRequest<'_>, outcome: JobOutcome) -> JobTermination {
@@ -484,8 +523,10 @@ fn render_outcome(
         if let Some(retrieval) = &outcome.retrieval {
             retrieval.report_text();
         }
-        print!("{}", outcome.exec.stdout);
-        eprint!("{}", outcome.exec.stderr);
+        if !outcome.streamed {
+            print!("{}", outcome.exec.stdout);
+            eprint!("{}", outcome.exec.stderr);
+        }
     }
 }
 
@@ -705,6 +746,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::extract::ws::{Message, WebSocketUpgrade};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
@@ -834,6 +876,7 @@ mod tests {
                 stdout: "output".into(),
                 stderr: "failure".into(),
             },
+            streamed: false,
             retrieval: None,
         };
 
@@ -851,6 +894,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             },
+            streamed: false,
             retrieval: None,
         };
 
@@ -919,6 +963,96 @@ mod tests {
             1,
             "an acquired Job VM must be destroyed exactly once"
         );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn text_job_uses_streaming_exec_without_replaying_the_command() {
+        let buffered_execs = Arc::new(AtomicUsize::new(0));
+        let buffered_route = Arc::clone(&buffered_execs);
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let deletes_route = Arc::clone(&deletes);
+        let app = Router::new()
+            .route(
+                "/v1/vms",
+                post(|| async {
+                    (
+                        StatusCode::CREATED,
+                        Json(serde_json::json!({"name": "job-x"})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/vms/{name}",
+                get(|| async { Json(running_vm_response()) }).delete(move || {
+                    let deletes = Arc::clone(&deletes_route);
+                    async move {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route(
+                "/v1/vms/{name}/ready",
+                get(|| async { Json(ready_response()) }),
+            )
+            .route(
+                "/v1/vms/{name}/exec",
+                post(move || {
+                    let buffered_route = Arc::clone(&buffered_route);
+                    async move {
+                        buffered_route.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "exit_code": 0,
+                            "stdout": "buffered",
+                            "stderr": "",
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/vms/{name}/exec/stream",
+                get(|ws: WebSocketUpgrade| async move {
+                    ws.on_upgrade(|mut socket| async move {
+                        let start = socket.recv().await.unwrap().unwrap();
+                        assert!(matches!(start, Message::Text(_)));
+                        for output in [
+                            husker_api::WsExecOutput::Started {
+                                streaming: Some(true),
+                                guest_protocol_version: Some(4),
+                            },
+                            husker_api::WsExecOutput::Stdout {
+                                data: husker_agent_proto::base64_encode(b"live\n"),
+                            },
+                            husker_api::WsExecOutput::Exit { exit_code: 0 },
+                        ] {
+                            socket
+                                .send(Message::Text(
+                                    serde_json::to_string(&output).unwrap().into(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                    })
+                }),
+            );
+        let (api_url, server) = serve_stub(app).await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["true".to_string()];
+        let secret_env = HashMap::new();
+        let mut request = base_request(&client, &body, &command, &secret_env);
+        request.output = OutputFormat::Text;
+
+        let termination = run_job(request).await;
+
+        assert!(matches!(termination, JobTermination::Success));
+        assert_eq!(
+            buffered_execs.load(Ordering::SeqCst),
+            0,
+            "a successfully upgraded command must never be replayed over HTTP"
+        );
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
         server.abort();
     }
 

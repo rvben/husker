@@ -28,7 +28,7 @@ use crate::cli_contract::command_contract;
 use crate::cli_contract::{normalize_error_kind, structured_output};
 use crate::config::*;
 use crate::daemon::*;
-use crate::daemon_client::{ApiFailure, DaemonClient, DaemonUnreachable};
+use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent, DaemonUnreachable};
 use crate::daemon_target::*;
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::*;
@@ -3502,7 +3502,7 @@ async fn secret_command(
     Ok(())
 }
 
-use husker_api::{WsExecInput, WsExecOutput, WsShellInput, WsShellOutput};
+use husker_api::{WsShellInput, WsShellOutput};
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -3516,75 +3516,30 @@ async fn run_exec_ws(
     name: &str,
     request: &ExecRequest,
 ) -> Result<Option<i32>> {
-    let ws_url = target
-        .api_url()
-        .replacen("http://", "ws://", 1)
-        .replacen("https://", "wss://", 1);
-    let url = format!("{ws_url}/v1/vms/{name}/exec/stream");
-    let mut ws_request = url
-        .into_client_request()
-        .context("building exec websocket request")?;
-    if let Some(token) = target.api_token() {
-        let header = tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("invalid API token for websocket auth header")?;
-        ws_request
-            .headers_mut()
-            .insert(tungstenite::http::header::AUTHORIZATION, header);
-    }
-    let (mut ws, _) = match tokio_tungstenite::connect_async(ws_request).await {
-        Ok(value) => value,
-        Err(tungstenite::Error::Http(response))
-            if matches!(
-                response.status(),
-                tungstenite::http::StatusCode::NOT_FOUND
-                    | tungstenite::http::StatusCode::METHOD_NOT_ALLOWED
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error).context("connecting to exec WebSocket"),
-    };
-    let start = serde_json::to_string(&WsExecInput::Start {
-        request: ExecRequest {
-            command: request.command.clone(),
-            args: request.args.clone(),
-            working_dir: request.working_dir.clone(),
-            env: request.env.clone(),
-            secret_env: request.secret_env.clone(),
-            connect_timeout_secs: request.connect_timeout_secs,
-            timeout_secs: request.timeout_secs,
-        },
-    })?;
-    ws.send(tungstenite::Message::Text(start.into())).await?;
+    target
+        .daemon()
+        .exec_stream(name, request, render_text_exec_event)
+        .await
+}
 
-    while let Some(message) = ws.next().await {
-        match message? {
-            tungstenite::Message::Text(text) => {
-                match serde_json::from_str::<WsExecOutput>(&text)? {
-                    WsExecOutput::Started => {}
-                    WsExecOutput::Stdout { data } => {
-                        let bytes = husker_agent_proto::base64_decode(&data)
-                            .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
-                        use std::io::Write;
-                        std::io::stdout().write_all(&bytes)?;
-                        std::io::stdout().flush()?;
-                    }
-                    WsExecOutput::Stderr { data } => {
-                        let bytes = husker_agent_proto::base64_decode(&data)
-                            .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
-                        use std::io::Write;
-                        std::io::stderr().write_all(&bytes)?;
-                        std::io::stderr().flush()?;
-                    }
-                    WsExecOutput::Exit { exit_code } => return Ok(Some(exit_code)),
-                    WsExecOutput::Error { message } => anyhow::bail!("exec failed: {message}"),
-                }
-            }
-            tungstenite::Message::Close(_) => break,
-            _ => {}
+fn render_text_exec_event(event: DaemonExecEvent) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(warning) = event.compatibility_warning() {
+        eprintln!("warning: {warning}");
+    }
+    match event {
+        DaemonExecEvent::Started { .. } => {}
+        DaemonExecEvent::Stdout(bytes) => {
+            std::io::stdout().write_all(&bytes)?;
+            std::io::stdout().flush()?;
+        }
+        DaemonExecEvent::Stderr(bytes) => {
+            std::io::stderr().write_all(&bytes)?;
+            std::io::stderr().flush()?;
         }
     }
-    anyhow::bail!("exec stream closed before an exit status")
+    Ok(())
 }
 
 /// Run an interactive shell session inside a VM.

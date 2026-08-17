@@ -1534,9 +1534,15 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
     if guest_version < husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM {
         // Compatibility for VMs created from older images: the transport still
         // works, but output arrives as two final chunks after completion.
-        if send_exec_ws_output(&mut ws, &WsExecOutput::Started)
-            .await
-            .is_err()
+        if send_exec_ws_output(
+            &mut ws,
+            &WsExecOutput::Started {
+                streaming: Some(false),
+                guest_protocol_version: Some(guest_version),
+            },
+        )
+        .await
+        .is_err()
         {
             return;
         }
@@ -1609,9 +1615,15 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
         .await;
         return;
     }
-    if send_exec_ws_output(&mut ws, &WsExecOutput::Started)
-        .await
-        .is_err()
+    if send_exec_ws_output(
+        &mut ws,
+        &WsExecOutput::Started {
+            streaming: Some(true),
+            guest_protocol_version: Some(guest_version),
+        },
+    )
+    .await
+    .is_err()
     {
         return;
     }
