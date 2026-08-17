@@ -102,6 +102,13 @@ lto = true
 strip = true
 codegen-units = 1
 
+# Transactional development deployments still ship optimized, stripped
+# binaries, but favor bounded rollout time over maximum whole-program LTO.
+[profile.deploy]
+inherits = "release"
+lto = "thin"
+codegen-units = 8
+
 [profile.dev]
 # Fast compile times for development
 opt-level = 0

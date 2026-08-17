@@ -8,6 +8,7 @@ HEALTH_URL="${HUSKER_DEPLOY_HEALTH_URL:-http://127.0.0.1:7777/v1/health}"
 INSTALL_PATH="${HUSKER_DEPLOY_INSTALL_PATH:-/usr/local/bin/husker}"
 STATE_DB="${HUSKER_DEPLOY_STATE_DB:-/var/lib/husker/husker.db}"
 BACKUP_ROOT="${HUSKER_DEPLOY_BACKUP_ROOT:-/var/lib/husker/deploy-backups}"
+BUILD_CACHE_ROOT="${HUSKER_DEPLOY_BUILD_CACHE_ROOT:-/var/cache/husker-build}"
 HEALTH_ATTEMPTS="${HUSKER_DEPLOY_HEALTH_ATTEMPTS:-30}"
 AGENT_LOG_ATTEMPTS="${HUSKER_DEPLOY_AGENT_LOG_ATTEMPTS:-10}"
 STABILITY_SECONDS="${HUSKER_DEPLOY_STABILITY_SECONDS:-3}"
@@ -25,9 +26,9 @@ Usage:
   scripts/deploy-linux.sh --host USER@HOST [--keep-staging]
 
 The deployment refuses tracked working-tree changes, archives HEAD (so untracked
-files are never copied), runs target-native state and userdata tests, builds the
-release daemon with its musl guest agent embedded, and validates that build fact
-through `husker capabilities`.
+files are never copied), runs target-native state and userdata tests, builds an
+optimized daemon with its musl guest agent embedded, and validates that build
+fact through `husker capabilities`.
 
 Cutover is transactional: the current binary and stopped SQLite state are saved
 before an atomic install. A failed start, health check, capability check, service
@@ -40,6 +41,8 @@ Environment overrides:
   HUSKER_DEPLOY_INSTALL_PATH  daemon binary (default: /usr/local/bin/husker)
   HUSKER_DEPLOY_STATE_DB      SQLite database (default: /var/lib/husker/husker.db)
   HUSKER_DEPLOY_BACKUP_ROOT   retained rollback root (default: /var/lib/husker/deploy-backups)
+  HUSKER_DEPLOY_BUILD_CACHE_ROOT
+                              root-only Cargo cache (default: /var/cache/husker-build)
 
 Internal test/build entrypoints:
   --remote-install             build and cut over a staged committed snapshot
@@ -135,6 +138,10 @@ while [[ $# -gt 0 ]]; do
             BACKUP_ROOT="${2:?--backup-root requires a path}"
             shift 2
             ;;
+        --build-cache-root)
+            BUILD_CACHE_ROOT="${2:?--build-cache-root requires a path}"
+            shift 2
+            ;;
         -h | --help)
             usage
             exit 0
@@ -151,9 +158,11 @@ validate_configuration() {
     validate_remote_setting "install path" "$INSTALL_PATH"
     validate_remote_setting "state database" "$STATE_DB"
     validate_remote_setting "backup root" "$BACKUP_ROOT"
+    validate_remote_setting "build cache root" "$BUILD_CACHE_ROOT"
     [[ "$INSTALL_PATH" == /* ]] || fail "install path must be absolute"
     [[ "$STATE_DB" == /* ]] || fail "state database must be absolute"
     [[ "$BACKUP_ROOT" == /* ]] || fail "backup root must be absolute"
+    [[ "$BUILD_CACHE_ROOT" == /* ]] || fail "build cache root must be absolute"
     [[ "$HEALTH_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] ||
         fail "HUSKER_DEPLOY_HEALTH_ATTEMPTS must be a positive integer"
     [[ "$AGENT_LOG_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] ||
@@ -231,7 +240,7 @@ REMOTE_PREPARE
         --remote-install --commit "$commit" --source-dir "$stage/src" \
         --service "$SERVICE" --health-url "$HEALTH_URL" \
         --install-path "$INSTALL_PATH" --state-db "$STATE_DB" \
-        --backup-root "$BACKUP_ROOT"; then
+        --backup-root "$BACKUP_ROOT" --build-cache-root "$BUILD_CACHE_ROOT"; then
         log "deployment failed; remote staging retained for diagnosis: $stage"
         return 1
     fi
@@ -347,6 +356,7 @@ prepare_remote_runtime() {
     validate_configuration
     export PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     require_command curl
+    require_command install
     require_command journalctl
     require_command mktemp
     require_command realpath
@@ -451,7 +461,9 @@ remote_install() {
     prepare_remote_runtime "--remote-install"
     [[ -n "$SOURCE_DIR" ]] || fail "--remote-install requires --source-dir"
     require_command cargo
+    require_command flock
     require_command make
+    require_command stat
 
     local short expected_source artifact
     short="${COMMIT:0:12}"
@@ -462,15 +474,33 @@ remote_install() {
     [[ ! -L "$SOURCE_DIR" ]] || fail "source staging directory must not be a symlink"
     cd "$SOURCE_DIR"
 
+    [[ ! -L "$BUILD_CACHE_ROOT" ]] || fail "build cache root must not be a symlink"
+    install -d -m 0700 "$BUILD_CACHE_ROOT"
+    [[ "$(realpath "$BUILD_CACHE_ROOT")" == "$BUILD_CACHE_ROOT" ]] ||
+        fail "build cache root must resolve to itself"
+    [[ "$(stat -c '%u' "$BUILD_CACHE_ROOT")" == "0" ]] ||
+        fail "build cache root must be owned by root"
+    chmod 0700 "$BUILD_CACHE_ROOT"
+
+    # Cargo permits parallel readers, but two deployments could otherwise race
+    # while embedding or copying the same cached output. Keep compilation under
+    # one root-only lock, then copy the result into this commit's private stage.
+    exec 9>"$BUILD_CACHE_ROOT/deploy.lock"
+    flock 9
+    export CARGO_TARGET_DIR="$BUILD_CACHE_ROOT/target"
+
     log "running target-native state and type tests"
     cargo test -p husker-types -p husker-state --all-targets
     log "running target-native userdata orchestration tests"
     cargo test -p husker-core --test orchestration_paths userdata -- --test-threads=1
-    log "building release daemon with the guest agent embedded"
-    make build-release-with-agent
+    log "building optimized deployment daemon with the guest agent embedded"
+    make build-deploy-with-agent
 
-    artifact="$SOURCE_DIR/target/release/husker"
-    [[ -x "$artifact" ]] || fail "release build did not produce $artifact"
+    [[ -x "$CARGO_TARGET_DIR/deploy/husker" ]] ||
+        fail "deployment build did not produce $CARGO_TARGET_DIR/deploy/husker"
+    artifact="$SOURCE_DIR/husker-deploy-artifact"
+    install -m 0755 "$CARGO_TARGET_DIR/deploy/husker" "$artifact"
+    flock -u 9
     cutover_artifact "$artifact"
 }
 

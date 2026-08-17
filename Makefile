@@ -1,9 +1,14 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-deploy-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
 # Alpine Linux version used by build-initramfs.
 ALPINE_VERSION ?= 3.21
+# Honor Cargo's standard target-directory override in recipes that embed or
+# sign a previously built artifact.
+CARGO_TARGET_DIR ?= target
+CARGO_TARGET_DIR_ABS := $(abspath $(CARGO_TARGET_DIR))
+export CARGO_TARGET_DIR
 
 # Optional, untracked local overrides. Kept out of git so a checkout can carry
 # machine-specific settings without touching the repo.
@@ -40,15 +45,22 @@ build-agent:
 # Requires the x86_64-musl target + linker (Linux/CI). The default `build` stays
 # musl-free for the macOS dev loop; cloud-image support is opt-in via this target.
 build-with-agent: build-agent
-	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/x86_64-unknown-linux-musl/agent/husker-agent \
+	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/x86_64-unknown-linux-musl/agent/husker-agent" \
 		cargo build -p husker
 
 # Release build of the daemon WITH the embedded guest agent (cloud-image support).
 # Requires the x86_64-musl target + linker (Linux/CI). Release/CI for cloud-image
 # support builds the agent first; see .github/workflows/release.yml.
 build-release-with-agent: build-agent
-	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/x86_64-unknown-linux-musl/agent/husker-agent \
+	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/x86_64-unknown-linux-musl/agent/husker-agent" \
 		cargo build --release -p husker
+
+# Optimized deployment build with faster ThinLTO. The transactional deployment
+# script copies this immutable artifact out of the shared build cache before
+# cutover, so concurrent rollouts cannot replace the candidate being verified.
+build-deploy-with-agent: build-agent
+	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/x86_64-unknown-linux-musl/agent/husker-agent" \
+		cargo build --profile deploy -p husker
 
 # Build guest agent for ARM64 (for macOS/VZ guests and VZ cloud-image seeds).
 # On macOS, zig provides the musl cross linker (brew install zig; cargo install cargo-zigbuild).
@@ -63,13 +75,13 @@ endif
 # Build release for macOS (no linux-net, with entitlement signing).
 # Embeds the aarch64-musl guest agent so Apple Silicon builds support VZ cloud images.
 build-release-macos: build-agent-aarch64
-	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/aarch64-unknown-linux-musl/agent/husker-agent \
+	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/aarch64-unknown-linux-musl/agent/husker-agent" \
 		cargo build --workspace --release --no-default-features
 	$(MAKE) sign-macos
 
 # Sign macOS binary with virtualization entitlement
 sign-macos:
-	codesign --entitlements husker.entitlements --force --sign - target/release/husker
+	codesign --entitlements husker.entitlements --force --sign - "$(CARGO_TARGET_DIR_ABS)/release/husker"
 
 # Check compilation without linux-net (macOS path)
 check-macos:
@@ -150,7 +162,7 @@ clean:
 install:
 ifeq ($(shell uname -s),Darwin)
 	$(MAKE) build-agent-aarch64
-	HUSKER_EMBED_AGENT_BIN=$(CURDIR)/target/aarch64-unknown-linux-musl/agent/husker-agent \
+	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/aarch64-unknown-linux-musl/agent/husker-agent" \
 		cargo install --path crates/husker --no-default-features
 	codesign --entitlements husker.entitlements --force --sign - "$$(which husker)"
 else
