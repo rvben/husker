@@ -159,6 +159,32 @@ fn inject_guest_runtime(
 ) -> Result<(), OciMaterializationError> {
     use std::os::unix::fs::PermissionsExt;
 
+    fn replace_with_directory(path: &Path) -> Result<(), OciMaterializationError> {
+        std::fs::remove_file(path)
+            .or_else(|_| std::fs::remove_dir_all(path))
+            .map_err(|error| {
+                OciMaterializationError::Runtime(format!("replace {}: {error}", path.display()))
+            })?;
+        std::fs::create_dir(path).map_err(|error| {
+            OciMaterializationError::Runtime(format!("mkdir {}: {error}", path.display()))
+        })
+    }
+
+    /// Resolve a symlinked path component the way the guest resolves it, where
+    /// an absolute target is relative to the image root. Answers `None` unless
+    /// the result is a directory inside the image, so an image cannot redirect
+    /// an injected file onto the host.
+    fn resolve_inside_image(root: &Path, link: &Path) -> Option<PathBuf> {
+        let target = std::fs::read_link(link).ok()?;
+        let candidate = if target.is_absolute() {
+            root.join(target.strip_prefix("/").ok()?)
+        } else {
+            link.parent()?.join(target)
+        };
+        let resolved = candidate.canonicalize().ok()?;
+        (resolved.starts_with(root.canonicalize().ok()?) && resolved.is_dir()).then_some(resolved)
+    }
+
     fn safe_target(dir: &Path, rel: &str) -> Result<PathBuf, OciMaterializationError> {
         let components: Vec<&str> = rel.split('/').filter(|part| !part.is_empty()).collect();
         let (directories, file) = components.split_at(components.len().saturating_sub(1));
@@ -167,22 +193,18 @@ fn inject_guest_runtime(
             current = current.join(directory);
             match std::fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.file_type().is_dir() => {}
-                Ok(_) => {
-                    std::fs::remove_file(&current)
-                        .or_else(|_| std::fs::remove_dir_all(&current))
-                        .map_err(|error| {
-                            OciMaterializationError::Runtime(format!(
-                                "replace {}: {error}",
-                                current.display()
-                            ))
-                        })?;
-                    std::fs::create_dir(&current).map_err(|error| {
-                        OciMaterializationError::Runtime(format!(
-                            "mkdir {}: {error}",
-                            current.display()
-                        ))
-                    })?;
+                // A distribution with a merged /usr ships `/sbin` as a symlink
+                // to `usr/sbin`. Replacing that with a real directory leaves the
+                // image unmerged, which its package manager refuses to install
+                // into, so a link that stays inside the image is followed and
+                // only one that escapes it is replaced.
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    match resolve_inside_image(dir, &current) {
+                        Some(resolved) => current = resolved,
+                        None => replace_with_directory(&current)?,
+                    }
                 }
+                Ok(_) => replace_with_directory(&current)?,
                 Err(_) => std::fs::create_dir(&current).map_err(|error| {
                     OciMaterializationError::Runtime(format!(
                         "mkdir {}: {error}",
@@ -312,6 +334,86 @@ mod tests {
         assert_eq!(
             std::fs::read(rootfs.path().join("usr/local/bin/husker-agent")).unwrap(),
             b"AGENT"
+        );
+    }
+
+    /// A merged-/usr image keeps `/sbin` as a link to `usr/sbin`. Replacing it
+    /// with a real directory unmerges the image, and its package manager then
+    /// refuses to install anything that requires the merge.
+    #[test]
+    fn runtime_injection_keeps_a_relative_merged_usr_link() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("usr/sbin")).unwrap();
+        std::os::unix::fs::symlink("usr/sbin", rootfs.path().join("sbin")).unwrap();
+
+        inject_guest_runtime(
+            rootfs.path(),
+            b"AGENT",
+            &husker_agent_proto::OciRuntimeConfig::default(),
+        )
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(rootfs.path().join("sbin"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "/sbin must still link to usr/sbin"
+        );
+        assert_eq!(
+            std::fs::read_link(rootfs.path().join("usr/sbin/init")).unwrap(),
+            Path::new("/usr/local/bin/husker-agent")
+        );
+    }
+
+    #[test]
+    fn runtime_injection_keeps_an_absolute_merged_usr_link() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("usr/sbin")).unwrap();
+        std::os::unix::fs::symlink("/usr/sbin", rootfs.path().join("sbin")).unwrap();
+
+        inject_guest_runtime(
+            rootfs.path(),
+            b"AGENT",
+            &husker_agent_proto::OciRuntimeConfig::default(),
+        )
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(rootfs.path().join("sbin"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "an absolute /sbin link is image-relative, not a host path"
+        );
+        assert_eq!(
+            std::fs::read_link(rootfs.path().join("usr/sbin/init")).unwrap(),
+            Path::new("/usr/local/bin/husker-agent")
+        );
+    }
+
+    /// The escape check must survive the merged-/usr fix: a link that climbs out
+    /// of the image is still replaced rather than followed.
+    #[test]
+    fn runtime_injection_replaces_a_link_that_climbs_out_of_the_image() {
+        let outside = tempfile::tempdir().unwrap();
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("image")).unwrap();
+        let image = rootfs.path().join("image");
+        std::os::unix::fs::symlink("../", image.join("sbin")).unwrap();
+
+        inject_guest_runtime(
+            &image,
+            b"AGENT",
+            &husker_agent_proto::OciRuntimeConfig::default(),
+        )
+        .unwrap();
+
+        assert!(!outside.path().join("init").exists());
+        assert!(!rootfs.path().join("init").exists());
+        assert_eq!(
+            std::fs::read_link(image.join("sbin/init")).unwrap(),
+            Path::new("/usr/local/bin/husker-agent")
         );
     }
 
