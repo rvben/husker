@@ -1063,6 +1063,10 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
         Arc::clone(&core),
         workers.shutdown_signal(),
     )));
+    workers.supervise(Some(spawn_expiration_loop(
+        Arc::clone(&core),
+        workers.shutdown_signal(),
+    )));
     workers.supervise_abortable(spawn_metrics_endpoint(
         Arc::clone(&core),
         config.metrics_listen,
@@ -1227,6 +1231,28 @@ fn spawn_idle_policy_loop<B: husker_vmm::VmmBackend + 'static>(
                 biased;
                 () = wait_for_runtime_shutdown(&mut shutdown) => break,
                 _ = ticker.tick() => core.idle_policy_tick().await,
+            }
+        }
+    })
+}
+
+/// Spawn the hard-lifetime reaper used by externally orchestrated ephemeral
+/// VMs. This runs in every daemon mode: unlike suspend-based idle policy,
+/// destroying an expired VM does not depend on Linux host networking.
+fn spawn_expiration_loop<B: husker_vmm::VmmBackend + 'static>(
+    core: Arc<husker_core::HuskerCore<B>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        // Run once immediately so overdue VMs from a daemon restart do not
+        // wait for another full interval.
+        loop {
+            tokio::select! {
+                biased;
+                () = wait_for_runtime_shutdown(&mut shutdown) => break,
+                _ = ticker.tick() => core.expiration_tick().await,
             }
         }
     })

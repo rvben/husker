@@ -82,6 +82,8 @@ pub enum StateError {
     HostResourceLeaseNotFound(Uuid),
     #[error("VM record does not match host-resource lease: {0}")]
     HostResourceLeaseMismatch(Uuid),
+    #[error("VM expiration does not match VM record: {0}")]
+    VmExpirationMismatch(Uuid),
     #[error("lock poisoned")]
     LockPoisoned,
     #[error("IO error: {0}")]
@@ -245,6 +247,18 @@ pub struct VmRecord {
     pub auto_resume: bool,
     /// Source VM this VM was forked from, or None. Fences reap of fork sources.
     pub forked_from: Option<Uuid>,
+}
+
+/// Durable hard-lifetime policy for an ephemeral VM.
+///
+/// Unlike the idle policy, expiration is independent of guest activity and VM
+/// state. It is intended for externally orchestrated one-shot workloads where
+/// the caller may disappear before it can issue the matching destroy request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmExpirationRecord {
+    pub vm_id: Uuid,
+    pub owner: Option<String>,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Persistent port forward record.
@@ -703,6 +717,17 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'invalid userdata status transition');
          END;",
     ),
+    (
+        13,
+        "CREATE TABLE vm_expirations (
+            vm_id TEXT PRIMARY KEY REFERENCES vms(id) ON DELETE CASCADE,
+            owner TEXT,
+            expires_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX idx_vm_expirations_expires_at
+            ON vm_expirations(expires_at);",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -839,6 +864,21 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             _ => return Err(StateError::Database(error)),
         }
     }
+    Ok(())
+}
+
+fn insert_vm_expiration_on(
+    conn: &Connection,
+    expiration: &VmExpirationRecord,
+) -> Result<(), StateError> {
+    conn.execute(
+        "INSERT INTO vm_expirations (vm_id, owner, expires_at) VALUES (?1, ?2, ?3)",
+        params![
+            expiration.vm_id.to_string(),
+            expiration.owner,
+            expiration.expires_at.timestamp(),
+        ],
+    )?;
     Ok(())
 }
 
@@ -1087,6 +1127,61 @@ impl StateStore {
     pub fn insert_vm(&self, record: &VmRecord) -> Result<(), StateError> {
         let conn = self.lock()?;
         insert_vm_on(&conn, record)
+    }
+
+    /// Atomically insert a VM and its optional hard-lifetime policy.
+    pub fn insert_vm_with_expiration(
+        &self,
+        record: &VmRecord,
+        expiration: Option<&VmExpirationRecord>,
+    ) -> Result<(), StateError> {
+        if expiration.is_some_and(|value| value.vm_id != record.id) {
+            return Err(StateError::VmExpirationMismatch(record.id));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        insert_vm_on(&tx, record)?;
+        if let Some(expiration) = expiration {
+            insert_vm_expiration_on(&tx, expiration)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return the hard-lifetime policy for a VM, if one was configured.
+    pub fn get_vm_expiration(&self, vm_id: Uuid) -> Result<Option<VmExpirationRecord>, StateError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT vm_id, owner, expires_at FROM vm_expirations WHERE vm_id = ?1",
+            params![vm_id.to_string()],
+            row_to_vm_expiration_record,
+        )
+        .optional()
+        .map_err(StateError::Database)
+    }
+
+    /// List every configured hard-lifetime policy, ordered by deadline.
+    pub fn list_vm_expirations(&self) -> Result<Vec<VmExpirationRecord>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT vm_id, owner, expires_at FROM vm_expirations ORDER BY expires_at")?;
+        Ok(stmt
+            .query_map([], row_to_vm_expiration_record)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// List VM generations whose hard lifetime has elapsed.
+    pub fn list_expired_vm_ids(&self, now: DateTime<Utc>) -> Result<Vec<Uuid>, StateError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT vm_id FROM vm_expirations WHERE expires_at <= ?1 ORDER BY expires_at",
+        )?;
+        Ok(stmt
+            .query_map(params![now.timestamp()], |row| {
+                let id: String = row.get(0)?;
+                parse_uuid(&id)
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Get a VM by its ID.
@@ -2240,6 +2335,20 @@ impl StateStore {
         record: &VmRecord,
         lease_id: Uuid,
     ) -> Result<(), StateError> {
+        self.commit_vm_from_host_resource_lease_with_expiration(record, lease_id, None)
+    }
+
+    /// Atomically transfer a creation lease to its final VM record and attach
+    /// an optional hard-lifetime policy to the same VM generation.
+    pub fn commit_vm_from_host_resource_lease_with_expiration(
+        &self,
+        record: &VmRecord,
+        lease_id: Uuid,
+        expiration: Option<&VmExpirationRecord>,
+    ) -> Result<(), StateError> {
+        if expiration.is_some_and(|value| value.vm_id != record.id) {
+            return Err(StateError::VmExpirationMismatch(record.id));
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let lease = tx
@@ -2271,6 +2380,9 @@ impl StateStore {
         }
 
         insert_vm_on(&tx, record)?;
+        if let Some(expiration) = expiration {
+            insert_vm_expiration_on(&tx, expiration)?;
+        }
         tx.execute(
             "DELETE FROM host_resource_leases WHERE id = ?1",
             params![lease_id.to_string()],
@@ -2746,6 +2858,26 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
     })
 }
 
+fn row_to_vm_expiration_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmExpirationRecord> {
+    let vm_id: String = row.get(0)?;
+    let expires_at: i64 = row.get(2)?;
+    Ok(VmExpirationRecord {
+        vm_id: parse_uuid(&vm_id)?,
+        owner: row.get(1)?,
+        expires_at: DateTime::from_timestamp(expires_at, 0).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "expiration timestamp is out of range",
+                )
+                .into(),
+            )
+        })?,
+    })
+}
+
 fn row_to_host_group_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostGroupRecord> {
     let id_str: String = row.get(0)?;
     let created_str: String = row.get(3)?;
@@ -3113,6 +3245,48 @@ mod tests {
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.name, "test-vm");
         assert_eq!(fetched.vcpu_count, 2);
+    }
+
+    #[test]
+    fn vm_expiration_is_atomic_queryable_and_cascades_on_retire() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("ephemeral-vm");
+        let expiration = VmExpirationRecord {
+            vm_id: rec.id,
+            owner: Some("werkt/run-123".into()),
+            expires_at: DateTime::from_timestamp(Utc::now().timestamp() - 1, 0).unwrap(),
+        };
+
+        store
+            .insert_vm_with_expiration(&rec, Some(&expiration))
+            .unwrap();
+
+        assert_eq!(store.get_vm_expiration(rec.id).unwrap(), Some(expiration));
+        assert_eq!(store.list_vm_expirations().unwrap().len(), 1);
+        assert_eq!(store.list_expired_vm_ids(Utc::now()).unwrap(), vec![rec.id]);
+
+        store.retire_vm(rec.id).unwrap();
+        assert_eq!(store.get_vm_expiration(rec.id).unwrap(), None);
+    }
+
+    #[test]
+    fn vm_expiration_cannot_be_attached_to_a_different_generation() {
+        let store = StateStore::open_memory().unwrap();
+        let rec = make_record("ephemeral-vm");
+        let expiration = VmExpirationRecord {
+            vm_id: Uuid::new_v4(),
+            owner: Some("werkt/run-123".into()),
+            expires_at: Utc::now(),
+        };
+
+        assert!(matches!(
+            store.insert_vm_with_expiration(&rec, Some(&expiration)),
+            Err(StateError::VmExpirationMismatch(id)) if id == rec.id
+        ));
+        assert!(matches!(
+            store.get_vm(rec.id),
+            Err(StateError::VmNotFound(id)) if id == rec.id
+        ));
     }
 
     #[test]

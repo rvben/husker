@@ -7,7 +7,44 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// partially allocated resources are rolled back. A stopped or failed VM
     /// with the same name is automatically replaced.
     pub async fn create_vm(&self, req: CreateVmRequest) -> Result<VmRecord, CoreError> {
-        self.create_vm_record(req, None, true).await
+        self.create_vm_record_inner(req, None, true, None).await
+    }
+
+    /// Create a VM with a durable hard lifetime.
+    ///
+    /// The expiration is persisted atomically with the final VM record, so an
+    /// external orchestrator can crash after a successful response without
+    /// leaking the guest indefinitely. Activity does not extend the deadline.
+    pub async fn create_ephemeral_vm(
+        &self,
+        req: CreateVmRequest,
+        expires_after_secs: u64,
+        owner: Option<String>,
+    ) -> Result<VmRecord, CoreError> {
+        if expires_after_secs == 0 {
+            return Err(CoreError::InvalidArgument(
+                "expires_after_secs must be greater than zero".into(),
+            ));
+        }
+        if owner.as_ref().is_some_and(|value| {
+            value.is_empty() || value.len() > 255 || value.chars().any(char::is_control)
+        }) {
+            return Err(CoreError::InvalidArgument(
+                "expiration owner must be 1-255 printable characters".into(),
+            ));
+        }
+        let seconds = i64::try_from(expires_after_secs)
+            .map_err(|_| CoreError::InvalidArgument("expires_after_secs is too large".into()))?;
+        let expires_at = chrono::Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(seconds))
+            .ok_or_else(|| CoreError::InvalidArgument("expiration deadline overflows".into()))?;
+        self.create_vm_record_inner(
+            req,
+            None,
+            true,
+            Some(PendingVmExpiration { owner, expires_at }),
+        )
+        .await
     }
 
     /// Resolve a `run`/`job` rootfs argument to a host path. Accepts a literal
@@ -57,9 +94,20 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// avoid clobbering a foreign stopped VM).
     pub async fn create_vm_record(
         &self,
+        req: CreateVmRequest,
+        tags: Option<ServiceTag>,
+        replace_existing_stopped: bool,
+    ) -> Result<VmRecord, CoreError> {
+        self.create_vm_record_inner(req, tags, replace_existing_stopped, None)
+            .await
+    }
+
+    async fn create_vm_record_inner(
+        &self,
         mut req: CreateVmRequest,
         tags: Option<ServiceTag>,
         replace_existing_stopped: bool,
+        expiration: Option<PendingVmExpiration>,
     ) -> Result<VmRecord, CoreError> {
         validate_resource_name("vm", &req.name)?;
         info!(name = %req.name, "creating VM");
@@ -120,7 +168,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         let mut resources = AllocatedResources::default();
-        match self.try_create_vm(req, tags, &mut resources).await {
+        match self
+            .try_create_vm(req, tags, expiration.as_ref(), &mut resources)
+            .await
+        {
             Ok(record) => {
                 info!(name = %record.name, id = %record.id, "VM created");
                 self.seed_activity(record.id);
@@ -140,6 +191,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         &self,
         req: CreateVmRequest,
         tags: Option<ServiceTag>,
+        expiration: Option<&PendingVmExpiration>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
         // Validate + default the network mode before touching any host resources.
@@ -567,8 +619,17 @@ impl<B: VmmBackend> HuskerCore<B> {
             forked_from: None,
         };
 
+        let expiration = expiration.map(|value| VmExpirationRecord {
+            vm_id: record.id,
+            owner: value.owner.clone(),
+            expires_at: value.expires_at,
+        });
         self.state
-            .commit_vm_from_host_resource_lease(&record, lease.id)
+            .commit_vm_from_host_resource_lease_with_expiration(
+                &record,
+                lease.id,
+                expiration.as_ref(),
+            )
             .map_err(map_vm_insert_error)?;
 
         Ok(record)
@@ -583,6 +644,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         &self,
         req: CreateVmRequest,
         tags: Option<ServiceTag>,
+        expiration: Option<&PendingVmExpiration>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
         // Apple VZ always installs a NAT attachment. Reject every other mode
@@ -799,7 +861,14 @@ impl<B: VmmBackend> HuskerCore<B> {
                 forked_from: None,
             };
 
-            self.state.insert_vm(&record).map_err(map_vm_insert_error)?;
+            let expiration = expiration.map(|value| VmExpirationRecord {
+                vm_id: record.id,
+                owner: value.owner.clone(),
+                expires_at: value.expires_at,
+            });
+            self.state
+                .insert_vm_with_expiration(&record, expiration.as_ref())
+                .map_err(map_vm_insert_error)?;
 
             return Ok(record);
         }
@@ -913,7 +982,14 @@ impl<B: VmmBackend> HuskerCore<B> {
             forked_from: None,
         };
 
-        self.state.insert_vm(&record).map_err(map_vm_insert_error)?;
+        let expiration = expiration.map(|value| VmExpirationRecord {
+            vm_id: record.id,
+            owner: value.owner.clone(),
+            expires_at: value.expires_at,
+        });
+        self.state
+            .insert_vm_with_expiration(&record, expiration.as_ref())
+            .map_err(map_vm_insert_error)?;
 
         Ok(record)
     }
@@ -1314,6 +1390,65 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// List all VMs.
     pub fn list_vms(&self) -> Result<Vec<VmRecord>, CoreError> {
         Ok(self.state.list_vms()?)
+    }
+
+    /// Return the durable hard-lifetime policy for a VM generation.
+    pub fn get_vm_expiration(&self, vm_id: Uuid) -> Result<Option<VmExpirationRecord>, CoreError> {
+        Ok(self.state.get_vm_expiration(vm_id)?)
+    }
+
+    /// List all configured hard-lifetime policies.
+    pub fn list_vm_expirations(&self) -> Result<Vec<VmExpirationRecord>, CoreError> {
+        Ok(self.state.list_vm_expirations()?)
+    }
+
+    /// Reap every VM generation whose durable hard lifetime has elapsed.
+    ///
+    /// Each candidate is re-read under its name lock before destruction. A
+    /// failed cleanup retains both the VM and expiration records so the next
+    /// daemon tick retries it.
+    pub async fn expiration_tick(self: &Arc<Self>)
+    where
+        B: 'static,
+    {
+        let expired = match self.state.list_expired_vm_ids(chrono::Utc::now()) {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!(%error, "expiration tick: list expired VMs failed");
+                return;
+            }
+        };
+        for id in expired {
+            let record = match self.state.get_vm(id) {
+                Ok(record) => record,
+                Err(husker_state::StateError::VmNotFound(_)) => continue,
+                Err(error) => {
+                    warn!(%id, %error, "expiration tick: load VM failed");
+                    continue;
+                }
+            };
+            let _guard = self.vm_name_lock(&record.name).lock_owned().await;
+            let Ok(fresh) = self.state.get_vm(id) else {
+                continue;
+            };
+            let still_expired = match self.state.get_vm_expiration(id) {
+                Ok(Some(value)) => value.expires_at <= chrono::Utc::now(),
+                Ok(None) => false,
+                Err(error) => {
+                    warn!(vm = %fresh.name, %id, %error, "expiration tick: reload policy failed");
+                    continue;
+                }
+            };
+            if !still_expired {
+                continue;
+            }
+            match self.destroy_vm_recoverable_locked(&fresh).await {
+                Ok(()) => info!(vm = %fresh.name, %id, "expired VM reaped"),
+                Err(error) => {
+                    warn!(vm = %fresh.name, %id, %error, "expiration tick: reap failed")
+                }
+            }
+        }
     }
 
     /// The capability-defining backend kind of this daemon's VMM backend

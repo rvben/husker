@@ -15,10 +15,10 @@ use tracing::{debug, info, warn};
 
 use husker_core::{
     BootKind, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest, CreateServiceRequest,
-    CreateSnapshotRequest, CreateVmRequest, CreateVolumeRequest, DiagnosticsReport,
-    ExecStreamEvent, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore,
-    ImageRecord, ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest,
-    SecretMetadata, ServiceRecord, ShellEvent, SnapshotRecord, VmLifecycleState, VmRecord,
+    CreateSnapshotRequest, CreateVolumeRequest, DiagnosticsReport, ExecStreamEvent,
+    ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
+    ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
+    ServiceRecord, ShellEvent, SnapshotRecord, VmExpirationRecord, VmLifecycleState, VmRecord,
     VolumeRecord,
 };
 use husker_vmm::VmmBackend;
@@ -1049,7 +1049,7 @@ pub(crate) async fn restore_snapshot<B: VmmBackend + 'static>(
     Json(req): Json<RestoreSnapshotRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
     let vm = core.restore_snapshot(&name, req).await.map_err(map_error)?;
-    Ok((StatusCode::CREATED, Json(record_to_response(vm))))
+    Ok((StatusCode::CREATED, Json(record_to_response(vm, None))))
 }
 
 #[utoipa::path(
@@ -1065,14 +1065,27 @@ pub(crate) async fn list_vms<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
 ) -> Result<Json<Vec<VmResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let vms = core.list_vms_refreshed().await.map_err(map_error)?;
-    Ok(Json(vms.into_iter().map(record_to_response).collect()))
+    let mut expirations: HashMap<_, _> = core
+        .list_vm_expirations()
+        .map_err(map_error)?
+        .into_iter()
+        .map(|value| (value.vm_id, value))
+        .collect();
+    Ok(Json(
+        vms.into_iter()
+            .map(|vm| {
+                let expiration = expirations.remove(&vm.id);
+                record_to_response(vm, expiration)
+            })
+            .collect(),
+    ))
 }
 
 #[utoipa::path(
     post,
     path = "/v1/vms",
     tag = "vms",
-    request_body = CreateVmRequest,
+    request_body = CreateVmApiRequest,
     responses(
         (status = 201, description = "VM created", body = VmResponse),
         (status = 409, description = "VM already exists", body = ErrorResponse),
@@ -1081,9 +1094,14 @@ pub(crate) async fn list_vms<B: VmmBackend + 'static>(
 )]
 pub(crate) async fn create_vm<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
-    Json(req): Json<CreateVmRequest>,
+    Json(req): Json<CreateVmApiRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
     let policy = current_policy();
+    let CreateVmApiRequest {
+        vm,
+        expires_after_secs,
+        owner,
+    } = req;
 
     // Admission control: cap the number of VMs a client can create so a single
     // caller cannot exhaust host CPU/memory by creating VMs without bound.
@@ -1101,7 +1119,7 @@ pub(crate) async fn create_vm<B: VmmBackend + 'static>(
         }
     }
 
-    for (i, spec) in req.mounts.iter().enumerate() {
+    for (i, spec) in vm.mounts.iter().enumerate() {
         let share = husker_core::parse_mount_spec(spec, i).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1128,11 +1146,26 @@ pub(crate) async fn create_vm<B: VmmBackend + 'static>(
         }
     }
 
-    let record = core.create_vm(req).await.map_err(map_error)?;
+    let record = match expires_after_secs {
+        Some(seconds) => core
+            .create_ephemeral_vm(vm, seconds, owner)
+            .await
+            .map_err(map_error)?,
+        None if owner.is_some() => {
+            return Err(map_error(husker_core::CoreError::InvalidArgument(
+                "owner requires expires_after_secs".into(),
+            )));
+        }
+        None => core.create_vm(vm).await.map_err(map_error)?,
+    };
 
     core.spawn_userdata(&record).await;
 
-    Ok((StatusCode::CREATED, Json(record_to_response(record))))
+    let expiration = core.get_vm_expiration(record.id).map_err(map_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(record_to_response(record, expiration)),
+    ))
 }
 
 #[utoipa::path(
@@ -1150,7 +1183,8 @@ pub(crate) async fn get_vm<B: VmmBackend + 'static>(
     Path(name): Path<String>,
 ) -> Result<Json<VmResponse>, (StatusCode, Json<ErrorResponse>)> {
     let record = core.get_vm_refreshed(&name).await.map_err(map_error)?;
-    Ok(Json(record_to_response(record)))
+    let expiration = core.get_vm_expiration(record.id).map_err(map_error)?;
+    Ok(Json(record_to_response(record, expiration)))
 }
 
 #[utoipa::path(
@@ -1274,7 +1308,7 @@ pub(crate) async fn fork_vm<B: VmmBackend + 'static>(
         .fork_vm(&name, &req.fork_name)
         .await
         .map_err(map_error)?;
-    Ok((StatusCode::CREATED, Json(record_to_response(record))))
+    Ok((StatusCode::CREATED, Json(record_to_response(record, None))))
 }
 
 #[utoipa::path(
@@ -2522,7 +2556,7 @@ pub(crate) async fn checkout_pool<B: VmmBackend + 'static>(
         .checkout_pool(&name, req.vm_name.as_deref())
         .await
         .map_err(map_error)?;
-    Ok((StatusCode::CREATED, Json(record_to_response(vm))))
+    Ok((StatusCode::CREATED, Json(record_to_response(vm, None))))
 }
 
 fn pool_to_response(r: PoolRecord) -> PoolResponse {
@@ -2632,7 +2666,10 @@ fn snapshot_to_response(r: SnapshotRecord) -> SnapshotResponse {
     }
 }
 
-pub(crate) fn record_to_response(r: VmRecord) -> VmResponse {
+pub(crate) fn record_to_response(
+    r: VmRecord,
+    expiration: Option<VmExpirationRecord>,
+) -> VmResponse {
     VmResponse {
         id: r.id.to_string(),
         name: r.name,
@@ -2658,6 +2695,10 @@ pub(crate) fn record_to_response(r: VmRecord) -> VmResponse {
         // stays tidy for the common (no-policy) case.
         auto_resume: r.idle_timeout_secs.is_some().then_some(r.auto_resume),
         suspended_at: r.suspended_at.map(|d| d.to_rfc3339()),
+        expires_at: expiration
+            .as_ref()
+            .map(|value| value.expires_at.to_rfc3339()),
+        owner: expiration.and_then(|value| value.owner),
     }
 }
 

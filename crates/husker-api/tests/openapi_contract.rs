@@ -159,3 +159,25 @@ async fn openapi_ports_tag_is_cross_platform() {
         "ports tag should no longer carry a Linux-only caveat"
     );
 }
+
+#[tokio::test]
+async fn openapi_documents_ephemeral_vm_creation_contract() {
+    let doc = fetch_openapi().await;
+    let request_schema =
+        &doc["paths"]["/v1/vms"]["post"]["requestBody"]["content"]["application/json"]["schema"];
+    assert_eq!(
+        request_schema["$ref"],
+        "#/components/schemas/CreateVmApiRequest"
+    );
+
+    let schema = &doc["components"]["schemas"]["CreateVmApiRequest"];
+    let encoded = serde_json::to_string(schema).unwrap();
+    assert!(
+        encoded.contains("expires_after_secs"),
+        "ephemeral lifetime is missing from CreateVmApiRequest: {schema}"
+    );
+    assert!(
+        encoded.contains("owner"),
+        "expiration owner is missing from CreateVmApiRequest: {schema}"
+    );
+}

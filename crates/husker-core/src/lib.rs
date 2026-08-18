@@ -39,8 +39,8 @@ use uuid::Uuid;
 
 pub use husker_state::{
     BackendKind, BootKind, HostGroupRecord, ImageKind, ImageRecord, NetworkMode, PoolRecord,
-    SecretRecord, ServiceRecord, SnapshotRecord, UserdataStatus, VmLifecycleState, VmRecord,
-    VolumeRecord,
+    SecretRecord, ServiceRecord, SnapshotRecord, UserdataStatus, VmExpirationRecord,
+    VmLifecycleState, VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
 
@@ -238,6 +238,12 @@ pub struct CreateVmRequest {
     /// meaningful when the idle policy is enabled.
     #[serde(default)]
     pub auto_resume: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingVmExpiration {
+    owner: Option<String>,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Parameters for creating a host group.
@@ -2629,6 +2635,47 @@ mod tests {
         let rec = sample_vm_record(name);
         core.state.insert_vm(&rec).unwrap();
         rec
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn expiration_tick_reaps_only_elapsed_vm_generations() {
+        let core = test_core().await;
+        let mut expired = sample_vm_record("expired");
+        expired.state = VmLifecycleState::Stopped;
+        let expired_policy = VmExpirationRecord {
+            vm_id: expired.id,
+            owner: Some("werkt/expired".into()),
+            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        core.state
+            .insert_vm_with_expiration(&expired, Some(&expired_policy))
+            .unwrap();
+
+        let mut live = sample_vm_record("live");
+        live.state = VmLifecycleState::Stopped;
+        let live_policy = VmExpirationRecord {
+            vm_id: live.id,
+            owner: Some("werkt/live".into()),
+            expires_at: chrono::DateTime::from_timestamp(
+                chrono::Utc::now().timestamp() + 5 * 60,
+                0,
+            )
+            .unwrap(),
+        };
+        core.state
+            .insert_vm_with_expiration(&live, Some(&live_policy))
+            .unwrap();
+
+        core.expiration_tick().await;
+
+        assert!(core.state.get_vm(expired.id).is_err());
+        assert_eq!(core.state.get_vm_expiration(expired.id).unwrap(), None);
+        assert_eq!(core.state.get_vm(live.id).unwrap().name, "live");
+        assert_eq!(
+            core.state.get_vm_expiration(live.id).unwrap(),
+            Some(live_policy)
+        );
     }
 
     /// A stopped, abandoned VM (old `updated_at`) still holding a TAP + IP.

@@ -7,6 +7,21 @@ use utoipa::ToSchema;
 
 use husker_core::{BootKind, DaemonProfile, ImageKind, UserdataStatus};
 
+/// API request for VM creation.
+///
+/// The flattened fields preserve the original `CreateVmRequest` JSON shape.
+/// Supplying `expires_after_secs` turns the VM into a hard-expiring ephemeral
+/// guest; `owner` is an informational correlation key for operators.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateVmApiRequest {
+    #[serde(flatten)]
+    pub vm: husker_core::CreateVmRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
 // ── Response Types ────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -51,6 +66,12 @@ pub struct VmResponse {
     /// Timestamp the VM was suspended at, if currently suspended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspended_at: Option<String>,
+    /// Hard-lifetime deadline for an ephemeral VM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Informational owner/correlation key attached to the hard lifetime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

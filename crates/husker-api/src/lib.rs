@@ -36,7 +36,9 @@ use axum::http::StatusCode;
 #[cfg(test)]
 use errors::{map_agent_connect_error, map_error};
 #[cfg(test)]
-use husker_core::{BackendKind, BootKind, CoreError, NetworkMode, VmLifecycleState, VmRecord};
+use husker_core::{
+    BackendKind, BootKind, CoreError, NetworkMode, VmExpirationRecord, VmLifecycleState, VmRecord,
+};
 #[cfg(test)]
 use router::{is_protected_route, is_rate_limited_route};
 #[cfg(test)]
@@ -284,6 +286,7 @@ pub(crate) fn max_vms() -> Option<usize> {
         RotateSecretRequest,
         ScaleServiceRequest,
         BalloonRequest,
+        CreateVmApiRequest,
         CreateVmRequest,
         DiagnosticsReport,
         CheckResult,
@@ -1150,6 +1153,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ephemeral_vm_creation_validates_expiration_before_allocating_resources() {
+        for body in [
+            serde_json::json!({
+                "name": "owner-without-expiration",
+                "owner": "werkt/run-1"
+            }),
+            serde_json::json!({
+                "name": "zero-expiration",
+                "expires_after_secs": 0
+            }),
+        ] {
+            let response = router(test_core())
+                .oneshot(
+                    Request::post("/v1/vms")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let json = response_json(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "response: {json}");
+            assert_eq!(json["kind"], "invalid_argument");
+        }
+    }
+
+    #[tokio::test]
     async fn create_rejected_when_max_vms_reached() {
         // One VM already exists and the limit is 1, so a create is rejected with
         // 429 at admission - before it reaches kernel validation (which would 500).
@@ -1686,18 +1717,53 @@ mod tests {
         let mut r = sample_vm_record("r");
         r.idle_timeout_secs = Some(120);
         r.auto_resume = false;
-        let resp = record_to_response(r);
+        let expiration = VmExpirationRecord {
+            vm_id: r.id,
+            owner: Some("werkt/run-123".into()),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        };
+        let resp = record_to_response(r, Some(expiration.clone()));
         assert_eq!(resp.vmm, "firecracker");
         assert_eq!(resp.idle_timeout_secs, Some(120));
         assert_eq!(resp.suspend_ttl_secs, None);
         assert_eq!(resp.auto_resume, Some(false));
+        assert_eq!(resp.expires_at, Some(expiration.expires_at.to_rfc3339()));
+        assert_eq!(resp.owner.as_deref(), Some("werkt/run-123"));
 
         // A VM that never opted into the idle policy must not surface
         // `auto_resume` at all, keeping the no-policy payload tidy.
         let no_policy = sample_vm_record("no-policy");
-        let resp = record_to_response(no_policy);
+        let resp = record_to_response(no_policy, None);
         assert_eq!(resp.idle_timeout_secs, None);
         assert_eq!(resp.auto_resume, None);
+        assert_eq!(resp.expires_at, None);
+        assert_eq!(resp.owner, None);
+    }
+
+    #[test]
+    fn create_vm_api_request_preserves_flat_shape_and_expiration_fields() {
+        let request: CreateVmApiRequest = serde_json::from_value(serde_json::json!({
+            "name": "werkt-run-123",
+            "rootfs_path": "python:3.12-alpine",
+            "network": "none",
+            "expires_after_secs": 420,
+            "owner": "werkt/run-123"
+        }))
+        .unwrap();
+
+        assert_eq!(request.vm.name, "werkt-run-123");
+        assert_eq!(
+            request.vm.rootfs_path.as_deref(),
+            Some(std::path::Path::new("python:3.12-alpine"))
+        );
+        assert_eq!(request.vm.network.as_deref(), Some("none"));
+        assert_eq!(request.expires_after_secs, Some(420));
+        assert_eq!(request.owner.as_deref(), Some("werkt/run-123"));
+
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["name"], "werkt-run-123");
+        assert_eq!(encoded["expires_after_secs"], 420);
+        assert!(encoded.get("vm").is_none(), "request must remain flat");
     }
 
     #[test]

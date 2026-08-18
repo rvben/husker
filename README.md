@@ -7,6 +7,7 @@ An open-source microVM manager built on [Firecracker](https://firecracker-microv
 - Stream serial console logs
 - Port forwarding (nftables NAT on Linux, a userspace TCP proxy on macOS)
 - REST API + CLI
+- Durable hard expirations for externally orchestrated ephemeral VMs
 - Cloud-init style userdata scripts
 
 ## Status
@@ -278,6 +279,13 @@ CLI (husker) ──> REST API (husker-api) ──> Core (husker-core)
 Host-guest communication uses vsock (port 52). Messages are length-prefixed JSON with base64-encoded binary payloads.
 
 Once the daemon is running, the REST API is browsable at `http://127.0.0.1:7777/docs` (Swagger UI), with the raw OpenAPI schema at `/api-docs/openapi.json`.
+
+External orchestrators can attach a hard lifetime when creating a VM by adding
+`expires_after_secs` and an optional informational `owner` to `POST /v1/vms`.
+The deadline is stored atomically with the VM record, is not extended by guest
+activity, appears as `expires_at`/`owner` in VM responses, and is reaped by the
+daemon even if the orchestrator disappears. See [Werkt integration](docs/werkt.md)
+for the intended execution-plane boundary.
 
 ## Security
 
