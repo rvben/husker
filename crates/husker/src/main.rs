@@ -3890,6 +3890,15 @@ impl ConfigCheckReport {
     }
 }
 
+/// True when the initrd path is one husker derived for itself rather than one
+/// the operator named. A derived path only exists once a kernel has been
+/// downloaded, and the boot path drops a missing initrd and starts the VM
+/// without one, so its absence is not a broken configuration.
+fn is_derived_initrd(config: &Config, initrd: &Path) -> bool {
+    initrd == husker::default_initrd_path()
+        || initrd == husker::default_initrd_path_for(&config.data_dir)
+}
+
 fn check_regular_file(report: &mut ConfigCheckReport, name: &str, path: &Path) {
     let message = path.display().to_string();
     if path.is_file() {
@@ -3959,7 +3968,18 @@ fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
     check_regular_file(&mut report, "default_kernel", &config.default_kernel);
     check_regular_file(&mut report, "default_rootfs", &config.default_rootfs);
     if let Some(initrd) = &config.default_initrd {
-        check_regular_file(&mut report, "default_initrd", initrd);
+        if !initrd.exists() && is_derived_initrd(&config, initrd) {
+            report.push(
+                "default_initrd",
+                "warn",
+                format!(
+                    "{}: not downloaded yet; VMs boot without an initrd",
+                    initrd.display()
+                ),
+            );
+        } else {
+            check_regular_file(&mut report, "default_initrd", initrd);
+        }
     }
     match reqwest::Url::parse(&config.images_base_url) {
         Ok(_) => report.push("images_base_url", "ok", &config.images_base_url),
@@ -4290,6 +4310,11 @@ fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()
         if initrd.is_file() {
             println!(
                 "  default_initrd ({}) ... OK{initrd_env_hint}",
+                initrd.display()
+            );
+        } else if !initrd.exists() && is_derived_initrd(&config, initrd) {
+            println!(
+                "  default_initrd ({}) ... not downloaded yet (VMs boot without an initrd){initrd_env_hint}",
                 initrd.display()
             );
         } else if initrd.exists() {
