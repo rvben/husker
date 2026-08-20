@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.45](https://github.com/rvben/husker/compare/v0.4.44...v0.4.45) - 2026-08-20
+
+### Added
+
+- **lifecycle**: add durable VM expirations ([55a6a38](https://github.com/rvben/husker/commit/55a6a380e9dc21b9d6b8293e77eb9411e9b1032a))
+- **job**: stream command output ([23fddd1](https://github.com/rvben/husker/commit/23fddd1e97ce9f31cb59dcc70f6fb40045e7da89))
+- **cli**: add structured config check reports ([26cbe1b](https://github.com/rvben/husker/commit/26cbe1b0a78bb1a7a04ad1e71945cc1fe05a0dbc))
+- **exec**: stream non-interactive command output ([102c55d](https://github.com/rvben/husker/commit/102c55d3b5649d1c9e00ae4d23c338ea67b747e5))
+
+### Fixed
+
+- **build**: compile command_available only where it is called ([6db5e0b](https://github.com/rvben/husker/commit/6db5e0b9e65c65cca86e6e2d4e84d171ca516c1f))
+- **config**: treat a never-downloaded initrd as a warning ([93de0f6](https://github.com/rvben/husker/commit/93de0f682d2dcfd93c02bdb0a1ba979b92cd1fb7))
+- stop a failed job from stranding its VM and volume ([b3a7d7e](https://github.com/rvben/husker/commit/b3a7d7eeef8eb04d8d0e6c7e6fa0f3dd3a055d6e))
+- survive the daemon's own rate limit instead of failing the command ([ae2c9a6](https://github.com/rvben/husker/commit/ae2c9a67e687bcfef738a879b6e5ef43e3eba448))
+- **cli**: keep ignored files out of a working-tree sync ([3879e86](https://github.com/rvben/husker/commit/3879e8682f3cc098649afbe6dd9f38813c462505))
+- **core**: keep an image's merged /usr when injecting the guest runtime ([1098f18](https://github.com/rvben/husker/commit/1098f18ed3e6f5c026806ede552e8dec2b587ada))
+- **ci**: embed agent from custom target dir ([3f09626](https://github.com/rvben/husker/commit/3f0962632c1bba36eb5bb032fa06e2b1973c9918))
+- **build**: vendor Swagger UI assets ([7c70fe8](https://github.com/rvben/husker/commit/7c70fe85fde3547e5dbb52c29a9f729bec8de05a))
+- **config**: skip Linux checks on macOS ([b0282e2](https://github.com/rvben/husker/commit/b0282e2ff7ccdc8c5a7aa5ebe7e0f384f0591701))
+- **agent**: provide a default guest home ([b6606f6](https://github.com/rvben/husker/commit/b6606f6f89c976fed74b87f08f688a1bff446505))
+- **release**: poll checksum before rollout ([e2fb390](https://github.com/rvben/husker/commit/e2fb390b769775929cbef7d43c79fd4f89fdac64))
+
+### Performance
+
+- **api**: shrink the error variant every handler returns ([79e5187](https://github.com/rvben/husker/commit/79e518726cc766ac35fd0f433b23719d463456d6))
+- **ci**: avoid redundant E2E rebuild ([7f4499a](https://github.com/rvben/husker/commit/7f4499a57748d57e605c430f9748c28e958fe8bc))
+- **deploy**: reuse stable source workspace ([f7379a3](https://github.com/rvben/husker/commit/f7379a3392d92885632601c8a97e7029358556df))
+- **deploy**: bound optimized link time ([28050c6](https://github.com/rvben/husker/commit/28050c6e4d9281a65e7c7376991de72cd876f015))
+- **deploy**: reuse guarded build cache ([efacbed](https://github.com/rvben/husker/commit/efacbed7dfc56b3078a675f6de7368f27fe7cf4a))
+
 ## [0.4.44](https://github.com/rvben/husker/compare/v0.4.43...v0.4.44) - 2026-08-15
 
 ### Added
