@@ -28,6 +28,35 @@ use crate::schema::exit_code;
 /// exposed to clients, so uploads stay comfortably below the default.
 pub(crate) const FILE_WRITE_CHUNK_BYTES: usize = 512 * 1024;
 
+/// Total sends of one rate-limited request, the first included. Backpressure
+/// that outlasts this is a real failure, and waiting on it silently hides that
+/// from whoever is watching the job.
+pub(crate) const RATE_LIMIT_MAX_ATTEMPTS: u32 = 8;
+/// Shortest wait between attempts, so a daemon asking for an immediate retry
+/// cannot turn the client into a tight loop.
+pub(crate) const RATE_LIMIT_MIN_DELAY: Duration = Duration::from_millis(100);
+/// Longest wait between attempts. The daemon's window is a minute wide, so
+/// nothing is gained by sleeping past one.
+pub(crate) const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// How long to wait before re-sending a request the daemon rate-limited.
+///
+/// `Retry-After` wins whenever the daemon sends a readable one: it knows when
+/// its window frees and the client can only guess. Without it the wait doubles
+/// per attempt so an unguided client still backs off instead of hammering.
+fn rate_limit_delay(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
+    let stated = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let delay = stated.unwrap_or_else(|| {
+        Duration::from_secs(1)
+            .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(31)))
+    });
+    delay.clamp(RATE_LIMIT_MIN_DELAY, RATE_LIMIT_MAX_DELAY)
+}
+
 /// A failure returned by the daemon and suitable for the CLI error envelope.
 #[derive(Debug, Clone)]
 pub(crate) struct ApiFailure {
@@ -488,7 +517,35 @@ impl DaemonClient {
 
     /// Send a request through this adapter, enriching connection failures with
     /// the resolved target and a stable marker for exit-code selection.
+    ///
+    /// A rate-limited response is backpressure rather than a result: the daemon
+    /// refuses it before the handler runs, so the request never took effect and
+    /// re-sending it cannot duplicate anything. Chunked uploads and downloads
+    /// are bursts by construction, and without this a large transfer fails the
+    /// whole command partway through instead of simply slowing down. Retries
+    /// are bounded, so a daemon that stays saturated is still reported.
     pub(crate) async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut pending = request;
+        let mut attempt = 1;
+        loop {
+            // A body that cannot be cloned (a stream) is sent once, as before.
+            let spare = (attempt < RATE_LIMIT_MAX_ATTEMPTS)
+                .then(|| pending.try_clone())
+                .flatten();
+            let response = self.send_once(pending).await?;
+            let Some(spare) = spare else {
+                return Ok(response);
+            };
+            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(response);
+            }
+            tokio::time::sleep(rate_limit_delay(response.headers(), attempt)).await;
+            pending = spare;
+            attempt += 1;
+        }
+    }
+
+    async fn send_once(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         request.send().await.map_err(|error| {
             if error.is_connect() {
                 anyhow::Error::new(DaemonUnreachable).context(format!(
@@ -599,6 +656,7 @@ mod tests {
     use axum::extract::Json as ExtractJson;
     use axum::extract::ws::{Message, WebSocketUpgrade};
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use axum::routing::get;
     use serde_json::json;
 
@@ -1036,6 +1094,148 @@ mod tests {
         assert_eq!(exit, None);
         assert!(!delivered);
         task.abort();
+    }
+
+    /// A chunked upload is a burst by construction, so the daemon's own rate
+    /// limiter is the thing most likely to reject it. The limiter rejects
+    /// before the handler runs, so the request never happened and re-sending it
+    /// is the correct response: the transfer slows down instead of the job
+    /// dying halfway through.
+    #[tokio::test]
+    async fn a_rate_limited_request_is_re_sent_rather_than_failing_the_command() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/files/write",
+            axum::routing::post(move || {
+                let counted = Arc::clone(&counted);
+                async move {
+                    let attempt = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(axum::http::header::RETRY_AFTER, "0")],
+                            Json(json!({
+                                "kind": "rate_limited",
+                                "message": "too many requests to sensitive endpoint",
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(json!({ "bytes_written": 5 })).into_response()
+                }
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let request = WriteFileRequest {
+            path: "/tmp/result".into(),
+            data: husker_agent_proto::base64_encode(b"hello"),
+            mode: None,
+            append: false,
+        };
+
+        let response = client.write_file("demo", &request).await.unwrap();
+
+        assert_eq!(response.bytes_written, 5);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the rejected attempt is re-sent exactly once"
+        );
+        task.abort();
+    }
+
+    /// Backpressure that never lets up is a real failure, and waiting on it
+    /// forever hides that from whoever is watching the job.
+    #[tokio::test]
+    async fn a_permanently_rate_limited_daemon_is_reported_rather_than_retried_forever() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/files/write",
+            axum::routing::post(move || {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(axum::http::header::RETRY_AFTER, "0")],
+                        Json(json!({
+                            "kind": "rate_limited",
+                            "message": "too many requests to sensitive endpoint",
+                        })),
+                    )
+                }
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let request = WriteFileRequest {
+            path: "/tmp/result".into(),
+            data: husker_agent_proto::base64_encode(b"hello"),
+            mode: None,
+            append: false,
+        };
+
+        let error = client.write_file("demo", &request).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("too many requests"),
+            "the daemon's own refusal survives the retries: {error:#}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            RATE_LIMIT_MAX_ATTEMPTS as usize,
+            "retries are bounded"
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn rate_limit_delay_prefers_the_daemons_own_deadline() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+
+        assert_eq!(rate_limit_delay(&headers, 1), Duration::from_secs(7));
+        assert_eq!(
+            rate_limit_delay(&headers, 5),
+            Duration::from_secs(7),
+            "the daemon's deadline does not drift with the attempt count"
+        );
+    }
+
+    #[test]
+    fn rate_limit_delay_backs_off_when_the_daemon_is_silent() {
+        let headers = reqwest::header::HeaderMap::new();
+
+        let first = rate_limit_delay(&headers, 1);
+        let second = rate_limit_delay(&headers, 2);
+        assert!(
+            second > first,
+            "an unguided retry backs off: {first:?} then {second:?}"
+        );
+        assert_eq!(
+            rate_limit_delay(&headers, 30),
+            RATE_LIMIT_MAX_DELAY,
+            "and is capped rather than growing without bound"
+        );
+    }
+
+    #[test]
+    fn rate_limit_delay_never_becomes_a_tight_loop() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        assert_eq!(rate_limit_delay(&headers, 1), RATE_LIMIT_MIN_DELAY);
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "not a number".parse().unwrap(),
+        );
+        assert!(
+            rate_limit_delay(&headers, 1) >= RATE_LIMIT_MIN_DELAY,
+            "an unreadable header falls back to the backoff, never to no wait"
+        );
     }
 
     #[tokio::test]

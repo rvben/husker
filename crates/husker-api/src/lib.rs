@@ -109,6 +109,20 @@ impl ApiMetrics {
     }
 }
 
+/// Width of the sliding window every sensitive-endpoint limit is counted over.
+pub(crate) const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// The outcome of one rate-limit check.
+///
+/// A rejection carries the wait because only the limiter knows it: the window
+/// frees capacity as its oldest event ages out, and a client left to guess
+/// either stalls far longer than needed or retries in a tight loop.
+#[derive(Debug)]
+pub(crate) enum RateLimitDecision {
+    Allowed,
+    Limited { retry_after: Duration },
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SlidingWindowRateLimiter {
     events: Mutex<HashMap<String, VecDeque<Instant>>>,
@@ -123,22 +137,31 @@ impl SlidingWindowRateLimiter {
             .clear();
     }
 
-    pub(crate) fn allow(&self, key: &str, limit_per_minute: u32) -> bool {
+    /// Record one request against `key`, or reject it and say when the window
+    /// next has room. A rejected request is deliberately not recorded, so
+    /// retrying while limited cannot push that moment further away.
+    pub(crate) fn check(&self, key: &str, limit_per_minute: u32) -> RateLimitDecision {
         if limit_per_minute == 0 {
-            return true;
+            return RateLimitDecision::Allowed;
         }
         let mut events = self.events.lock().expect("rate limiter lock poisoned");
         let now = Instant::now();
-        let window_start = now - Duration::from_secs(60);
+        let window_start = now - RATE_LIMIT_WINDOW;
         let queue = events.entry(key.to_string()).or_default();
         while queue.front().is_some_and(|t| *t < window_start) {
             queue.pop_front();
         }
         if queue.len() >= limit_per_minute as usize {
-            return false;
+            // The request that frees a slot is the oldest one still in the
+            // window; capacity returns one window after it was recorded.
+            let retry_after = queue
+                .front()
+                .map(|oldest| (*oldest + RATE_LIMIT_WINDOW).saturating_duration_since(now))
+                .unwrap_or(RATE_LIMIT_WINDOW);
+            return RateLimitDecision::Limited { retry_after };
         }
         queue.push_back(now);
-        true
+        RateLimitDecision::Allowed
     }
 }
 
@@ -2208,19 +2231,116 @@ mod tests {
         set_policy(ApiPolicy::default());
     }
 
+    /// A rate-limited client that is told nothing can only guess when to come
+    /// back, and a guess is either a stall or a spin. The daemon knows, so it
+    /// says so in the header the standard reserves for it.
+    #[tokio::test]
+    async fn rate_limited_response_says_when_to_retry() {
+        let _guard = policy_test_lock().lock().await;
+        rate_limiter().clear();
+        set_policy(ApiPolicy {
+            sensitive_rate_limit_per_minute: 1,
+            ..ApiPolicy::default()
+        });
+
+        let body = serde_json::json!({ "path": "/safe/ok" });
+        let request = || {
+            Request::post("/v1/vms/any/files/read")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap()
+        };
+        let accepted = router(test_core()).oneshot(request()).await.unwrap();
+        assert_ne!(accepted.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let limited = router(test_core()).oneshot(request()).await.unwrap();
+
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = limited
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("a rate-limited response carries Retry-After")
+            .to_str()
+            .expect("Retry-After is ASCII")
+            .parse::<u64>()
+            .expect("Retry-After is whole seconds");
+        // The one accepted request was made moments ago and is the only thing
+        // holding the slot, so it leaves the window in very nearly its full
+        // width. Both bounds matter: a constant zero and a constant window
+        // width are each wrong, and each would satisfy only one of them.
+        assert!(
+            (56..=60).contains(&retry_after),
+            "the header must carry the real deadline, not a placeholder: {retry_after}"
+        );
+
+        rate_limiter().clear();
+        set_policy(ApiPolicy::default());
+    }
+
     #[test]
     fn rate_limiter_blocks_when_limit_reached() {
         let limiter = SlidingWindowRateLimiter::default();
-        assert!(limiter.allow("k", 2));
-        assert!(limiter.allow("k", 2));
-        assert!(!limiter.allow("k", 2));
+        assert!(matches!(limiter.check("k", 2), RateLimitDecision::Allowed));
+        assert!(matches!(limiter.check("k", 2), RateLimitDecision::Allowed));
+        assert!(matches!(
+            limiter.check("k", 2),
+            RateLimitDecision::Limited { .. }
+        ));
     }
 
     #[test]
     fn rate_limiter_zero_limit_allows_requests() {
         let limiter = SlidingWindowRateLimiter::default();
-        assert!(limiter.allow("k", 0));
-        assert!(limiter.allow("k", 0));
+        assert!(matches!(limiter.check("k", 0), RateLimitDecision::Allowed));
+        assert!(matches!(limiter.check("k", 0), RateLimitDecision::Allowed));
+    }
+
+    /// A sliding window frees capacity as its oldest event ages out, and the
+    /// limiter is the only party that knows when that is. Reporting it turns a
+    /// rejection into backpressure a client can act on.
+    #[test]
+    fn rate_limiter_reports_when_capacity_frees() {
+        let limiter = SlidingWindowRateLimiter::default();
+        assert!(matches!(limiter.check("k", 2), RateLimitDecision::Allowed));
+        assert!(matches!(limiter.check("k", 2), RateLimitDecision::Allowed));
+
+        let RateLimitDecision::Limited { retry_after } = limiter.check("k", 2) else {
+            panic!("a third request against a limit of two must be limited");
+        };
+
+        // The two accepted events were recorded moments ago, so the oldest of
+        // them leaves the window in just under its full width.
+        assert!(
+            retry_after <= Duration::from_secs(60),
+            "never longer than the window: {retry_after:?}"
+        );
+        assert!(
+            retry_after > Duration::from_secs(55),
+            "the window has barely advanced yet: {retry_after:?}"
+        );
+    }
+
+    /// A rejected request is not recorded, so retrying while limited must not
+    /// push the moment capacity frees any further away.
+    #[test]
+    fn rate_limiter_retry_does_not_extend_the_window() {
+        let limiter = SlidingWindowRateLimiter::default();
+        assert!(matches!(limiter.check("k", 1), RateLimitDecision::Allowed));
+
+        let RateLimitDecision::Limited { retry_after: first } = limiter.check("k", 1) else {
+            panic!("second request against a limit of one must be limited");
+        };
+        let RateLimitDecision::Limited {
+            retry_after: second,
+        } = limiter.check("k", 1)
+        else {
+            panic!("a retry while still limited must stay limited");
+        };
+
+        assert!(
+            second <= first,
+            "the wait must shrink as the window advances, not grow: {first:?} then {second:?}"
+        );
     }
 
     // ── tail_lines unit tests ─────────────────────────────────────────

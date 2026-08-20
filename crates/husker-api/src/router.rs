@@ -22,7 +22,10 @@ use husker_vmm::VmmBackend;
 
 use crate::errors::error_response_with_hint;
 use crate::handlers::*;
-use crate::{ApiDoc, PortForwardApiDoc, REQUEST_COUNTER, current_policy, metrics, rate_limiter};
+use crate::{
+    ApiDoc, PortForwardApiDoc, REQUEST_COUNTER, RateLimitDecision, current_policy, metrics,
+    rate_limiter,
+};
 
 pub(crate) fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'static str> {
     if *method == Method::POST && path.ends_with("/exec") {
@@ -347,14 +350,20 @@ async fn rate_limit_middleware(
             .map(|ci| ci.0.ip().to_string())
             .unwrap_or_else(|| "unknown".into());
         let key = format!("{kind}:{client}");
-        if !rate_limiter().allow(&key, policy.sensitive_rate_limit_per_minute) {
+        if let RateLimitDecision::Limited { retry_after } =
+            rate_limiter().check(&key, policy.sensitive_rate_limit_per_minute)
+        {
             metrics().rate_limited_total.fetch_add(1, Ordering::Relaxed);
+            // Whole seconds, rounded up, is what the header can carry; never
+            // zero, which would invite the caller into a tight retry loop.
+            let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
             return (
                 StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, seconds.to_string())],
                 error_response_with_hint(
                     "rate_limited",
                     "too many requests to sensitive endpoint",
-                    "retry after a short delay",
+                    format!("retry after {seconds}s"),
                 ),
             )
                 .into_response();
