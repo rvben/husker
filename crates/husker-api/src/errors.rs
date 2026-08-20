@@ -16,8 +16,11 @@ pub struct ErrorResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Boxed so the error half of every handler's `Result` stays small: a
+    /// `serde_json::Value` inline puts the `Err` variant over the size clippy
+    /// flags, and this field is a schema placeholder that is rarely set.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<serde_json::Value>,
+    pub details: Option<Box<serde_json::Value>>,
     // Backward-compatible alias kept for existing clients/tests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
