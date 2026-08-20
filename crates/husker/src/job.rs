@@ -347,8 +347,14 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
             eprintln!("[job] syncing working tree from {}", cwd.display());
         }
         let archive = build_sync_archive(&cwd)?;
+        // Say what is going up before it goes. A sync that swept in a directory
+        // nobody meant to send is only cheap to notice here, and it is invisible
+        // once the upload is under way.
+        if output == OutputFormat::Text {
+            eprintln!("[job] {}", archive.summary());
+        }
         daemon
-            .write_file_bytes(name, SYNC_ARCHIVE_GUEST_PATH, &archive, None)
+            .write_file_bytes(name, SYNC_ARCHIVE_GUEST_PATH, &archive.bytes, None)
             .await?;
         // --write-back returns the synced files as the command left them
         // (modifications only; new build artifacts are never pulled back).

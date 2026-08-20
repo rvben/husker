@@ -4607,13 +4607,29 @@ pub(crate) const SYNC_OUTPUT_GUEST_PATH: &str = "/tmp/.husker-out.tgz";
 /// contain.
 pub(crate) const SYNC_MANIFEST_GUEST_PATH: &str = "/tmp/.husker-out.manifest";
 
+/// Whether `dir` sits inside a git working tree, according to git itself.
+///
+/// The presence of a `.git` entry is not the test. A linked worktree keeps a pointer
+/// *file* there, and a subdirectory of a repository has no entry at all; both are inside
+/// the repository and both are still governed by its ignore rules. Git being absent or
+/// failing answers "no", so an unusual environment falls back to a plain walk instead of
+/// failing the job.
+fn is_inside_git_work_tree(dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|out| out.status.success() && out.stdout.starts_with(b"true"))
+}
+
 /// Collect the set of files to sync into a `--sync-cwd` sandbox, relative to `dir`.
 ///
-/// In a git repository the list is git-aware: tracked plus untracked-but-not-ignored
+/// Inside a git repository the list is git-aware: tracked plus untracked-but-not-ignored
 /// files (so gitignored build dirs like `target/` are excluded by construction). Outside
-/// a git repo it falls back to every file under `dir`, skipping any `.git` directory.
+/// one it falls back to every file under `dir`, skipping any `.git` entry.
 pub(crate) fn collect_sync_paths(dir: &Path) -> Result<Vec<PathBuf>> {
-    if dir.join(".git").is_dir() {
+    if is_inside_git_work_tree(dir) {
         // git-aware: tracked (--cached) plus untracked-but-not-ignored (--others
         // --exclude-standard), so gitignored build dirs are excluded by construction.
         let out = std::process::Command::new("git")
@@ -4652,14 +4668,18 @@ pub(crate) fn collect_sync_paths(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Recursively collect regular files under `dir` (relative to `root`), skipping `.git`.
+///
+/// `.git` is skipped whether it is a directory or a worktree's pointer file: the pointer
+/// names a gitdir on the host that does not exist in the guest, so syncing it leaves the
+/// guest looking at a repository it cannot read.
 fn collect_walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if entry.file_name() == ".git" {
-                continue;
-            }
             collect_walk(root, &entry.path(), out)?;
         } else if file_type.is_file()
             && let Ok(rel) = entry.path().strip_prefix(root)
@@ -4670,18 +4690,73 @@ fn collect_walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// A packed `--sync-cwd` working tree, and what went into it.
+///
+/// The counts travel with the bytes so the job can say what it is about to
+/// upload. A sync is normally a few megabytes; when it is not, the cause is a
+/// directory nobody meant to send, and the only moment that is cheap to notice
+/// is before the upload starts.
+pub(crate) struct SyncArchive {
+    /// The gzip-compressed tar, as it goes over the wire.
+    pub(crate) bytes: Vec<u8>,
+    /// How many files it holds.
+    pub(crate) file_count: usize,
+    /// Their combined size on disk, before compression.
+    pub(crate) source_bytes: u64,
+}
+
+impl SyncArchive {
+    /// One line naming what is being sent, both unpacked and on the wire.
+    pub(crate) fn summary(&self) -> String {
+        let files = if self.file_count == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        format!(
+            "{} {files}, {} ({} compressed)",
+            self.file_count,
+            sync_bytes(self.source_bytes),
+            sync_bytes(self.bytes.len() as u64)
+        )
+    }
+}
+
+/// Render a byte count for someone reading a progress line.
+///
+/// The unit carries the alarm: a runaway sync has to look different from a
+/// normal one at a glance, which it does not when both are printed in bytes.
+fn sync_bytes(bytes: u64) -> String {
+    const SCALES: [(u64, &str); 3] = [(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
+    for (scale, unit) in SCALES {
+        if bytes >= scale {
+            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
 /// Build a gzip-compressed tar archive of the `--sync-cwd` file set rooted at `dir`.
-pub(crate) fn build_sync_archive(dir: &Path) -> Result<Vec<u8>> {
+pub(crate) fn build_sync_archive(dir: &Path) -> Result<SyncArchive> {
     let paths = collect_sync_paths(dir)?;
     let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(enc);
+    let mut source_bytes = 0u64;
     for rel in &paths {
+        let source = dir.join(rel);
         builder
-            .append_path_with_name(dir.join(rel), rel)
+            .append_path_with_name(&source, rel)
             .with_context(|| format!("adding {} to sync archive", rel.display()))?;
+        source_bytes += std::fs::metadata(&source)
+            .with_context(|| format!("sizing {} for the sync archive", rel.display()))?
+            .len();
     }
     let enc = builder.into_inner().context("finalizing sync tar")?;
-    enc.finish().context("finalizing sync gzip")
+    Ok(SyncArchive {
+        bytes: enc.finish().context("finalizing sync gzip")?,
+        file_count: paths.len(),
+        source_bytes,
+    })
 }
 
 /// Single-quote a string for safe inclusion in a POSIX shell script, so a path
@@ -5035,6 +5110,15 @@ mod tests {
         run_git(root, &["config", "user.name", "t"]);
     }
 
+    /// The sync set for `dir` as slash-separated strings, for assertions.
+    fn collected(dir: &Path) -> std::collections::HashSet<String> {
+        collect_sync_paths(dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
     #[test]
     fn collect_sync_paths_is_git_aware() {
         let dir = tempfile::tempdir().unwrap();
@@ -5068,6 +5152,85 @@ mod tests {
         );
     }
 
+    /// A linked worktree keeps its `.git` as a *file* pointing at the real
+    /// gitdir. Detecting a repository by looking for a `.git` directory misses
+    /// that, and the fallback then uploads the gitignored build output the
+    /// git-aware path exists to exclude.
+    #[test]
+    fn collect_sync_paths_is_git_aware_in_a_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        init_repo(&main);
+        std::fs::write(main.join("Cargo.toml"), "name=\"x\"").unwrap();
+        std::fs::write(main.join(".gitignore"), "target/\n").unwrap();
+        run_git(&main, &["add", "Cargo.toml", ".gitignore"]);
+        run_git(&main, &["commit", "-qm", "init"]);
+
+        let tree = dir.path().join("wt");
+        run_git(&main, &["worktree", "add", "-q", tree.to_str().unwrap()]);
+        assert!(
+            tree.join(".git").is_file(),
+            "fixture must reproduce a worktree's .git file"
+        );
+        std::fs::create_dir_all(tree.join("target")).unwrap();
+        std::fs::write(tree.join("target/junk.bin"), "x".repeat(1024)).unwrap();
+
+        let set = collected(&tree);
+        assert!(set.contains("Cargo.toml"), "tracked file synced: {set:?}");
+        assert!(
+            !set.iter().any(|p| p.starts_with("target/")),
+            "gitignored build dir excluded inside a worktree: {set:?}"
+        );
+        assert!(
+            !set.contains(".git"),
+            "the worktree's .git pointer file is never synced: {set:?}"
+        );
+    }
+
+    /// Syncing a subdirectory of a repository is still inside that repository,
+    /// so its ignore rules still apply. The paths that come back stay relative
+    /// to the synced directory, not to the repository root.
+    #[test]
+    fn collect_sync_paths_is_git_aware_in_a_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(root.join("sub/src")).unwrap();
+        std::fs::write(root.join("sub/src/lib.rs"), "pub fn f() {}").unwrap();
+        run_git(root, &["add", ".gitignore", "sub/src/lib.rs"]);
+        std::fs::create_dir_all(root.join("sub/target")).unwrap();
+        std::fs::write(root.join("sub/target/junk.bin"), "x".repeat(1024)).unwrap();
+
+        let set = collected(&root.join("sub"));
+        assert!(
+            set.contains("src/lib.rs"),
+            "paths stay relative to the synced directory: {set:?}"
+        );
+        assert!(
+            !set.iter().any(|p| p.starts_with("target/")),
+            "the repository's ignore rules still apply: {set:?}"
+        );
+    }
+
+    /// Outside a repository a stray `.git` file is still git's, not the user's
+    /// source: syncing it points the guest at a gitdir that does not exist.
+    #[test]
+    fn collect_sync_paths_skips_a_dot_git_file_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("top.txt"), "y").unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /nowhere\n").unwrap();
+
+        let set = collected(root);
+        assert!(set.contains("top.txt"), "real file collected: {set:?}");
+        assert!(
+            !set.contains(".git"),
+            "the .git pointer is skipped: {set:?}"
+        );
+    }
+
     #[test]
     fn collect_sync_paths_walks_non_git_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -5095,9 +5258,9 @@ mod tests {
         std::fs::write(root.join("ignored.txt"), "secret").unwrap();
         run_git(root, &["add", "a.txt", ".gitignore"]);
 
-        let bytes = build_sync_archive(root).unwrap();
-        assert!(!bytes.is_empty(), "archive must not be empty");
-        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let archive = build_sync_archive(root).unwrap();
+        assert!(!archive.bytes.is_empty(), "archive must not be empty");
+        let gz = flate2::read::GzDecoder::new(&archive.bytes[..]);
         let mut ar = tar::Archive::new(gz);
         let names: Vec<String> = ar
             .entries()
@@ -5119,6 +5282,47 @@ mod tests {
             !names.iter().any(|n| n == "ignored.txt"),
             "archive excludes gitignored file: {names:?}"
         );
+    }
+
+    /// An unnoticed 2 GB sync is what turned a working tree upload into an hour
+    /// of stalled uploads, so the archive has to say how big it is.
+    #[test]
+    fn a_sync_archive_reports_what_it_contains() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "x".repeat(2048)).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/b.txt"), "y".repeat(1024)).unwrap();
+
+        let archive = build_sync_archive(root).unwrap();
+
+        assert_eq!(archive.file_count, 2, "both files counted");
+        assert_eq!(
+            archive.source_bytes, 3072,
+            "unpacked size is the file bytes"
+        );
+        assert!(!archive.bytes.is_empty(), "archive must not be empty");
+
+        let summary = archive.summary();
+        assert!(
+            summary.starts_with("2 files, 3.0 KiB"),
+            "the summary leads with what is being sent: {summary}"
+        );
+        assert!(
+            summary.contains("compressed"),
+            "and says what actually goes over the wire: {summary}"
+        );
+    }
+
+    /// The report exists to make a runaway sync obvious at a glance, so a
+    /// gigabyte must never render in the same unit as a kilobyte.
+    #[test]
+    fn sync_bytes_is_readable_at_every_scale() {
+        assert_eq!(sync_bytes(0), "0 B");
+        assert_eq!(sync_bytes(999), "999 B");
+        assert_eq!(sync_bytes(1536), "1.5 KiB");
+        assert_eq!(sync_bytes(4_823_449), "4.6 MiB");
+        assert_eq!(sync_bytes(2_469_606_195), "2.3 GiB");
     }
 
     #[test]
