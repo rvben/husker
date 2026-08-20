@@ -8,14 +8,22 @@ fn valid_config_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let rootfs = dir.path().join("rootfs.ext4");
     fs::write(&kernel, b"kernel").unwrap();
     fs::write(&rootfs, b"rootfs").unwrap();
+    // These tests are about config validation, so every path the check reads
+    // has to come from the fixture. Left to the default, `firecracker_bin`
+    // resolves against the host's PATH and the same config passes on a
+    // provisioned machine and fails on a bare one. The key is ignored on
+    // builds without `linux-net`, where the check does not exist.
+    let firecracker = dir.path().join("firecracker");
+    fs::write(&firecracker, b"vmm").unwrap();
     let config = dir.path().join("config.toml");
     fs::write(
         &config,
         format!(
-            "data_dir = {:?}\ndefault_kernel = {:?}\ndefault_rootfs = {:?}\nimages_base_url = \"https://example.invalid/images\"\n",
+            "data_dir = {:?}\ndefault_kernel = {:?}\ndefault_rootfs = {:?}\nfirecracker_bin = {:?}\nimages_base_url = \"https://example.invalid/images\"\n",
             dir.path().join("data"),
             kernel,
             rootfs,
+            firecracker,
         ),
     )
     .unwrap();
