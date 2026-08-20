@@ -4168,6 +4168,9 @@ fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Compiled only where a config check calls it: Linux with the networking
+/// stack, and macOS.
+#[cfg(any(all(feature = "linux-net", target_os = "linux"), target_os = "macos"))]
 fn command_available(command: &str) -> bool {
     std::process::Command::new(command)
         .arg("--version")
