@@ -560,27 +560,57 @@ fn outcome_json(
     payload
 }
 
+/// Total destroy attempts for one finished job, the first included. A destroy
+/// lost in transit leaves the VM running and holding its volume, so one loss
+/// must not end the attempt; a daemon that has genuinely gone away still has to
+/// be reported rather than waited on.
+const CLEANUP_MAX_ATTEMPTS: usize = 3;
+/// Wait before the first destroy retry, doubling for each further attempt.
+const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Destroy the job's VM, retrying a destroy that never reached the daemon.
+///
+/// Losing the request in transit is the one failure worth another attempt: the
+/// VM keeps running and keeps whatever it holds, so the next job wanting that
+/// volume is refused by a machine nobody is using. DELETE is idempotent and a
+/// VM already gone answers 404, so asking again cannot destroy anything twice.
+/// A daemon that answers with a refusal has made a decision, and repeating the
+/// request will not change it.
 async fn cleanup_vm(req: &JobRequest<'_>) -> Option<ApiFailure> {
-    let response = match req
-        .daemon
-        .send(
-            req.daemon
-                .delete(format!("/v1/vms/{}", req.name))
-                .timeout(std::time::Duration::from_secs(10)),
-        )
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => return Some(cleanup_failure(req.name, ApiFailure::from_error(&error))),
-    };
-    if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
-        return None;
+    let mut delay = CLEANUP_RETRY_DELAY;
+    let mut attempt = 1;
+    loop {
+        let sent = req
+            .daemon
+            .send(
+                req.daemon
+                    .delete(format!("/v1/vms/{}", req.name))
+                    .timeout(std::time::Duration::from_secs(10)),
+            )
+            .await;
+        match sent {
+            Ok(response) => {
+                if response.status().is_success()
+                    || response.status() == reqwest::StatusCode::NOT_FOUND
+                {
+                    return None;
+                }
+                let failure = req
+                    .daemon
+                    .error(response, &format!("VM '{}'", req.name))
+                    .await;
+                return Some(cleanup_failure(req.name, failure));
+            }
+            Err(error) if attempt == CLEANUP_MAX_ATTEMPTS => {
+                return Some(cleanup_failure(req.name, ApiFailure::from_error(&error)));
+            }
+            Err(_) => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                attempt += 1;
+            }
+        }
     }
-    let failure = req
-        .daemon
-        .error(response, &format!("VM '{}'", req.name))
-        .await;
-    Some(cleanup_failure(req.name, failure))
 }
 
 fn cleanup_failure(name: &str, mut failure: ApiFailure) -> ApiFailure {
@@ -858,6 +888,89 @@ mod tests {
             env: &[],
             secret_env,
         }
+    }
+
+    /// A daemon whose first `drops` connections are accepted and then closed
+    /// without a reply. That is exactly how a connection lost in flight looks
+    /// to the client, and it is what left real job VMs running.
+    async fn flaky_delete_stub(
+        drops: usize,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = counted.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                if seen < drops {
+                    continue;
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), handle, attempts)
+    }
+
+    /// A destroy lost in transit leaves the VM running, holding whatever it was
+    /// given: the next job asking for the same volume is refused by a machine
+    /// nobody is using. DELETE is idempotent, so the answer is to ask again.
+    #[tokio::test]
+    async fn a_destroy_lost_in_transit_is_retried() {
+        let (base_url, handle, attempts) = flaky_delete_stub(1).await;
+        let client = DaemonClient::new(base_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = Vec::new();
+        let secret_env = HashMap::new();
+        let request = base_request(&client, &body, &command, &secret_env);
+
+        let failure = cleanup_vm(&request).await;
+
+        assert!(
+            failure.is_none(),
+            "the retry destroyed the VM: {:?}",
+            failure.map(|f| f.message)
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    /// Retrying forever would hang the job on a daemon that is simply gone, and
+    /// the VM it could not reach still needs a human.
+    #[tokio::test]
+    async fn an_unreachable_daemon_ends_cleanup_with_a_warning() {
+        let (base_url, handle, attempts) = flaky_delete_stub(usize::MAX).await;
+        let client = DaemonClient::new(base_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = Vec::new();
+        let secret_env = HashMap::new();
+        let request = base_request(&client, &body, &command, &secret_env);
+
+        let failure = cleanup_vm(&request).await.expect("cleanup gave up");
+
+        assert!(
+            failure.message.contains("could not be destroyed"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            CLEANUP_MAX_ATTEMPTS,
+            "retries are bounded"
+        );
+        handle.abort();
     }
 
     #[test]

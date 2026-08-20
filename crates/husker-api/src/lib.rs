@@ -2393,6 +2393,25 @@ mod tests {
         assert_eq!(tail_lines(content, 3), "b\n\nc\n");
     }
 
+    /// A volume held by a VM nobody is using blocks every later job, and the
+    /// only way out is to destroy that VM. Naming it is not enough when the
+    /// reader has to guess the command.
+    #[test]
+    fn a_held_volume_says_how_to_release_it() {
+        let (status, body) = map_error(CoreError::VolumeAttached {
+            volume: "build-cache".into(),
+            vm: "job-dd1980c6".into(),
+        });
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.kind, "volume_attached");
+        let hint = body.hint.as_deref().expect("a held volume carries a hint");
+        assert!(
+            hint.contains("husker destroy job-dd1980c6"),
+            "the hint names the VM that must go: {hint}"
+        );
+    }
+
     #[test]
     fn error_mapping_variants() {
         use husker_core::AgentError;

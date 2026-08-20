@@ -191,7 +191,24 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             err.to_string(),
         ),
     };
-    (status, error_response(kind, message))
+    match hint_for(&err) {
+        Some(hint) => (status, error_response_with_hint(kind, message, hint)),
+        None => (status, error_response(kind, message)),
+    }
+}
+
+/// The recovery step for failures whose cause names something the caller can
+/// act on but not what to do about it.
+fn hint_for(err: &CoreError) -> Option<String> {
+    match err {
+        // A job that could not be destroyed keeps its volume, and every later
+        // job wanting that volume is refused by a VM nobody is using. The way
+        // out is to destroy it, so say which one and how.
+        CoreError::VolumeAttached { vm, .. } => Some(format!(
+            "destroy the VM still holding it: `husker destroy {vm} --yes`"
+        )),
+        _ => None,
+    }
 }
 
 pub(crate) fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
