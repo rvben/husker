@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.46](https://github.com/rvben/husker/compare/v0.4.45...v0.4.46) - 2026-08-21
+
+### Added
+
+- **guest**: support nested container runtimes ([158cee3](https://github.com/rvben/husker/commit/158cee3cdaeb9fff9b6f1fdfa7edf3e538c4b501))
+
 ## [0.4.45](https://github.com/rvben/husker/compare/v0.4.44...v0.4.45) - 2026-08-20
 
 ### Added
