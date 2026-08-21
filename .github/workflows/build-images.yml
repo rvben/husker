@@ -199,8 +199,10 @@ jobs:
           name: Default images ${{ steps.tag.outputs.tag }}
           body: |
             Default kernel, initramfs, and rootfs images for husker. The kernel is a
-            modules-free build from kernel.org source (all virtio drivers built in);
-            the rootfs is Alpine 3.21 minirootfs. Verify downloads against SHA256SUMS.
+            modules-free build from kernel.org source with virtio and nested-container
+            support built in (Docker/containerd/runc, cgroup BPF, bridge/veth,
+            nftables, OverlayFS, and seccomp); the rootfs is Alpine 3.21 minirootfs.
+            Verify downloads against SHA256SUMS.
 
             Built from `${{ github.event.workflow_run.head_sha || github.sha }}`,
             triggered by `${{ github.event_name }}`.

@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-deploy-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-deploy-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline test-kernel-config coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -391,7 +391,9 @@ K3S_ROOTFS ?= k3s-rootfs.ext4
 build-k3s-rootfs: build-agent
 	sudo guest/build-k3s-rootfs.sh $(K3S_ROOTFS)
 
-# Build k3s-compatible kernel (requires root, build-essential, flex, bison, libelf-dev)
+# Build k3s-compatible kernel. This layers Kubernetes networking features over
+# the same container-capable kernel configuration shipped in default images.
+# Requires root, build-essential, flex, bison, libelf-dev, bc, libssl-dev, curl, xz.
 K3S_KERNEL ?= /mnt/husker/vmlinux-k3s
 build-k3s-kernel:
 	sudo guest/build-k3s-kernel.sh $(K3S_KERNEL)
@@ -402,6 +404,12 @@ build-k3s-kernel:
 # Override output dir: HUSKER_KERNEL_OUT=/path bash guest/build-microvm-kernel.sh
 build-microvm-kernel: ## Build the modules-free microVM kernel from source
 	bash guest/build-microvm-kernel.sh
+
+# Resolve all release Kconfigs without compiling Linux. This is intentionally
+# suitable for ordinary pull-request CI; full kernel builds remain in the image
+# workflow.
+test-kernel-config: ## Validate x86_64, aarch64, and k3s kernel configurations
+	bash guest/test-kernel-config.sh
 
 # Run k3s E2E cluster test (requires running daemon, k3s rootfs + kernel)
 K3S_ROOTFS ?= k3s-rootfs.ext4

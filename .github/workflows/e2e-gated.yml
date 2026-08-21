@@ -73,7 +73,10 @@ jobs:
 
       # The general daemon e2e stands up an isolated daemon (own bridge/subnet/
       # CID/data-dir/high port) and boots real VMs against it - safe alongside
-      # the production daemon on this host. musl-gcc links the embedded agent.
+      # the production daemon on this host. It also installs Docker in a
+      # disposable guest and proves bridge/NAT, cgroup BPF, seccomp, and an
+      # actual container process against the published kernel. musl-gcc links
+      # the embedded agent.
       - name: General daemon e2e
         run: |
           sudo env \
@@ -84,4 +87,5 @@ jobs:
             HUSKER_E2E_KERNEL="${{ steps.images.outputs.kernel }}" \
             HUSKER_E2E_ROOTFS="${{ steps.images.outputs.rootfs }}" \
             HUSKER_E2E_INITRD="${{ steps.images.outputs.initrd }}" \
+            HUSKER_E2E_DOCKER=1 \
             bash scripts/ci/general_e2e.sh

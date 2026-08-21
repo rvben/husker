@@ -15,6 +15,8 @@ KERNEL_SHA256="${KERNEL_SHA256:-$KERNEL_SHA256_DEFAULT}"
 ARCH="${ARCH:-$(uname -m)}"
 JOBS="${JOBS:-$(nproc)}"
 OUT_DIR="${HUSKER_KERNEL_OUT:-$HOME/.local/share/husker/kernels}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONTAINER_CONFIG="${HUSKER_CONTAINER_KERNEL_CONFIG:-$SCRIPT_DIR/container-kernel.config}"
 
 _OWN_WORK_DIR=0
 if [ -z "${WORK_DIR:-}" ]; then
@@ -57,6 +59,40 @@ make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} defconfig
 sed -i 's/^\(CONFIG_.*\)=m$/# \1 is not set/' .config
 
 cfg() { scripts/config "$@"; }
+
+apply_config_fragment() {
+  local fragment="$1" line symbol
+  [ -f "$fragment" ] || { echo "FATAL: kernel config fragment not found: $fragment" >&2; exit 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+      CONFIG_*=y)
+        symbol="${line%%=*}"
+        cfg --enable "${symbol#CONFIG_}"
+        ;;
+      *)
+        echo "FATAL: unsupported line in $fragment: $line" >&2
+        echo "       fragments may contain comments, blank lines, and CONFIG_NAME=y" >&2
+        exit 1
+        ;;
+    esac
+  done < "$fragment"
+}
+
+assert_config_fragment() {
+  local fragment="$1" line symbol
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      CONFIG_*=y)
+        symbol="${line%%=*}"
+        grep -q "^${symbol}=y$" .config || {
+          echo "FATAL: ${symbol} requested by $fragment is not =y after olddefconfig" >&2
+          exit 1
+        }
+        ;;
+    esac
+  done < "$fragment"
+}
 
 # Everything below is built in: no loadable modules, ever.
 cfg --disable MODULES
@@ -114,6 +150,13 @@ cfg --enable PACKET
 cfg --enable CGROUPS
 cfg --enable MEMCG
 
+# Nested Docker/containerd/runc support. Keep this in a declarative fragment so
+# the default and k3s kernels cannot drift apart again.
+apply_config_fragment "$CONTAINER_CONFIG"
+if [ -n "${HUSKER_KERNEL_CONFIG_FRAGMENT:-}" ]; then
+  apply_config_fragment "$HUSKER_KERNEL_CONFIG_FRAGMENT"
+fi
+
 # pseudo filesystems the init path expects
 cfg --enable TMPFS
 cfg --enable DEVTMPFS
@@ -137,6 +180,11 @@ fi
 
 make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} olddefconfig
 
+assert_config_fragment "$CONTAINER_CONFIG"
+if [ -n "${HUSKER_KERNEL_CONFIG_FRAGMENT:-}" ]; then
+  assert_config_fragment "$HUSKER_KERNEL_CONFIG_FRAGMENT"
+fi
+
 # olddefconfig silently drops options with unmet dependencies; fail loudly.
 for opt in VIRTIO VIRTIO_PCI VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES \
            VIRTIO_BLK VIRTIO_NET VIRTIO_BALLOON VIRTIO_CONSOLE \
@@ -157,10 +205,16 @@ else
   done
 fi
 
+mkdir -p "$OUT_DIR"
+cp .config "$OUT_DIR/config-${ARCH}"
+if [ "${HUSKER_KERNEL_CONFIG_ONLY:-0}" = 1 ]; then
+  echo "==> Wrote $OUT_DIR/config-${ARCH} (configuration-only run)"
+  exit 0
+fi
+
 echo "==> Building (this takes a while)"
 make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} -j"$JOBS" "$KTARGET"
 
-mkdir -p "$OUT_DIR"
 if [ "$KARCH" = "x86_64" ]; then
   cp vmlinux "$OUT_DIR/$OUT_NAME"
 else

@@ -72,10 +72,6 @@ chroot "$MOUNT_DIR" /bin/bash -c '
     apt-get clean
     rm -rf /var/lib/apt/lists/*
 
-    # Use iptables-legacy instead of iptables-nft.
-    # The Firecracker kernel has legacy iptables support but lacks nftables.
-    update-alternatives --set iptables /usr/sbin/iptables-legacy
-    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
 '
 
 echo "==> Downloading k3s binary"

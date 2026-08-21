@@ -110,6 +110,28 @@ If you want to use your own images, pass `--kernel` and the rootfs path:
 husker run /path/to/rootfs.ext4 --kernel /path/to/vmlinux
 ```
 
+## Docker inside a VM
+
+The default Husker kernel includes the namespaces, cgroup BPF, OverlayFS,
+bridge/veth, nftables, iptables compatibility, and seccomp support required by
+Docker, containerd, and runc. Allocate enough disk and memory for the daemon and
+its image store; the 128 MiB VM default is intended for lightweight jobs, not a
+container daemon.
+
+```bash
+husker run alpine:latest --name docker-host --cpus 2 --memory 1024 --disk-size 4G
+husker exec docker-host -- apk add --no-cache docker
+husker shell docker-host
+
+# Inside the VM:
+dockerd >/var/log/dockerd.log 2>&1 &
+docker run --rm alpine:latest echo container-ok
+```
+
+Running an OCI image directly with `husker job <image>` remains lighter when a
+nested container daemon is unnecessary. See [Docker and container runtimes](docs/container-runtimes.md)
+for usage, kernel compatibility, and troubleshooting details.
+
 ## Hot Pools
 
 A **pool** is a pre-warmed, suspended template VM that husker forks fresh,

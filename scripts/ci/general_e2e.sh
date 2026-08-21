@@ -17,6 +17,8 @@ set -euo pipefail
 # the embedded agent, and privileges for TAP/Firecracker (run as root).
 #
 # Run via: HUSKER_RUN_IGNORED_E2E=1 bash scripts/ci/general_e2e.sh
+# Set HUSKER_E2E_DOCKER=1 to additionally install Docker in a disposable VM
+# and verify the published kernel's nested-container contract end to end.
 
 PORT="${HUSKER_GENERAL_E2E_PORT:-17801}"
 BASE="http://127.0.0.1:${PORT}"
@@ -116,5 +118,87 @@ HUSKER_E2E_ROOTFS="${ROOTFS_COPY}" \
 HUSKER_E2E_INITRD="${INITRD}" \
 HUSKER_EMBED_AGENT_BIN="${AGENT}" \
   cargo test --package husker --test e2e -- --ignored --test-threads=1
+
+if [[ "${HUSKER_E2E_DOCKER:-0}" == 1 ]]; then
+  DOCKER_VM="docker-e2e-$$"
+  log "booting ${DOCKER_VM} for the nested Docker regression gate"
+  C() { "${H}" --api-url "${BASE}" "$@"; }
+
+  C run --name "${DOCKER_VM}" --kernel "${KERNEL}" --cpus 2 --memory 1024 \
+    --disk-size 4G "${ROOTFS_COPY}" >/dev/null
+
+  docker_ready=0
+  for _ in {1..60}; do
+    if C exec "${DOCKER_VM}" -- true >/dev/null 2>&1; then
+      docker_ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "${docker_ready}" != 1 ]]; then
+    echo "Docker e2e guest agent did not become reachable; serial log:" >&2
+    C logs "${DOCKER_VM}" --source serial -n 200 >&2 || true
+    exit 1
+  fi
+
+  # The single-quoted program is intentionally expanded by the guest shell.
+  # shellcheck disable=SC2016
+  if ! C exec "${DOCKER_VM}" -- sh -c '
+    set -eu
+    apk add --no-cache docker nftables >/tmp/docker-apk.log
+
+    # Keep a small direct check here in addition to the behavioral assertions:
+    # it makes a regressed image explain itself instead of only reporting the
+    # first opaque error returned by nftables or runc.
+    zcat /proc/config.gz > /tmp/kernel.config
+    for option in CGROUP_BPF BPF_SYSCALL NF_TABLES NFT_COMPAT VETH BRIDGE BRIDGE_NETFILTER OVERLAY_FS SECCOMP SECCOMP_FILTER; do
+      grep -q "^CONFIG_${option}=y$" /tmp/kernel.config || {
+        echo "missing CONFIG_${option}=y" >&2
+        exit 1
+      }
+    done
+    nft list ruleset >/dev/null
+
+    dockerd >/tmp/dockerd.log 2>&1 &
+    dockerd_pid=$!
+    cleanup_dockerd() {
+      kill "$dockerd_pid" 2>/dev/null || true
+      wait "$dockerd_pid" 2>/dev/null || true
+    }
+    trap cleanup_dockerd EXIT
+
+    ready=0
+    i=0
+    while [ "$i" -lt 30 ]; do
+      if docker info >/tmp/docker-info 2>&1; then
+        ready=1
+        break
+      fi
+      kill -0 "$dockerd_pid" 2>/dev/null || break
+      sleep 1
+      i=$((i + 1))
+    done
+    if [ "$ready" != 1 ]; then
+      cat /tmp/dockerd.log >&2
+      exit 1
+    fi
+
+    docker run --rm alpine:latest sh -ec '\''
+      grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+      ip route | grep -q "^default via "
+      nslookup example.com >/dev/null
+      echo container-ok
+    '\''
+    ip link show docker0 >/dev/null
+    nft list ruleset | grep -q DOCKER
+  '; then
+    echo "nested Docker regression gate failed; guest serial log:" >&2
+    C logs "${DOCKER_VM}" --source serial -n 200 >&2 || true
+    exit 1
+  fi
+
+  C destroy "${DOCKER_VM}" --yes >/dev/null
+  log "PASS: dockerd, bridge/NAT, cgroup BPF, seccomp, and docker run are functional"
+fi
 
 log "PASS: general husker e2e suite green against the isolated daemon"
