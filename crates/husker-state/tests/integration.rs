@@ -37,6 +37,7 @@ fn make_record(name: &str) -> VmRecord {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     }
 }
 

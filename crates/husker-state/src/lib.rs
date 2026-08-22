@@ -233,6 +233,9 @@ pub struct VmRecord {
     pub volume: Option<String>,
     /// Host networking topology assigned to this VM.
     pub network: NetworkMode,
+    /// JSON-serialized concrete outbound rules enforced by the host. `None`
+    /// means no per-VM policy was requested.
+    pub egress_policy: Option<String>,
     /// Last control-plane interaction, debounced observability mirror of the
     /// in-memory activity signal used by the idle policy.
     pub last_activity_at: DateTime<Utc>,
@@ -728,6 +731,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX idx_vm_expirations_expires_at
             ON vm_expirations(expires_at);",
     ),
+    (14, "ALTER TABLE vms ADD COLUMN egress_policy TEXT;"),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -798,8 +802,8 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
                           created_at, updated_at, userdata, userdata_status, userdata_env,
                           service_id, service_ordinal, vmm, boot_mode, balloon, volume,
                           network, last_activity_at, suspended_at, idle_timeout_secs,
-                          suspend_ttl_secs, auto_resume, forked_from)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                          suspend_ttl_secs, auto_resume, forked_from, egress_policy)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
         params![
             record.id.to_string(),
             record.name,
@@ -831,6 +835,7 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.suspend_ttl_secs.map(|v| v as i64),
             record.auto_resume as i64,
             record.forked_from.map(|u| u.to_string()),
+            record.egress_policy,
         ],
     );
     if let Err(error) = insert_result {
@@ -1193,7 +1198,7 @@ impl StateStore {
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
                     network, last_activity_at, suspended_at, idle_timeout_secs,
-                    suspend_ttl_secs, auto_resume, forked_from
+                    suspend_ttl_secs, auto_resume, forked_from, egress_policy
              FROM vms WHERE id = ?1",
             params![id.to_string()],
             row_to_vm_record,
@@ -1213,7 +1218,7 @@ impl StateStore {
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
                     network, last_activity_at, suspended_at, idle_timeout_secs,
-                    suspend_ttl_secs, auto_resume, forked_from
+                    suspend_ttl_secs, auto_resume, forked_from, egress_policy
              FROM vms WHERE name = ?1",
             params![name],
             row_to_vm_record,
@@ -1233,7 +1238,7 @@ impl StateStore {
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
                     network, last_activity_at, suspended_at, idle_timeout_secs,
-                    suspend_ttl_secs, auto_resume, forked_from
+                    suspend_ttl_secs, auto_resume, forked_from, egress_policy
              FROM vms ORDER BY created_at",
         )?;
 
@@ -1253,7 +1258,7 @@ impl StateStore {
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
                     network, last_activity_at, suspended_at, idle_timeout_secs,
-                    suspend_ttl_secs, auto_resume, forked_from
+                    suspend_ttl_secs, auto_resume, forked_from, egress_policy
              FROM vms WHERE service_id = ?1 ORDER BY service_ordinal",
         )?;
         let records = stmt
@@ -2712,7 +2717,7 @@ impl StateStore {
                     created_at, updated_at, userdata, userdata_status, userdata_env,
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
                     network, last_activity_at, suspended_at, idle_timeout_secs,
-                    suspend_ttl_secs, auto_resume, forked_from
+                    suspend_ttl_secs, auto_resume, forked_from, egress_policy
              FROM vms WHERE volume = ?1 LIMIT 1",
             params![volume_name],
             row_to_vm_record,
@@ -2855,6 +2860,7 @@ fn row_to_vm_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmRecord> {
             let s: Option<String> = row.get(29)?;
             s.as_deref().map(parse_uuid).transpose()?
         },
+        egress_policy: row.get(30)?,
     })
 }
 
@@ -3109,6 +3115,7 @@ mod tests {
             suspend_ttl_secs: None,
             auto_resume: true,
             forked_from: None,
+            egress_policy: None,
         }
     }
 
@@ -5211,6 +5218,17 @@ mod tests {
         store.insert_vm(&rec).unwrap();
         let fetched = store.get_vm_by_name("net-vm").unwrap();
         assert_eq!(fetched.network, NetworkMode::Bridged);
+    }
+
+    #[test]
+    fn egress_policy_round_trips_without_interpretation() {
+        let store = StateStore::open_memory().unwrap();
+        let mut rec = make_record("egress-vm");
+        rec.egress_policy =
+            Some(r#"[{"destination":"203.0.113.8","protocol":"tcp","port":443}]"#.into());
+        store.insert_vm(&rec).unwrap();
+        let fetched = store.get_vm_by_name("egress-vm").unwrap();
+        assert_eq!(fetched.egress_policy, rec.egress_policy);
     }
 
     #[test]

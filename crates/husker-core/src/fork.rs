@@ -190,6 +190,36 @@ impl<B: VmmBackend> HuskerCore<B> {
             .attach_to_bridge(&tap_name, &self.bridge_name)
             .await?;
 
+        if let Some(serialized) = source.egress_policy.as_deref() {
+            let persisted: Vec<crate::egress::ResolvedEgressRule> =
+                serde_json::from_str(serialized).map_err(|error| {
+                    CoreError::State(husker_state::StateError::CorruptData {
+                        column: "vms.egress_policy",
+                        message: error.to_string(),
+                    })
+                })?;
+            let resolvers = self
+                .dns_servers
+                .iter()
+                .filter_map(|value| value.parse().ok())
+                .collect::<Vec<_>>();
+            let rules = persisted
+                .iter()
+                .map(|rule| husker_net::EgressRule {
+                    destination: rule.destination,
+                    protocol: if rule.protocol == "tcp" {
+                        husker_net::EgressProtocol::Tcp
+                    } else {
+                        husker_net::EgressProtocol::Udp
+                    },
+                    port: rule.port,
+                })
+                .collect::<Vec<_>>();
+            self.host_network
+                .apply_egress_policy(&tap_name, &self.bridge_name, gateway, &resolvers, &rules)
+                .await?;
+        }
+
         // Persist the fork as a running VM.
         let now = chrono::Utc::now();
         let record = VmRecord {
@@ -217,6 +247,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
+            egress_policy: source.egress_policy.clone(),
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,

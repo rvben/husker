@@ -110,6 +110,18 @@ impl<B: VmmBackend> HuskerCore<B> {
         expiration: Option<PendingVmExpiration>,
     ) -> Result<VmRecord, CoreError> {
         validate_resource_name("vm", &req.name)?;
+        crate::validate_egress_network_contract(req.network.as_deref(), !req.egress.is_empty())?;
+        #[cfg(feature = "linux-net")]
+        let resolved_egress = crate::egress::resolve_egress_rules(&req.egress).await?;
+        #[cfg(not(feature = "linux-net"))]
+        let resolved_egress: Vec<crate::egress::ResolvedEgressRule> = {
+            if !req.egress.is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "per-VM egress policy requires Linux host networking".into(),
+                ));
+            }
+            Vec::new()
+        };
         info!(name = %req.name, "creating VM");
 
         let _name_guard = self.vm_name_lock(&req.name).lock_owned().await;
@@ -169,7 +181,13 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let mut resources = AllocatedResources::default();
         match self
-            .try_create_vm(req, tags, expiration.as_ref(), &mut resources)
+            .try_create_vm(
+                req,
+                &resolved_egress,
+                tags,
+                expiration.as_ref(),
+                &mut resources,
+            )
             .await
         {
             Ok(record) => {
@@ -190,13 +208,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     async fn try_create_vm(
         &self,
         req: CreateVmRequest,
+        resolved_egress: &[crate::egress::ResolvedEgressRule],
         tags: Option<ServiceTag>,
         expiration: Option<&PendingVmExpiration>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
         // Validate + default the network mode before touching any host resources.
         let network_mode = validate_network_mode(req.network.as_deref())?;
-
         // Bridged mode preconditions: must have a cloud image and a configured LAN bridge.
         // These checks run before any resource allocation so tests can verify them in-memory.
         if network_mode == NetworkMode::Bridged {
@@ -327,6 +345,29 @@ impl<B: VmmBackend> HuskerCore<B> {
             self.host_network
                 .attach_to_bridge(&tap_name, attach_bridge)
                 .await?;
+
+            if !resolved_egress.is_empty() {
+                let resolvers = self
+                    .dns_servers
+                    .iter()
+                    .filter_map(|value| value.parse().ok())
+                    .collect::<Vec<_>>();
+                let rules = resolved_egress
+                    .iter()
+                    .map(|rule| husker_net::EgressRule {
+                        destination: rule.destination,
+                        protocol: if rule.protocol == "tcp" {
+                            husker_net::EgressProtocol::Tcp
+                        } else {
+                            husker_net::EgressProtocol::Udp
+                        },
+                        port: rule.port,
+                    })
+                    .collect::<Vec<_>>();
+                self.host_network
+                    .apply_egress_policy(&tap_name, &self.bridge_name, gateway, &resolvers, &rules)
+                    .await?;
+            }
         }
 
         let vm_dir = self.storage.vm_dir(&req.name);
@@ -611,6 +652,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
             network: network_mode,
+            egress_policy: if resolved_egress.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&resolved_egress).expect("egress rules serialize"))
+            },
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs,
@@ -643,6 +689,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     async fn try_create_vm(
         &self,
         req: CreateVmRequest,
+        _resolved_egress: &[crate::egress::ResolvedEgressRule],
         tags: Option<ServiceTag>,
         expiration: Option<&PendingVmExpiration>,
         resources: &mut AllocatedResources,
@@ -853,6 +900,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 balloon: req.balloon,
                 volume: None,
                 network: network_mode,
+                egress_policy: None,
                 last_activity_at: now,
                 suspended_at: None,
                 idle_timeout_secs: None,
@@ -974,6 +1022,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: req.balloon,
             volume: volume_attachment.map(|(vol_name, _)| vol_name),
             network: network_mode,
+            egress_policy: None,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,
@@ -1013,6 +1062,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         #[cfg(feature = "linux-net")]
         if let Some(ref tap) = resources.tap_name {
             debug!(tap, "rolling back: removing TAP");
+            if let Err(e) = self
+                .host_network
+                .remove_egress_policy(tap, &self.bridge_name)
+                .await
+            {
+                host_cleanup_succeeded = false;
+                warn!(tap, error = %e, "rollback: failed to remove egress policy");
+            }
             if let Err(e) = self
                 .host_network
                 .remove_all_port_forwards(tap, &self.bridge_name)

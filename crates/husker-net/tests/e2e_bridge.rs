@@ -65,6 +65,11 @@ fn nft_table_output(bridge: &str) -> String {
     cmd_output("nft", &["list", "table", "ip", &table])
 }
 
+fn nft_egress_table_output(bridge: &str) -> String {
+    let table = format!("{}_egress", husker_net::nft_table_for_bridge(bridge));
+    cmd_output("nft", &["list", "table", "bridge", &table])
+}
+
 // ── Bridge lifecycle ─────────────────────────────────────────────────
 
 #[tokio::test]
@@ -285,6 +290,66 @@ async fn nftables_init_and_cleanup() {
         !nft_table_exists(bridge),
         "husker table should be gone after cleanup"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn per_vm_egress_policy_installs_and_removes_real_nft_rules() {
+    let bridge = "huskereg0";
+    let tap = "huskereg1";
+    let _ = husker_net::cleanup_nat(bridge).await;
+    husker_net::init_nat(bridge, "192.0.2.0/24", "eth0", None)
+        .await
+        .expect("init_nat should create the bridge-family policy table");
+
+    husker_net::apply_egress_policy(
+        tap,
+        bridge,
+        Ipv4Addr::new(192, 0, 2, 1),
+        &[Ipv4Addr::new(192, 0, 2, 53)],
+        &[husker_net::EgressRule {
+            destination: Ipv4Addr::new(203, 0, 113, 8),
+            protocol: husker_net::EgressProtocol::Tcp,
+            port: 443,
+        }],
+    )
+    .await
+    .expect("policy should install atomically");
+
+    let output = nft_egress_table_output(bridge);
+    assert!(
+        output.contains("hook input"),
+        "missing input hook: {output}"
+    );
+    assert!(
+        output.contains("hook forward"),
+        "missing forward hook: {output}"
+    );
+    assert!(
+        output.contains("iifname \"huskereg1\""),
+        "policy is not TAP-keyed: {output}"
+    );
+    assert!(
+        output.contains("203.0.113.8 tcp dport 443 accept"),
+        "missing allow rule: {output}"
+    );
+    assert!(
+        output.contains("husker-egress:huskereg1:default-deny"),
+        "missing deny rule: {output}"
+    );
+
+    husker_net::remove_egress_policy(tap, bridge)
+        .await
+        .expect("policy removal should succeed");
+    let output = nft_egress_table_output(bridge);
+    assert!(
+        !output.contains("husker-egress:huskereg1:"),
+        "owned rules survived removal: {output}"
+    );
+
+    husker_net::cleanup_nat(bridge)
+        .await
+        .expect("cleanup should remove both nftables tables");
 }
 
 // ── Port forwarding ──────────────────────────────────────────────────

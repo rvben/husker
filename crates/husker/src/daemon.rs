@@ -1035,6 +1035,13 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
                     "reattached suspended VM networks to host bridges"
                 );
             }
+            let restored_egress = core
+                .reconcile_egress_policies_from_state()
+                .await
+                .context("restoring per-VM egress policies")?;
+            if restored_egress > 0 {
+                tracing::info!(restored_egress, "restored persisted per-VM egress policies");
+            }
             let reconcile = core.reconcile_port_forwards_from_state().await;
             if reconcile.restored > 0 {
                 tracing::info!(

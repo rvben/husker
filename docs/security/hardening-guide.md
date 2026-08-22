@@ -55,6 +55,9 @@
 - Restrict direct access to the daemon port with the host firewall so callers
   cannot bypass proxy identity policy.
 - Avoid exposing daemon directly on public interfaces.
+- Give untrusted jobs `network: "none"`, or use `network: "filtered"` with the
+  smallest practical destination/port set. Plain `nat` is unrestricted egress.
+  See [Per-VM egress policies](egress-policies.md).
 
 ## 7. Logging and monitoring
 

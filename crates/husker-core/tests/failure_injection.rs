@@ -21,11 +21,13 @@ use uuid::Uuid;
 struct TestHostNetwork {
     taps: Mutex<HashSet<String>>,
     forwards: Mutex<HashSet<(u16, String)>>,
+    egress: Mutex<Vec<(String, Vec<husker_net::EgressRule>)>>,
     fail_next_create_tap: std::sync::atomic::AtomicBool,
     fail_next_attach: std::sync::atomic::AtomicBool,
     fail_next_delete_tap: std::sync::atomic::AtomicBool,
     fail_next_forward: std::sync::atomic::AtomicBool,
     fail_next_remove_forward: std::sync::atomic::AtomicBool,
+    fail_next_egress: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "linux-net")]
@@ -56,6 +58,11 @@ impl TestHostNetwork {
 
     fn fail_next_remove_forward(&self) {
         self.fail_next_remove_forward
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail_next_egress(&self) {
+        self.fail_next_egress
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -191,6 +198,43 @@ impl husker_net::HostNetwork for TestHostNetwork {
         _bridge_name: &'a str,
     ) -> husker_net::NetworkFuture<'a, HashMap<String, (u64, u64)>> {
         Box::pin(async { Ok(HashMap::new()) })
+    }
+
+    fn apply_egress_policy<'a>(
+        &'a self,
+        tap_name: &'a str,
+        _bridge_name: &'a str,
+        _gateway: std::net::Ipv4Addr,
+        _resolvers: &'a [std::net::Ipv4Addr],
+        rules: &'a [husker_net::EgressRule],
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            if self
+                .fail_next_egress
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "nft -f -".into(),
+                    message: "injected egress policy failure".into(),
+                });
+            }
+            self.egress
+                .lock()
+                .await
+                .push((tap_name.to_string(), rules.to_vec()));
+            Ok(())
+        })
+    }
+
+    fn remove_egress_policy<'a>(
+        &'a self,
+        tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            self.egress.lock().await.retain(|(tap, _)| tap != tap_name);
+            Ok(())
+        })
     }
 }
 
@@ -489,6 +533,7 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
+        egress_policy: None,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,
@@ -659,6 +704,75 @@ async fn create_uses_complete_disk_preparation_boundary() {
         std::fs::read(tmp.path().join("vms/prepared/rootfs.ext4")).unwrap(),
         b"prepared-disk"
     );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn create_applies_and_persists_pinned_egress_before_returning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+    let mut request = linux_create_request("egress-guarded", &kernel, &rootfs);
+    request.network = Some("filtered".into());
+    request.egress = vec![husker_core::EgressRuleRequest {
+        host: "203.0.113.8".into(),
+        port: 443,
+        protocol: "tcp".into(),
+    }];
+
+    let created = core.create_vm(request).await.unwrap();
+    let applied = network.egress.lock().await;
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].0, created.tap_device.as_deref().unwrap());
+    assert_eq!(applied[0].1.len(), 1);
+    assert_eq!(
+        applied[0].1[0].destination,
+        "203.0.113.8".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+    assert_eq!(applied[0].1[0].port, 443);
+    drop(applied);
+
+    let persisted = core.get_vm("egress-guarded").unwrap();
+    let policy = persisted.egress_policy.expect("concrete policy persisted");
+    assert!(policy.contains("203.0.113.8"));
+    assert!(policy.contains("\"port\":443"));
+
+    network.egress.lock().await.clear();
+    assert_eq!(
+        core.reconcile_egress_policies_from_state().await.unwrap(),
+        1
+    );
+    let restored = network.egress.lock().await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        restored[0].1[0].destination,
+        "203.0.113.8".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn egress_policy_failure_rolls_back_before_vm_boot_or_persistence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    network.fail_next_egress();
+    let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
+    let mut request = linux_create_request("egress-fails", &kernel, &rootfs);
+    request.network = Some("filtered".into());
+    request.egress = vec![husker_core::EgressRuleRequest {
+        host: "203.0.113.8".into(),
+        port: 443,
+        protocol: "tcp".into(),
+    }];
+
+    let error = core.create_vm(request).await.unwrap_err();
+
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert!(core.list_vms().unwrap().is_empty());
+    assert!(!network.has_tap("husker3").await);
+    assert!(network.egress.lock().await.is_empty());
 }
 
 #[cfg(feature = "linux-net")]

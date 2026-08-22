@@ -180,4 +180,15 @@ async fn openapi_documents_ephemeral_vm_creation_contract() {
         encoded.contains("owner"),
         "expiration owner is missing from CreateVmApiRequest: {schema}"
     );
+    let vm_schema = &doc["components"]["schemas"]["CreateVmRequest"];
+    assert!(
+        vm_schema["properties"].get("egress").is_some(),
+        "per-VM egress policy is missing from CreateVmRequest: {vm_schema}"
+    );
+    assert!(
+        doc["components"]["schemas"]
+            .get("EgressRuleRequest")
+            .is_some(),
+        "egress rule schema is missing"
+    );
 }

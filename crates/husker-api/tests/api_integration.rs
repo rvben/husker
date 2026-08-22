@@ -131,6 +131,7 @@ async fn health_counts_vms_correctly() {
             suspend_ttl_secs: None,
             auto_resume: true,
             forked_from: None,
+            egress_policy: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -428,6 +429,7 @@ async fn snapshot_endpoints_roundtrip() {
             suspend_ttl_secs: None,
             auto_resume: true,
             forked_from: None,
+            egress_policy: None,
         })
         .unwrap();
 
@@ -957,6 +959,7 @@ async fn exec_running_vm_with_unavailable_agent_returns_503() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1120,6 +1123,7 @@ async fn vm_response_json_structure() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1218,6 +1222,7 @@ async fn list_vms_returns_all_records() {
             suspend_ttl_secs: None,
             auto_resume: true,
             forked_from: None,
+            egress_policy: None,
         };
         state.insert_vm(&record).unwrap();
     }
@@ -1459,6 +1464,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1522,6 +1528,7 @@ async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
     let storage = husker_storage::StorageConfig {
@@ -1585,6 +1592,7 @@ async fn vm_response_with_null_optional_fields() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1667,6 +1675,7 @@ async fn logs_returns_serial_output() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1733,6 +1742,7 @@ async fn logs_tail_returns_last_n_lines() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1799,6 +1809,7 @@ async fn logs_no_serial_file_returns_404() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -1867,6 +1878,7 @@ fn logs_test_core(
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 
@@ -2116,6 +2128,7 @@ async fn logs_large_file_is_truncated() {
         suspend_ttl_secs: None,
         auto_resume: true,
         forked_from: None,
+        egress_policy: None,
     };
     state.insert_vm(&record).unwrap();
 

@@ -76,6 +76,30 @@ pub trait HostNetwork: Send + Sync {
         &'a self,
         bridge_name: &'a str,
     ) -> NetworkFuture<'a, HashMap<String, (u64, u64)>>;
+
+    fn apply_egress_policy<'a>(
+        &'a self,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+        _gateway: Ipv4Addr,
+        _resolvers: &'a [Ipv4Addr],
+        _rules: &'a [EgressRule],
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(async {
+            Err(NetError::CommandFailed {
+                cmd: "apply egress policy".into(),
+                message: "host network backend does not support per-VM egress policy".into(),
+            })
+        })
+    }
+
+    fn remove_egress_policy<'a>(
+        &'a self,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Daemon-wide Linux bridge and NAT lifecycle operations.
@@ -163,6 +187,31 @@ impl HostNetwork for SystemHostNetwork {
         bridge_name: &'a str,
     ) -> NetworkFuture<'a, HashMap<String, (u64, u64)>> {
         Box::pin(read_all_port_forward_counters(bridge_name))
+    }
+
+    fn apply_egress_policy<'a>(
+        &'a self,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+        gateway: Ipv4Addr,
+        resolvers: &'a [Ipv4Addr],
+        rules: &'a [EgressRule],
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(apply_egress_policy(
+            tap_name,
+            bridge_name,
+            gateway,
+            resolvers,
+            rules,
+        ))
+    }
+
+    fn remove_egress_policy<'a>(
+        &'a self,
+        tap_name: &'a str,
+        bridge_name: &'a str,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(remove_egress_policy(tap_name, bridge_name))
     }
 }
 
@@ -571,6 +620,129 @@ fn is_missing_interface_error(error: &NetError) -> bool {
 
 // ── Guest network isolation ────────────────────────────────────────────
 
+/// Transport protocol admitted by a per-VM egress rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressProtocol {
+    Tcp,
+    Udp,
+}
+
+impl EgressProtocol {
+    fn nft_name(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// One concrete destination admitted by a per-VM policy.
+///
+/// Hostnames are deliberately resolved by the control plane before this
+/// boundary. The host firewall receives only pinned IPv4 addresses, protocols,
+/// and ports, so later DNS answers cannot widen a running VM's access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressRule {
+    pub destination: Ipv4Addr,
+    pub protocol: EgressProtocol,
+    pub port: u16,
+}
+
+fn egress_table_for_bridge(bridge: &str) -> String {
+    format!("{}_egress", nft_table_for_bridge(bridge))
+}
+
+fn egress_comment_prefix(tap_name: &str) -> String {
+    format!("husker-egress:{tap_name}:")
+}
+
+fn egress_rules_for_chain(
+    tap_name: &str,
+    gateway: Ipv4Addr,
+    resolvers: &[Ipv4Addr],
+    rules: &[EgressRule],
+) -> Vec<Vec<String>> {
+    let mut result = Vec::new();
+    let prefix = egress_comment_prefix(tap_name);
+
+    // Direct-kernel NAT guests use a static address and need only ARP for their
+    // gateway. Do not admit broad ARP: that would reopen guest-to-guest L2
+    // discovery on the shared bridge.
+    result.push(vec![
+        "iifname".into(),
+        tap_name.into(),
+        "ether".into(),
+        "type".into(),
+        "arp".into(),
+        "arp".into(),
+        "operation".into(),
+        "request".into(),
+        "arp".into(),
+        "daddr".into(),
+        "ip".into(),
+        gateway.to_string(),
+        "accept".into(),
+        "comment".into(),
+        format!("\"{prefix}arp-gateway\""),
+    ]);
+
+    // DNS is an implementation dependency of hostname-based application
+    // traffic, not a general escape hatch. Only the configured resolvers and
+    // port 53 are admitted.
+    for resolver in resolvers {
+        for protocol in [EgressProtocol::Udp, EgressProtocol::Tcp] {
+            result.push(vec![
+                "iifname".into(),
+                tap_name.into(),
+                "ether".into(),
+                "type".into(),
+                "ip".into(),
+                "ip".into(),
+                "daddr".into(),
+                resolver.to_string(),
+                protocol.nft_name().into(),
+                "dport".into(),
+                "53".into(),
+                "accept".into(),
+                "comment".into(),
+                format!("\"{prefix}dns-{}-{protocol:?}\"", resolver),
+            ]);
+        }
+    }
+
+    for (index, rule) in rules.iter().enumerate() {
+        result.push(vec![
+            "iifname".into(),
+            tap_name.into(),
+            "ether".into(),
+            "type".into(),
+            "ip".into(),
+            "ip".into(),
+            "daddr".into(),
+            rule.destination.to_string(),
+            rule.protocol.nft_name().into(),
+            "dport".into(),
+            rule.port.to_string(),
+            "accept".into(),
+            "comment".into(),
+            format!("\"{prefix}allow-{index}\""),
+        ]);
+    }
+
+    // A final interface-keyed drop is the default-deny boundary. Matching the
+    // kernel-provided ingress TAP rather than a guest-controlled source address
+    // prevents source-IP spoofing from bypassing the policy. It also blocks
+    // IPv6 and all non-IP L2 traffic not explicitly admitted above.
+    result.push(vec![
+        "iifname".into(),
+        tap_name.into(),
+        "drop".into(),
+        "comment".into(),
+        format!("\"{prefix}default-deny\""),
+    ]);
+    result
+}
+
 /// Private destination ranges an isolated guest may not reach: RFC1918 plus
 /// the CGNAT block (100.64/10, which the tailnet uses). Same-bridge traffic is
 /// L2 and never reaches the forward hook, so a guest's own subnet does not need
@@ -739,6 +911,28 @@ pub async fn init_nat(
 
     run_cmd("nft", &["add", "table", "ip", &table]).await?;
 
+    // Per-VM egress policies live in the bridge family so the firewall can key
+    // decisions on the ingress TAP. The ip-family forward hook sees only the
+    // shared bridge interface, which would force source-IP matching and allow a
+    // malicious guest to spoof around its policy.
+    let egress_table = egress_table_for_bridge(bridge_name);
+    let _ = run_cmd("nft", &["delete", "table", "bridge", &egress_table]).await;
+    run_cmd("nft", &["add", "table", "bridge", &egress_table]).await?;
+    for chain in ["input", "forward"] {
+        run_cmd(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "bridge",
+                &egress_table,
+                chain,
+                &format!("{{ type filter hook {chain} priority -10; policy accept; }}"),
+            ],
+        )
+        .await?;
+    }
+
     // Postrouting chain with masquerade rule
     run_cmd(
         "nft",
@@ -868,6 +1062,102 @@ pub async fn init_nat(
     }
 
     Ok(())
+}
+
+/// Install a pinned, default-deny egress policy for one TAP.
+///
+/// Rules are installed in both bridge input and forward hooks: traffic aimed at
+/// the host itself is local delivery and never reaches the forward hook. The
+/// old and new rules are replaced in one nftables transaction, making
+/// retries idempotent without a fail-open gap for an already-running guest.
+pub async fn apply_egress_policy(
+    tap_name: &str,
+    bridge_name: &str,
+    gateway: Ipv4Addr,
+    resolvers: &[Ipv4Addr],
+    rules: &[EgressRule],
+) -> Result<(), NetError> {
+    validate_interface_name(tap_name)?;
+    validate_interface_name(bridge_name)?;
+    let table = egress_table_for_bridge(bridge_name);
+    let current = run_cmd("nft", &["-j", "list", "table", "bridge", &table]).await?;
+    let prefix = egress_comment_prefix(tap_name);
+    let existing = find_rules_by_comment_prefix(&current, &prefix);
+    let policy_rules = egress_rules_for_chain(tap_name, gateway, resolvers, rules);
+    let (default_deny, allows) = policy_rules
+        .split_last()
+        .expect("an egress policy always contains a default-deny rule");
+
+    let mut transaction = String::new();
+    for (chain, handle) in existing {
+        transaction.push_str(&format!(
+            "delete rule bridge {table} {chain} handle {handle}\n"
+        ));
+    }
+
+    // Install both guards before their allow rules. nft applies the complete
+    // script atomically, and `insert` places every allow ahead of the guard.
+    // If validation or execution fails, the previous policy remains intact.
+    for chain in ["input", "forward"] {
+        transaction.push_str(&format!(
+            "add rule bridge {table} {chain} {}\n",
+            default_deny.join(" ")
+        ));
+        for rule in allows {
+            transaction.push_str(&format!(
+                "insert rule bridge {table} {chain} {}\n",
+                rule.join(" ")
+            ));
+        }
+    }
+    run_cmd_with_input("nft", &["-f", "-"], transaction.as_bytes()).await?;
+    info!(
+        tap = tap_name,
+        allowed = rules.len(),
+        "installed VM egress policy"
+    );
+    Ok(())
+}
+
+/// Remove every egress rule owned by one TAP. Missing tables are already clean.
+pub async fn remove_egress_policy(tap_name: &str, bridge_name: &str) -> Result<(), NetError> {
+    validate_interface_name(tap_name)?;
+    validate_interface_name(bridge_name)?;
+    let table = egress_table_for_bridge(bridge_name);
+    let output = match run_cmd("nft", &["-j", "list", "table", "bridge", &table]).await {
+        Ok(output) => output,
+        Err(error) if is_missing_nft_table_error(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let prefix = egress_comment_prefix(tap_name);
+    let matches = find_rules_by_comment_prefix(&output, &prefix);
+    let mut failures = Vec::new();
+    for (chain, handle) in matches {
+        if let Err(error) = run_cmd(
+            "nft",
+            &[
+                "delete",
+                "rule",
+                "bridge",
+                &table,
+                &chain,
+                "handle",
+                &handle.to_string(),
+            ],
+        )
+        .await
+        {
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(NetError::CommandFailed {
+            cmd: "nft delete bridge egress rules".into(),
+            message: failures.join("; "),
+        })
+    }
 }
 
 // ── Host uplink resolution ─────────────────────────────────────────────
@@ -1180,7 +1470,11 @@ fn is_missing_nft_table_error(error: &NetError) -> bool {
 pub async fn cleanup_nat(bridge_name: &str) -> Result<(), NetError> {
     let table = nft_table_for_bridge(bridge_name);
     info!(table = %table, "removing nftables table");
-    run_cmd("nft", &["delete", "table", "ip", &table]).await?;
+    let nat_result = run_cmd("nft", &["delete", "table", "ip", &table]).await;
+    let egress_table = egress_table_for_bridge(bridge_name);
+    let egress_result = run_cmd("nft", &["delete", "table", "bridge", &egress_table]).await;
+    nat_result?;
+    egress_result?;
     Ok(())
 }
 
@@ -1379,6 +1673,36 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, NetError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+async fn run_cmd_with_input(cmd: &str, args: &[&str], input: &[u8]) -> Result<String, NetError> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    debug!(cmd, args = args.join(" "), "executing command with input");
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| NetError::CommandFailed {
+        cmd: format!("{cmd} {}", args.join(" ")),
+        message: "failed to open command stdin".into(),
+    })?;
+    stdin.write_all(input).await?;
+    drop(stdin);
+    let output = child.wait_with_output().await?;
+
+    if !output.status.success() {
+        return Err(NetError::CommandFailed {
+            cmd: format!("{cmd} {}", args.join(" ")),
+            message: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 // ── Subnet conflict detection ──────────────────────────────────────────
 
 /// Network address of `addr` masked to `prefix_len` bits.
@@ -1506,6 +1830,63 @@ mod tests {
 
     fn rule_str(rule: &[String]) -> String {
         rule.join(" ")
+    }
+
+    #[test]
+    fn per_vm_egress_is_tap_keyed_and_default_deny() {
+        let rules = egress_rules_for_chain(
+            "husker9",
+            "172.20.0.1".parse().unwrap(),
+            &["10.10.30.10".parse().unwrap()],
+            &[
+                EgressRule {
+                    destination: "140.82.121.4".parse().unwrap(),
+                    protocol: EgressProtocol::Tcp,
+                    port: 443,
+                },
+                EgressRule {
+                    destination: "10.10.30.53".parse().unwrap(),
+                    protocol: EgressProtocol::Udp,
+                    port: 9090,
+                },
+            ],
+        );
+        let joined: Vec<String> = rules.iter().map(|rule| rule_str(rule)).collect();
+
+        assert!(joined.iter().all(|rule| rule.contains("iifname husker9")));
+        assert!(joined.iter().all(|rule| !rule.contains("saddr")));
+        assert!(joined[0].contains("arp operation request arp daddr ip 172.20.0.1 accept"));
+        assert!(
+            joined
+                .iter()
+                .any(|rule| { rule.contains("10.10.30.10 udp dport 53 accept") })
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|rule| { rule.contains("140.82.121.4 tcp dport 443 accept") })
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|rule| { rule.contains("10.10.30.53 udp dport 9090 accept") })
+        );
+        assert!(joined.last().unwrap().contains("default-deny"));
+        assert!(joined.last().unwrap().contains("drop"));
+    }
+
+    #[test]
+    fn per_vm_egress_does_not_open_guest_to_guest_arp() {
+        let joined: Vec<String> =
+            egress_rules_for_chain("husker9", "172.20.0.1".parse().unwrap(), &[], &[])
+                .iter()
+                .map(|rule| rule_str(rule))
+                .collect();
+
+        assert_eq!(joined.len(), 2, "gateway ARP plus default deny: {joined:?}");
+        assert!(joined[0].contains("arp daddr ip 172.20.0.1"));
+        assert!(!joined[0].contains("accept comment \"husker-egress:husker9:default"));
+        assert!(joined[1].contains("drop"));
     }
 
     #[test]

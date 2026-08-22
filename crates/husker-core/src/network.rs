@@ -414,6 +414,63 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(reattached)
     }
 
+    /// Restore every persisted per-VM egress policy after daemon startup.
+    /// `init_nat` deliberately recreates the bridge-family table, so policy
+    /// restoration is part of admitting traffic, not an optional repair task.
+    #[cfg(feature = "linux-net")]
+    pub async fn reconcile_egress_policies_from_state(&self) -> Result<usize, CoreError> {
+        let resolvers = self
+            .dns_servers
+            .iter()
+            .map(|value| {
+                value.parse::<Ipv4Addr>().map_err(|error| {
+                    CoreError::InvalidArgument(format!(
+                        "configured DNS server {value:?} is not IPv4: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let gateway = self.ip_allocator.gateway();
+        let mut restored = 0;
+        for vm in self.state.list_vms()? {
+            let Some(serialized) = vm.egress_policy.as_deref() else {
+                continue;
+            };
+            let tap = vm
+                .tap_device
+                .as_deref()
+                .ok_or_else(|| CoreError::InvalidState {
+                    name: vm.name.clone(),
+                    actual: "persisted egress policy without a TAP device".into(),
+                    expected: "NAT networking with a TAP device".into(),
+                })?;
+            let persisted: Vec<crate::egress::ResolvedEgressRule> =
+                serde_json::from_str(serialized).map_err(|error| {
+                    CoreError::State(husker_state::StateError::CorruptData {
+                        column: "vms.egress_policy",
+                        message: error.to_string(),
+                    })
+                })?;
+            let rules = persisted
+                .iter()
+                .map(|rule| husker_net::EgressRule {
+                    destination: rule.destination,
+                    protocol: if rule.protocol == "tcp" {
+                        husker_net::EgressProtocol::Tcp
+                    } else {
+                        husker_net::EgressProtocol::Udp
+                    },
+                    port: rule.port,
+                })
+                .collect::<Vec<_>>();
+            self.host_network
+                .apply_egress_policy(tap, &self.bridge_name, gateway, &resolvers, &rules)
+                .await?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
     /// Rebuild nftables port-forward rules from persisted state on startup.
     ///
     /// This closes drift after daemon restarts because `init_nat` recreates the

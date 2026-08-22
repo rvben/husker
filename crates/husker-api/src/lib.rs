@@ -12,7 +12,7 @@ use utoipa::ToSchema;
 use husker_core::{
     CheckResult, CheckStatus, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest,
     CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, DaemonProfile, DiagnosticsReport,
-    ExportImageRequest, HuskerCore, ImportImageRequest, RestoreSnapshotRequest,
+    EgressRuleRequest, ExportImageRequest, HuskerCore, ImportImageRequest, RestoreSnapshotRequest,
     RotateSecretRequest,
 };
 
@@ -311,6 +311,7 @@ pub(crate) fn max_vms() -> Option<usize> {
         BalloonRequest,
         CreateVmApiRequest,
         CreateVmRequest,
+        EgressRuleRequest,
         DiagnosticsReport,
         CheckResult,
         CheckStatus,
@@ -494,6 +495,7 @@ mod tests {
                 suspend_ttl_secs: None,
                 auto_resume: true,
                 forked_from: None,
+                egress_policy: None,
             })
             .unwrap();
 
@@ -530,6 +532,7 @@ mod tests {
                 suspend_ttl_secs: None,
                 auto_resume: true,
                 forked_from: None,
+                egress_policy: None,
             })
             .unwrap();
 
@@ -869,6 +872,7 @@ mod tests {
                 suspend_ttl_secs: None,
                 auto_resume: true,
                 forked_from: None,
+                egress_policy: None,
             })
             .unwrap();
 
@@ -1241,6 +1245,7 @@ mod tests {
                 suspend_ttl_secs: None,
                 auto_resume: true,
                 forked_from: None,
+                egress_policy: None,
             })
             .unwrap();
         let storage = husker_storage::StorageConfig {
@@ -1361,6 +1366,7 @@ mod tests {
                 suspend_ttl_secs: None,
                 auto_resume: true,
                 forked_from: None,
+                egress_policy: None,
             })
             .unwrap();
 
@@ -1494,6 +1500,7 @@ mod tests {
                 suspend_ttl_secs: None,
                 auto_resume: true,
                 forked_from: None,
+                egress_policy: None,
             })
             .unwrap();
         let core = make_core(
@@ -1732,6 +1739,7 @@ mod tests {
             suspend_ttl_secs: None,
             auto_resume: true,
             forked_from: None,
+            egress_policy: None,
         }
     }
 
@@ -2718,6 +2726,7 @@ mod tests {
                 suspend_ttl_secs: None,
                 auto_resume: true,
                 forked_from: None,
+                egress_policy: None,
             })
             .unwrap();
 

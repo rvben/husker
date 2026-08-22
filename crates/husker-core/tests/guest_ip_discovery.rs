@@ -145,6 +145,7 @@ fn make_vm_record(
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
+        egress_policy: None,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,

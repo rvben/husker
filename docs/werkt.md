@@ -30,6 +30,13 @@ For each run attempt, Werkt cold-boots a separate VM, waits for the guest agent,
 
 Werkt defaults builders to `network: nat` for dependency resolution and runtime VMs to `network: none`; these policies are configured independently. Current Firecracker pool forks are NAT-only, so Werkt intentionally does not use pools yet. An isolated pool path must preserve no-network semantics and attach expiration metadata atomically at checkout before it is suitable as the default fast path.
 
+When a manifest declares runtime egress, Werkt sends `network: filtered` and
+the exact hostname/protocol/port rules. The distinct wire value is intentional:
+an older Husker daemon rejects it instead of silently ignoring an unknown
+`egress` field and creating an unrestricted NAT VM. Husker resolves hostnames
+before allocating host resources, pins the resulting IPv4 addresses for the VM
+lifetime, and persists those concrete rules for restart reconciliation.
+
 ## Trust boundary
 
 Use bearer-token authentication and keep Werkt and Husker in the same trust domain. Husker currently treats authenticated callers as operators of the whole daemon; `owner` does not restrict who can inspect, execute in, or destroy a VM. Separate daemon instances are required for separate trust domains today.

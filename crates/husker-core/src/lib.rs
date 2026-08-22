@@ -9,6 +9,7 @@ mod port_proxy;
 
 mod agent_ops;
 mod diagnostics;
+mod egress;
 mod fork;
 #[cfg(feature = "linux-net")]
 mod host_resources;
@@ -166,6 +167,22 @@ pub struct DaemonProfile {
     pub network: Option<String>,
 }
 
+/// One requested outbound destination. Hostnames are resolved and pinned
+/// before the VM boots; wildcard hosts and port ranges are intentionally not
+/// part of the contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct EgressRuleRequest {
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "default_egress_protocol")]
+    pub protocol: String,
+}
+
+fn default_egress_protocol() -> String {
+    "tcp".into()
+}
+
 /// Parameters for creating a new VM.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -219,6 +236,11 @@ pub struct CreateVmRequest {
     /// non-NAT modes currently require Linux host networking.
     #[serde(default)]
     pub network: Option<String>,
+    /// Hostname/IP, transport, and port tuples this VM may contact. Supplying
+    /// any rule requires NAT networking and Linux host enforcement; all other
+    /// guest-originated traffic is denied by the host firewall.
+    #[serde(default)]
+    pub egress: Vec<EgressRuleRequest>,
     /// Host directories to share into the guest over virtiofs.
     /// Each entry is a `host:guest[:ro]` spec (e.g. `/srv/work:/build:ro`).
     /// Supported on Linux with the direct-kernel boot path only.
@@ -1460,15 +1482,39 @@ fn infer_image_format(path: &Path) -> String {
 
 /// Validate and normalize the network mode field.
 ///
-/// Returns the default NAT mode when omitted. Unknown values are rejected with
-/// an `InvalidArgument` error listing the accepted wire values.
+/// Returns the default NAT mode when omitted. `filtered` is a request-only wire
+/// value that persists as NAT after the caller's egress-policy contract has
+/// been validated. Unknown values are rejected with an `InvalidArgument` error
+/// listing the accepted wire values.
 pub fn validate_network_mode(value: Option<&str>) -> Result<NetworkMode, CoreError> {
+    if value == Some("filtered") {
+        return Ok(NetworkMode::Nat);
+    }
     value
         .unwrap_or(NetworkMode::Nat.as_str())
         .parse::<NetworkMode>()
         .map_err(|error| {
-            CoreError::InvalidArgument(format!("{error} (accepted: nat, bridged, none)"))
+            CoreError::InvalidArgument(format!("{error} (accepted: nat, filtered, bridged, none)"))
         })
+}
+
+/// Bind policy-bearing requests to a wire value unknown to older daemons.
+///
+/// An older Husker rejects `filtered` instead of silently ignoring a newly
+/// added `egress` field and creating an unrestricted NAT guest.
+pub(crate) fn validate_egress_network_contract(
+    network: Option<&str>,
+    has_egress: bool,
+) -> Result<(), CoreError> {
+    match (network == Some("filtered"), has_egress) {
+        (true, false) => Err(CoreError::InvalidArgument(
+            "network mode filtered requires at least one egress rule".into(),
+        )),
+        (false, true) => Err(CoreError::InvalidArgument(
+            "egress rules require network mode filtered".into(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Validate and default an image-import kind ("rootfs" when unset).
@@ -2617,6 +2663,7 @@ mod tests {
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
+            egress_policy: None,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,
@@ -3570,6 +3617,10 @@ mod tests {
         assert_eq!(
             validate_network_mode(Some("bridged")).unwrap(),
             NetworkMode::Bridged
+        );
+        assert_eq!(
+            validate_network_mode(Some("filtered")).unwrap(),
+            NetworkMode::Nat
         );
         let err = validate_network_mode(Some("off")).unwrap_err();
         assert!(
@@ -4538,6 +4589,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: Some("mydata".into()),
             network: NetworkMode::Nat,
+            egress_policy: None,
             last_activity_at: chrono::Utc::now(),
             suspended_at: None,
             idle_timeout_secs: None,
@@ -4988,6 +5040,30 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     }
 
     #[test]
+    fn validate_network_mode_accepts_filtered_as_nat_storage_mode() {
+        assert_eq!(
+            validate_network_mode(Some("filtered")).unwrap(),
+            NetworkMode::Nat
+        );
+    }
+
+    #[test]
+    fn filtered_network_and_egress_rules_are_an_indivisible_contract() {
+        assert!(validate_egress_network_contract(Some("filtered"), true).is_ok());
+        assert!(validate_egress_network_contract(Some("nat"), false).is_ok());
+
+        let missing_policy = validate_egress_network_contract(Some("filtered"), false).unwrap_err();
+        assert!(
+            matches!(missing_policy, CoreError::InvalidArgument(ref message) if message.contains("at least one"))
+        );
+
+        let unsafe_mode = validate_egress_network_contract(Some("nat"), true).unwrap_err();
+        assert!(
+            matches!(unsafe_mode, CoreError::InvalidArgument(ref message) if message.contains("network mode filtered"))
+        );
+    }
+
+    #[test]
     fn validate_network_mode_rejects_unknown() {
         let err = validate_network_mode(Some("vxlan")).unwrap_err();
         assert!(
@@ -5148,6 +5224,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             balloon: false,
             volume: None,
             network: NetworkMode::Bridged,
+            egress_policy: None,
             last_activity_at: chrono::Utc::now(),
             suspended_at: None,
             idle_timeout_secs: None,
@@ -6213,6 +6290,7 @@ mod idle_policy_tests {
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
+            egress_policy: None,
             last_activity_at: now,
             suspended_at: None,
             idle_timeout_secs: None,

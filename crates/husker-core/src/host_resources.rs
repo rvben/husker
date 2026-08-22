@@ -2,12 +2,17 @@ use super::*;
 
 impl<B: VmmBackend> HuskerCore<B> {
     async fn remove_tap_host_resources(&self, tap: &str) -> Result<(), CoreError> {
+        let egress_result = self
+            .host_network
+            .remove_egress_policy(tap, &self.bridge_name)
+            .await;
         let forward_result = self
             .host_network
             .remove_all_port_forwards(tap, &self.bridge_name)
             .await;
         let tap_result = self.host_network.delete_tap(tap).await;
 
+        egress_result?;
         forward_result?;
         tap_result?;
         Ok(())

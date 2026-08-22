@@ -158,6 +158,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
+        egress_policy: None,
         last_activity_at: now,
         suspended_at: None,
         idle_timeout_secs: None,

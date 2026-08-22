@@ -205,6 +205,7 @@ supports aarch64 (agent-less build - see below).
 | Host bind-mounts (`--mount`) | — | ✓ (virtiofs) | — |
 | Memory balloon (`--balloon`) | ✓ | ✓ | ✓ |
 | Bridged LAN (`--net bridged`) | — | ✓ ³ | — |
+| Per-VM egress allowlist (API `network: filtered`) | ✓ | ✓ | — |
 | Snapshots | ✓ | — | — |
 | Fork / pool checkout | ✓ | — | — |
 | Idle suspend / resume | ✓ | — | — |
@@ -309,10 +310,16 @@ activity, appears as `expires_at`/`owner` in VM responses, and is reaped by the
 daemon even if the orchestrator disappears. See [Werkt integration](docs/werkt.md)
 for the intended execution-plane boundary.
 
+Linux API clients can request a default-deny egress boundary with
+`network: "filtered"` and explicit hostname/protocol/port entries. Husker
+resolves and pins those entries before boot, then restores the concrete policy
+after daemon restarts. See [Per-VM egress policies](docs/security/egress-policies.md).
+
 ## Security
 
 - [Threat model](docs/security/threat-model.md) — STRIDE analysis and residual risks.
 - [Hardening guide](docs/security/hardening-guide.md) — deployment posture and config recommendations.
+- [Per-VM egress policies](docs/security/egress-policies.md) — filtered-network API contract and limits.
 - Report vulnerabilities privately via [GitHub Security Advisories](https://github.com/rvben/husker/security/advisories/new). See [SECURITY.md](SECURITY.md).
 
 The daemon defaults to loopback-only. Don't bind it on a public interface without a bearer token and a terminating reverse proxy.
