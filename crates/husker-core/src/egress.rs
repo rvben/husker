@@ -1,11 +1,17 @@
+#[cfg(feature = "linux-net")]
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr};
+#[cfg(feature = "linux-net")]
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "linux-net")]
 use crate::{CoreError, EgressRuleRequest};
 
+#[cfg(feature = "linux-net")]
 const MAX_REQUESTED_EGRESS_RULES: usize = 32;
+#[cfg(feature = "linux-net")]
 const MAX_RESOLVED_EGRESS_RULES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -15,6 +21,7 @@ pub(crate) struct ResolvedEgressRule {
     pub port: u16,
 }
 
+#[cfg(feature = "linux-net")]
 pub(crate) async fn resolve_egress_rules(
     requested: &[EgressRuleRequest],
 ) -> Result<Vec<ResolvedEgressRule>, CoreError> {
@@ -96,6 +103,7 @@ pub(crate) async fn resolve_egress_rules(
     Ok(resolved.into_iter().collect())
 }
 
+#[cfg(feature = "linux-net")]
 fn validate_host(value: &str) -> Result<String, &'static str> {
     let value = value.trim().trim_end_matches('.');
     if value.is_empty() {
@@ -129,7 +137,7 @@ fn validate_host(value: &str) -> Result<String, &'static str> {
     Ok(value.to_ascii_lowercase())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "linux-net"))]
 mod tests {
     use super::*;
 
