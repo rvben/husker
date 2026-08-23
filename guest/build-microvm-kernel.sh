@@ -39,7 +39,10 @@ cd "$WORK_DIR"
 MAJOR="${KERNEL_VERSION%%.*}"
 echo "==> Fetching linux-${KERNEL_VERSION} (${KARCH})"
 [ -f "linux-${KERNEL_VERSION}.tar.xz" ] || \
-  curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz"
+  curl --fail --silent --show-error --location \
+    --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
+    --output "linux-${KERNEL_VERSION}.tar.xz" \
+    "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz"
 
 if [ "$KERNEL_SHA256" != "skip" ]; then
   echo "$KERNEL_SHA256  linux-${KERNEL_VERSION}.tar.xz" | sha256sum -c
