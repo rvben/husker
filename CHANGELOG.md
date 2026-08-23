@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.47](https://github.com/rvben/husker/compare/v0.4.46...v0.4.47) - 2026-08-23
+
+### Added
+
+- **network**: enforce per-VM egress allowlists ([d40e963](https://github.com/rvben/husker/commit/d40e96328f3de594d4cf8dc81f180ae7521c27f0))
+
+### Fixed
+
+- **network**: compile egress policy cross-platform ([5664869](https://github.com/rvben/husker/commit/566486915e1bb32a955d066db093a0eb2c0dcbc5))
+
 ## [0.4.46](https://github.com/rvben/husker/compare/v0.4.45...v0.4.46) - 2026-08-21
 
 ### Added
