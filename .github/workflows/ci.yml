@@ -45,7 +45,7 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518
         with:
           tool: nextest
       - run: make test
@@ -107,7 +107,7 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -165,7 +165,7 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518
         with:
           tool: nextest
       - run: make test-macos
@@ -181,7 +181,7 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518
         with:
           tool: cargo-audit
       - run: make audit
@@ -195,7 +195,7 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518
         with:
           tool: cargo-deny
       - run: make deny
