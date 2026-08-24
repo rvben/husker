@@ -87,6 +87,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          clean: false
+
+      - name: Isolate Cargo and wheel state
+        shell: bash
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          {
+            echo "CARGO_HOME=${RUNNER_TEMP}/cargo-home-${GITHUB_RUN_ID}-${{ matrix.target }}"
+            echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/cargo-target-${GITHUB_RUN_ID}-${{ matrix.target }}"
+            echo "DIST_DIR=${RUNNER_TEMP}/husker-dist-${GITHUB_RUN_ID}-${{ matrix.target }}"
+          } >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
@@ -97,7 +109,9 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
 
       - name: Clean stale dist
-        run: rm -rf dist target/wheels
+        run: |
+          rm -rf "$DIST_DIR" "$CARGO_TARGET_DIR/wheels"
+          mkdir -p "$DIST_DIR"
 
       - name: Install maturin + zig (Linux)
         if: runner.os == 'Linux'
@@ -122,7 +136,7 @@ jobs:
         run: |
           rustup target add x86_64-unknown-linux-musl
           cargo build --package husker-agent --profile agent --target x86_64-unknown-linux-musl
-          echo "HUSKER_EMBED_AGENT_BIN=${GITHUB_WORKSPACE}/target/x86_64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
+          echo "HUSKER_EMBED_AGENT_BIN=${CARGO_TARGET_DIR}/x86_64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
 
       # Apple Silicon embeds the aarch64-musl agent (VZ cloud images).
       # aarch64 Linux and Intel macOS ship without an embedded agent.
@@ -135,7 +149,7 @@ jobs:
           uv pip install --python "${RUNNER_TEMP}/build-venv/bin/python" ziglang cargo-zigbuild
           rustup target add aarch64-unknown-linux-musl
           make build-agent-aarch64
-          echo "HUSKER_EMBED_AGENT_BIN=$PWD/target/aarch64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
+          echo "HUSKER_EMBED_AGENT_BIN=${CARGO_TARGET_DIR}/aarch64-unknown-linux-musl/agent/husker-agent" >> "$GITHUB_ENV"
 
       - name: Build binary (Linux, cross via zigbuild for manylinux_2_28)
         if: runner.os == 'Linux'
@@ -143,41 +157,43 @@ jobs:
 
       - name: Build wheel (Linux, maturin + zig for manylinux_2_28)
         if: runner.os == 'Linux'
-        run: maturin build --release --target ${{ matrix.target }} --compatibility manylinux_2_28 --zig --out dist
+        run: maturin build --release --target ${{ matrix.target }} --compatibility manylinux_2_28 --zig --out "$DIST_DIR"
 
       - name: Build binary (macOS, no-default-features + codesign)
         if: runner.os == 'macOS'
         run: |
           cargo build --release --no-default-features --target ${{ matrix.target }} --package husker
           codesign --entitlements husker.entitlements --force --sign - \
-            target/${{ matrix.target }}/release/husker
-          codesign -d --entitlements :- target/${{ matrix.target }}/release/husker
+            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/husker"
+          codesign -d --entitlements :- "$CARGO_TARGET_DIR/${{ matrix.target }}/release/husker"
 
       - name: Build wheel (macOS, no-default-features)
         if: runner.os == 'macOS'
-        run: maturin build --release --no-default-features --target ${{ matrix.target }} --out dist
+        run: maturin build --release --no-default-features --target ${{ matrix.target }} --out "$DIST_DIR"
 
       - name: Codesign wheel binary (macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          mkdir -p wheel-extract
-          WHEEL=$(ls dist/*.whl)
-          wheel unpack "$WHEEL" -d wheel-extract
-          BIN=$(find wheel-extract -type f -name husker | head -1)
+          WHEEL_EXTRACT_DIR="${RUNNER_TEMP}/wheel-extract-${GITHUB_RUN_ID}-${{ matrix.target }}"
+          mkdir -p "$WHEEL_EXTRACT_DIR"
+          WHEEL=$(ls "$DIST_DIR"/*.whl)
+          wheel unpack "$WHEEL" -d "$WHEEL_EXTRACT_DIR"
+          BIN=$(find "$WHEEL_EXTRACT_DIR" -type f -name husker | head -1)
           if [[ -z "$BIN" ]]; then
             echo "error: husker binary not found in wheel" >&2
             exit 1
           fi
           codesign --entitlements husker.entitlements --force --sign - "$BIN"
-          EXTRACT_DIR=$(find wheel-extract -maxdepth 1 -mindepth 1 -type d | head -1)
+          EXTRACT_DIR=$(find "$WHEEL_EXTRACT_DIR" -maxdepth 1 -mindepth 1 -type d | head -1)
           rm "$WHEEL"
-          wheel pack "$EXTRACT_DIR" --dest-dir dist/
-          rm -rf wheel-extract
+          wheel pack "$EXTRACT_DIR" --dest-dir "$DIST_DIR"
+          rm -rf "$WHEEL_EXTRACT_DIR"
 
       - name: Verify native binary (host-runnable targets)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
-        run: ./target/${{ matrix.target }}/release/husker --version
+        run: |
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/husker" --version
 
       - name: Create release archive
         shell: bash
@@ -188,13 +204,14 @@ jobs:
           fi
           ARCHIVE_NAME="husker-${VERSION}-${{ matrix.target }}"
 
-          mkdir -p release-package
-          cp target/${{ matrix.target }}/release/husker release-package/husker
+          RELEASE_PACKAGE="${RUNNER_TEMP}/release-package-${GITHUB_RUN_ID}-${{ matrix.target }}"
+          mkdir -p "$RELEASE_PACKAGE"
+          cp "$CARGO_TARGET_DIR/${{ matrix.target }}/release/husker" "$RELEASE_PACKAGE/husker"
           if [[ "${{ runner.os }}" == "macOS" ]]; then
-            cp husker.entitlements release-package/
+            cp husker.entitlements "$RELEASE_PACKAGE/"
           fi
 
-          tar -czf "${ARCHIVE_NAME}.tar.gz" -C release-package .
+          tar -czf "${ARCHIVE_NAME}.tar.gz" -C "$RELEASE_PACKAGE" .
 
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
@@ -202,12 +219,12 @@ jobs:
             sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
           fi
 
-          rm -rf release-package
+          rm -rf "$RELEASE_PACKAGE"
 
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          path: dist/*.whl
+          path: ${{ runner.temp }}/husker-dist-${{ github.run_id }}-${{ matrix.target }}/*.whl
           name: wheel-${{ matrix.target }}
 
       - name: Upload release archives
