@@ -16,6 +16,8 @@ const MAX_RESOLVED_EGRESS_RULES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct ResolvedEgressRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub destination: Ipv4Addr,
     pub protocol: String,
     pub port: u16,
@@ -48,9 +50,9 @@ pub(crate) async fn resolve_egress_rules(
             )));
         }
 
-        let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
+        let (addresses, hostname) = if let Ok(ip) = host.parse::<IpAddr>() {
             match ip {
-                IpAddr::V4(ip) => vec![ip],
+                IpAddr::V4(ip) => (vec![ip], None),
                 IpAddr::V6(_) => {
                     return Err(CoreError::InvalidArgument(format!(
                         "{path}.host must resolve to IPv4; IPv6 egress is not supported"
@@ -65,14 +67,15 @@ pub(crate) async fn resolve_egress_rules(
                         "{path}.host could not be resolved: {error}"
                     ))
                 })?;
-            lookup
+            let addresses = lookup
                 .filter_map(|address| match address.ip() {
                     IpAddr::V4(ip) => Some(ip),
                     IpAddr::V6(_) => None,
                 })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .collect()
+                .collect();
+            (addresses, Some(host.clone()))
         };
         if addresses.is_empty() {
             return Err(CoreError::InvalidArgument(format!(
@@ -89,6 +92,7 @@ pub(crate) async fn resolve_egress_rules(
                 )));
             }
             resolved.insert(ResolvedEgressRule {
+                host: hostname.clone(),
                 destination,
                 protocol: protocol.clone(),
                 port: rule.port,
@@ -164,6 +168,38 @@ mod tests {
             "203.0.113.8".parse::<Ipv4Addr>().unwrap()
         );
         assert_eq!(resolved[0].protocol, "tcp");
+        assert_eq!(resolved[0].host, None);
+    }
+
+    #[tokio::test]
+    async fn preserves_normalized_hostname_with_every_resolved_destination() {
+        let resolved = resolve_egress_rules(&[EgressRuleRequest {
+            host: "LOCALHOST.".into(),
+            port: 443,
+            protocol: "tcp".into(),
+        }])
+        .await
+        .unwrap();
+
+        assert!(!resolved.is_empty());
+        assert!(resolved.iter().all(|rule| {
+            rule.host.as_deref() == Some("localhost")
+                && rule.destination.is_loopback()
+                && rule.protocol == "tcp"
+                && rule.port == 443
+        }));
+    }
+
+    #[test]
+    fn persisted_rules_without_a_hostname_remain_compatible() {
+        let rule: ResolvedEgressRule = serde_json::from_value(serde_json::json!({
+            "destination": "203.0.113.8",
+            "protocol": "tcp",
+            "port": 443
+        }))
+        .unwrap();
+
+        assert_eq!(rule.host, None);
     }
 
     #[tokio::test]

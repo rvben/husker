@@ -493,10 +493,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             )
         };
 
-        // resolv.conf injection loop-mounts the ext4 rootfs; skip it for qcow2 cloud
-        // images, which are not ext4. Cloud images configure DNS via cloud-init at boot.
-        if !is_cloud && !self.dns_servers.is_empty() {
-            inject_resolv_conf(&disk_path, &self.dns_servers).await?;
+        // Network config injection loop-mounts the ext4 rootfs; skip it for qcow2
+        // cloud images, which are not ext4. Hostname egress entries make the
+        // guest use the exact addresses admitted by the host firewall, avoiding
+        // a second DNS lookup whose rotating answer could be denied.
+        let egress_hosts = resolved_egress
+            .iter()
+            .filter_map(|rule| {
+                rule.host
+                    .as_ref()
+                    .map(|host| (host.clone(), rule.destination))
+            })
+            .collect::<Vec<_>>();
+        if !is_cloud && (!self.dns_servers.is_empty() || !egress_hosts.is_empty()) {
+            inject_network_config(&disk_path, &self.dns_servers, &egress_hosts).await?;
         }
 
         // For direct-kernel boot: resolve the kernel now (validation already ran in

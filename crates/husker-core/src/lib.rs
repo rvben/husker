@@ -1655,9 +1655,67 @@ fn report_agent_refresh(vm_name: &str, refresh: Option<husker_storage::AgentRefr
     }
 }
 
-/// Mount a rootfs image via loop, write `/etc/resolv.conf`, and unmount.
+fn merge_egress_hosts(existing: &str, entries: &[(String, Ipv4Addr)]) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let targets = entries
+        .iter()
+        .map(|(host, _)| host.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut output = String::new();
+    for raw_line in existing.lines() {
+        let (body, comment) = raw_line
+            .split_once('#')
+            .map_or((raw_line, None), |(body, comment)| (body, Some(comment)));
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 || !fields[1..].iter().any(|host| targets.contains(host)) {
+            output.push_str(raw_line);
+            output.push('\n');
+            continue;
+        }
+
+        let retained = fields[1..]
+            .iter()
+            .copied()
+            .filter(|host| !targets.contains(host))
+            .collect::<Vec<_>>();
+        if !retained.is_empty() {
+            output.push_str(fields[0]);
+            output.push('\t');
+            output.push_str(&retained.join("\t"));
+            if let Some(comment) = comment {
+                output.push_str(" #");
+                output.push_str(comment);
+            }
+            output.push('\n');
+        } else if let Some(comment) = comment
+            && !comment.trim().is_empty()
+        {
+            output.push('#');
+            output.push_str(comment);
+            output.push('\n');
+        }
+    }
+
+    let mut grouped = BTreeMap::<&str, BTreeSet<Ipv4Addr>>::new();
+    for (host, address) in entries {
+        grouped.entry(host).or_default().insert(*address);
+    }
+    for (host, addresses) in grouped {
+        for address in addresses {
+            output.push_str(&format!("{address}\t{host}\t# husker-egress-pin\n"));
+        }
+    }
+    output
+}
+
+/// Mount a rootfs image, pin its DNS and hostname egress decisions, and unmount.
 #[cfg(feature = "linux-net")]
-async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Result<(), CoreError> {
+async fn inject_network_config(
+    rootfs: &std::path::Path,
+    servers: &[String],
+    egress_hosts: &[(String, Ipv4Addr)],
+) -> Result<(), CoreError> {
     use tokio::process::Command;
 
     let mount_dir =
@@ -1678,6 +1736,7 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
     }
 
     let resolv_path = mount_dir.path().join("etc/resolv.conf");
+    let hosts_path = mount_dir.path().join("etc/hosts");
 
     // Remove symlink if present (e.g. systemd-resolved's stub-resolv.conf)
     // so we can write a static file that persists across boot.
@@ -1687,12 +1746,24 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
         warn!(path = %resolv_path.display(), error = %e, "failed to remove resolv.conf symlink");
     }
 
-    let contents: String = servers
-        .iter()
-        .map(|s| format!("nameserver {s}\n"))
-        .collect();
-
-    let write_result = tokio::fs::write(&resolv_path, contents.as_bytes()).await;
+    let write_result = async {
+        if !servers.is_empty() {
+            let contents: String = servers
+                .iter()
+                .map(|s| format!("nameserver {s}\n"))
+                .collect();
+            tokio::fs::write(&resolv_path, contents.as_bytes()).await?;
+        }
+        if !egress_hosts.is_empty() {
+            let existing = tokio::fs::read_to_string(&hosts_path)
+                .await
+                .unwrap_or_default();
+            let contents = merge_egress_hosts(&existing, egress_hosts);
+            tokio::fs::write(&hosts_path, contents.as_bytes()).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
 
     // Mask systemd-resolved so it doesn't recreate the symlink on boot
     let resolved_link = mount_dir
@@ -1716,6 +1787,11 @@ async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Res
         ))),
         Err(e) => Err(CoreError::Storage(husker_storage::StorageError::Io(e))),
     }
+}
+
+#[cfg(all(test, feature = "linux-net"))]
+async fn inject_resolv_conf(rootfs: &std::path::Path, servers: &[String]) -> Result<(), CoreError> {
+    inject_network_config(rootfs, servers, &[]).await
 }
 
 /// If a serial-console tail shows a kernel/module ABI mismatch - stale baked
@@ -4023,6 +4099,7 @@ if [ "${HUSKER_FAKE_SKIP_ETC_DIR:-0}" = "1" ]; then
 fi
 mkdir -p "$mount_dir/etc/systemd/system"
 mkdir -p "$mount_dir/run/systemd/resolve"
+printf '127.0.0.1 localhost\n192.0.2.1 api.example.test old-alias # retained\n' > "$mount_dir/etc/hosts"
 touch "$mount_dir/run/systemd/resolve/stub-resolv.conf"
 ln -sf "$mount_dir/run/systemd/resolve/stub-resolv.conf" "$mount_dir/etc/resolv.conf"
 exit "${HUSKER_FAKE_MOUNT_EXIT:-0}"
@@ -4037,6 +4114,9 @@ if [ -n "${HUSKER_FAKE_CAPTURE_FILE:-}" ] && [ -f "$mount_dir/etc/resolv.conf" ]
 fi
 if [ -n "${HUSKER_FAKE_MASK_CAPTURE_FILE:-}" ] && [ -L "$mount_dir/etc/systemd/system/systemd-resolved.service" ]; then
   readlink "$mount_dir/etc/systemd/system/systemd-resolved.service" > "$HUSKER_FAKE_MASK_CAPTURE_FILE"
+fi
+if [ -n "${HUSKER_FAKE_HOSTS_CAPTURE_FILE:-}" ] && [ -f "$mount_dir/etc/hosts" ]; then
+  cp "$mount_dir/etc/hosts" "$HUSKER_FAKE_HOSTS_CAPTURE_FILE"
 fi
 exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 "#;
@@ -4132,6 +4212,82 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
         let result = rotate_log_file(&path, LOG_ROTATE_KEEP).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn merge_egress_hosts_replaces_conflicts_and_deduplicates_addresses() {
+        let existing = concat!(
+            "127.0.0.1 localhost\n",
+            "192.0.2.1 api.example.test old-alias # retained\n",
+            "192.0.2.2 api.example.test # stale\n",
+        );
+        let entries = vec![
+            (
+                "api.example.test".to_string(),
+                "198.51.100.2".parse().unwrap(),
+            ),
+            (
+                "api.example.test".to_string(),
+                "198.51.100.1".parse().unwrap(),
+            ),
+            (
+                "api.example.test".to_string(),
+                "198.51.100.2".parse().unwrap(),
+            ),
+        ];
+
+        assert_eq!(
+            merge_egress_hosts(existing, &entries),
+            concat!(
+                "127.0.0.1 localhost\n",
+                "192.0.2.1\told-alias # retained\n",
+                "# stale\n",
+                "198.51.100.1\tapi.example.test\t# husker-egress-pin\n",
+                "198.51.100.2\tapi.example.test\t# husker-egress-pin\n",
+            )
+        );
+    }
+
+    #[cfg(all(feature = "linux-net", unix))]
+    #[tokio::test]
+    async fn inject_network_config_pins_egress_hosts() {
+        let _guard = env_test_lock().lock().await;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        write_executable_script(&bin_dir.path().join("mount"), FAKE_MOUNT_SCRIPT);
+        write_executable_script(&bin_dir.path().join("umount"), FAKE_UMOUNT_SCRIPT);
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = rootfs_dir.path().join("rootfs.img");
+        std::fs::write(&rootfs, b"fake-rootfs").unwrap();
+        let capture_dir = tempfile::tempdir().unwrap();
+        let hosts_capture = capture_dir.path().join("hosts.capture");
+        let mut path = OsString::from(bin_dir.path().as_os_str());
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        let _path_guard = ScopedEnvVar::set("PATH", &path);
+        let _mount_exit = ScopedEnvVar::set("HUSKER_FAKE_MOUNT_EXIT", "0");
+        let _umount_exit = ScopedEnvVar::set("HUSKER_FAKE_UMOUNT_EXIT", "0");
+        let _hosts_guard = ScopedEnvVar::set("HUSKER_FAKE_HOSTS_CAPTURE_FILE", &hosts_capture);
+
+        inject_network_config(
+            &rootfs,
+            &["10.10.30.10".to_string()],
+            &[(
+                "api.example.test".to_string(),
+                "198.51.100.7".parse().unwrap(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(hosts_capture).unwrap(),
+            concat!(
+                "127.0.0.1 localhost\n",
+                "192.0.2.1\told-alias # retained\n",
+                "198.51.100.7\tapi.example.test\t# husker-egress-pin\n",
+            )
+        );
     }
 
     #[cfg(all(feature = "linux-net", unix))]
