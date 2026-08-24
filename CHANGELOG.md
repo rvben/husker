@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.48](https://github.com/rvben/husker/compare/v0.4.47...v0.4.48) - 2026-08-24
+
+### Fixed
+
+- **network**: pin hostname egress inside guests ([51a42e7](https://github.com/rvben/husker/commit/51a42e71a0c8fba4e5a0f464a6b7078a0c2297e7))
+- **network**: honor explicit egress under guest isolation ([2e133bb](https://github.com/rvben/husker/commit/2e133bb0712d0bd6cb072fafc1074a7c0bd1d913))
+
 ## [0.4.47](https://github.com/rvben/husker/compare/v0.4.46...v0.4.47) - 2026-08-23
 
 ### Added
