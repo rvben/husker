@@ -330,7 +330,8 @@ async fn per_vm_egress_policy_installs_and_removes_real_nft_rules() {
         "policy is not TAP-keyed: {output}"
     );
     assert!(
-        output.contains("203.0.113.8 tcp dport 443 accept"),
+        output.contains("203.0.113.8 tcp dport 443")
+            && output.contains("meta mark set mark | 0x80000000 accept"),
         "missing allow rule: {output}"
     );
     assert!(
@@ -645,6 +646,11 @@ async fn isolation_installs_deny_carveout_and_host_guard_in_order() {
     assert!(
         output.contains("husker:isolation-host-guard"),
         "host-guard input rule missing: {output}"
+    );
+    assert!(
+        output.contains("husker:isolation-explicit-egress")
+            && output.contains("meta mark & 0x80000000 != 0"),
+        "explicit per-VM egress carve-out missing: {output}"
     );
     assert!(
         output.contains("type filter hook input"),

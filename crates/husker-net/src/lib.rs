@@ -656,6 +656,13 @@ fn egress_comment_prefix(tap_name: &str) -> String {
     format!("husker-egress:{tap_name}:")
 }
 
+// The bridge-family hook can identify the unforgeable ingress TAP, while the
+// later ip-family isolation hook sees only the shared bridge. Carry an allow
+// decision between those hooks in one packet-mark bit, then clear it as soon as
+// isolation consumes it so the mark cannot affect routing or another firewall.
+const EGRESS_POLICY_MARK: &str = "0x80000000";
+const EGRESS_POLICY_MARK_CLEAR_MASK: &str = "0x7fffffff";
+
 fn egress_rules_for_chain(
     tap_name: &str,
     gateway: Ipv4Addr,
@@ -723,6 +730,13 @@ fn egress_rules_for_chain(
             rule.protocol.nft_name().into(),
             "dport".into(),
             rule.port.to_string(),
+            "meta".into(),
+            "mark".into(),
+            "set".into(),
+            "meta".into(),
+            "mark".into(),
+            "|".into(),
+            EGRESS_POLICY_MARK.into(),
             "accept".into(),
             "comment".into(),
             format!("\"{prefix}allow-{index}\""),
@@ -804,6 +818,33 @@ fn dns_carveout_rules(bridge: &str, policy: &IsolationPolicy) -> Vec<Vec<String>
     rules
 }
 
+/// Accept a packet that the TAP-keyed bridge policy explicitly admitted.
+///
+/// The mark bit is cleared before accepting so it is a private handoff between
+/// Husker's two hooks, not state leaked into policy routing or other firewalls.
+fn egress_policy_carveout_rule(bridge: &str) -> Vec<String> {
+    vec![
+        "iifname".into(),
+        bridge.into(),
+        "meta".into(),
+        "mark".into(),
+        "&".into(),
+        EGRESS_POLICY_MARK.into(),
+        "!=".into(),
+        "0".into(),
+        "meta".into(),
+        "mark".into(),
+        "set".into(),
+        "meta".into(),
+        "mark".into(),
+        "&".into(),
+        EGRESS_POLICY_MARK_CLEAR_MASK.into(),
+        "accept".into(),
+        "comment".into(),
+        "\"husker:isolation-explicit-egress\"".into(),
+    ]
+}
+
 /// The forward-chain rules an isolation policy installs, in order, each as an
 /// `nft` argument vector (after `add rule ip <table> forward`). Returned as data
 /// so the exact rules and their ordering can be unit-tested without running
@@ -832,6 +873,10 @@ fn isolation_forward_rules(bridge: &str, policy: &IsolationPolicy) -> Vec<Vec<St
         "comment".into(),
         "\"husker:isolation-est\"".into(),
     ]);
+    // A TAP-keyed per-VM policy is narrower than daemon-wide isolation and may
+    // deliberately admit one private host and port. Consume that authenticated
+    // decision before the broad private-destination deny.
+    rules.push(egress_policy_carveout_rule(bridge));
     // DNS carve-out: a private resolver must be reachable on port 53 before the
     // private-address deny below would drop it.
     rules.extend(dns_carveout_rules(bridge, policy));
@@ -860,7 +905,8 @@ fn isolation_forward_rules(bridge: &str, policy: &IsolationPolicy) -> Vec<Vec<St
 /// Keyed on `iifname <bridge>`, not the guest source address, for the same
 /// anti-spoofing reason as the forward rules.
 fn isolation_input_rules(bridge: &str, policy: &IsolationPolicy) -> Vec<Vec<String>> {
-    let mut rules = dns_carveout_rules(bridge, policy);
+    let mut rules = vec![egress_policy_carveout_rule(bridge)];
+    rules.extend(dns_carveout_rules(bridge, policy));
     rules.push(vec![
         "iifname".into(),
         bridge.into(),
@@ -1861,16 +1907,14 @@ mod tests {
                 .iter()
                 .any(|rule| { rule.contains("10.10.30.10 udp dport 53 accept") })
         );
-        assert!(
-            joined
-                .iter()
-                .any(|rule| { rule.contains("140.82.121.4 tcp dport 443 accept") })
-        );
-        assert!(
-            joined
-                .iter()
-                .any(|rule| { rule.contains("10.10.30.53 udp dport 9090 accept") })
-        );
+        assert!(joined.iter().any(|rule| {
+            rule.contains("140.82.121.4 tcp dport 443")
+                && rule.contains("meta mark set meta mark | 0x80000000 accept")
+        }));
+        assert!(joined.iter().any(|rule| {
+            rule.contains("10.10.30.53 udp dport 9090")
+                && rule.contains("meta mark set meta mark | 0x80000000 accept")
+        }));
         assert!(joined.last().unwrap().contains("default-deny"));
         assert!(joined.last().unwrap().contains("drop"));
     }
@@ -1919,6 +1963,20 @@ mod tests {
         assert!(joined[deny_idx].contains("10.0.0.0/8"));
         assert!(joined[deny_idx].contains("192.168.0.0/16"));
         assert!(joined[deny_idx].contains("100.64.0.0/10"));
+        let egress_idx = joined
+            .iter()
+            .position(|r| r.contains("isolation-explicit-egress"))
+            .expect("explicit egress carve-out present");
+        assert!(
+            joined[egress_idx].contains("meta mark & 0x80000000 != 0")
+                && joined[egress_idx].contains("meta mark set meta mark & 0x7fffffff accept"),
+            "carve-out must consume and clear the bridge-policy mark: {}",
+            joined[egress_idx]
+        );
+        assert!(
+            egress_idx < deny_idx,
+            "explicit egress carve-out must precede the deny: {joined:?}"
+        );
         // Every carve-out accept precedes the deny, or the deny shadows DNS.
         let last_accept = joined.iter().rposition(|r| r.contains("accept")).unwrap();
         assert!(
@@ -1961,10 +2019,16 @@ mod tests {
         let rules = isolation_forward_rules("husker0", &policy);
         let joined: Vec<String> = rules.iter().map(|r| rule_str(r)).collect();
         assert!(!joined.iter().any(|r| r.contains("1.1.1.1")));
-        // Just the established accept and the deny, no DNS carve-out.
-        assert_eq!(rules.len(), 2, "expected [established, deny]: {joined:?}");
+        // Established reply traffic and explicit per-VM egress are admitted,
+        // but a public resolver earns no dedicated DNS carve-out.
+        assert_eq!(
+            rules.len(),
+            3,
+            "expected [established, explicit egress, deny]: {joined:?}"
+        );
         assert!(joined[0].contains("ct state established,related"));
-        assert!(joined[1].contains("drop"));
+        assert!(joined[1].contains("isolation-explicit-egress"));
+        assert!(joined[2].contains("drop"));
     }
 
     /// Reply traffic for a connection reaching a guest through a DNAT port
@@ -2012,10 +2076,19 @@ mod tests {
             .iter()
             .position(|r| r.contains("isolation-host-guard"))
             .expect("host guard present");
+        let egress_idx = joined
+            .iter()
+            .position(|r| r.contains("isolation-explicit-egress"))
+            .expect("input explicit egress carve-out present");
         assert!(
             dns_idx < guard_idx,
             "DNS carve-out must precede the guard: {joined:?}"
         );
+        assert!(
+            egress_idx < guard_idx,
+            "explicit egress carve-out must precede the host guard: {joined:?}"
+        );
+        assert!(joined[egress_idx].contains("meta mark set meta mark & 0x7fffffff"));
         // The guard drops all guest-bridge input, not a source-scoped subset.
         assert!(joined[guard_idx].contains("iifname husker0"));
         assert!(joined[guard_idx].contains("drop"));
