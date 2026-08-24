@@ -378,3 +378,8 @@ Issues and pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 ## License
 
 See [`LICENSE`](LICENSE).
+
+## Releasing
+
+Vership owns versioning, changelog generation, release commits, and tags. See
+[the release runbook](docs/releases.md) for the verified workflow and recovery policy.
