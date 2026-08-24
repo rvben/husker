@@ -1655,6 +1655,7 @@ fn report_agent_refresh(vm_name: &str, refresh: Option<husker_storage::AgentRefr
     }
 }
 
+#[cfg(feature = "linux-net")]
 fn merge_egress_hosts(existing: &str, entries: &[(String, Ipv4Addr)]) -> String {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -4214,6 +4215,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "linux-net")]
     #[test]
     fn merge_egress_hosts_replaces_conflicts_and_deduplicates_addresses() {
         let existing = concat!(
