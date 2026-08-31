@@ -4,9 +4,10 @@ use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use husker_core::{
-    BootKind, CoreError, CreateHostGroupRequest, CreateSecretRequest, CreateServiceRequest,
-    CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskerCore, ImportImageRequest,
-    NetworkMode, RestoreSnapshotRequest, RotateSecretRequest, UserdataStatus,
+    BootKind, CommitVmImageRequest, CoreError, CreateHostGroupRequest, CreateSecretRequest,
+    CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskerCore,
+    ImageKind, ImageRecord, ImportImageRequest, NetworkMode, RestoreSnapshotRequest,
+    RotateSecretRequest, UserdataStatus,
 };
 #[cfg(feature = "linux-net")]
 use husker_state::PortForwardRecord;
@@ -1823,6 +1824,210 @@ async fn image_roundtrip_import_list_get_export_delete() {
     core.delete_image("ubuntu-base").await.unwrap();
     assert!(!catalog_path.exists());
     assert!(core.list_images().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    let catalog_dir = data_dir.join("images/catalog");
+    let vm_dir = data_dir.join("vms/preparer");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&catalog_dir).unwrap();
+    std::fs::create_dir_all(&vm_dir).unwrap();
+
+    let parent_path = catalog_dir.join("base.ext4");
+    let prepared_path = vm_dir.join("rootfs.ext4");
+    std::fs::write(&parent_path, b"base-rootfs").unwrap();
+    std::fs::write(&prepared_path, b"base-rootfs-with-python").unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    state
+        .insert_image(&ImageRecord {
+            id: Uuid::new_v4(),
+            name: "base".into(),
+            source_path: "test://base".into(),
+            file_path: parent_path.to_string_lossy().into_owned(),
+            format: "ext4".into(),
+            kind: ImageKind::Rootfs,
+            boot_init: Some("/usr/local/bin/husker-agent".into()),
+            content_digest: Some("sha256:base".into()),
+            parent_image: None,
+            size_bytes: 11,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+    let mut vm = vm_record(
+        Uuid::new_v4(),
+        "preparer",
+        "stopped",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    vm.rootfs_path = parent_path.to_string_lossy().into_owned();
+    vm.pid = None;
+    state.insert_vm(&vm).unwrap();
+
+    let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
+    let request = CommitVmImageRequest {
+        name: "tools-python-3.13.7".into(),
+    };
+    let committed = core
+        .commit_vm_image("preparer", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(committed.parent_image.as_deref(), Some("base"));
+    assert_eq!(
+        committed.boot_init.as_deref(),
+        Some("/usr/local/bin/husker-agent")
+    );
+    assert!(
+        committed
+            .content_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    assert_eq!(
+        std::fs::read(&committed.file_path).unwrap(),
+        b"base-rootfs-with-python"
+    );
+
+    let repeated = core
+        .commit_vm_image("preparer", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(repeated.id, committed.id);
+
+    // A repeat is a no-op only while the catalog file still holds the recorded
+    // bytes: an altered or missing artifact must fail, not be certified.
+    std::fs::write(&committed.file_path, b"tampered-catalog-file").unwrap();
+    let tampered = core
+        .commit_vm_image("preparer", request.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(tampered, CoreError::Io(_)), "{tampered:?}");
+    std::fs::remove_file(&committed.file_path).unwrap();
+    let missing = core.commit_vm_image("preparer", request).await.unwrap_err();
+    assert!(matches!(missing, CoreError::Io(_)), "{missing:?}");
+
+    std::fs::write(&prepared_path, b"different-prepared-rootfs").unwrap();
+    let conflict = core
+        .commit_vm_image(
+            "preparer",
+            CommitVmImageRequest {
+                name: committed.name,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, CoreError::ImageAlreadyExists(_)));
+}
+
+#[tokio::test]
+async fn commit_vm_image_refuses_a_parent_replaced_after_the_vm_was_created() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    let catalog_dir = data_dir.join("images/catalog");
+    let vm_dir = data_dir.join("vms/preparer");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&catalog_dir).unwrap();
+    std::fs::create_dir_all(&vm_dir).unwrap();
+    let parent_path = catalog_dir.join("base.ext4");
+    std::fs::write(&parent_path, b"reimported-base").unwrap();
+    std::fs::write(vm_dir.join("rootfs.ext4"), b"original-base-with-python").unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mut vm = vm_record(
+        Uuid::new_v4(),
+        "preparer",
+        "stopped",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    vm.rootfs_path = parent_path.to_string_lossy().into_owned();
+    vm.pid = None;
+    state.insert_vm(&vm).unwrap();
+    // The image the VM was cloned from was deleted and a different one
+    // imported under the same name, so it sits at the same catalog path.
+    state
+        .insert_image(&ImageRecord {
+            id: Uuid::new_v4(),
+            name: "base".into(),
+            source_path: "test://reimported-base".into(),
+            file_path: parent_path.to_string_lossy().into_owned(),
+            format: "ext4".into(),
+            kind: ImageKind::Rootfs,
+            boot_init: None,
+            content_digest: Some("sha256:reimported".into()),
+            parent_image: None,
+            size_bytes: 15,
+            created_at: vm.created_at + chrono::Duration::minutes(5),
+        })
+        .unwrap();
+
+    let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
+    let error = core
+        .commit_vm_image(
+            "preparer",
+            CommitVmImageRequest {
+                name: "derived".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, CoreError::InvalidArgument(msg) if msg.contains("replaced")),
+        "{error:?}"
+    );
+    assert!(
+        core.list_images()
+            .unwrap()
+            .iter()
+            .all(|image| image.name != "derived")
+    );
+}
+
+#[tokio::test]
+async fn commit_vm_image_requires_stopped_managed_direct_kernel_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    let vm_dir = data_dir.join("vms/preparer");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&vm_dir).unwrap();
+    std::fs::write(vm_dir.join("rootfs.ext4"), b"prepared-rootfs").unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let running = vm_record(
+        Uuid::new_v4(),
+        "preparer",
+        "running",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    state.insert_vm(&running).unwrap();
+    let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
+    let error = core
+        .commit_vm_image(
+            "preparer",
+            CommitVmImageRequest {
+                name: "derived".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::InvalidState { .. }));
 }
 
 #[tokio::test]

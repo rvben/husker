@@ -123,6 +123,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route("/v1/vms", get(list_vms::<B>).post(create_vm::<B>))
         .route("/v1/vms/{name}", get(get_vm::<B>).delete(destroy_vm::<B>))
         .route("/v1/vms/{name}/stop", post(stop_vm::<B>))
+        .route("/v1/vms/{name}/commit-image", post(commit_vm_image::<B>))
         .route("/v1/vms/{name}/pause", post(pause_vm::<B>))
         .route("/v1/vms/{name}/resume", post(resume_vm::<B>))
         .route("/v1/vms/{name}/balloon", put(set_balloon::<B>))

@@ -362,6 +362,8 @@ impl husker_core::OciImageMaterializer for CatalogRacingOciMaterializer {
                     format: "ext4".into(),
                     kind: husker_core::ImageKind::Rootfs,
                     boot_init: Some("/winner".into()),
+                    content_digest: None,
+                    parent_image: None,
                     size_bytes: 1,
                     created_at: chrono::Utc::now(),
                 })

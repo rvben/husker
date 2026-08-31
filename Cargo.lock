@@ -1159,6 +1159,7 @@ version = "0.4.49"
 dependencies = [
  "chrono",
  "futures-util",
+ "hex",
  "husker-agent",
  "husker-agent-proto",
  "husker-cloudinit",

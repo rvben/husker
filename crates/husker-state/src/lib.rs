@@ -375,6 +375,12 @@ pub struct ImageRecord {
     /// Kernel `init=` to boot this image with. Set by `import-oci` to the guest
     /// agent (agent-supervisor mode); `None` uses the default boot path.
     pub boot_init: Option<String>,
+    /// SHA-256 of the complete catalog artifact bytes. Legacy records created
+    /// before content digests were tracked may leave this unset.
+    pub content_digest: Option<String>,
+    /// Catalog image from which a committed VM was cloned. Imported base
+    /// images and legacy records leave this unset.
+    pub parent_image: Option<String>,
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
 }
@@ -1025,7 +1031,10 @@ impl StateStore {
                 format TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'rootfs',
                 size_bytes INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                boot_init TEXT,
+                content_digest TEXT,
+                parent_image TEXT
             );
 
             CREATE TABLE IF NOT EXISTS secrets (
@@ -1069,6 +1078,8 @@ impl StateStore {
             // image catalog: kind + agent-supervisor boot init=
             "ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'rootfs'",
             "ALTER TABLE images ADD COLUMN boot_init TEXT",
+            "ALTER TABLE images ADD COLUMN content_digest TEXT",
+            "ALTER TABLE images ADD COLUMN parent_image TEXT",
             // service VM template columns; NOT NULL DEFAULT '' for populated tables
             "ALTER TABLE services ADD COLUMN kernel_path TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE services ADD COLUMN rootfs_path TEXT NOT NULL DEFAULT ''",
@@ -1977,8 +1988,8 @@ impl StateStore {
 
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO images (id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO images (id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init, content_digest, parent_image)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -1989,6 +2000,8 @@ impl StateStore {
                 size_bytes_i64,
                 record.created_at.to_rfc3339(),
                 record.boot_init,
+                record.content_digest,
+                record.parent_image,
             ],
         )
         .map_err(|e| match &e {
@@ -2006,7 +2019,7 @@ impl StateStore {
     pub fn get_image(&self, id: Uuid) -> Result<ImageRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init, content_digest, parent_image
              FROM images WHERE id = ?1",
             params![id.to_string()],
             row_to_image_record,
@@ -2021,7 +2034,7 @@ impl StateStore {
     pub fn get_image_by_name(&self, name: &str) -> Result<ImageRecord, StateError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init, content_digest, parent_image
              FROM images WHERE name = ?1",
             params![name],
             row_to_image_record,
@@ -2036,7 +2049,7 @@ impl StateStore {
     pub fn list_images(&self) -> Result<Vec<ImageRecord>, StateError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init
+            "SELECT id, name, source_path, file_path, format, kind, size_bytes, created_at, boot_init, content_digest, parent_image
              FROM images ORDER BY created_at",
         )?;
         let records = stmt
@@ -2997,6 +3010,8 @@ fn row_to_image_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord>
                 })?
         },
         boot_init: row.get(8)?,
+        content_digest: row.get(9)?,
+        parent_image: row.get(10)?,
         size_bytes,
         created_at: parse_datetime(&created_str)?,
     })
@@ -3171,6 +3186,8 @@ mod tests {
             format: "ext4".into(),
             kind: ImageKind::Rootfs,
             boot_init: None,
+            content_digest: None,
+            parent_image: None,
             size_bytes: 1024,
             created_at: Utc::now(),
         }

@@ -192,6 +192,15 @@ pub struct ImageResponse {
     /// Image kind: "rootfs" (direct-kernel boot) or "cloud-image" (UEFI/OVMF boot).
     #[schema(value_type = String, example = "rootfs")]
     pub kind: ImageKind,
+    /// PID 1 override inherited by derived direct-kernel images.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_init: Option<String>,
+    /// Digest of the complete catalog artifact, including sparse regions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    /// Catalog image from which this image was prepared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_image: Option<String>,
     pub size_bytes: u64,
     pub created_at: String,
 }

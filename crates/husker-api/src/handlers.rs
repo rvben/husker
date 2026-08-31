@@ -14,12 +14,12 @@ use axum::response::IntoResponse;
 use tracing::{debug, info, warn};
 
 use husker_core::{
-    BootKind, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest, CreateServiceRequest,
-    CreateSnapshotRequest, CreateVolumeRequest, DiagnosticsReport, ExecStreamEvent,
-    ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore, ImageRecord,
-    ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata,
-    ServiceRecord, ShellEvent, SnapshotRecord, VmExpirationRecord, VmLifecycleState, VmRecord,
-    VolumeRecord,
+    BootKind, CommitVmImageRequest, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest,
+    CreateServiceRequest, CreateSnapshotRequest, CreateVolumeRequest, DiagnosticsReport,
+    ExecStreamEvent, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore,
+    ImageRecord, ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest,
+    SecretMetadata, ServiceRecord, ShellEvent, SnapshotRecord, VmExpirationRecord,
+    VmLifecycleState, VmRecord, VolumeRecord,
 };
 use husker_vmm::VmmBackend;
 
@@ -688,6 +688,31 @@ pub(crate) async fn import_oci_image<B: VmmBackend + 'static>(
 ) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
     let image = core
         .import_oci_image(&req.name, &req.reference)
+        .await
+        .map_err(map_error)?;
+    Ok((StatusCode::CREATED, Json(image_to_response(image))))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/vms/{vm_name}/commit-image",
+    tag = "images",
+    params(("vm_name" = String, Path, description = "Stopped VM name")),
+    request_body = CommitVmImageRequest,
+    responses(
+        (status = 201, description = "VM root filesystem committed to the image catalog", body = ImageResponse),
+        (status = 400, description = "VM or source image is not commit-compatible", body = ErrorResponse),
+        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 409, description = "Image name already exists with different content", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn commit_vm_image<B: VmmBackend + 'static>(
+    State(core): State<AppState<B>>,
+    Path(vm_name): Path<String>,
+    Json(req): Json<CommitVmImageRequest>,
+) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let image = core
+        .commit_vm_image(&vm_name, req)
         .await
         .map_err(map_error)?;
     Ok((StatusCode::CREATED, Json(image_to_response(image))))
@@ -2634,6 +2659,9 @@ fn image_to_response(r: ImageRecord) -> ImageResponse {
         file_path: r.file_path,
         format: r.format,
         kind: r.kind,
+        boot_init: r.boot_init,
+        content_digest: r.content_digest,
+        parent_image: r.parent_image,
         size_bytes: r.size_bytes,
         created_at: r.created_at.to_rfc3339(),
     }

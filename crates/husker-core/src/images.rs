@@ -1,9 +1,12 @@
 use super::*;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 impl<B: VmmBackend> HuskerCore<B> {
     /// Import an image into the managed image catalog.
     pub async fn import_image(&self, req: ImportImageRequest) -> Result<ImageRecord, CoreError> {
         validate_resource_name("image", &req.name)?;
+        let _image_guard = self.image_name_lock(&req.name).lock_owned().await;
         validate_host_path("import source", &req.source_path)?;
         let kind = validate_image_kind(req.kind.as_deref())?;
         match self.state.get_image_by_name(&req.name) {
@@ -40,6 +43,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             (_, Some(format)) => format,
             (ImageKind::Rootfs, None) => infer_image_format(&req.source_path),
         };
+        let content_digest = digest_new_artifact(&image_path).await?;
         let record = ImageRecord {
             id: Uuid::new_v4(),
             name: req.name.clone(),
@@ -48,6 +52,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             format,
             kind,
             boot_init: None,
+            content_digest: Some(content_digest),
+            parent_image: None,
             size_bytes: metadata.len(),
             created_at: chrono::Utc::now(),
         };
@@ -79,6 +85,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         reference: &str,
     ) -> Result<ImageRecord, CoreError> {
         validate_resource_name("image", name)?;
+        let _image_guard = self.image_name_lock(name).lock_owned().await;
         // Canonicalise before anything records or reports it: an image's
         // `source_path` is `oci://<reference>`, and re-importing that value must
         // not stack a second scheme onto the one already there.
@@ -110,6 +117,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             })
             .await
             .map_err(map_oci_materialization_error)?;
+        let content_digest = digest_new_artifact(&image_path).await?;
         let record = ImageRecord {
             id: Uuid::new_v4(),
             name: name.into(),
@@ -121,6 +129,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             // supervisor does mounts/network/reaping), since they carry no
             // busybox init. The injected agent lives at this path.
             boot_init: Some("/usr/local/bin/husker-agent".to_string()),
+            content_digest: Some(content_digest),
+            parent_image: None,
             size_bytes: artifact.size_bytes,
             created_at: chrono::Utc::now(),
         };
@@ -130,6 +140,128 @@ impl<B: VmmBackend> HuskerCore<B> {
         }) {
             let _ = tokio::fs::remove_file(&image_path).await;
             return Err(err);
+        }
+        Ok(record)
+    }
+
+    /// Promote the prepared disk of a stopped direct-kernel VM into the image
+    /// catalog. A repeated request with the same immutable name and bytes is a
+    /// successful no-op; conflicting bytes fail closed.
+    pub async fn commit_vm_image(
+        &self,
+        vm_name: &str,
+        req: CommitVmImageRequest,
+    ) -> Result<ImageRecord, CoreError> {
+        validate_resource_name("image", &req.name)?;
+        let _vm_guard = self.vm_name_lock(vm_name).lock_owned().await;
+        let _image_guard = self.image_name_lock(&req.name).lock_owned().await;
+
+        let vm = self.lookup_vm(vm_name)?;
+        self.ensure_vm_is_not_pool_template(&vm)?;
+        if vm.state != VmLifecycleState::Stopped {
+            return Err(CoreError::InvalidState {
+                name: vm_name.into(),
+                actual: vm.state.to_string(),
+                expected: "stopped".into(),
+            });
+        }
+        if vm.boot_mode != BootKind::DirectKernel {
+            return Err(CoreError::InvalidArgument(
+                "only direct-kernel VM root filesystems can be committed".into(),
+            ));
+        }
+
+        let parent = self
+            .state
+            .list_images()?
+            .into_iter()
+            .find(|image| image.file_path == vm.rootfs_path)
+            .ok_or_else(|| {
+                CoreError::InvalidArgument(
+                    "VM must be backed by a managed catalog image before it can be committed"
+                        .into(),
+                )
+            })?;
+        // A catalog path is reused when an image is deleted and re-imported
+        // under the same name, so the path alone does not identify the image
+        // the VM was cloned from. An image newer than the VM cannot be it.
+        if parent.created_at > vm.created_at {
+            return Err(CoreError::InvalidArgument(format!(
+                "catalog image '{}' was replaced after VM '{vm_name}' was created from it; \
+                 its parent can no longer be identified",
+                parent.name
+            )));
+        }
+        let source = self.storage.vm_dir(vm_name).join("rootfs.ext4");
+        husker_storage::validate_rootfs(&source)?;
+        let content_digest = sha256_file(&source).await?;
+
+        match self.state.get_image_by_name(&req.name) {
+            Ok(existing)
+                if existing.content_digest.as_deref() == Some(content_digest.as_str())
+                    && existing.parent_image.as_deref() == Some(parent.name.as_str()) =>
+            {
+                // The record alone does not prove the catalog file still holds
+                // these bytes; a no-op must never certify a missing or altered
+                // artifact.
+                verify_catalog_artifact(&existing, &content_digest).await?;
+                return Ok(existing);
+            }
+            Ok(_) => return Err(CoreError::ImageAlreadyExists(req.name)),
+            Err(husker_state::StateError::ImageNotFoundByName(_)) => {}
+            Err(other) => return Err(CoreError::State(other)),
+        }
+
+        let catalog_dir = self.storage.images_dir().join("catalog");
+        tokio::fs::create_dir_all(&catalog_dir)
+            .await
+            .map_err(husker_storage::StorageError::Io)?;
+        let image_path = catalog_dir.join(format!("{}.ext4", req.name));
+        let created_catalog_file = if image_path.exists() {
+            let orphan_digest = sha256_file(&image_path).await?;
+            if orphan_digest != content_digest {
+                return Err(CoreError::ImageAlreadyExists(req.name));
+            }
+            false
+        } else {
+            let staging = catalog_dir.join(format!(".{}.{}.staging", req.name, Uuid::new_v4()));
+            if let Err(error) = self.storage_driver.clone_rootfs(&source, &staging).await {
+                let _ = tokio::fs::remove_file(&staging).await;
+                return Err(error.into());
+            }
+            if let Err(error) = tokio::fs::rename(&staging, &image_path).await {
+                let _ = tokio::fs::remove_file(&staging).await;
+                return Err(husker_storage::StorageError::Io(error).into());
+            }
+            true
+        };
+
+        let metadata = tokio::fs::metadata(&image_path)
+            .await
+            .map_err(husker_storage::StorageError::Io)?;
+        let record = ImageRecord {
+            id: Uuid::new_v4(),
+            name: req.name,
+            source_path: format!("derived://{}/{}", parent.name, content_digest),
+            file_path: image_path.to_string_lossy().into_owned(),
+            format: "ext4".into(),
+            kind: ImageKind::Rootfs,
+            boot_init: parent.boot_init,
+            content_digest: Some(content_digest),
+            parent_image: Some(parent.name),
+            size_bytes: metadata.len(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(error) = self.state.insert_image(&record) {
+            if created_catalog_file {
+                let _ = tokio::fs::remove_file(&image_path).await;
+            }
+            return Err(match error {
+                husker_state::StateError::ImageAlreadyExists(name) => {
+                    CoreError::ImageAlreadyExists(name)
+                }
+                other => CoreError::State(other),
+            });
         }
         Ok(record)
     }
@@ -185,6 +317,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Delete a catalog image by name.
     pub async fn delete_image(&self, name: &str) -> Result<(), CoreError> {
+        let _image_guard = self.image_name_lock(name).lock_owned().await;
         let image = self.get_image(name)?;
         match tokio::fs::remove_file(&image.file_path).await {
             Ok(()) => {}
@@ -197,6 +330,57 @@ impl<B: VmmBackend> HuskerCore<B> {
             other => CoreError::State(other),
         })
     }
+}
+
+/// Digest a catalog file this request just wrote. On failure the file is
+/// removed: no record points at it yet, and a leftover would make every retry
+/// of the import fail on an existing destination.
+async fn digest_new_artifact(path: &Path) -> Result<String, CoreError> {
+    match sha256_file(path).await {
+        Ok(digest) => Ok(digest),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(path).await;
+            Err(error)
+        }
+    }
+}
+
+async fn verify_catalog_artifact(image: &ImageRecord, expected: &str) -> Result<(), CoreError> {
+    let actual = match sha256_file(Path::new(&image.file_path)).await {
+        Ok(digest) => digest,
+        Err(error) => {
+            return Err(CoreError::Io(format!(
+                "catalog image '{}' artifact {} is unreadable: {error}",
+                image.name, image.file_path
+            )));
+        }
+    };
+    if actual != expected {
+        return Err(CoreError::Io(format!(
+            "catalog image '{}' artifact {} holds {actual}, not its recorded {expected}",
+            image.name, image.file_path
+        )));
+    }
+    Ok(())
+}
+
+async fn sha256_file(path: &Path) -> Result<String, CoreError> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(husker_storage::StorageError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(husker_storage::StorageError::Io)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 #[cfg(feature = "linux-net")]
@@ -230,7 +414,35 @@ fn oci_source_path(reference: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::oci_source_path;
+    use super::{digest_new_artifact, oci_source_path};
+
+    #[tokio::test]
+    async fn an_unreadable_new_artifact_is_removed_rather_than_left_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root reads a mode-000 file, so the failure cannot be provoked there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.ext4");
+        std::fs::write(&path, b"copied").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(digest_new_artifact(&path).await.is_err());
+        assert!(
+            !path.exists(),
+            "a failed digest must not leave the copy behind"
+        );
+
+        std::fs::write(&path, b"copied").unwrap();
+        assert!(
+            digest_new_artifact(&path)
+                .await
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(path.exists());
+    }
 
     #[test]
     fn reported_source_path_carries_exactly_one_scheme() {

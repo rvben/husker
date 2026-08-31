@@ -380,6 +380,17 @@ pub struct ImportImageRequest {
     pub kind: Option<String>,
 }
 
+/// Parameters for promoting a stopped VM's prepared root disk into the image
+/// catalog. The VM remains present after promotion so callers can inspect or
+/// destroy it explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CommitVmImageRequest {
+    /// Immutable catalog name chosen by the caller, normally derived from the
+    /// logical environment digest.
+    pub name: String,
+}
+
 /// Parameters for exporting a catalog image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -843,6 +854,10 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks:
         parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-image-name locks serialize catalog publication and make a repeated
+    /// commit idempotent without allowing two VMs to race on the same path.
+    image_name_locks:
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-volume locks span asynchronous VM preparation and catalog deletion,
     /// closing the gap that cannot safely be covered by a SQLite transaction.
     volume_locks:
@@ -998,6 +1013,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             runtime_dir,
             userdata_jobs: Arc::new(agent_ops::UserdataJobs::default()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             control_plane_last_active: Arc::new(parking_lot::Mutex::new(
@@ -1043,6 +1059,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             runtime_dir,
             userdata_jobs: Arc::new(agent_ops::UserdataJobs::default()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             control_plane_last_active: Arc::new(parking_lot::Mutex::new(
@@ -1269,6 +1286,13 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.vm_name_locks.lock();
+        map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn image_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.image_name_locks.lock();
         map.entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -3875,6 +3899,8 @@ mod tests {
                 format: "ext4".into(),
                 kind: ImageKind::Rootfs,
                 boot_init: Some("/usr/local/bin/husker-agent".into()),
+                content_digest: None,
+                parent_image: None,
                 size_bytes: 1,
                 created_at: chrono::Utc::now(),
             })

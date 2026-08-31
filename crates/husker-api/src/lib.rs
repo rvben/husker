@@ -10,10 +10,10 @@ use utoipa::OpenApi;
 use utoipa::ToSchema;
 
 use husker_core::{
-    CheckResult, CheckStatus, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest,
-    CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, DaemonProfile, DiagnosticsReport,
-    EgressRuleRequest, ExportImageRequest, HuskerCore, ImportImageRequest, RestoreSnapshotRequest,
-    RotateSecretRequest,
+    CheckResult, CheckStatus, CommitVmImageRequest, CreateHostGroupRequest, CreatePoolRequest,
+    CreateSecretRequest, CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest,
+    DaemonProfile, DiagnosticsReport, EgressRuleRequest, ExportImageRequest, HuskerCore,
+    ImportImageRequest, RestoreSnapshotRequest, RotateSecretRequest,
 };
 
 type AppState<B> = Arc<HuskerCore<B>>;
@@ -219,6 +219,7 @@ pub(crate) fn max_vms() -> Option<usize> {
         list_images,
         import_image,
         import_oci_image,
+        commit_vm_image,
         get_image,
         delete_image,
         export_image,
@@ -275,6 +276,7 @@ pub(crate) fn max_vms() -> Option<usize> {
         ReconcileFailure,
         SnapshotResponse,
         ImageResponse,
+        CommitVmImageRequest,
         ExportImageResponse,
         VolumeResponse,
         CreateVolumeApiRequest,
