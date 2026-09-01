@@ -329,9 +329,11 @@ async fn per_vm_egress_policy_installs_and_removes_real_nft_rules() {
         output.contains("iifname \"huskereg1\""),
         "policy is not TAP-keyed: {output}"
     );
+    // nft lists the statement with the `meta` keyword on both sides of the
+    // assignment: `meta mark set meta mark | 0x80000000 accept`.
     assert!(
         output.contains("203.0.113.8 tcp dport 443")
-            && output.contains("meta mark set mark | 0x80000000 accept"),
+            && output.contains("meta mark set meta mark | 0x80000000 accept"),
         "missing allow rule: {output}"
     );
     assert!(
@@ -647,9 +649,13 @@ async fn isolation_installs_deny_carveout_and_host_guard_in_order() {
         output.contains("husker:isolation-host-guard"),
         "host-guard input rule missing: {output}"
     );
+    // nft renders the high-bit match in prefix notation (`0x00000000/1` is
+    // mask 0x80000000, so `!= 0x00000000/1` means "high bit set") and keeps
+    // the clear-and-accept statement verbatim.
     assert!(
         output.contains("husker:isolation-explicit-egress")
-            && output.contains("meta mark & 0x80000000 != 0"),
+            && output.contains("meta mark != 0x00000000/1")
+            && output.contains("meta mark set meta mark & 0x7fffffff accept"),
         "explicit per-VM egress carve-out missing: {output}"
     );
     assert!(
