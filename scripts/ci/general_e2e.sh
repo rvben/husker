@@ -142,10 +142,27 @@ if [[ "${HUSKER_E2E_DOCKER:-0}" == 1 ]]; then
   fi
 
   # The single-quoted program is intentionally expanded by the guest shell.
+  # Network fetches (the apk repo, Docker Hub) dominate this step's runtime and
+  # vary enough that the daemon's default 30s exec timeout can expire mid-pull.
+  # Request the full exec window (the isolated daemon clamps to its 300s
+  # exec_timeout_max_secs) and retry the fetches: registry availability is not
+  # what this gate proves.
   # shellcheck disable=SC2016
-  if ! C exec "${DOCKER_VM}" -- sh -c '
+  if ! C exec --timeout 300 "${DOCKER_VM}" -- sh -c '
     set -eu
-    apk add --no-cache docker nftables >/tmp/docker-apk.log
+
+    retry() {
+      attempt=1
+      until "$@"; do
+        if [ "${attempt}" -ge 3 ]; then
+          return 1
+        fi
+        attempt=$((attempt + 1))
+        sleep 2
+      done
+    }
+
+    retry apk add --no-cache docker nftables >/tmp/docker-apk.log
 
     # Keep a small direct check here in addition to the behavioral assertions:
     # it makes a regressed image explain itself instead of only reporting the
@@ -183,6 +200,7 @@ if [[ "${HUSKER_E2E_DOCKER:-0}" == 1 ]]; then
       exit 1
     fi
 
+    retry docker pull alpine:latest >/tmp/docker-pull.log
     docker run --rm alpine:latest sh -ec '\''
       grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
       ip route | grep -q "^default via "
