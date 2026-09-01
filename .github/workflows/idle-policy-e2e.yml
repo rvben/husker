@@ -21,7 +21,7 @@ jobs:
     name: Idle Policy E2E (self-hosted, KVM)
     runs-on: [self-hosted, husker, linux]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Resolve kernel + rootfs from the latest images-* release (the standard
       # Firecracker/MMIO kernel boots here, unlike the QEMU gate). Written to a
