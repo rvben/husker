@@ -29,7 +29,12 @@ jobs:
       - name: QEMU e2e gate
         run: |
           # The test writes to the rootfs (cache=writeback); use a disposable copy.
+          # The trap, not a trailing `rm`, is what frees it: `run:` blocks execute
+          # under `bash -e`, so a failing gate aborts the step and never reaches
+          # its last line - which would strand 256 MiB in /var/tmp on every red
+          # build, the same way the guest-image downloads filled /tmp.
           rootfs="$(mktemp --tmpdir=/var/tmp qemu-e2e-rootfs.XXXXXX.ext4)"
+          trap 'rm -f "$rootfs"' EXIT
           sudo cp /var/lib/husker/images/alpine-x86_64.ext4 "$rootfs"
           sudo env \
             HOME=/root \
@@ -40,4 +45,3 @@ jobs:
             HUSKER_E2E_ROOTFS="$rootfs" \
             HUSKER_E2E_INITRD=/var/lib/husker/kernels/initramfs-x86_64-virt.gz \
             make test-qemu-e2e-gated
-          rm -f "$rootfs"

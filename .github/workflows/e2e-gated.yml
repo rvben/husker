@@ -35,13 +35,22 @@ jobs:
 
       # Resolve kernel + rootfs + initrd from the latest images-* release for the
       # general daemon e2e, which boots real Firecracker VMs.
+      #
+      # The images live under RUNNER_TEMP, which the runner clears between jobs,
+      # and the job removes them itself in its final step. A bare `mktemp -d`
+      # has neither bound: this step and its twin in idle-policy-e2e.yml wrote a
+      # ~299 MB kernel+rootfs+initramfs trio into /tmp on every nightly run and
+      # never removed it, which is what filled the self-hosted runner's root
+      # disk. Keep both bounds - they fail independently.
       - name: Fetch guest images
         id: images
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          work="$(mktemp -d)"
+          work="${RUNNER_TEMP}/guest-images"
+          rm -rf "$work"
+          mkdir -p "$work"
           url="$(bash scripts/ci/resolve-images-tag.sh --url)"
           echo "using images from ${url##*/}"
           curl -fsSL "${url}/kernel-x86_64"      -o "${work}/kernel"
@@ -89,3 +98,10 @@ jobs:
             HUSKER_E2E_INITRD="${{ steps.images.outputs.initrd }}" \
             HUSKER_E2E_DOCKER=1 \
             bash scripts/ci/general_e2e.sh
+
+      # Second bound on the guest images, independent of the runner clearing
+      # RUNNER_TEMP between jobs. `always()` so a failed or cancelled gate
+      # still gives the disk back.
+      - name: Remove guest images
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/guest-images"
