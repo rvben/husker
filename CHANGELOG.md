@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.49](https://github.com/rvben/husker/compare/v0.4.48...v0.4.49) - 2026-09-27
+
+### Fixed
+
+- **deps**: update rustls to 0.23.45 for RUSTSEC-2026-0285 ([019ff15](https://github.com/rvben/husker/commit/019ff15ea0777d2e2d80cc5d525c2c5e6c685f4a))
+- **deps**: replace yanked chacha20 release ([9d1a196](https://github.com/rvben/husker/commit/9d1a196306f1485598318f20ef8219fe379c962f))
+- **ci**: stop the nested Docker gate flaking on slow registry fetches ([19ef2cc](https://github.com/rvben/husker/commit/19ef2ccdeb2015b616a05db6a7d7335ed30962f0))
+- **net**: match nftables' canonical rule rendering in bridge e2e assertions ([f8be031](https://github.com/rvben/husker/commit/f8be0311a426eb2c42f065a957c0c00b7e3828a3))
+- **release**: isolate matrix build state ([03aa5b0](https://github.com/rvben/husker/commit/03aa5b053aa9d69eaea575173514cf9cae3c88eb))
+- **release**: use package version in dry runs ([e4d0835](https://github.com/rvben/husker/commit/e4d0835a8d38e16f8f2c361244ce18564b65c7c3))
+- **ci**: install pinned Rust components ([45b0f58](https://github.com/rvben/husker/commit/45b0f5857dedcc433f68a674e537b474984a33e9))
+
 ## [0.4.48](https://github.com/rvben/husker/compare/v0.4.47...v0.4.48) - 2026-08-24
 
 ### Fixed
