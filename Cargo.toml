@@ -57,7 +57,7 @@ anyhow = "1"
 
 # Compression / archive
 flate2 = "1"
-tar = "0.4"
+tar = "0.4.46"
 
 # FAT filesystem
 fatfs = "0.3"
