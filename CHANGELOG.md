@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.50](https://github.com/rvben/husker/compare/v0.4.49...v0.4.50) - 2026-09-28
+
+### Added
+
+- **images**: commit stopped VMs to catalog ([3a55ba7](https://github.com/rvben/husker/commit/3a55ba7a16d9318ec0c40cad16d54ce3ecfdab56))
+
 ## [0.4.49](https://github.com/rvben/husker/compare/v0.4.48...v0.4.49) - 2026-09-27
 
 ### Fixed
