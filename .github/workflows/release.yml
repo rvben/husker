@@ -274,6 +274,19 @@ jobs:
       - name: Build sdist
         run: maturin sdist --out dist
 
+      - name: Verify source package contents
+        run: |
+          python - <<'PY'
+          import pathlib
+          import tarfile
+
+          sdist, = pathlib.Path("dist").glob("*.tar.gz")
+          with tarfile.open(sdist) as archive:
+              names = archive.getnames()
+          for required in ("husker/__init__.py", "guest/dev/provision.sh"):
+              assert any(name.endswith("/" + required) for name in names), required
+          PY
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: dist/*.tar.gz

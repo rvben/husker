@@ -37,4 +37,7 @@ bindings = "bin"
 manifest-path = "crates/husker/Cargo.toml"
 python-packages = ["husker_cli", "husker"]
 strip = true
-include = [{ path = "LICENSE", format = "sdist" }]
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "guest/dev/provision.sh", format = "sdist" },
+]

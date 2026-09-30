@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.51](https://github.com/rvben/husker/compare/v0.4.50...v0.4.51) - 2026-09-30
+
+### Added
+
+- Prepared development images, development-computer health checks, and detached Codex/Claude prompts.
+- Durable guest command sessions with reconnectable, bounded output, cancellation, and authenticated private previews.
+- A dependency-free Python SDK for VM lifecycle, sessions, readiness checks, and binary file transfers.
+- Session and preview metrics, lifecycle regression tests, and an opt-in live development-computer proof.
+
+### Fixed
+
+- Install inherited egress restrictions before attaching forked VMs to external networking; reject corrupt policies and preserve corrupt destination state.
+- Repair guest wall clocks after restore and require a bound VMGENID device before exposing warm forks.
+- Preserve session ownership across client cancellation, recover interrupted session creation, and bound transport deadlines and preview buffers.
+
+### Breaking Changes
+
+- Warm forks require guest agent protocol v5 and a kernel with a bound VMGENID device. Upgrade or rebuild guest images before forking. Older-agent resume remains supported without clock repair.
+
+### Validation Limits
+
+- Live fork entropy, clock, and copy-on-write validation is hardware-gated; native macOS snapshots and surviving TCP connections across forks remain unsupported.
+
 ## [0.4.50](https://github.com/rvben/husker/compare/v0.4.49...v0.4.50) - 2026-09-28
 
 ### Added
