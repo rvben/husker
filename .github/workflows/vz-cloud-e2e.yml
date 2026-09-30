@@ -33,7 +33,7 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       # The self-hosted runner user has no uv on PATH; install it (same as release.yml).
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       # zig + cargo-zigbuild (via a uv venv, mirroring release.yml) to
       # cross-build the aarch64-musl guest agent the cloud-image path embeds.
