@@ -181,8 +181,17 @@ else
   cfg --enable SERIAL_AMBA_PL011_CONSOLE
 fi
 
+# Firecracker changes VMGenID on every snapshot restore. Compile its guest
+# driver in so the kernel immediately reseeds its CRNG after clone notification.
+cfg --enable VIRT_DRIVERS
+cfg --enable VMGENID
+
 make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} olddefconfig
 
+grep -q '^CONFIG_VMGENID=y$' .config || {
+  echo "FATAL: VMGENID must be built in for safe snapshot cloning" >&2
+  exit 1
+}
 assert_config_fragment "$CONTAINER_CONFIG"
 if [ -n "${HUSKER_KERNEL_CONFIG_FRAGMENT:-}" ]; then
   assert_config_fragment "$HUSKER_KERNEL_CONFIG_FRAGMENT"

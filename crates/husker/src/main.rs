@@ -17,6 +17,7 @@ mod config;
 mod daemon;
 mod daemon_client;
 mod daemon_target;
+mod dev;
 mod guest_file;
 mod job;
 mod schema;
@@ -67,6 +68,8 @@ fn command_requires_text_output(command: &Commands) -> bool {
     matches!(
         command,
         Commands::Daemon { .. }
+            | Commands::Preview { .. }
+            | Commands::Events { follow: true, .. }
             | Commands::Shell { .. }
             | Commands::Logs { follow: true, .. }
             | Commands::Config { .. }
@@ -769,6 +772,52 @@ async fn run(cli: Cli) -> Result<()> {
         ))
         .await?;
     match command {
+        Commands::Dev { action } => {
+            dev::development(&target, config_path.as_deref(), output, action).await
+        }
+        Commands::Prompt {
+            name,
+            prompt,
+            agent,
+            workdir,
+            timeout,
+            env_file,
+            secret,
+        } => {
+            let command = dev::agent_command(&agent, prompt);
+            dev::start_session(
+                target.daemon(),
+                &name,
+                Some(workdir),
+                timeout,
+                env_file,
+                secret,
+                command,
+                output,
+                "prompt",
+            )
+            .await
+        }
+        Commands::Session { name, action } => {
+            dev::session(target.daemon(), &name, action, output).await
+        }
+        Commands::Events {
+            name,
+            id,
+            after,
+            follow,
+        } => dev::events(target.daemon(), &name, &id, after, follow, output).await,
+        Commands::Preview {
+            name,
+            port,
+            local_port,
+        } => {
+            anyhow::ensure!(
+                output != OutputFormat::Json,
+                "preview is a long-running tunnel; use --output text"
+            );
+            dev::preview(target.daemon(), &name, port, local_port).await
+        }
         Commands::Daemon { .. } => unreachable!("daemon handled before target connection"),
         Commands::Run {
             rootfs,

@@ -20,6 +20,7 @@ use uuid::Uuid;
 #[derive(Default)]
 struct TestHostNetwork {
     taps: Mutex<HashSet<String>>,
+    operations: Mutex<Vec<String>>,
     forwards: Mutex<HashSet<(u16, String)>>,
     egress: Mutex<Vec<(String, Vec<husker_net::EgressRule>)>>,
     fail_next_create_tap: std::sync::atomic::AtomicBool,
@@ -103,10 +104,14 @@ impl husker_net::HostNetwork for TestHostNetwork {
 
     fn attach_to_bridge<'a>(
         &'a self,
-        _tap_name: &'a str,
+        tap_name: &'a str,
         _bridge_name: &'a str,
     ) -> husker_net::NetworkFuture<'a, ()> {
         Box::pin(async move {
+            self.operations
+                .lock()
+                .await
+                .push(format!("attach:{tap_name}"));
             if self
                 .fail_next_attach
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -209,6 +214,10 @@ impl husker_net::HostNetwork for TestHostNetwork {
         rules: &'a [husker_net::EgressRule],
     ) -> husker_net::NetworkFuture<'a, ()> {
         Box::pin(async move {
+            self.operations
+                .lock()
+                .await
+                .push(format!("egress:{tap_name}"));
             if self
                 .fail_next_egress
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -486,13 +495,76 @@ impl VmmBackend for FailingVmm {
     async fn restore_vm(
         &self,
         _src: &SnapshotPaths,
-        _target: RestoreTarget,
+        target: RestoreTarget,
     ) -> Result<VmInfo, VmmError> {
-        Err(VmmError::Unsupported("mock".into()))
+        let RestoreTarget::Fork {
+            id,
+            name,
+            vcpu_count,
+            mem_size_mib,
+            vsock_cid,
+            ..
+        } = target
+        else {
+            return Err(VmmError::Unsupported("mock".into()));
+        };
+        let info = VmInfo {
+            id,
+            name,
+            vcpu_count,
+            mem_size_mib,
+            vsock_cid,
+            state: VmState::Running,
+            pid: None,
+        };
+        self.vms.lock().await.insert(id, info.clone());
+        Ok(info)
     }
 
     async fn vsock_connect(&self, id: Uuid, _port: u32) -> Result<Self::VsockStream, VmmError> {
-        Err(VmmError::VmNotFound(id))
+        if self
+            .vms
+            .lock()
+            .await
+            .get(&id)
+            .is_none_or(|info| info.pid.is_some())
+        {
+            return Err(VmmError::VmNotFound(id));
+        }
+        let (host, mut guest) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            use husker_agent_proto::{
+                AgentRequest, AgentResponse, GuestInfoResponse, ReconfigureNetworkResponse,
+            };
+            while let Ok(Some(request)) =
+                husker_agent_proto::read_message::<AgentRequest, _>(&mut guest).await
+            {
+                let response = match request {
+                    AgentRequest::GuestInfo => AgentResponse::GuestInfo(GuestInfoResponse {
+                        ipv4: vec![],
+                        protocol_version: 5,
+                    }),
+                    AgentRequest::RestoreGuest(request) => {
+                        assert!(request.require_vmgenid);
+                        AgentResponse::GuestRestored
+                    }
+                    AgentRequest::ReconfigureNetwork(request) => {
+                        AgentResponse::ReconfigureNetwork(ReconfigureNetworkResponse {
+                            interface: request.interface,
+                            ipv4: request.ipv4,
+                        })
+                    }
+                    _ => break,
+                };
+                if husker_agent_proto::write_message(&mut guest, &response)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(host)
     }
 
     async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
@@ -775,6 +847,120 @@ async fn egress_policy_failure_rolls_back_before_vm_boot_or_persistence() {
     assert!(core.list_vms().unwrap().is_empty());
     assert!(!network.has_tap("husker3").await);
     assert!(network.egress.lock().await.is_empty());
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn fork_inherits_deny_all_and_installs_firewall_before_network_attachment() {
+    for (policy, fail) in [
+        ("[]", false),
+        (
+            r#"[{"destination":"203.0.113.8","protocol":"tcp","port":443}]"#,
+            false,
+        ),
+        ("[]", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let mut source = core_with_vm("source", "suspended", &[])
+            .get_vm("source")
+            .unwrap();
+        source.egress_policy = Some(policy.into());
+        state.insert_vm(&source).unwrap();
+        let network = Arc::new(TestHostNetwork::default());
+        if fail {
+            network.fail_next_egress();
+        }
+        let core = fresh_linux_core_with_state(tmp.path(), state, network.clone());
+        std::fs::create_dir_all(tmp.path().join("vms/source")).unwrap();
+        std::fs::write(tmp.path().join("vms/source/rootfs.ext4"), b"source disk").unwrap();
+        let result = core.fork_vm("source", "clone").await;
+        let operations = network.operations.lock().await;
+        assert!(operations.first().unwrap().starts_with("egress:"));
+        if fail {
+            assert!(result.is_err());
+            assert_eq!(
+                operations.len(),
+                1,
+                "failed firewall must never attach the TAP"
+            );
+            assert!(network.taps.lock().await.is_empty());
+            assert!(core.get_vm("clone").is_err());
+            assert!(!tmp.path().join("vms/clone").exists());
+        } else {
+            assert_eq!(result.unwrap().egress_policy.as_deref(), Some(policy));
+            assert!(operations[1].starts_with("attach:"));
+        }
+        assert_eq!(
+            core.get_vm("source").unwrap().state,
+            husker_state::VmLifecycleState::Suspended
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("vms/source/rootfs.ext4")).unwrap(),
+            b"source disk"
+        );
+    }
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn corrupt_destination_record_cannot_be_mistaken_for_an_unused_fork_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let database = tmp.path().join("state.sqlite");
+    let state = husker_state::StateStore::open(&database).unwrap();
+    let source = core_with_vm("source", "suspended", &[])
+        .get_vm("source")
+        .unwrap();
+    state.insert_vm(&source).unwrap();
+    let mut destination = source.clone();
+    destination.id = Uuid::new_v4();
+    destination.name = "clone".into();
+    state.insert_vm(&destination).unwrap();
+    let corruptor = rusqlite::Connection::open(&database).unwrap();
+    // Simulate damage outside Husker, bypassing its normal database guard.
+    corruptor
+        .execute_batch("DROP TRIGGER vm_backend_must_be_known_on_update;")
+        .unwrap();
+    corruptor
+        .execute(
+            "UPDATE vms SET vmm = 'unknown_backend' WHERE name = 'clone'",
+            [],
+        )
+        .unwrap();
+    let directory = tmp.path().join("vms/clone");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("rootfs.ext4"), b"existing VM data").unwrap();
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_state(tmp.path(), state, network.clone());
+    assert!(matches!(
+        core.fork_vm("source", "clone").await,
+        Err(CoreError::State(_))
+    ));
+    assert!(network.taps.lock().await.is_empty());
+    assert!(network.operations.lock().await.is_empty());
+    assert_eq!(
+        std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+        b"existing VM data"
+    );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn corrupt_fork_policy_is_rejected_before_allocating_resources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = husker_state::StateStore::open_memory().unwrap();
+    let mut source = core_with_vm("source", "suspended", &[])
+        .get_vm("source")
+        .unwrap();
+    source.egress_policy =
+        Some(r#"[{"destination":"203.0.113.8","protocol":"invalid","port":443}]"#.into());
+    state.insert_vm(&source).unwrap();
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_state(tmp.path(), state, network.clone());
+    assert!(core.fork_vm("source", "clone").await.is_err());
+    assert!(network.operations.lock().await.is_empty());
+    assert!(network.taps.lock().await.is_empty());
+    assert!(!tmp.path().join("vms/clone").exists());
 }
 
 #[cfg(feature = "linux-net")]

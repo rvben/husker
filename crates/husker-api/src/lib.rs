@@ -22,9 +22,11 @@ mod dto;
 mod errors;
 mod handlers;
 mod router;
+mod sessions;
 
 pub use dto::*;
 pub use errors::ErrorResponse;
+pub use husker_agent_proto::{SessionEvent, SessionEventsResponse, SessionInfo, SessionState};
 pub use router::{metrics_router, router, router_with_auth, serve, serve_metrics, serve_with_auth};
 
 use handlers::*;
@@ -92,6 +94,8 @@ pub(crate) struct ApiMetrics {
     pub(crate) file_reads_total: AtomicU64,
     pub(crate) file_writes_total: AtomicU64,
     pub(crate) shell_sessions_total: AtomicU64,
+    pub(crate) detached_sessions_total: AtomicU64,
+    pub(crate) preview_connections_total: AtomicU64,
 }
 
 impl ApiMetrics {
@@ -105,6 +109,8 @@ impl ApiMetrics {
             file_reads_total: AtomicU64::new(0),
             file_writes_total: AtomicU64::new(0),
             shell_sessions_total: AtomicU64::new(0),
+            detached_sessions_total: AtomicU64::new(0),
+            preview_connections_total: AtomicU64::new(0),
         }
     }
 }

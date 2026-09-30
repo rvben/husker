@@ -23,6 +23,53 @@ pub(crate) struct ResolvedEgressRule {
     pub port: u16,
 }
 
+/// Persisted rules are security state: never reinterpret an unknown protocol
+/// or silently discard malformed destinations when rebuilding the firewall.
+#[cfg(any(test, feature = "linux-net"))]
+pub(crate) fn parse_persisted_rules(
+    value: &str,
+) -> Result<Vec<ResolvedEgressRule>, crate::CoreError> {
+    let corrupt = |message: String| {
+        crate::CoreError::State(husker_state::StateError::CorruptData {
+            column: "vms.egress_policy",
+            message,
+        })
+    };
+    let rules: Vec<ResolvedEgressRule> =
+        serde_json::from_str(value).map_err(|error| corrupt(error.to_string()))?;
+    if rules.len() > 128
+        || rules.iter().any(|rule| {
+            !matches!(rule.protocol.as_str(), "tcp" | "udp")
+                || rule.port == 0
+                || rule.destination.is_unspecified()
+                || rule.destination.is_multicast()
+                || rule.destination == Ipv4Addr::BROADCAST
+        })
+    {
+        return Err(corrupt("invalid persisted egress rule".into()));
+    }
+    Ok(rules)
+}
+
+#[cfg(test)]
+mod persisted_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_corrupt_security_state_and_preserves_deny_all() {
+        assert!(parse_persisted_rules("[]").unwrap().is_empty());
+        for value in [
+            "null",
+            "{}",
+            r#"[{"destination":"203.0.113.8","protocol":"sctp","port":443}]"#,
+            r#"[{"destination":"0.0.0.0","protocol":"tcp","port":443}]"#,
+            r#"[{"destination":"203.0.113.8","protocol":"tcp","port":0}]"#,
+        ] {
+            assert!(parse_persisted_rules(value).is_err(), "accepted {value}");
+        }
+    }
+}
+
 #[cfg(feature = "linux-net")]
 pub(crate) async fn resolve_egress_rules(
     requested: &[EgressRuleRequest],

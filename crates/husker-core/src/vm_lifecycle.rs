@@ -342,10 +342,6 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 &self.bridge_name
             };
-            self.host_network
-                .attach_to_bridge(&tap_name, attach_bridge)
-                .await?;
-
             if !resolved_egress.is_empty() {
                 let resolvers = self
                     .dns_servers
@@ -368,6 +364,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                     .apply_egress_policy(&tap_name, &self.bridge_name, gateway, &resolvers, &rules)
                     .await?;
             }
+            self.host_network
+                .attach_to_bridge(&tap_name, attach_bridge)
+                .await?;
         }
 
         let vm_dir = self.storage.vm_dir(&req.name);

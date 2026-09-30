@@ -35,6 +35,6 @@ Issues = "https://github.com/rvben/husker/issues"
 [tool.maturin]
 bindings = "bin"
 manifest-path = "crates/husker/Cargo.toml"
-python-packages = ["husker_cli"]
+python-packages = ["husker_cli", "husker"]
 strip = true
 include = [{ path = "LICENSE", format = "sdist" }]

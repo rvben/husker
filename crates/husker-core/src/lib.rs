@@ -3474,21 +3474,33 @@ mod tests {
     /// guest interface, so it is safe to run against a shared host.
     #[cfg(feature = "linux-net")]
     async fn fake_agent_reconfigure_responder(mut stream: tokio::net::UnixStream) {
-        let request: Option<husker_agent_proto::AgentRequest> =
-            husker_agent_proto::read_message(&mut stream)
-                .await
-                .ok()
-                .flatten();
-        let Some(husker_agent_proto::AgentRequest::ReconfigureNetwork(req)) = request else {
-            return;
+        use husker_agent_proto::{
+            AgentRequest, AgentResponse, GuestInfoResponse, ReconfigureNetworkResponse,
         };
-        let response = husker_agent_proto::AgentResponse::ReconfigureNetwork(
-            husker_agent_proto::ReconfigureNetworkResponse {
-                interface: req.interface,
-                ipv4: req.ipv4,
-            },
-        );
-        let _ = husker_agent_proto::write_message(&mut stream, &response).await;
+        while let Ok(Some(request)) =
+            husker_agent_proto::read_message::<AgentRequest, _>(&mut stream).await
+        {
+            let response = match request {
+                AgentRequest::GuestInfo => AgentResponse::GuestInfo(GuestInfoResponse {
+                    ipv4: vec![],
+                    protocol_version: 5,
+                }),
+                AgentRequest::RestoreGuest(_) => AgentResponse::GuestRestored,
+                AgentRequest::ReconfigureNetwork(req) => {
+                    AgentResponse::ReconfigureNetwork(ReconfigureNetworkResponse {
+                        interface: req.interface,
+                        ipv4: req.ipv4,
+                    })
+                }
+                _ => break,
+            };
+            if husker_agent_proto::write_message(&mut stream, &response)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
     }
 
     /// Like `test_core`, but backed by `ForkMockVmm` and a caller-chosen

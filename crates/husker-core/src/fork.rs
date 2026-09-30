@@ -9,14 +9,11 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// allocated TAP/IP/MAC, and re-homes the guest's network in place via the
     /// agent. The source stays suspended.
     ///
-    /// Limitations (v1): NAT-mode, Firecracker-backed, volume-free sources only.
-    /// The fork reuses the source's vsock path, so (a) only one running fork per
-    /// source at a time and the source must stay suspended while a fork of it
-    /// runs, and (b) forks are ephemeral - destroy them rather than suspending
-    /// them (a forked VM's snapshot still embeds the source's vsock path, which a
-    /// plain resume cannot reconstruct). A volume-backed source is rejected
-    /// because the snapshot embeds the source's writable volume disk, which the
-    /// fork would otherwise share.
+    /// NAT-mode, Firecracker-backed, volume-free sources only. Each fork owns
+    /// its disk clone, TAP and vsock socket; multiple forks and the resumed
+    /// source can coexist. Attached volumes are rejected because their writable
+    /// backing files are outside the rootfs clone. Existing TCP/vsock connections
+    /// must reconnect after restore; guest processes and disk state survive.
     #[cfg(feature = "linux-net")]
     pub async fn fork_vm(&self, source_name: &str, fork_name: &str) -> Result<VmRecord, CoreError> {
         info!(%source_name, %fork_name, "forking VM");
@@ -67,8 +64,15 @@ impl<B: VmmBackend> HuskerCore<B> {
                     .into(),
             ));
         }
-        if self.lookup_vm(fork_name).is_ok() {
-            return Err(CoreError::VmAlreadyExists(fork_name.into()));
+        match self.lookup_vm(fork_name) {
+            Ok(_) => return Err(CoreError::VmAlreadyExists(fork_name.into())),
+            Err(CoreError::VmNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        // Validate security state before allocating or restoring any resources.
+        if let Some(serialized) = source.egress_policy.as_deref() {
+            crate::egress::parse_persisted_rules(serialized)?;
         }
 
         let mut resources = AllocatedResources::default();
@@ -185,19 +189,8 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.reconfigure_fork_network(info.id, &guest_ip, prefix_len, gateway, &mac)
             .await?;
 
-        // Now that the guest carries its own MAC and IP, join it to the bridge.
-        self.host_network
-            .attach_to_bridge(&tap_name, &self.bridge_name)
-            .await?;
-
         if let Some(serialized) = source.egress_policy.as_deref() {
-            let persisted: Vec<crate::egress::ResolvedEgressRule> =
-                serde_json::from_str(serialized).map_err(|error| {
-                    CoreError::State(husker_state::StateError::CorruptData {
-                        column: "vms.egress_policy",
-                        message: error.to_string(),
-                    })
-                })?;
+            let persisted = crate::egress::parse_persisted_rules(serialized)?;
             let resolvers = self
                 .dns_servers
                 .iter()
@@ -219,6 +212,13 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .apply_egress_policy(&tap_name, &self.bridge_name, gateway, &resolvers, &rules)
                 .await?;
         }
+
+        // Install inherited restrictions while the TAP is still disconnected.
+        // A firewall failure rolls back the fork without exposing it to the LAN.
+        // Now that the guest carries its own MAC and IP, join it to the bridge.
+        self.host_network
+            .attach_to_bridge(&tap_name, &self.bridge_name)
+            .await?;
 
         // Persist the fork as a running VM.
         let now = chrono::Utc::now();
@@ -287,12 +287,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     ) -> Result<(), CoreError> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let attempt = async {
+            let attempt = tokio::time::timeout_at(deadline, async {
                 let stream = self
                     .vmm
                     .vsock_connect(fork_id, husker_agent_proto::AGENT_VSOCK_PORT)
                     .await?;
                 let mut conn = crate::agent_client::AgentConnection::new(stream);
+                conn.restore_guest(true).await?;
                 conn.reconfigure_network(
                     "eth0",
                     &guest_ip.to_string(),
@@ -303,8 +304,14 @@ impl<B: VmmBackend> HuskerCore<B> {
                 )
                 .await?;
                 Ok::<(), CoreError>(())
-            }
-            .await;
+            })
+            .await
+            .map_err(|_| {
+                CoreError::Agent(AgentError::NotReady {
+                    timeout: std::time::Duration::from_secs(10),
+                    detail: ": fork restoration timed out".into(),
+                })
+            })?;
             match attempt {
                 Ok(()) => return Ok(()),
                 // The agent connected but did not understand the reconfigure
@@ -320,6 +327,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                          forking"
                             .into(),
                     ));
+                }
+                Err(CoreError::Agent(AgentError::Agent(message))) => {
+                    return Err(CoreError::InvalidArgument(message));
                 }
                 Err(e) => {
                     if tokio::time::Instant::now() >= deadline {

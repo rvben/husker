@@ -5,10 +5,36 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod sessions;
+pub use sessions::*;
+
 /// Messages sent from the host to the guest agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentRequest {
+    /// Start a detached command with durable, bounded output in the guest.
+    SessionStart(SessionStartRequest),
+    SessionGet {
+        id: String,
+    },
+    SessionList,
+    SessionEvents {
+        id: String,
+        after: u64,
+    },
+    SessionCancel {
+        id: String,
+    },
+    SessionRemove {
+        id: String,
+    },
+    /// Switch this connection to a byte tunnel to a guest-loopback TCP port.
+    Tunnel {
+        port: u16,
+    },
+    /// Reconcile wall time after restoring a snapshot. Forks additionally
+    /// require a bound VMGenID driver before joining an external network.
+    RestoreGuest(RestoreGuestRequest),
     /// Execute a command inside the VM.
     Exec(ExecRequest),
 
@@ -53,6 +79,14 @@ pub enum AgentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentResponse {
+    Session(SessionInfo),
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    SessionEvents(SessionEventsResponse),
+    SessionRemoved,
+    TunnelReady,
+    GuestRestored,
     /// Result of a command execution.
     Exec(ExecResponse),
 
@@ -98,6 +132,13 @@ pub enum AgentResponse {
     /// Acknowledgement that the guest has synced dirty pages and unmounted the
     /// data volume; the host may now kill the VM process.
     ShuttingDown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreGuestRequest {
+    pub unix_time_secs: i64,
+    pub unix_time_nanos: u32,
+    pub require_vmgenid: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,7 +409,12 @@ pub const AGENT_VSOCK_PORT: u32 = 52;
 /// Bump this whenever the framed message contract changes in a way that a peer
 /// must be aware of. The agent reports it via [`GuestInfoResponse`], and the
 /// host warns when a connected guest reports a different (non-zero) version.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// Detached sessions and loopback TCP tunnels were added together in v5.
+pub const MIN_PROTOCOL_VERSION_FOR_SESSIONS: u32 = 5;
+/// Guest wall-clock reconciliation and kernel clone notification checks.
+pub const MIN_PROTOCOL_VERSION_FOR_RESTORE: u32 = 5;
 
 /// Minimum [`PROTOCOL_VERSION`] an agent must report for `WriteFileRequest.append`
 /// to be honoured. An agent older than this always truncates on every write, so
@@ -671,8 +717,32 @@ mod tests {
             }
             other => panic!("expected GuestInfo, got {other:?}"),
         }
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM, 4);
+    }
+
+    #[test]
+    fn restore_messages_preserve_clock_and_clone_requirements() {
+        let request = AgentRequest::RestoreGuest(RestoreGuestRequest {
+            unix_time_secs: 1_800_000_000,
+            unix_time_nanos: 123_456_789,
+            require_vmgenid: true,
+        });
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let AgentRequest::RestoreGuest(decoded) = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("wrong restore request");
+        };
+        assert_eq!(decoded.unix_time_secs, 1_800_000_000);
+        assert_eq!(decoded.unix_time_nanos, 123_456_789);
+        assert!(decoded.require_vmgenid);
+        assert_eq!(MIN_PROTOCOL_VERSION_FOR_RESTORE, 5);
+        assert!(matches!(
+            serde_json::from_slice::<AgentResponse>(
+                &serde_json::to_vec(&AgentResponse::GuestRestored).unwrap()
+            )
+            .unwrap(),
+            AgentResponse::GuestRestored
+        ));
     }
 
     #[test]

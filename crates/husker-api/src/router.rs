@@ -28,6 +28,12 @@ use crate::{
 };
 
 pub(crate) fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'static str> {
+    if *method == Method::POST && path.ends_with("/sessions") {
+        return Some("exec");
+    }
+    if *method == Method::GET && path.contains("/tunnel/") {
+        return Some("tunnel");
+    }
     if *method == Method::POST && path.ends_with("/exec") {
         return Some("exec");
     }
@@ -63,6 +69,26 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
 ) -> Router {
     let policy = current_policy();
     let router = Router::new()
+        .route(
+            "/v1/vms/{name}/sessions",
+            get(crate::sessions::list::<B>).post(crate::sessions::start::<B>),
+        )
+        .route(
+            "/v1/vms/{name}/sessions/{id}",
+            get(crate::sessions::get::<B>).delete(crate::sessions::remove::<B>),
+        )
+        .route(
+            "/v1/vms/{name}/sessions/{id}/events",
+            get(crate::sessions::events::<B>),
+        )
+        .route(
+            "/v1/vms/{name}/sessions/{id}/cancel",
+            post(crate::sessions::cancel::<B>),
+        )
+        .route(
+            "/v1/vms/{name}/tunnel/{port}",
+            get(crate::sessions::tunnel::<B>),
+        )
         .route(
             "/v1/host-groups",
             get(list_host_groups::<B>).post(create_host_group::<B>),
@@ -152,6 +178,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         );
 
     let mut openapi = ApiDoc::openapi();
+    openapi.merge(crate::sessions::SessionApiDoc::openapi());
 
     {
         let pf_doc = PortForwardApiDoc::openapi();

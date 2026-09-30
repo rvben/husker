@@ -67,6 +67,9 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Test Python SDK
+        run: make test-sdk
+
   build:
     name: Build ${{ matrix.target }}
     needs: test
@@ -189,6 +192,23 @@ jobs:
           rm "$WHEEL"
           wheel pack "$EXTRACT_DIR" --dest-dir "$DIST_DIR"
           rm -rf "$WHEEL_EXTRACT_DIR"
+
+      - name: Verify packaged Python SDK
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import sys
+          import zipfile
+
+          wheel, = pathlib.Path(os.environ["DIST_DIR"]).glob("*.whl")
+          with zipfile.ZipFile(wheel) as archive:
+              assert "husker/__init__.py" in archive.namelist(), "SDK missing from wheel"
+          sys.path.insert(0, str(wheel))
+          from husker import Client
+          assert callable(Client), "SDK import failed"
+          PY
 
       - name: Verify native binary (host-runnable targets)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'

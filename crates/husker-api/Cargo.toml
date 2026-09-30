@@ -10,9 +10,11 @@ default = ["linux-net"]
 linux-net = ["husker-core/linux-net"]
 
 [dependencies]
+futures-util = { workspace = true }
 husker-core = { workspace = true, features = ["utoipa"] }
 husker-vmm = { workspace = true }
-husker-agent-proto = { workspace = true }
+husker-agent-proto = { workspace = true, features = ["schema"] }
+uuid = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -26,6 +28,8 @@ async-stream = "0.3"
 subtle = "2"
 
 [dev-dependencies]
+husker-agent = { path = "../husker-agent" }
+tokio-tungstenite = { workspace = true }
 husker-vmm = { workspace = true }
 husker-state = { workspace = true }
 husker-net = { workspace = true }

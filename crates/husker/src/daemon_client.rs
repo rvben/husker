@@ -195,6 +195,35 @@ impl DaemonExecEvent {
 }
 
 impl DaemonClient {
+    pub(crate) async fn tunnel(
+        &self,
+        name: &str,
+        port: u16,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        let base = self
+            .base_url
+            .replacen("http://", "ws://", 1)
+            .replacen("https://", "wss://", 1);
+        let mut request = format!("{base}/v1/vms/{name}/tunnel/{port}").into_client_request()?;
+        if let Some(token) = &self.api_token {
+            request.headers_mut().insert(
+                tungstenite::http::header::AUTHORIZATION,
+                tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+            );
+        }
+        let (socket, _) = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .context("guest preview handshake timed out")?
+        .context("opening authenticated guest preview tunnel")?;
+        Ok(socket)
+    }
     pub(crate) fn new(base_url: impl Into<String>, api_token: Option<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -611,7 +640,11 @@ impl DaemonClient {
     /// Complete an operation whose success response is part of the daemon's
     /// JSON contract. Keeping status handling and strict DTO decoding together
     /// prevents each command from inventing its own fallback semantics.
-    async fn execute_json<T>(&self, request: reqwest::RequestBuilder, subject: &str) -> Result<T>
+    pub(crate) async fn execute_json<T>(
+        &self,
+        request: reqwest::RequestBuilder,
+        subject: &str,
+    ) -> Result<T>
     where
         T: DeserializeOwned,
     {

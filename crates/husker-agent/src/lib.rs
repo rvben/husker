@@ -1,6 +1,9 @@
 //! Guest-side agent handlers for exec, file transfer, and interactive shell services.
 
 mod pty;
+mod sessions;
+pub use sessions::SessionStore;
+mod restore;
 
 /// Minimal `NETLINK_ROUTE` message encoding for `iproute2`-free static network
 /// setup in the guest supervisor (a distroless rootfs has no `ip`/`busybox`).
@@ -31,7 +34,19 @@ use tracing::warn;
 ///
 /// Generic over the stream type so it works with both Unix sockets (dev/test)
 /// and vsock streams (production in-VM).
-pub async fn handle_connection<S>(mut stream: S) -> Result<()>
+pub async fn handle_connection<S>(stream: S) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    handle_connection_with_sessions(stream, sessions::store().clone()).await
+}
+
+/// Serve a connection using an explicitly owned session store. All connections
+/// for one guest must share this store; useful for isolated integration tests.
+pub async fn handle_connection_with_sessions<S>(
+    mut stream: S,
+    sessions: std::sync::Arc<SessionStore>,
+) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -42,6 +57,34 @@ where
         };
 
         match request {
+            AgentRequest::Tunnel { port } => {
+                if port == 0 {
+                    write_message(
+                        &mut stream,
+                        &AgentResponse::Error(ErrorResponse {
+                            message: "tunnel port must be nonzero".into(),
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                    Ok(mut guest) => {
+                        write_message(&mut stream, &AgentResponse::TunnelReady).await?;
+                        tokio::io::copy_bidirectional(&mut stream, &mut guest).await?;
+                    }
+                    Err(error) => {
+                        write_message(
+                            &mut stream,
+                            &AgentResponse::Error(ErrorResponse {
+                                message: format!("guest-loopback connection failed: {error}"),
+                            }),
+                        )
+                        .await?
+                    }
+                }
+                return Ok(());
+            }
             AgentRequest::ExecStream(req) => {
                 // Streaming exec owns the connection until the command exits.
                 return handle_exec_stream(&mut stream, req).await;
@@ -51,7 +94,7 @@ where
                 return handle_shell(&mut stream, req).await;
             }
             other => {
-                let response = handle_request(other).await;
+                let response = handle_request_with_sessions(other, &sessions).await;
                 write_message(&mut stream, &response).await?;
             }
         }
@@ -739,9 +782,59 @@ fn build_exec_command(
     Ok((cmd, timeout))
 }
 
+#[cfg(test)]
 async fn handle_request(request: AgentRequest) -> AgentResponse {
+    handle_request_with_sessions(request, sessions::store()).await
+}
+
+async fn handle_request_with_sessions(
+    request: AgentRequest,
+    sessions: &std::sync::Arc<SessionStore>,
+) -> AgentResponse {
+    let session_result = match &request {
+        AgentRequest::SessionStart(req) => Some(
+            sessions
+                .start(req.clone())
+                .await
+                .map(AgentResponse::Session),
+        ),
+        AgentRequest::SessionGet { id } => Some(sessions.get(id).await.map(AgentResponse::Session)),
+        AgentRequest::SessionList => Some(
+            sessions
+                .list()
+                .await
+                .map(|sessions| AgentResponse::Sessions { sessions }),
+        ),
+        AgentRequest::SessionEvents { id, after } => Some(
+            sessions
+                .events(id, *after)
+                .await
+                .map(AgentResponse::SessionEvents),
+        ),
+        AgentRequest::SessionCancel { id } => {
+            Some(sessions.cancel(id).await.map(AgentResponse::Session))
+        }
+        AgentRequest::SessionRemove { id } => Some(
+            sessions
+                .remove(id)
+                .await
+                .map(|()| AgentResponse::SessionRemoved),
+        ),
+        _ => None,
+    };
+    if let Some(result) = session_result {
+        return result.unwrap_or_else(|error| {
+            AgentResponse::Error(ErrorResponse {
+                message: format!("{error:#}"),
+            })
+        });
+    }
     match request {
         AgentRequest::Ping => AgentResponse::Pong,
+        AgentRequest::RestoreGuest(request) => match restore::reconcile(&request) {
+            Ok(()) => AgentResponse::GuestRestored,
+            Err(message) => AgentResponse::Error(ErrorResponse { message }),
+        },
 
         AgentRequest::GuestInfo => match if_addrs::get_if_addrs() {
             Ok(addrs) => {
@@ -940,7 +1033,14 @@ async fn handle_request(request: AgentRequest) -> AgentResponse {
 
         // ShellStart is handled in handle_connection before reaching here.
         // ShellData and ShellResize are only valid during an active shell session.
-        AgentRequest::ExecStream(_)
+        AgentRequest::SessionStart(_)
+        | AgentRequest::SessionGet { .. }
+        | AgentRequest::SessionList
+        | AgentRequest::SessionEvents { .. }
+        | AgentRequest::SessionCancel { .. }
+        | AgentRequest::SessionRemove { .. }
+        | AgentRequest::Tunnel { .. }
+        | AgentRequest::ExecStream(_)
         | AgentRequest::ShellStart(_)
         | AgentRequest::ShellData(_)
         | AgentRequest::ShellResize(_) => AgentResponse::Error(ErrorResponse {

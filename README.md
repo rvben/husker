@@ -7,6 +7,8 @@ An open-source microVM manager built on [Firecracker](https://firecracker-microv
 - Stream serial console logs
 - Port forwarding (nftables NAT on Linux, a userspace TCP proxy on macOS)
 - REST API + CLI
+- Prepared development images, detached agent sessions, and private previews
+- Synchronous Python client for VM lifecycle, commands, files, and sessions
 - Durable hard expirations for externally orchestrated ephemeral VMs
 - Cloud-init style userdata scripts
 
@@ -42,6 +44,9 @@ patterns with observed build, runner, scheduler, boot, storage, and network
 isolation evidence from a real deployment.
 
 ## Quick Start
+
+For the prepared-image, agent, and private-preview workflow, see
+[Development computers](docs/development-computers.md).
 
 ### Install
 

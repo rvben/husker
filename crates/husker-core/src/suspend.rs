@@ -21,7 +21,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     {
         info!(%name, "suspending VM");
         // Serialize against a concurrent resume/fork of this VM: fork moves the
-        // source's rootfs aside during `/snapshot/load` and reuses its vsock path,
+        // source's rootfs aside during `/snapshot/load`,
         // so suspend/resume/fork on one name must not interleave. `fork_vm` takes
         // this same lock on the source name.
         let _guard = self.vm_name_lock(name).lock_owned().await;
@@ -374,6 +374,24 @@ impl<B: VmmBackend> HuskerCore<B> {
             vsock_cid: record.vsock_cid,
         };
         let restored = self.vmm.restore_vm(&paths, target).await?;
+        // A restored realtime clock can retain the snapshot's old wall time.
+        // Current agents reconcile it from the host without altering monotonic
+        // timers. Keep old snapshots resumable and report unavailable hooks.
+        let correction = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let stream = self
+                .vmm
+                .vsock_connect(record.id, husker_agent_proto::AGENT_VSOCK_PORT)
+                .await?;
+            let mut connection = crate::agent_client::AgentConnection::new(stream);
+            connection
+                .restore_guest(false)
+                .await
+                .map_err(CoreError::Agent)
+        })
+        .await;
+        if !matches!(correction, Ok(Ok(true))) {
+            warn!(vm = %record.name, ?correction, "guest wall-clock reconciliation unavailable; use a current guest agent");
+        }
         self.state
             .update_vm_runtime(record.id, VmLifecycleState::Running, restored.pid)?;
 

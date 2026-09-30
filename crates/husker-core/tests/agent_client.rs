@@ -808,3 +808,206 @@ async fn guest_info_returns_info_with_addresses() {
     assert_eq!(info.protocol_version, husker_agent_proto::PROTOCOL_VERSION);
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn sessions_refuse_old_guest_without_sending_unknown_request() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let task = tokio::spawn(async move {
+        assert!(matches!(
+            read_message::<AgentRequest, _>(&mut server).await.unwrap(),
+            Some(AgentRequest::GuestInfo)
+        ));
+        write_message(
+            &mut server,
+            &AgentResponse::GuestInfo(GuestInfoResponse {
+                ipv4: vec![],
+                protocol_version: 4,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            read_message::<AgentRequest, _>(&mut server)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+    let mut connection = AgentConnection::new(client);
+    let error = connection.session_list().await.unwrap_err();
+    assert!(error.to_string().contains("v5 required"));
+    drop(connection);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn tunnel_relays_binary_guest_loopback_and_eof() {
+    let (_dir, path) = spawn_agent().await;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let (mut stream, peer) = listener.accept().await.unwrap();
+        assert!(peer.ip().is_loopback());
+        let mut bytes = [0u8; 4];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, [0, 255, 128, 42]);
+        stream.write_all(&bytes).await.unwrap();
+    });
+    let mut tunnel = AgentClient::connect_unix(&path)
+        .await
+        .unwrap()
+        .tunnel(port)
+        .await
+        .unwrap();
+    tunnel.write_all(&[0, 255, 128, 42]).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tunnel.read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response, [0, 255, 128, 42]);
+    task.await.unwrap();
+    let error = AgentClient::connect_unix(&path)
+        .await
+        .unwrap()
+        .tunnel(0)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("nonzero"));
+}
+#[tokio::test]
+async fn restore_hook_negotiates_before_sending_and_preserves_old_guest_resume() {
+    use husker_agent_proto::{
+        AgentRequest, AgentResponse, GuestInfoResponse, read_message, write_message,
+    };
+    for required in [false, true] {
+        let (host, mut guest) = tokio::net::UnixStream::pair().unwrap();
+        let responder = tokio::spawn(async move {
+            assert!(matches!(
+                read_message::<AgentRequest, _>(&mut guest).await.unwrap(),
+                Some(AgentRequest::GuestInfo)
+            ));
+            write_message(
+                &mut guest,
+                &AgentResponse::GuestInfo(GuestInfoResponse {
+                    ipv4: vec![],
+                    protocol_version: 4,
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                read_message::<AgentRequest, _>(&mut guest)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "old guest must never receive unsupported restore request"
+            );
+        });
+        let mut connection = AgentConnection::new(host);
+        let result = connection.restore_guest(required).await;
+        if required {
+            assert!(result.is_err());
+        } else {
+            assert!(!result.unwrap());
+        }
+        drop(connection);
+        responder.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn restore_hook_carries_fresh_clock_and_propagates_kernel_errors() {
+    use husker_agent_proto::{
+        AgentRequest, AgentResponse, ErrorResponse, GuestInfoResponse, read_message, write_message,
+    };
+    let (host, mut guest) = tokio::net::UnixStream::pair().unwrap();
+    let responder = tokio::spawn(async move {
+        let _ = read_message::<AgentRequest, _>(&mut guest).await.unwrap();
+        write_message(
+            &mut guest,
+            &AgentResponse::GuestInfo(GuestInfoResponse {
+                ipv4: vec![],
+                protocol_version: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        let Some(AgentRequest::RestoreGuest(request)) =
+            read_message::<AgentRequest, _>(&mut guest).await.unwrap()
+        else {
+            panic!("missing restore request");
+        };
+        assert!(request.require_vmgenid);
+        assert!(request.unix_time_nanos < 1_000_000_000);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((request.unix_time_secs - now).abs() <= 1);
+        write_message(
+            &mut guest,
+            &AgentResponse::Error(ErrorResponse {
+                message: "VMGenID unavailable".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    let mut connection = AgentConnection::new(host);
+    assert!(
+        connection
+            .restore_guest(true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("VMGenID")
+    );
+    responder.await.unwrap();
+}
+#[tokio::test]
+async fn stalled_session_response_has_a_bounded_transport_deadline() {
+    let (host, mut guest) = tokio::io::duplex(4096);
+    let responder = tokio::spawn(async move {
+        assert!(matches!(
+            read_message::<AgentRequest, _>(&mut guest).await.unwrap(),
+            Some(AgentRequest::GuestInfo)
+        ));
+        write_message(
+            &mut guest,
+            &AgentResponse::GuestInfo(GuestInfoResponse {
+                ipv4: vec![],
+                protocol_version: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message::<AgentRequest, _>(&mut guest).await.unwrap(),
+            Some(AgentRequest::SessionList)
+        ));
+        // Simulate a guest that accepts the request but never answers it.
+        assert!(
+            read_message::<AgentRequest, _>(&mut guest)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+    let mut connection = AgentConnection::new(host);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        connection.session_list(),
+    )
+    .await
+    .expect("an unresponsive guest must not hold the host request forever");
+    assert!(matches!(result, Err(AgentError::NotReady { .. })));
+    drop(connection);
+    responder.await.unwrap();
+}

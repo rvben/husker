@@ -1,4 +1,4 @@
-.PHONY: all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-deploy-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline test-kernel-config coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: test-sdk test-dev-e2e-gated all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-deploy-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline test-kernel-config coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -296,6 +296,14 @@ coverage-ci:
 # documented equivalent/flaky exclusions).
 mutation-gate:
 	cargo mutants --package husker-agent-proto -j 4
+
+# SDK contracts and proof-workload checks use disposable loopback servers.
+test-sdk:
+	python3 -m unittest discover -s tests
+
+# Explicitly opt in against a prepared test daemon; never deploys/restarts it.
+test-dev-e2e-gated:
+	python3 scripts/ci/dev_computer_e2e.py
 
 # Compile every fuzz target without running an unbounded campaign.
 fuzz-check:

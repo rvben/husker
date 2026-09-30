@@ -344,6 +344,13 @@ husker_vms_failed {}\n",
         count("failed"),
     ));
 
+    out.push_str(&format!(
+        "# TYPE husker_detached_sessions_total counter\nhusker_detached_sessions_total {}\n\
+# TYPE husker_preview_connections_total counter\nhusker_preview_connections_total {}\n",
+        m.detached_sessions_total.load(Ordering::Relaxed),
+        m.preview_connections_total.load(Ordering::Relaxed),
+    ));
+
     // Per-service gauges. Service names are husker-validated resource names
     // (lowercase alphanumeric + hyphens, no special characters), so no
     // Prometheus label escaping is needed. The exposition format requires all
@@ -1447,7 +1454,7 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
 /// security-sensitive logic between buffered and streaming transports.
 type BoxedHandlerError = Box<(StatusCode, Json<ErrorResponse>)>;
 
-fn resolve_exec_environment<B: VmmBackend + 'static>(
+pub(crate) fn resolve_exec_environment<B: VmmBackend + 'static>(
     core: &HuskerCore<B>,
     req: &ExecRequest,
     policy: &ApiPolicy,

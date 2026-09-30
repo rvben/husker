@@ -172,6 +172,157 @@ impl<S> AgentConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    async fn session_request(
+        &mut self,
+        request: AgentRequest,
+    ) -> Result<AgentResponse, AgentError> {
+        let timeout = Duration::from_secs(10);
+        tokio::time::timeout(timeout, self.session_request_inner(request)).await
+            .map_err(|_| AgentError::NotReady { timeout,
+                detail: ": guest session operation timed out; inspect session status before retrying a start".into(),
+            })?
+    }
+
+    async fn session_request_inner(
+        &mut self,
+        request: AgentRequest,
+    ) -> Result<AgentResponse, AgentError> {
+        let version = self.guest_info().await?.protocol_version;
+        if version < husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_SESSIONS {
+            return Err(AgentError::Agent(format!(
+                "guest agent protocol v{version} does not support sessions or preview tunnels; refresh the guest image (v5 required)"
+            )));
+        }
+        write_message(&mut self.stream, &request).await?;
+        match read_message(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?
+        {
+            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            response => Ok(response),
+        }
+    }
+
+    /// Restore wall time and require kernel clone notification support for a
+    /// fork. Older guests remain resumable, but cannot be safely forked.
+    pub async fn restore_guest(&mut self, require_vmgenid: bool) -> Result<bool, AgentError> {
+        let version = self.guest_info().await?.protocol_version;
+        if version < husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_RESTORE {
+            if require_vmgenid {
+                return Err(AgentError::Agent(
+                    "fork requires guest restore hooks (protocol v5); refresh the guest image"
+                        .into(),
+                ));
+            }
+            return Ok(false);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| AgentError::Agent(format!("host clock predates Unix epoch: {e}")))?;
+        write_message(
+            &mut self.stream,
+            &AgentRequest::RestoreGuest(husker_agent_proto::RestoreGuestRequest {
+                unix_time_secs: now
+                    .as_secs()
+                    .try_into()
+                    .map_err(|_| AgentError::Agent("host clock out of range".into()))?,
+                unix_time_nanos: now.subsec_nanos(),
+                require_vmgenid,
+            }),
+        )
+        .await?;
+        match read_message(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?
+        {
+            AgentResponse::GuestRestored => Ok(true),
+            AgentResponse::Error(error) => Err(AgentError::Agent(error.message)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_start(
+        &mut self,
+        request: husker_agent_proto::SessionStartRequest,
+    ) -> Result<husker_agent_proto::SessionInfo, AgentError> {
+        match self
+            .session_request(AgentRequest::SessionStart(request))
+            .await?
+        {
+            AgentResponse::Session(info) => Ok(info),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_get(
+        &mut self,
+        id: &str,
+    ) -> Result<husker_agent_proto::SessionInfo, AgentError> {
+        match self
+            .session_request(AgentRequest::SessionGet { id: id.into() })
+            .await?
+        {
+            AgentResponse::Session(info) => Ok(info),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_list(
+        &mut self,
+    ) -> Result<Vec<husker_agent_proto::SessionInfo>, AgentError> {
+        match self.session_request(AgentRequest::SessionList).await? {
+            AgentResponse::Sessions { sessions } => Ok(sessions),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_events(
+        &mut self,
+        id: &str,
+        after: u64,
+    ) -> Result<husker_agent_proto::SessionEventsResponse, AgentError> {
+        match self
+            .session_request(AgentRequest::SessionEvents {
+                id: id.into(),
+                after,
+            })
+            .await?
+        {
+            AgentResponse::SessionEvents(events) => Ok(events),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_cancel(
+        &mut self,
+        id: &str,
+    ) -> Result<husker_agent_proto::SessionInfo, AgentError> {
+        match self
+            .session_request(AgentRequest::SessionCancel { id: id.into() })
+            .await?
+        {
+            AgentResponse::Session(info) => Ok(info),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_remove(&mut self, id: &str) -> Result<(), AgentError> {
+        match self
+            .session_request(AgentRequest::SessionRemove { id: id.into() })
+            .await?
+        {
+            AgentResponse::SessionRemoved => Ok(()),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    /// The returned stream keeps its VM active until the preview connection closes.
+    pub async fn tunnel(mut self, port: u16) -> Result<AgentTunnel<S>, AgentError> {
+        match self.session_request(AgentRequest::Tunnel { port }).await? {
+            AgentResponse::TunnelReady => Ok(AgentTunnel { connection: self }),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
     /// Wrap an existing stream as an agent connection, with no session guard.
     pub fn new(stream: S) -> Self {
         Self {
@@ -502,6 +653,42 @@ where
         let request = AgentRequest::ShellResize(ShellResizeRequest { cols, rows });
         write_message(&mut self.stream, &request).await?;
         Ok(())
+    }
+}
+
+pub struct AgentTunnel<S> {
+    connection: AgentConnection<S>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for AgentTunnel<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().connection.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for AgentTunnel<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().connection.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().connection.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().connection.stream).poll_shutdown(cx)
     }
 }
 

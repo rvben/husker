@@ -1115,6 +1115,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "utoipa",
 ]
 
 [[package]]
@@ -1124,7 +1125,9 @@ dependencies = [
  "async-stream",
  "axum",
  "chrono",
+ "futures-util",
  "http-body-util",
+ "husker-agent",
  "husker-agent-proto",
  "husker-core",
  "husker-net",
@@ -1137,6 +1140,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.30.0",
  "tower",
  "tracing",
  "utoipa",
@@ -1171,6 +1175,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

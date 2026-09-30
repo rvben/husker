@@ -53,6 +53,53 @@ pub(crate) enum OutputFormat {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Prepare and create development computers on the selected daemon
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
+    /// Start a detached coding-agent session; inspect it with `session` and `events`
+    Prompt {
+        name: String,
+        prompt: String,
+        #[arg(long, value_parser = ["codex", "claude"], default_value = "codex")]
+        agent: String,
+        #[arg(long, default_value = "/workspace")]
+        workdir: String,
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+        /// Read credentials from KEY=VALUE files without exposing them in argv
+        #[arg(long = "env-file")]
+        env_file: Vec<PathBuf>,
+        /// Inject a stored daemon secret as ENV_KEY=secret-name (repeatable)
+        #[arg(long)]
+        secret: Vec<String>,
+    },
+    /// Inspect, start, cancel, or remove detached guest sessions
+    Session {
+        name: String,
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+    /// Read a page of session output, or reconnect and follow until completion
+    Events {
+        name: String,
+        id: String,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Open a private loopback preview tunnel; keeps running until Ctrl-C
+    Preview {
+        name: String,
+        /// TCP port of the application inside the guest (loopback is supported)
+        #[arg(value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        /// Local loopback port; 0 asks the OS to choose a free port
+        #[arg(long, default_value_t = 0)]
+        local_port: u16,
+    },
     /// Start the husker daemon
     Daemon {
         /// Address to listen on
@@ -608,6 +655,76 @@ pub(crate) enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum DevAction {
+    /// Provision a credential-free Ubuntu dev image once on the daemon host
+    Prepare {
+        #[arg(long, default_value = "husker-dev")]
+        image: String,
+        /// Base OCI image; use a digest to pin the base exactly
+        #[arg(long, default_value = "ubuntu:24.04")]
+        base: String,
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+        #[arg(long, default_value_t = 4096)]
+        memory: u32,
+        #[arg(long, default_value = "20G")]
+        disk_size: String,
+        /// Rust toolchain installed by the provisioning recipe
+        #[arg(long, default_value = "1.96.0")]
+        rust: String,
+        /// npm version/tag of @openai/codex; pin a version for repeatable builds
+        #[arg(long, default_value = "latest")]
+        codex: String,
+        /// npm version/tag of @anthropic-ai/claude-code
+        #[arg(long, default_value = "latest")]
+        claude: String,
+    },
+    /// Create a ready development VM from a prepared catalog image
+    New {
+        name: String,
+        #[arg(long, default_value = "husker-dev")]
+        image: String,
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+        #[arg(long, default_value_t = 4096)]
+        memory: u32,
+        #[arg(long, default_value = "20G")]
+        disk_size: String,
+    },
+    /// Check the guest agent, dev tools, and Docker daemon in an existing VM
+    Check { name: String },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SessionAction {
+    /// Start any non-interactive command independently of the client connection
+    Start {
+        #[arg(long)]
+        workdir: Option<String>,
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+        #[arg(long = "env-file")]
+        env_file: Vec<PathBuf>,
+        #[arg(long)]
+        secret: Vec<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// List retained sessions in the VM
+    List,
+    /// Inspect a session state and exit code
+    Get { id: String },
+    /// Cancel a running session and its child processes
+    Cancel { id: String },
+    /// Remove a finished session and its retained log
+    Remove {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(clap::Subcommand)]
 pub(crate) enum SetupAction {
     /// Generate the script + unit to migrate the data dir onto a reflink volume
@@ -1110,6 +1227,30 @@ const EXEC_OUTPUT: &[F] = &[
     F::required("vm", T::String),
     F::required("result", T::Object),
 ];
+const SESSION_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("session", T::Object),
+];
+const SESSION_LIST_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("sessions", T::Array),
+];
+const EVENTS_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("page", T::Object),
+];
+const DEV_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("vm", T::String),
+    F::required("result", T::Object),
+];
 const JOB_OUTPUT: &[F] = &[
     F::required("status", T::String),
     F::required("action", T::String),
@@ -1399,6 +1540,17 @@ const SECRET_ITEM: &[F] = &[
 ];
 
 pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
+    CommandContract::object("dev prepare", true, DEV_OUTPUT),
+    CommandContract::object("dev new", true, DEV_OUTPUT),
+    CommandContract::object("dev check", true, DEV_OUTPUT),
+    CommandContract::object("prompt", true, SESSION_OUTPUT),
+    CommandContract::object("session start", true, SESSION_OUTPUT),
+    CommandContract::object("session list", true, SESSION_LIST_OUTPUT),
+    CommandContract::object("session get", true, SESSION_OUTPUT),
+    CommandContract::object("session cancel", true, SESSION_OUTPUT),
+    CommandContract::object("session remove", true, VM_ACTION),
+    CommandContract::object("events", true, EVENTS_OUTPUT),
+    CommandContract::unsupported("preview", true),
     CommandContract::unsupported("daemon", true),
     CommandContract::object("run", true, RUN_OUTPUT),
     CommandContract::list("list", false, VM_LIST, "items", VM_ITEM),

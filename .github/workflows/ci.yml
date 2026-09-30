@@ -50,6 +50,7 @@ jobs:
           tool: nextest
       - run: make test
       - run: make test-initramfs
+      - run: make test-sdk
 
   kernel-config:
     name: Kernel Config

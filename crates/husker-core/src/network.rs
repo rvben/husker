@@ -444,13 +444,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                     actual: "persisted egress policy without a TAP device".into(),
                     expected: "NAT networking with a TAP device".into(),
                 })?;
-            let persisted: Vec<crate::egress::ResolvedEgressRule> =
-                serde_json::from_str(serialized).map_err(|error| {
-                    CoreError::State(husker_state::StateError::CorruptData {
-                        column: "vms.egress_policy",
-                        message: error.to_string(),
-                    })
-                })?;
+            let persisted = crate::egress::parse_persisted_rules(serialized)?;
             let rules = persisted
                 .iter()
                 .map(|rule| husker_net::EgressRule {
