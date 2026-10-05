@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.52](https://github.com/rvben/husker/compare/v0.4.51...v0.4.52) - 2026-10-05
+
+### Fixed
+
+- **storage**: replay a pending ext4 journal before editing or committing a rootfs ([5dab467](https://github.com/rvben/husker/commit/5dab467798731dd2a17ed6e972a62275307dc2f2))
+
 ## [0.4.51](https://github.com/rvben/husker/compare/v0.4.50...v0.4.51) - 2026-09-30
 
 ### Added
