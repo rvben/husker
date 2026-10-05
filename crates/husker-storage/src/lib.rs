@@ -471,6 +471,91 @@ pub async fn grow_rootfs_ext4(path: &Path, new_size_bytes: u64) -> Result<(), St
     Ok(())
 }
 
+/// Outcome of [`replay_ext4_journal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalReplay {
+    /// The filesystem had no pending journal; the image was not written.
+    Clean,
+    /// A pending journal was replayed into the filesystem.
+    Replayed,
+}
+
+/// Whether the superblock of the ext4 image at `path` carries
+/// `needs_recovery`, i.e. holds a journal the kernel would replay on mount.
+///
+/// A filesystem whose features cannot be read at all is an error, never
+/// "clean": the callers use a clean answer to justify editing or publishing
+/// the image.
+async fn ext4_needs_recovery(path: &Path) -> Result<bool, StorageError> {
+    let out = tokio::process::Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| {
+            StorageError::CommandFailed(format!(
+                "dumpe2fs not runnable ({e}); inspecting an ext4 journal needs e2fsprogs"
+            ))
+        })?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let features = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Filesystem features:"))
+        .ok_or_else(|| {
+            StorageError::CommandFailed(format!(
+                "dumpe2fs could not read the ext4 superblock of {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        })?;
+    Ok(features.split_whitespace().any(|f| f == "needs_recovery"))
+}
+
+/// Replay a pending ext4 journal into the image at `path`.
+///
+/// A guest that is stopped without unmounting its root filesystem leaves
+/// committed transactions in the journal that were never written to their
+/// home blocks. The kernel replays them at the next mount, so anything that
+/// reads or edits the image offline before then (debugfs, a digest) sees a
+/// filesystem the guest will never see: an offline edit can be silently
+/// overwritten by the replay, and a digest names bytes that change on first
+/// boot. Replaying here first is exactly what the next mount would do.
+///
+/// Only an image that carries `needs_recovery` is written; a clean one keeps
+/// its bytes, so a digest taken before and after agrees.
+pub async fn replay_ext4_journal(path: &Path) -> Result<JournalReplay, StorageError> {
+    if !ext4_needs_recovery(path).await? {
+        return Ok(JournalReplay::Clean);
+    }
+    let fsck = tokio::process::Command::new("e2fsck")
+        .arg("-y")
+        .arg("-E")
+        .arg("journal_only")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| {
+            StorageError::CommandFailed(format!(
+                "e2fsck not runnable ({e}); replaying an ext4 journal needs e2fsprogs"
+            ))
+        })?;
+    // Exit code 1 means "errors corrected", which is what a replay reports.
+    if !matches!(fsck.status.code(), Some(0) | Some(1)) {
+        return Err(StorageError::CommandFailed(format!(
+            "e2fsck could not replay the journal of {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&fsck.stderr).trim()
+        )));
+    }
+    if ext4_needs_recovery(path).await? {
+        return Err(StorageError::CommandFailed(format!(
+            "e2fsck left a pending journal in {}",
+            path.display()
+        )));
+    }
+    Ok(JournalReplay::Replayed)
+}
+
 /// Absolute path of the husker guest agent inside a rootfs image. `import-oci`
 /// writes the agent here and points `/sbin/init` at it, and the baseline rootfs
 /// ships it at the same path.
@@ -489,8 +574,8 @@ pub enum AgentRefresh {
     /// Nothing at [`GUEST_AGENT_PATH`], so husker did not put an agent in this
     /// image. Left untouched.
     Absent,
-    /// The refresh could not be attempted. The image is untouched; the string
-    /// says why.
+    /// The refresh could not be attempted and the agent was not written; the
+    /// string says why.
     Skipped(String),
 }
 
@@ -559,6 +644,15 @@ pub async fn refresh_guest_agent(image: &Path, agent: &[u8]) -> Result<AgentRefr
         return Ok(AgentRefresh::Skipped(format!(
             "{} contains whitespace, which a debugfs command script cannot express",
             work.display()
+        )));
+    }
+    // debugfs ignores the journal, so an agent written over a filesystem with
+    // one pending passes the readback below and is then undone by the guest
+    // kernel's replay at mount: the old inode comes back over the new bytes
+    // and init is cut short. Replay first, or leave the agent alone.
+    if let Err(e) = replay_ext4_journal(image).await {
+        return Ok(AgentRefresh::Skipped(format!(
+            "the rootfs carries a journal that could not be replayed before the refresh: {e}"
         )));
     }
     let _ = tokio::fs::remove_dir_all(&work).await;

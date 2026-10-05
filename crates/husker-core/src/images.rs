@@ -194,6 +194,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         let source = self.storage.vm_dir(vm_name).join("rootfs.ext4");
         husker_storage::validate_rootfs(&source)?;
+        // A VM stopped without unmounting leaves its last transactions in the
+        // journal. Published that way, every VM created from the image has the
+        // kernel replay them at boot, undoing any offline edit made to its
+        // clone before then, and the digest names bytes no guest ever runs.
+        husker_storage::replay_ext4_journal(&source).await?;
         let content_digest = sha256_file(&source).await?;
 
         match self.state.get_image_by_name(&req.name) {

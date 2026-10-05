@@ -1826,8 +1826,106 @@ async fn image_roundtrip_import_list_get_export_delete() {
     assert!(core.list_images().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_contract() {
+/// True when the e2fsprogs tools a commit drives are present. Skips quietly on
+/// hosts without them (e.g. stock macOS); Linux CI and dev hosts run them.
+fn e2fsprogs_available() -> bool {
+    for tool in ["mkfs.ext4", "debugfs", "dumpe2fs", "e2fsck"] {
+        if std::process::Command::new(tool).arg("-V").output().is_err() {
+            eprintln!("skipping: {tool} not available on this host");
+            return false;
+        }
+    }
+    true
+}
+
+/// Write a real ext4 rootfs at `path` holding one file with `content`, so a
+/// commit inspects a filesystem husker could actually have produced.
+async fn ext4_rootfs(path: &Path, content: &[u8]) {
+    let tree = path.with_extension("tree");
+    std::fs::create_dir_all(tree.join("etc")).unwrap();
+    std::fs::write(tree.join("etc/prepared"), content).unwrap();
+    husker_storage::build_ext4_from_dir(&tree, path, 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&tree).unwrap();
+}
+
+fn needs_recovery(img: &Path) -> bool {
+    let out = std::process::Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(img)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Filesystem features:"))
+        .expect("dumpe2fs must report the filesystem features")
+        .split_whitespace()
+        .any(|feature| feature == "needs_recovery")
+}
+
+/// Leave `img` the way a guest stopped without unmounting leaves its root
+/// filesystem: a committed journal transaction not yet written back.
+fn leave_pending_journal(img: &Path) {
+    let imap = std::process::Command::new("debugfs")
+        .arg("-R")
+        .arg("imap /etc/prepared")
+        .arg(img)
+        .output()
+        .unwrap();
+    let imap = String::from_utf8_lossy(&imap.stdout);
+    let block: u64 = imap
+        .split("located at block ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("debugfs imap gave no block: {imap}"));
+    let stats = std::process::Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(img)
+        .output()
+        .unwrap();
+    let block_size: u64 = String::from_utf8_lossy(&stats.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Block size:"))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("dumpe2fs must report the block size");
+    let bytes = std::fs::read(img).unwrap();
+    let start = (block * block_size) as usize;
+    let snapshot = img.with_extension("inode-block");
+    std::fs::write(&snapshot, &bytes[start..start + block_size as usize]).unwrap();
+    let script = img.with_extension("journal.debugfs");
+    std::fs::write(
+        &script,
+        format!("jo\njw -b {block} {}\njc\n", snapshot.display()),
+    )
+    .unwrap();
+    let out = std::process::Command::new("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .arg(&script)
+        .arg(img)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fixture setup: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        needs_recovery(img),
+        "fixture must leave a journal pending replay"
+    );
+}
+
+/// A stopped VM's catalog base plus its prepared disk, ready to commit.
+struct CommitFixture {
+    _tmp: tempfile::TempDir,
+    prepared_path: PathBuf,
+    core: Arc<HuskerCore<MockVmm>>,
+}
+
+async fn commit_fixture() -> CommitFixture {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("run");
     let data_dir = tmp.path().join("data");
@@ -1839,8 +1937,8 @@ async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_cont
 
     let parent_path = catalog_dir.join("base.ext4");
     let prepared_path = vm_dir.join("rootfs.ext4");
-    std::fs::write(&parent_path, b"base-rootfs").unwrap();
-    std::fs::write(&prepared_path, b"base-rootfs-with-python").unwrap();
+    ext4_rootfs(&parent_path, b"base-rootfs").await;
+    ext4_rootfs(&prepared_path, b"base-rootfs-with-python").await;
 
     let state = StateStore::open_memory().unwrap();
     state
@@ -1854,7 +1952,7 @@ async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_cont
             boot_init: Some("/usr/local/bin/husker-agent".into()),
             content_digest: Some("sha256:base".into()),
             parent_image: None,
-            size_bytes: 11,
+            size_bytes: std::fs::metadata(&parent_path).unwrap().len(),
             created_at: Utc::now(),
         })
         .unwrap();
@@ -1873,6 +1971,24 @@ async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_cont
     state.insert_vm(&vm).unwrap();
 
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
+    CommitFixture {
+        _tmp: tmp,
+        prepared_path,
+        core,
+    }
+}
+
+#[tokio::test]
+async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_contract() {
+    if !e2fsprogs_available() {
+        return;
+    }
+    let CommitFixture {
+        _tmp,
+        prepared_path,
+        core,
+    } = commit_fixture().await;
+    let prepared = std::fs::read(&prepared_path).unwrap();
     let request = CommitVmImageRequest {
         name: "tools-python-3.13.7".into(),
     };
@@ -1891,9 +2007,9 @@ async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_cont
             .as_deref()
             .is_some_and(|digest| digest.starts_with("sha256:"))
     );
-    assert_eq!(
-        std::fs::read(&committed.file_path).unwrap(),
-        b"base-rootfs-with-python"
+    assert!(
+        std::fs::read(&committed.file_path).unwrap() == prepared,
+        "the catalog must hold the prepared disk's bytes"
     );
 
     let repeated = core
@@ -1914,7 +2030,8 @@ async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_cont
     let missing = core.commit_vm_image("preparer", request).await.unwrap_err();
     assert!(matches!(missing, CoreError::Io(_)), "{missing:?}");
 
-    std::fs::write(&prepared_path, b"different-prepared-rootfs").unwrap();
+    std::fs::remove_file(&prepared_path).unwrap();
+    ext4_rootfs(&prepared_path, b"different-prepared-rootfs").await;
     let conflict = core
         .commit_vm_image(
             "preparer",
@@ -1925,6 +2042,90 @@ async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_cont
         .await
         .unwrap_err();
     assert!(matches!(conflict, CoreError::ImageAlreadyExists(_)));
+}
+
+/// A preparation VM is stopped with its root filesystem still mounted, so its
+/// disk carries a journal the kernel replays at the next boot. Published that
+/// way, every VM created from the image boots by replaying it, which undoes
+/// any offline edit to its clone (the guest-agent refresh) and makes the
+/// digest name bytes no guest runs. The catalog must hold a settled
+/// filesystem, and a repeat must still recognise it.
+#[tokio::test]
+async fn commit_vm_image_publishes_a_filesystem_with_no_pending_journal() {
+    if !e2fsprogs_available() {
+        return;
+    }
+    let CommitFixture {
+        _tmp,
+        prepared_path,
+        core,
+    } = commit_fixture().await;
+    leave_pending_journal(&prepared_path);
+    let request = CommitVmImageRequest {
+        name: "tools-python-3.13.7".into(),
+    };
+
+    let committed = core
+        .commit_vm_image("preparer", request.clone())
+        .await
+        .unwrap();
+
+    let catalog = Path::new(&committed.file_path);
+    assert!(
+        !needs_recovery(catalog),
+        "the catalog image must not carry a pending journal"
+    );
+    let check = std::process::Command::new("e2fsck")
+        .arg("-fn")
+        .arg(catalog)
+        .output()
+        .unwrap();
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "the catalog image must be consistent: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let repeated = core.commit_vm_image("preparer", request).await.unwrap();
+    assert_eq!(repeated.id, committed.id);
+}
+
+/// A disk that is not a readable ext4 filesystem has no journal state anyone
+/// can vouch for, so it is refused rather than published unchecked.
+#[tokio::test]
+async fn commit_vm_image_refuses_a_disk_whose_filesystem_cannot_be_read() {
+    if !e2fsprogs_available() {
+        return;
+    }
+    let CommitFixture {
+        _tmp,
+        prepared_path,
+        core,
+    } = commit_fixture().await;
+    std::fs::write(&prepared_path, vec![0x5au8; 2 * 1024 * 1024]).unwrap();
+
+    let error = core
+        .commit_vm_image(
+            "preparer",
+            CommitVmImageRequest {
+                name: "derived".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("could not read the ext4 superblock"),
+        "{error:?}"
+    );
+    assert!(
+        core.list_images()
+            .unwrap()
+            .iter()
+            .all(|image| image.name != "derived")
+    );
 }
 
 #[tokio::test]

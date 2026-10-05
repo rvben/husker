@@ -115,7 +115,7 @@ async fn grow_rootfs_ext4_grows_a_real_filesystem() {
 /// True when every e2fsprogs tool these tests drive is present. Skips quietly
 /// on hosts without them (e.g. stock macOS); Linux CI and dev hosts run them.
 fn e2fsprogs_available() -> bool {
-    for tool in ["mkfs.ext4", "debugfs"] {
+    for tool in ["mkfs.ext4", "debugfs", "dumpe2fs", "e2fsck"] {
         if std::process::Command::new(tool).arg("-V").output().is_err() {
             eprintln!("skipping: {tool} not available on this host");
             return false;
@@ -357,6 +357,179 @@ async fn refresh_guest_agent_reports_skipped_for_an_unreadable_image() {
         }
         other => panic!("an unreadable image must not be reported as {other:?}"),
     }
+}
+
+// ── replay_ext4_journal ─────────────────────────────────────────────
+
+fn run_e2fs(tool: &str, args: &[&str], img: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(tool)
+        .args(args)
+        .arg(img)
+        .output()
+        .unwrap()
+}
+
+fn needs_recovery(img: &std::path::Path) -> bool {
+    let out = run_e2fs("dumpe2fs", &["-h"], img);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Filesystem features:"))
+        .expect("dumpe2fs must report the filesystem features")
+        .split_whitespace()
+        .any(|feature| feature == "needs_recovery")
+}
+
+/// Leave `img` the way a guest that was stopped without unmounting leaves its
+/// root filesystem: a committed journal transaction holding the agent's inode
+/// as it is now, not yet written back. The kernel replays it at the next
+/// mount, putting that inode back over whatever an offline edit wrote there.
+fn leave_pending_journal_over_agent(img: &std::path::Path) {
+    let imap = run_e2fs(
+        "debugfs",
+        &["-R", &format!("imap {}", husker_storage::GUEST_AGENT_PATH)],
+        img,
+    );
+    let imap = String::from_utf8_lossy(&imap.stdout);
+    let block: u64 = imap
+        .split("located at block ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("debugfs imap gave no block: {imap}"));
+    let stats = run_e2fs("dumpe2fs", &["-h"], img);
+    let block_size: u64 = String::from_utf8_lossy(&stats.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Block size:"))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("dumpe2fs must report the block size");
+
+    let bytes = std::fs::read(img).unwrap();
+    let start = (block * block_size) as usize;
+    let snapshot = img.with_extension("inode-block");
+    std::fs::write(&snapshot, &bytes[start..start + block_size as usize]).unwrap();
+    let script = img.with_extension("journal.debugfs");
+    std::fs::write(
+        &script,
+        format!("jo\njw -b {block} {}\njc\n", snapshot.display()),
+    )
+    .unwrap();
+    let out = run_e2fs("debugfs", &["-w", "-f", script.to_str().unwrap()], img);
+    assert!(
+        out.status.success(),
+        "fixture setup: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Positive control: without a pending journal the tests below would pass
+    // on code that ignores it.
+    assert!(
+        needs_recovery(img),
+        "fixture must leave a journal pending replay"
+    );
+}
+
+/// Replay the journal the way the guest kernel does when it mounts the root
+/// filesystem, independently of the code under test.
+fn mount_time_replay(img: &std::path::Path) {
+    let out = run_e2fs("e2fsck", &["-fy", "-E", "journal_only"], img);
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "replay: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The agent refresh edits the image with debugfs, which ignores the journal.
+/// Over a pending journal the readback check passes and the guest kernel's
+/// replay then restores the old inode at mount: its size and blocks come back
+/// over the new agent and init is cut short. The refresh must leave an image
+/// whose agent is the new one after that replay.
+#[tokio::test]
+async fn refresh_guest_agent_survives_the_journal_replay_at_guest_mount() {
+    if !e2fsprogs_available() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let old_agent = vec![b'o'; 20_000];
+    let img = image_with_agent(dir.path(), &old_agent).await;
+    leave_pending_journal_over_agent(&img);
+
+    let outcome = husker_storage::refresh_guest_agent(&img, b"current-agent")
+        .await
+        .unwrap();
+    assert_eq!(outcome, husker_storage::AgentRefresh::Replaced);
+
+    mount_time_replay(&img);
+    let booted = dump_from_image(&img, husker_storage::GUEST_AGENT_PATH)
+        .expect("the agent must survive the replay");
+    assert!(
+        booted == b"current-agent",
+        "the guest must boot the refreshed agent, not the inode the journal held: \
+         {} bytes after replay, expected {}",
+        booted.len(),
+        b"current-agent".len()
+    );
+}
+
+#[tokio::test]
+async fn replay_ext4_journal_replays_a_pending_journal() {
+    if !e2fsprogs_available() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let img = image_with_agent(dir.path(), b"agent").await;
+    leave_pending_journal_over_agent(&img);
+
+    let outcome = husker_storage::replay_ext4_journal(&img).await.unwrap();
+
+    assert_eq!(outcome, husker_storage::JournalReplay::Replayed);
+    assert!(
+        !needs_recovery(&img),
+        "the journal must no longer be pending"
+    );
+    let check = run_e2fs("e2fsck", &["-fn"], &img);
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "the replayed filesystem must be consistent: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+}
+
+/// A digest taken of a clean image must still name it afterwards, so a clean
+/// image is not written at all.
+#[tokio::test]
+async fn replay_ext4_journal_leaves_a_clean_image_byte_identical() {
+    if !e2fsprogs_available() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let img = image_with_agent(dir.path(), b"agent").await;
+    let before = std::fs::read(&img).unwrap();
+
+    let outcome = husker_storage::replay_ext4_journal(&img).await.unwrap();
+
+    assert_eq!(outcome, husker_storage::JournalReplay::Clean);
+    assert_eq!(std::fs::read(&img).unwrap(), before);
+}
+
+/// Something that is not an ext4 filesystem has no readable journal state, and
+/// calling it clean would let it be edited or published as one.
+#[tokio::test]
+async fn replay_ext4_journal_refuses_an_unreadable_image() {
+    if !e2fsprogs_available() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let img = dir.path().join("rootfs.ext4");
+    std::fs::write(&img, vec![0x5au8; 2 * 1024 * 1024]).unwrap();
+
+    let err = husker_storage::replay_ext4_journal(&img).await.unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("could not read the ext4 superblock"),
+        "{err}"
+    );
 }
 
 // ── clone_rootfs ────────────────────────────────────────────────────
