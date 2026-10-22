@@ -15,7 +15,7 @@ tracing = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 # Pure-Rust zstd decode for OCI layers (no C dependency).
-ruzstd = "0.8"
+ruzstd = "0.9.1"
 sha2 = "0.11"
 
 [dev-dependencies]
