@@ -122,6 +122,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             Vec::new()
         };
+        if req.macos_image.is_some() {
+            crate::macos_guest::validate_macos_request(&req)?;
+        }
         info!(name = %req.name, "creating VM");
 
         let _name_guard = self.vm_name_lock(&req.name).lock_owned().await;
@@ -143,7 +146,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
 
-        if req.cloud_image.is_none() {
+        if req.cloud_image.is_none() && req.macos_image.is_none() {
             // Fill daemon defaults for any path the client omitted. A remote client
             // sends only the paths the user explicitly specified; the daemon fills the
             // rest from its own configured defaults so the paths are valid on the
@@ -213,6 +216,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         expiration: Option<&PendingVmExpiration>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
+        if req.macos_image.is_some() {
+            return Err(CoreError::InvalidArgument(
+                "macOS guests require the Apple Virtualization.framework backend on an \
+                 Apple Silicon Mac"
+                    .into(),
+            ));
+        }
         // Validate + default the network mode before touching any host resources.
         let network_mode = validate_network_mode(req.network.as_deref())?;
         // Bridged mode preconditions: must have a cloud image and a configured LAN bridge.
@@ -726,7 +736,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             .vmm
             .select_backend(husker_vmm::BackendRequirements {
                 requested: None,
-                boot: if req.cloud_image.is_some() {
+                boot: if req.macos_image.is_some() {
+                    husker_vmm::BootKind::MacOs
+                } else if req.cloud_image.is_some() {
                     husker_vmm::BootKind::Efi
                 } else {
                     husker_vmm::BootKind::DirectKernel
@@ -756,6 +768,23 @@ impl<B: VmmBackend> HuskerCore<B> {
             if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
                 warn!(dir = %vm_dir.display(), error = %e, "failed to remove stale VM directory");
             }
+        }
+
+        if let Some(image) = req.macos_image.as_deref() {
+            let bundle = crate::macos_guest::resolve_macos_bundle(&self.storage.data_dir, image)?;
+            return self
+                .create_macos_vm(
+                    req,
+                    bundle,
+                    backend_selection,
+                    network_mode,
+                    cid,
+                    vm_dir,
+                    tags,
+                    expiration,
+                    resources,
+                )
+                .await;
         }
 
         if let Some(image) = req.cloud_image.as_ref() {
@@ -1579,7 +1608,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     }
 }
 
-fn map_vm_insert_error(error: husker_state::StateError) -> CoreError {
+pub(crate) fn map_vm_insert_error(error: husker_state::StateError) -> CoreError {
     match error {
         husker_state::StateError::VmAlreadyExists(name) => CoreError::VmAlreadyExists(name),
         husker_state::StateError::VolumeAttached { volume, vm } => {

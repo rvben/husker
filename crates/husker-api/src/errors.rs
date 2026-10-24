@@ -127,6 +127,7 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
         CoreError::VolumeAttached { .. } => {
             (StatusCode::CONFLICT, "volume_attached", err.to_string())
         }
+        CoreError::ImageBusy(_) => (StatusCode::CONFLICT, "image_busy", err.to_string()),
         CoreError::SecretAlreadyExists(_) => (
             StatusCode::CONFLICT,
             "secret_already_exists",

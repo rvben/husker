@@ -4,6 +4,7 @@ mod pty;
 mod sessions;
 pub use sessions::SessionStore;
 mod restore;
+pub mod serve;
 
 /// Minimal `NETLINK_ROUTE` message encoding for `iproute2`-free static network
 /// setup in the guest supervisor (a distroless rootfs has no `ip`/`busybox`).

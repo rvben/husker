@@ -24,7 +24,8 @@ registry. CI verifies that every command leaf has exactly one contract.
 - Text output is human-oriented and is not a machine contract.
 
 Some local, interactive, or streaming commands do not define structured
-output: `daemon`, `shell`, `setup storage`, `completions`, and `logs --follow`.
+output: `daemon`, `guest-agent`, `shell`, `setup storage`, `completions`, and
+`logs --follow`.
 Their schema entries have no `output_fields`; unsupported JSON modes fail rather
 than emitting a partial or mixed stream. `config check` is structured: it emits
 one report with a stable overall status and an array of named checks.

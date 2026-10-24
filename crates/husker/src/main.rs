@@ -20,6 +20,7 @@ mod daemon_target;
 mod dev;
 mod guest_file;
 mod job;
+mod macos;
 mod schema;
 mod vm_creation;
 
@@ -75,6 +76,22 @@ fn command_requires_text_output(command: &Commands) -> bool {
             | Commands::Config { .. }
             | Commands::Setup { .. }
             | Commands::Completions { .. }
+            | Commands::GuestAgent
+    )
+}
+
+/// Commands whose output is not a JSON document, so an explicit
+/// `--output json` is refused rather than ignored.
+fn command_rejects_json_output(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Daemon { .. }
+            | Commands::Shell { .. }
+            | Commands::Setup {
+                action: SetupAction::Storage { .. }
+            }
+            | Commands::Completions { .. }
+            | Commands::GuestAgent
     )
 }
 
@@ -102,6 +119,11 @@ fn host_local_refusal(command: &Commands) -> Option<String> {
         Commands::Setup {
             action: SetupAction::Storage { .. },
         } => Some("setup storage runs on the daemon host; ssh to it and run there".to_string()),
+        Commands::Macos { .. } => Some(
+            "macos commands manage images in THIS machine's husker data dir and cannot target a \
+             remote context; run them on the Mac that runs the daemon"
+                .to_string(),
+        ),
         Commands::Image {
             action: ImageAction::Pull { .. },
         } => Some(format!(
@@ -671,22 +693,16 @@ async fn run(cli: Cli) -> Result<()> {
     if let Commands::Context { action } = command {
         return context_command(action, output);
     }
-
-    if output == OutputFormat::Json
-        && matches!(
-            &command,
-            Commands::Daemon { .. }
-                | Commands::Shell { .. }
-                | Commands::Setup {
-                    action: SetupAction::Storage { .. }
-                }
-                | Commands::Completions { .. }
-        )
-    {
+    if output == OutputFormat::Json && command_rejects_json_output(&command) {
         exit_with_error(
             output,
             "this command does not support --output json; use text output",
         );
+    }
+    // Inside a macOS guest this binary is the guest agent; it needs no config,
+    // context or daemon.
+    if matches!(command, Commands::GuestAgent) {
+        return husker_agent::serve::serve().await;
     }
 
     // These commands are entirely local and must not resolve a saved context,
@@ -765,6 +781,14 @@ async fn run(cli: Cli) -> Result<()> {
         exit_with_error(output, msg);
     }
 
+    if let Commands::Macos { action } = command {
+        let data_dir = load_config_strict(config_path.as_deref())?.data_dir;
+        if let Err(e) = macos::command(&data_dir, action, output).await {
+            exit_with_error(output, ApiFailure::from_error(&e));
+        }
+        return Ok(());
+    }
+
     let target = resolved_target
         .connect(resolve_api_token(
             cli_api_token.clone(),
@@ -834,6 +858,7 @@ async fn run(cli: Cli) -> Result<()> {
             add_host,
             vmm,
             cloud_image,
+            macos,
             disk_size,
             ssh_key,
             balloon,
@@ -883,6 +908,7 @@ async fn run(cli: Cli) -> Result<()> {
                         memory,
                         vmm,
                         cloud_image,
+                        macos_image: macos,
                         disk_size,
                         ssh_key,
                         env,
@@ -1414,6 +1440,7 @@ async fn run(cli: Cli) -> Result<()> {
                         memory,
                         vmm,
                         cloud_image,
+                        macos_image: None,
                         disk_size,
                         ssh_key,
                         env: Vec::new(),
@@ -1959,6 +1986,8 @@ async fn run(cli: Cli) -> Result<()> {
             unreachable!("Context is handled before daemon-target resolution in run()")
         }
         Commands::Schema => unreachable!("schema handled before target resolution"),
+        Commands::GuestAgent => unreachable!("guest-agent handled before target resolution"),
+        Commands::Macos { .. } => unreachable!("macos handled before target connection"),
         Commands::Capabilities => {
             unreachable!("capabilities handled before target resolution")
         }
@@ -5894,6 +5923,7 @@ mod tests {
             vec!["husker", "config", "check"],
             vec!["husker", "setup", "storage"],
             vec!["husker", "completions", "bash"],
+            vec!["husker", "guest-agent"],
         ] {
             let cli = Cli::try_parse_from(args).expect("text-only command should parse");
             assert_eq!(cli.output, OutputFormat::Auto);
@@ -5912,6 +5942,17 @@ mod tests {
             resolve_command_format(cli.output, &cli.command),
             OutputFormat::Json
         );
+    }
+
+    #[test]
+    fn the_guest_agent_refuses_json_output_instead_of_serving() {
+        let cli = Cli::try_parse_from(["husker", "--output", "json", "guest-agent"])
+            .expect("guest-agent should parse");
+        assert_eq!(
+            resolve_command_format(cli.output, &cli.command),
+            OutputFormat::Json
+        );
+        assert!(command_rejects_json_output(&cli.command));
     }
 
     #[test]
@@ -8013,9 +8054,9 @@ default_auto_resume = false
     fn second_daemon_lock_acquisition_fails() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("husker.lock");
-        let _held = acquire_daemon_lock(&lock).expect("first lock acquires");
+        let _held = try_lock_exclusive(&lock).expect("first lock acquires");
         // A second exclusive non-blocking lock on the same path must fail.
-        assert!(acquire_daemon_lock(&lock).is_err());
+        assert!(try_lock_exclusive(&lock).is_err());
     }
 
     #[test]

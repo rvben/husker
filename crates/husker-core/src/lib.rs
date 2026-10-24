@@ -15,6 +15,7 @@ mod fork;
 mod host_resources;
 mod idle;
 mod images;
+pub mod macos_guest;
 mod network;
 #[cfg(feature = "linux-net")]
 mod oci_materializer;
@@ -96,6 +97,8 @@ pub enum CoreError {
     VolumeAlreadyExists(String),
     #[error("volume '{volume}' is attached to VM '{vm}'")]
     VolumeAttached { volume: String, vm: String },
+    #[error("macOS image {0} is being provisioned; retry once `husker macos provision` finishes")]
+    ImageBusy(String),
     #[error("secret not found: {0}")]
     SecretNotFound(String),
     #[error("secret already exists: {0}")]
@@ -216,6 +219,11 @@ pub struct CreateVmRequest {
     /// path on the host. Implies the QEMU backend; `kernel_path`/`rootfs_path` are ignored.
     #[serde(default)]
     pub cloud_image: Option<String>,
+    /// Boot a macOS guest from an installed bundle: a name under
+    /// `<data_dir>/macos/` or a bundle directory path. Apple Silicon hosts
+    /// only; `kernel_path`/`rootfs_path` must be unset.
+    #[serde(default)]
+    pub macos_image: Option<String>,
     /// Grow the cloud-image disk to this many bytes before boot (cloud-image only).
     #[serde(default)]
     pub disk_size: Option<u64>,
@@ -920,14 +928,20 @@ pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 120;
 /// installing and starting the agent).
 pub const UEFI_READY_TIMEOUT_SECS: u64 = 180;
 
+/// Default agent-readiness wait (seconds) for macOS guests. A first boot of a
+/// freshly cloned macOS image runs Setup-time indexing and system daemons
+/// before launchd starts the agent; measured at over five minutes on Apple
+/// Silicon with two guests booting concurrently.
+pub const MACOS_READY_TIMEOUT_SECS: u64 = 480;
+
 /// Boot-mode-aware default readiness timeout. Both UEFI (Linux/QEMU cloud
 /// image) and EFI (macOS/VZ cloud image) run full cloud-init on first boot and
-/// need the extended timeout.
+/// need the extended timeout; macOS guests need longer still.
 pub fn default_ready_timeout(boot_kind: BootKind) -> std::time::Duration {
-    let secs = if boot_kind.uses_firmware() {
-        UEFI_READY_TIMEOUT_SECS
-    } else {
-        DEFAULT_READY_TIMEOUT_SECS
+    let secs = match boot_kind {
+        BootKind::MacOs => MACOS_READY_TIMEOUT_SECS,
+        BootKind::Uefi | BootKind::Efi => UEFI_READY_TIMEOUT_SECS,
+        BootKind::DirectKernel => DEFAULT_READY_TIMEOUT_SECS,
     };
     std::time::Duration::from_secs(secs)
 }
@@ -4711,6 +4725,10 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             default_ready_timeout(BootKind::Efi),
             std::time::Duration::from_secs(UEFI_READY_TIMEOUT_SECS)
         );
+        assert_eq!(
+            default_ready_timeout(BootKind::MacOs),
+            std::time::Duration::from_secs(MACOS_READY_TIMEOUT_SECS)
+        );
     }
 
     // ── Volume CRUD tests ────────────────────────────────────────────────────
@@ -5917,6 +5935,55 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             core.list_vms().unwrap().is_empty(),
             "no VM should be persisted after a failed create"
         );
+    }
+
+    /// The image is validated under the bundle lock: while a provision holds
+    /// it (having marked the image unprovisioned to rewrite its disk), create
+    /// reports the image busy and allocates nothing from it.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn macos_create_validates_the_image_under_the_provision_lock() {
+        use husker_vmm::macos_bundle::{MACOS_BUNDLE_FORMAT, MacOsBundle, MacOsBundleManifest};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let core = make_vz_core(state, tmp.path());
+        let dir = crate::macos_guest::macos_images_dir(tmp.path()).join("img");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = MacOsBundle::new(&dir);
+        bundle
+            .write_manifest(&MacOsBundleManifest {
+                format: MACOS_BUNDLE_FORMAT,
+                build: "26A434".into(),
+                os_version: "27.0.1".into(),
+                disk_size_bytes: 64 << 30,
+                min_cpus: 2,
+                min_memory_mib: 4096,
+                agent_provisioned: false,
+            })
+            .unwrap();
+        for p in [
+            bundle.disk_path(),
+            bundle.aux_path(),
+            bundle.hardware_model_path(),
+        ] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let _provision = bundle.try_lock(true).unwrap().unwrap();
+
+        let err = core
+            .create_vm(CreateVmRequest {
+                name: "mac1".into(),
+                macos_image: Some("img".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::ImageBusy(_)),
+            "expected ImageBusy, got {err:?}"
+        );
+        assert!(!core.storage.vm_dir("mac1").exists());
+        assert!(core.list_vms().unwrap().is_empty());
     }
 
     /// create_service with cloud_image on macOS must be rejected eagerly.

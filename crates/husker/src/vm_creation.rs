@@ -24,6 +24,7 @@ pub(crate) struct VmRequestArgs {
     pub memory: Option<u32>,
     pub vmm: Option<String>,
     pub cloud_image: Option<PathBuf>,
+    pub macos_image: Option<String>,
     pub disk_size: Option<String>,
     pub ssh_key: Vec<PathBuf>,
     pub env: Vec<String>,
@@ -54,6 +55,7 @@ pub(crate) struct VmCreationIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VmCreationDiagnostic {
     CloudImage(PathBuf),
+    MacOsImage(String),
     DirectBoot {
         kernel: Option<PathBuf>,
         rootfs: Option<PathBuf>,
@@ -68,6 +70,9 @@ impl VmCreationDiagnostic {
         match self {
             Self::CloudImage(path) if output == OutputFormat::Text => {
                 eprintln!("Using: cloud-image={}", path.display());
+            }
+            Self::MacOsImage(image) if output == OutputFormat::Text => {
+                eprintln!("Using: macos-image={image}");
             }
             Self::DirectBoot {
                 kernel,
@@ -96,7 +101,7 @@ impl VmCreationDiagnostic {
                  Run `husker images pull` to fetch it, or pass a rootfs path explicitly.",
                 path.display()
             ),
-            Self::CloudImage(_) | Self::DirectBoot { .. } => {}
+            Self::CloudImage(_) | Self::MacOsImage(_) | Self::DirectBoot { .. } => {}
         }
     }
 }
@@ -250,6 +255,7 @@ fn pool_conflicting_flags(
         (args.memory.is_some(), "--memory"),
         (args.vmm.is_some(), "--vmm"),
         (args.cloud_image.is_some(), "--cloud-image"),
+        (args.macos_image.is_some(), "--macos"),
         (args.disk_size.is_some(), "--disk-size"),
         (args.volume.is_some(), "--volume"),
         (!args.mount.is_empty(), "--mount"),
@@ -308,6 +314,20 @@ pub(crate) fn build_vm_request(
             anyhow::bail!("unknown profile '{profile_name}' (available: {available})");
         };
         apply_profile(&mut args, profile_value);
+        if args.macos_image.is_some() {
+            // The command line cannot combine these with --macos, so here
+            // they came from the profile; they describe a Linux guest and
+            // do not apply to a macOS image.
+            args.cloud_image = None;
+            args.rootfs = None;
+            args.kernel = None;
+            args.initrd = None;
+            args.disk_size = None;
+            args.ssh_key.clear();
+            args.volume = None;
+            args.mount.clear();
+            args.vmm = None;
+        }
     }
 
     anyhow::ensure!(
@@ -363,7 +383,20 @@ pub(crate) fn build_vm_request(
         ..husker_core::CreateVmRequest::default()
     };
 
-    if let Some(cloud_image) = args.cloud_image {
+    if let Some(image) = args.macos_image {
+        // The daemon resolves a path, so send it absolute; a bare name never
+        // contains `/` and is sent as is.
+        let image = if image.contains('/') {
+            std::path::absolute(&image)
+                .with_context(|| format!("resolving macOS image path {image}"))?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            image
+        };
+        diagnostics.push(VmCreationDiagnostic::MacOsImage(image.clone()));
+        body.macos_image = Some(image);
+    } else if let Some(cloud_image) = args.cloud_image {
         body.cloud_image = Some(cloud_image.to_string_lossy().into_owned());
         if !args.ssh_key.is_empty() {
             let mut keys = Vec::new();
@@ -529,7 +562,7 @@ pub(crate) async fn fetch_daemon_profiles(
 
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 fn needs_firecracker_preflight(body: &husker_core::CreateVmRequest) -> bool {
-    body.cloud_image.is_none() && body.vmm.as_deref() != Some("qemu")
+    body.cloud_image.is_none() && body.macos_image.is_none() && body.vmm.as_deref() != Some("qemu")
 }
 
 #[cfg(not(all(target_os = "linux", feature = "linux-net")))]
@@ -558,6 +591,12 @@ mod tests {
 
         request.vmm = None;
         request.cloud_image = Some("/img.qcow2".into());
+        assert!(!needs_firecracker_preflight(&request));
+
+        // The daemon rejects a macOS guest on Linux with its own error,
+        // which a missing Firecracker must not mask.
+        request.cloud_image = None;
+        request.macos_image = Some("sonoma".into());
         assert!(!needs_firecracker_preflight(&request));
     }
 
@@ -610,6 +649,54 @@ mod tests {
                 initrd: None
             }]
         );
+    }
+
+    #[test]
+    fn a_profile_does_not_carry_linux_guest_settings_into_a_macos_vm() {
+        let profile = Profile {
+            cloud_image: Some("/img.qcow2".into()),
+            rootfs: Some("/rootfs.ext4".into()),
+            kernel: Some("/vmlinux".into()),
+            initrd: Some("/initrd".into()),
+            cpus: Some(6),
+            memory: Some(12288),
+            disk_size: Some("20G".into()),
+            ssh_keys: vec!["/missing/key.pub".into()],
+            vmm: Some("qemu".into()),
+            volume: Some("data".into()),
+            mounts: vec!["/host:/guest".into()],
+            ..Profile::default()
+        };
+        let profiles = HashMap::from([("dev".to_string(), profile)]);
+        let config = Config {
+            default_disk_size: Some("30G".into()),
+            ..Config::default()
+        };
+        let built = build_vm_request(
+            "mac1",
+            VmRequestArgs {
+                macos_image: Some("sequoia".into()),
+                ..VmRequestArgs::default()
+            },
+            Some("dev"),
+            &profiles,
+            &HashMap::new(),
+            &config,
+            false,
+        )
+        .unwrap();
+        let body = built.body;
+        assert_eq!(body.macos_image.as_deref(), Some("sequoia"));
+        assert_eq!((body.vcpu_count, body.mem_size_mib), (Some(6), Some(12288)));
+        assert_eq!(body.disk_size, None);
+        assert_eq!(body.cloud_image, None);
+        assert_eq!(body.rootfs_path, None);
+        assert_eq!(body.kernel_path, None);
+        assert_eq!(body.initrd_path, None);
+        assert!(body.ssh_authorized_keys.is_empty());
+        assert_eq!(body.volume, None);
+        assert!(body.mounts.is_empty());
+        assert_eq!(body.vmm, None);
     }
 
     #[test]

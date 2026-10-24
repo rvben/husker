@@ -176,6 +176,18 @@ pub(crate) enum Commands {
         #[arg(long)]
         cloud_image: Option<PathBuf>,
 
+        /// Boot a macOS guest from an installed image (see `husker macos install`):
+        /// an image name or a bundle directory path. Apple Silicon hosts only.
+        #[arg(
+            long,
+            value_name = "IMAGE",
+            conflicts_with_all = [
+                "rootfs", "kernel", "initrd", "cloud_image", "disk_size", "ssh_key",
+                "volume", "mount", "dns", "add_host", "pool", "vmm"
+            ]
+        )]
+        macos: Option<String>,
+
         /// Resize the VM disk before boot, e.g. 10G. Cloud images grow on first boot (cloud-init); rootfs images are resized offline (needs e2fsprogs on the daemon host)
         #[arg(long)]
         disk_size: Option<String>,
@@ -556,6 +568,16 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ImageAction,
     },
+
+    /// Install, list and provision macOS guest images (Apple Silicon hosts)
+    Macos {
+        #[command(subcommand)]
+        action: MacosAction,
+    },
+
+    /// Serve the guest agent on vsock port 52. Runs inside macOS guests, where
+    /// `husker macos provision` installs it as a LaunchDaemon.
+    GuestAgent,
 
     /// Manage persistent volumes
     #[command(visible_aliases = ["volumes", "vol"])]
@@ -1023,6 +1045,45 @@ pub(crate) enum SnapshotAction {
         /// Skip confirmation prompt (required when stdin is not a TTY)
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MacosAction {
+    /// Install macOS from a restore image into a new named image. Without
+    /// --ipsw, downloads the latest restore image this host supports.
+    Install {
+        /// Image name (letters, digits, `-`, `_`, `.`)
+        name: String,
+        /// Local restore image (.ipsw) to install from. Read in place and
+        /// never deleted
+        #[arg(long, conflicts_with_all = ["download_dir", "keep_ipsw"])]
+        ipsw: Option<PathBuf>,
+        /// Directory to download the restore image into, e.g. on an external
+        /// disk (default: <data_dir>/macos/.downloads)
+        #[arg(long)]
+        download_dir: Option<PathBuf>,
+        /// Keep the downloaded restore image after a successful install
+        /// instead of deleting it
+        #[arg(long)]
+        keep_ipsw: bool,
+        /// Boot disk size, e.g. 64G (sparse; minimum 32G)
+        #[arg(long, default_value = "64G")]
+        disk_size: String,
+        /// vCPUs for the installer VM
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory in MiB for the installer VM
+        #[arg(long)]
+        memory: Option<u32>,
+    },
+    /// List installed macOS images
+    List,
+    /// Install the husker guest agent into an image so `husker exec` works.
+    /// Writes root-owned files into the guest disk, so it must run as root.
+    Provision {
+        /// Image name or bundle directory path
+        image: String,
     },
 }
 
@@ -1500,6 +1561,26 @@ const IMAGE_PULL: &[F] = &[
     F::required("rootfs", T::String),
     F::required("initrd", T::NullableString),
 ];
+const MACOS_IMAGE_ACTION: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("image", T::Object),
+];
+const MACOS_LIST: &[F] = &[
+    F::required("status", T::String),
+    F::required("action", T::String),
+    F::required("images", T::Array),
+];
+const MACOS_IMAGE_ITEM: &[F] = &[
+    F::required("name", T::String),
+    F::required("path", T::String),
+    F::required("build", T::String),
+    F::required("os_version", T::String),
+    F::required("disk_size_bytes", T::Integer),
+    F::required("min_cpus", T::Integer),
+    F::required("min_memory_mib", T::Integer),
+    F::required("agent_provisioned", T::Boolean),
+];
 const VOLUME_ACTION: &[F] = &[
     F::required("status", T::String),
     F::required("action", T::String),
@@ -1612,6 +1693,10 @@ pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
     CommandContract::object("image export", true, IMAGE_EXPORT),
     CommandContract::object("image delete", true, IMAGE_DELETE),
     CommandContract::object("image pull", true, IMAGE_PULL),
+    CommandContract::object("macos install", true, MACOS_IMAGE_ACTION),
+    CommandContract::list("macos list", false, MACOS_LIST, "images", MACOS_IMAGE_ITEM),
+    CommandContract::object("macos provision", true, MACOS_IMAGE_ACTION),
+    CommandContract::unsupported("guest-agent", false),
     CommandContract::object("volume create", true, VOLUME_ACTION),
     CommandContract::list("volume list", false, VOLUME_LIST, "volumes", VOLUME_ITEM),
     CommandContract::object("volume get", false, VOLUME_ACTION),

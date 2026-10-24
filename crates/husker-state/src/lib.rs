@@ -738,6 +738,25 @@ const MIGRATIONS: &[(u32, &str)] = &[
             ON vm_expirations(expires_at);",
     ),
     (14, "ALTER TABLE vms ADD COLUMN egress_policy TEXT;"),
+    (
+        15,
+        "DROP TRIGGER vm_boot_kind_must_be_known_on_insert;
+         DROP TRIGGER vm_boot_kind_must_be_known_on_update;
+
+         CREATE TRIGGER vm_boot_kind_must_be_known_on_insert
+         BEFORE INSERT ON vms
+         WHEN NEW.boot_mode NOT IN ('direct', 'uefi', 'efi', 'macos')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM boot kind');
+         END;
+
+         CREATE TRIGGER vm_boot_kind_must_be_known_on_update
+         BEFORE UPDATE OF boot_mode ON vms
+         WHEN NEW.boot_mode NOT IN ('direct', 'uefi', 'efi', 'macos')
+         BEGIN
+             SELECT RAISE(ABORT, 'unknown VM boot kind');
+         END;",
+    ),
 ];
 
 /// Bring a database's schema version up to date: stamp the baseline onto a
@@ -5444,6 +5463,22 @@ mod tests {
 
         let error = store.get_vm(record.id).unwrap_err();
         assert!(error.to_string().contains("unknown backend kind 'xen'"));
+    }
+
+    #[test]
+    fn every_boot_kind_round_trips_through_the_database() {
+        let store = StateStore::open_memory().unwrap();
+        for kind in [
+            BootKind::DirectKernel,
+            BootKind::Uefi,
+            BootKind::Efi,
+            BootKind::MacOs,
+        ] {
+            let mut record = make_record(&format!("boot-{kind}"));
+            record.boot_mode = kind;
+            store.insert_vm(&record).unwrap();
+            assert_eq!(store.get_vm(record.id).unwrap().boot_mode, kind);
+        }
     }
 
     #[test]

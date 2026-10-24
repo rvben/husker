@@ -183,6 +183,11 @@ fn select_vmm_kind(
             "EFI boot is not supported by the Linux VMM dispatcher".into(),
         ));
     }
+    if requirements.boot == BootKind::MacOs {
+        return Err(VmmError::InvalidConfig(
+            crate::MACOS_GUEST_UNSUPPORTED.into(),
+        ));
+    }
     if requirements.requested.is_none() && requirements.has_host_shares {
         Ok(VmmKind::Qemu)
     } else {
@@ -387,6 +392,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn macos_guests_are_rejected_for_every_linux_backend() {
+        for requested in [None, Some(VmmKind::Firecracker), Some(VmmKind::Qemu)] {
+            let err = select_vmm_kind(
+                BackendRequirements {
+                    requested,
+                    boot: BootKind::MacOs,
+                    has_host_shares: false,
+                },
+                VmmKind::Firecracker,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Apple Silicon"), "{err}");
+        }
     }
 
     // An id not in the route map must return VmNotFound before touching any backend.

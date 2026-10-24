@@ -21,6 +21,8 @@ linux-net = ["husker-core/linux-net", "husker-api/linux-net", "husker-net"]
 husker-api = { workspace = true }
 husker-core = { workspace = true }
 husker-vmm = { workspace = true }
+# macOS guests run this same binary as their guest agent (`husker guest-agent`).
+husker-agent = { workspace = true }
 husker-net = { workspace = true, optional = true }
 husker-storage = { workspace = true }
 husker-state = { workspace = true }
@@ -45,10 +47,12 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
 libc = "0.2"
+# The 0700 mount directory `macos provision` attaches the guest disk under.
+tempfile = "3"
+
 
 [dev-dependencies]
 assert_cmd = "2"
-tempfile = "3"
 jsonschema = { version = "0.47", default-features = false }
 # Stub daemon for the `job` behavioural tests (already a workspace dep via husker-api).
 axum = { workspace = true }

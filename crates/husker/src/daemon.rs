@@ -211,11 +211,11 @@ pub(crate) fn find_in_path(name: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Acquire an exclusive, non-blocking advisory lock on the daemon lock file.
-/// The returned `File` must be kept alive for the daemon's lifetime; the lock
-/// releases when it is dropped or the process exits. An error means another
-/// process already holds it (a daemon is running).
-pub(crate) fn acquire_daemon_lock(path: &Path) -> std::io::Result<std::fs::File> {
+/// Acquire an exclusive, non-blocking advisory lock on `path` (the daemon lock
+/// file, or a per-operation lock such as a macOS image install). The returned
+/// `File` holds the lock until it is dropped or the process exits. An error of
+/// kind `WouldBlock` means another process already holds it.
+pub(crate) fn try_lock_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -373,7 +373,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
     // Daemon lock: refuse to start a second daemon against the same state dir.
     std::fs::create_dir_all(storage.state_dir.clone()).context("creating state directory")?;
     restrict_dir_permissions(&storage.state_dir);
-    let _daemon_lock = acquire_daemon_lock(&storage.lock_path())
+    let _daemon_lock = try_lock_exclusive(&storage.lock_path())
         .context("another husker daemon is already running (state dir is locked)")?;
 
     let runtime_dir = storage.runtime_dir();

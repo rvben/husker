@@ -1053,6 +1053,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "husker-agent",
  "husker-agent-proto",
  "husker-api",
  "husker-core",

@@ -40,7 +40,7 @@ use crate::{BackendKind, CreatedVm, VmConfig, VmInfo, VmState, VmmBackend, VmmEr
 /// created on. By confining access to that queue (via `dispatch_sync_result` and
 /// `dispatch_vz_op`), the `Send + Sync` impl is sound: the value is moved
 /// between threads only inside closures dispatched to the correct queue.
-struct QueueConfined<T>(T);
+pub(crate) struct QueueConfined<T>(pub(crate) T);
 
 // Safety: Values are only accessed from their associated serial dispatch queue,
 // satisfying VZVirtualMachine's queue-affinity requirement. Cross-thread moves
@@ -189,6 +189,9 @@ impl AppleVzBackend {
                             unsafe { efi_loader.setVariableStore(Some(&store)) };
                             objc2::rc::Retained::into_super(efi_loader)
                         }
+                        crate::BootMode::MacOs { .. } => {
+                            crate::apple_vz_macos::macos_boot_loader()?
+                        }
                         crate::BootMode::Uefi { .. } => {
                             // Filtered out before entering the dispatch closure; this
                             // arm is unreachable but required for exhaustive matching.
@@ -324,10 +327,29 @@ impl AppleVzBackend {
                     }
                 }
 
-                // Platform (required for Linux on ARM64)
-                let platform = unsafe { VZGenericPlatformConfiguration::new() };
-                unsafe {
-                    vz_config.setPlatform(&platform);
+                // Platform: a macOS guest needs the Mac platform it was
+                // installed for plus the Mac input/graphics devices; Linux on
+                // ARM64 uses the generic platform.
+                if let crate::BootMode::MacOs {
+                    auxiliary_storage,
+                    hardware_model,
+                    machine_identifier,
+                } = &config.boot
+                {
+                    let platform = crate::apple_vz_macos::mac_platform(
+                        hardware_model,
+                        machine_identifier,
+                        auxiliary_storage,
+                    )?;
+                    unsafe {
+                        vz_config.setPlatform(&platform);
+                        crate::apple_vz_macos::add_macos_devices(&vz_config);
+                    }
+                } else {
+                    let platform = unsafe { VZGenericPlatformConfiguration::new() };
+                    unsafe {
+                        vz_config.setPlatform(&platform);
+                    }
                 }
 
                 // Serial console (hvc0 — virtio console)
@@ -408,7 +430,7 @@ impl Drop for AppleVzBackend {
 ///
 /// Uses a oneshot channel to transfer the result from the dispatch queue thread
 /// back to the async caller, avoiding any mutex unwrap.
-async fn dispatch_sync_result<T: Send + 'static>(
+pub(crate) async fn dispatch_sync_result<T: Send + 'static>(
     queue: DispatchRetained<DispatchQueue>,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, VmmError> {
@@ -430,7 +452,7 @@ async fn dispatch_sync_result<T: Send + 'static>(
 ///
 /// Convenience wrapper over `dispatch_sync_result` for closures that return
 /// `Result<T, VmmError>`, avoiding the `??` pattern at call sites.
-async fn dispatch_sync_fallible<T: Send + 'static>(
+pub(crate) async fn dispatch_sync_fallible<T: Send + 'static>(
     queue: DispatchRetained<DispatchQueue>,
     f: impl FnOnce() -> Result<T, VmmError> + Send + 'static,
 ) -> Result<T, VmmError> {

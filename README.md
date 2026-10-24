@@ -203,6 +203,7 @@ supports aarch64 (agent-less build - see below).
 |---------|:---:|:---:|:---:|
 | Direct-kernel boot | ✓ | ✓ | ✓ |
 | Cloud images (`--cloud-image`) | — ¹ | ✓ (UEFI/OVMF) | ✓ (EFI) |
+| macOS guests (`--macos`) | - | - | ✓ ⁴ |
 | `exec` / `shell` / file copy | ✓ | ✓ | ✓ |
 | One-shot jobs (`husker job`) | ✓ | ✓ | ✓ |
 | Self-healing services | ✓ | ✓ | ✓ ² |
@@ -219,6 +220,7 @@ Notes:
 1. Cloud-image boot needs UEFI; Firecracker does direct-kernel boot only, so use `--vmm qemu` on Linux for cloud images.
 2. On macOS, `--volume` and services are not yet supported together with `--cloud-image` (both work with the default rootfs).
 3. Bridged networking requires a cloud-image VM (so `--vmm qemu`) plus the `lan_bridge` config option, and is Linux-only.
+4. Apple Silicon only. See [macOS guests](#macos-guests) below.
 
 Only the two primary targets (Linux x86_64 and macOS ARM64) ship with the
 embedded guest agent. The Linux ARM64 and Intel-macOS builds are agent-less:
@@ -278,6 +280,23 @@ the IP is known.
 
 **Not yet supported on macOS with cloud images:** `--volume`, `--mount`, `--balloon`, and services
 (`husker service`). Bridged networking (`--net bridged`) is Linux-only.
+
+### macOS guests
+
+On Apple Silicon, husker runs macOS itself as a guest through
+Virtualization.framework: install an image from Apple's latest restore image
+(or a local IPSW), provision the guest agent into it once, then boot VMs from it
+(up to two at a time, Apple's limit), each with its own cloned disk and
+machine identifier.
+
+```bash
+husker macos install sonoma                                   # downloads the latest IPSW and installs it
+sudo husker macos provision ~/.local/share/husker/macos/sonoma # installs the guest agent (needs root)
+husker run --macos sonoma --name mac1
+husker exec mac1 -- sw_vers
+```
+
+See [docs/macos-guests.md](docs/macos-guests.md) for requirements, options and limitations.
 
 ## Alternatives
 

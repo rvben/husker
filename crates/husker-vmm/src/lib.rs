@@ -21,6 +21,10 @@ pub use dispatch::{LinuxDispatchBackend, LinuxVsockStream};
 
 #[cfg(target_os = "macos")]
 pub mod apple_vz;
+#[cfg(target_os = "macos")]
+pub mod apple_vz_macos;
+
+pub mod macos_bundle;
 
 use std::path::PathBuf;
 
@@ -43,6 +47,10 @@ pub use husker_types::{BackendKind, BootKind, InvalidBackendKind, InvalidBootKin
 /// Applies to direct-kernel boots only. Cloud images boot their own bootloader
 /// and do not take a husker-built cmdline.
 pub const LEGACY_PROBE_SUPPRESSION: &str = "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd";
+
+/// Error text for backends that cannot run a macOS guest.
+pub const MACOS_GUEST_UNSUPPORTED: &str =
+    "macOS guests require the Apple Virtualization.framework backend on an Apple Silicon Mac";
 
 /// A host directory shared into the guest over virtiofs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +295,8 @@ impl Capabilities {
 /// kernel + initrd + appended cmdline). `Uefi` boots the disk's own bootloader via
 /// OVMF firmware and carries the firmware paths it needs. `Efi` is for Apple VZ
 /// where the Virtualization framework supplies the firmware and only a per-VM NVRAM
-/// file is needed.
+/// file is needed. `MacOs` boots an installed macOS guest on Apple VZ's Mac
+/// platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum BootMode {
@@ -303,6 +312,17 @@ pub enum BootMode {
     /// EFI boot with a per-VM variable store (Apple VZ; firmware comes from
     /// the Virtualization framework, only the NVRAM file is ours).
     Efi { variable_store: PathBuf },
+    /// macOS guest on Apple VZ's Mac platform (Apple Silicon hosts only).
+    /// `rootfs_path` is the installed APFS boot disk.
+    #[serde(rename = "macos")]
+    MacOs {
+        /// Per-VM VZMacAuxiliaryStorage cloned from the bundle (writable).
+        auxiliary_storage: PathBuf,
+        /// VZMacHardwareModel data the guest was installed for.
+        hardware_model: PathBuf,
+        /// Per-VM VZMacMachineIdentifier data; distinct for every VM.
+        machine_identifier: PathBuf,
+    },
 }
 
 impl BootMode {
@@ -316,6 +336,7 @@ impl BootMode {
             BootMode::DirectKernel => BootKind::DirectKernel,
             BootMode::Uefi { .. } => BootKind::Uefi,
             BootMode::Efi { .. } => BootKind::Efi,
+            BootMode::MacOs { .. } => BootKind::MacOs,
         }
     }
 }
@@ -808,6 +829,21 @@ mod tests {
         let json = serde_json::to_string(&mode).unwrap();
         assert!(json.contains("\"efi\""), "tagged as efi: {json}");
         let back: BootMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, mode);
+    }
+
+    #[test]
+    fn boot_mode_macos_serde_round_trip_uses_the_macos_tag() {
+        use super::BootMode;
+        let mode = BootMode::MacOs {
+            auxiliary_storage: "/vm/aux.img".into(),
+            hardware_model: "/vm/hardware-model.bin".into(),
+            machine_identifier: "/vm/machine-identifier.bin".into(),
+        };
+        let json = serde_json::to_value(&mode).unwrap();
+        assert_eq!(json["mode"], "macos");
+        assert_eq!(mode.as_str(), "macos");
+        let back: BootMode = serde_json::from_value(json).unwrap();
         assert_eq!(back, mode);
     }
 

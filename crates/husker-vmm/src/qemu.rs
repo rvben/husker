@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
 use crate::{BackendKind, CreatedVm};
-use crate::{VmConfig, VmInfo, VmState, VmmError};
+use crate::{MACOS_GUEST_UNSUPPORTED, VmConfig, VmInfo, VmState, VmmError};
 
 /// A running QEMU VM tracked by the backend.
 pub(crate) struct QemuInstance {
@@ -251,6 +251,9 @@ impl QemuKvmBackend {
                     "BootMode::Efi is not supported by the QEMU backend; use BootMode::Uefi with OVMF paths".into(),
                 ));
             }
+            crate::BootMode::MacOs { .. } => {
+                return Err(VmmError::InvalidConfig(MACOS_GUEST_UNSUPPORTED.into()));
+            }
         }
 
         // Networking: husker-core already created/attached `config.tap_device`.
@@ -285,6 +288,9 @@ impl QemuKvmBackend {
             return Err(VmmError::InvalidConfig(
                 "BootMode::Efi is not supported by the QEMU backend; use BootMode::Uefi with OVMF paths".into(),
             ));
+        }
+        if matches!(config.boot, crate::BootMode::MacOs { .. }) {
+            return Err(VmmError::InvalidConfig(MACOS_GUEST_UNSUPPORTED.into()));
         }
         {
             let instances = self.instances.lock().await;

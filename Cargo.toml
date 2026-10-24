@@ -92,6 +92,7 @@ husker-core = { path = "crates/husker-core", default-features = false }
 husker-vmm = { path = "crates/husker-vmm" }
 husker-net = { path = "crates/husker-net" }
 husker-storage = { path = "crates/husker-storage" }
+husker-agent = { path = "crates/husker-agent" }
 husker-agent-proto = { path = "crates/husker-agent-proto" }
 husker-api = { path = "crates/husker-api", default-features = false }
 husker-state = { path = "crates/husker-state" }

@@ -53,8 +53,8 @@ impl std::str::FromStr for BackendKind {
 /// The guest boot mechanism, without backend-specific artifact paths.
 ///
 /// This identity is used for backend selection, persistence, readiness policy,
-/// and API serialization. The stable wire values remain `direct`, `uefi`, and
-/// `efi`.
+/// and API serialization. The stable wire values are `direct`, `uefi`, `efi`,
+/// and `macos`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BootKind {
@@ -63,21 +63,31 @@ pub enum BootKind {
     DirectKernel,
     Uefi,
     Efi,
+    /// A macOS guest booted by Apple VZ's macOS boot loader on a Mac platform.
+    #[serde(rename = "macos")]
+    MacOs,
 }
 
 impl BootKind {
-    pub const ALL: [Self; 3] = [Self::DirectKernel, Self::Uefi, Self::Efi];
+    pub const ALL: [Self; 4] = [Self::DirectKernel, Self::Uefi, Self::Efi, Self::MacOs];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DirectKernel => "direct",
             Self::Uefi => "uefi",
             Self::Efi => "efi",
+            Self::MacOs => "macos",
         }
     }
 
     pub const fn uses_firmware(self) -> bool {
-        matches!(self, Self::Uefi | Self::Efi)
+        matches!(self, Self::Uefi | Self::Efi | Self::MacOs)
+    }
+
+    /// Whether the guest obtains its address by DHCP from the VMM's NAT, so the
+    /// host learns it only from the running guest agent.
+    pub const fn learns_guest_ip_from_agent(self) -> bool {
+        matches!(self, Self::Efi | Self::MacOs)
     }
 }
 
@@ -99,6 +109,7 @@ impl std::str::FromStr for BootKind {
             "direct" => Ok(Self::DirectKernel),
             "uefi" => Ok(Self::Uefi),
             "efi" => Ok(Self::Efi),
+            "macos" => Ok(Self::MacOs),
             other => Err(InvalidBootKind(other.to_string())),
         }
     }
@@ -318,6 +329,17 @@ mod tests {
 
         assert!("Direct".parse::<BootKind>().is_err());
         assert!("bios".parse::<BootKind>().is_err());
+    }
+
+    #[test]
+    fn macos_boot_kind_is_a_firmware_boot_with_an_agent_reported_ip() {
+        assert_eq!(BootKind::MacOs.as_str(), "macos");
+        assert!(BootKind::MacOs.uses_firmware());
+        assert!(BootKind::MacOs.learns_guest_ip_from_agent());
+        assert!(BootKind::Efi.learns_guest_ip_from_agent());
+        assert!(!BootKind::Uefi.learns_guest_ip_from_agent());
+        assert!(!BootKind::DirectKernel.learns_guest_ip_from_agent());
+        assert!(!BootKind::DirectKernel.uses_firmware());
     }
 
     #[test]

@@ -39,14 +39,15 @@ pub(crate) const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
 /// unset (UEFI/cloud VMs boot far slower than microVMs), clamped to
 /// `[1, MAX_EXEC_CONNECT_TIMEOUT_SECS]` otherwise.
 ///
-/// Both "uefi" (Linux/QEMU cloud-image) and "efi" (macOS/VZ cloud-image) need
-/// the extended timeout because both run cloud-init on first boot.
+/// Firmware-booted guests ("uefi", "efi" and "macos") wait as long as the
+/// core readiness default for their boot mode, since all of them run a full OS
+/// first boot before the agent starts.
 pub(crate) fn resolve_exec_connect_timeout(
     requested: Option<u64>,
     boot_kind: BootKind,
 ) -> Duration {
     let default = if boot_kind.uses_firmware() {
-        husker_core::UEFI_READY_TIMEOUT_SECS
+        husker_core::default_ready_timeout(boot_kind).as_secs()
     } else {
         DEFAULT_EXEC_CONNECT_TIMEOUT_SECS
     };

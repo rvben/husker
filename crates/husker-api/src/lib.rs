@@ -2089,6 +2089,10 @@ mod tests {
             Duration::from_secs(husker_core::UEFI_READY_TIMEOUT_SECS)
         );
         assert_eq!(
+            resolve_exec_connect_timeout(None, BootKind::MacOs),
+            Duration::from_secs(husker_core::MACOS_READY_TIMEOUT_SECS)
+        );
+        assert_eq!(
             resolve_exec_connect_timeout(Some(5), BootKind::DirectKernel),
             Duration::from_secs(5)
         );

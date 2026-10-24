@@ -284,6 +284,12 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// instead of leaving the user to discover `husker logs` on their own.
     /// Returns an empty string if the VM record is gone (nothing to point at).
     fn boot_failure_detail(&self, name: &str) -> String {
+        let Ok(record) = self.lookup_vm(name) else {
+            return String::new();
+        };
+        if record.boot_mode == BootKind::MacOs {
+            return macos_guest::macos_boot_failure_hint();
+        }
         let Ok(path) = self.serial_log_path(name) else {
             return String::new();
         };
