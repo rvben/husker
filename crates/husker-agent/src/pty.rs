@@ -71,7 +71,10 @@ impl Pty {
         let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
 
-        let async_master = AsyncFd::new(master)?;
+        // Safety: the AsyncFd takes the master OwnedFd and Pty never closes,
+        // replaces or releases it, so the fd stays open and refers to the
+        // same file description until the AsyncFd is dropped.
+        let async_master = unsafe { AsyncFd::register(master)? };
         Ok((Self { fd: async_master }, slave))
     }
 

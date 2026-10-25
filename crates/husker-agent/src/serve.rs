@@ -128,7 +128,12 @@ async fn listen_vsock() -> Result<()> {
     if unsafe { libc::listen(listener.as_raw_fd(), 128) } < 0 {
         return Err(vsock_bind_error(port, std::io::Error::last_os_error()));
     }
-    let listener = tokio::io::unix::AsyncFd::new(listener).context("registering vsock listener")?;
+    // Safety: the AsyncFd takes the listening OwnedFd and this loop only
+    // accepts on it, so the fd stays open and refers to the same socket
+    // until the AsyncFd is dropped.
+    let listener = unsafe { tokio::io::unix::AsyncFd::register(listener) }
+        .map_err(std::io::Error::from)
+        .context("registering vsock listener")?;
     info!("listening on vsock port {port}");
 
     loop {

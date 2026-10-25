@@ -67,7 +67,10 @@ impl FdStream {
 
             // raw_fd is a valid, open fd that we own (caller's contract).
             let owned = OwnedFd::from_raw_fd(raw_fd);
-            let async_fd = AsyncFd::new(owned)?;
+            // The AsyncFd takes the OwnedFd and FdStream never closes,
+            // replaces or releases it, so the fd stays open and refers to
+            // the same file description until the AsyncFd is dropped.
+            let async_fd = AsyncFd::register(owned)?;
             Ok(Self { fd: async_fd })
         }
     }
