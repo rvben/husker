@@ -442,6 +442,20 @@ impl Config {
             .clone()
             .unwrap_or_else(|| self.data_dir.clone())
     }
+
+    /// The image-release assets `husker image pull` downloads for `arch`, each
+    /// paired with its configured destination. The kernel and initramfs must
+    /// stay a matched pair, so callers treat the whole set as one unit.
+    pub(crate) fn image_pull_targets(&self, arch: &str) -> Vec<(String, PathBuf)> {
+        let mut targets = vec![
+            (format!("kernel-{arch}"), self.default_kernel.clone()),
+            (format!("rootfs-{arch}.ext4"), self.default_rootfs.clone()),
+        ];
+        if let Some(initrd) = &self.default_initrd {
+            targets.push((format!("initramfs-{arch}.gz"), initrd.clone()));
+        }
+        targets
+    }
 }
 
 /// Resolve the config file path by checking (in order):

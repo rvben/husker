@@ -126,12 +126,15 @@ fn host_local_refusal(command: &Commands) -> Option<String> {
         ),
         Commands::Image {
             action: ImageAction::Pull { .. },
-        } => Some(format!(
-            "image pull downloads into THIS machine's husker data dir and cannot target a remote \
-             context; ssh to the daemon host and run it there (destinations: {}, {})",
-            load_config(None).default_kernel.display(),
-            husker::default_rootfs_path().display(),
-        )),
+        } => {
+            let config = load_config(None);
+            Some(format!(
+                "image pull downloads into THIS machine's husker data dir and cannot target a \
+                 remote context; ssh to the daemon host and run it there (destinations: {}, {})",
+                config.default_kernel.display(),
+                config.default_rootfs.display(),
+            ))
+        }
         _ => None,
     }
 }
@@ -3245,18 +3248,7 @@ async fn image_command(
                 .await
                 .context("fetching SHA256SUMS manifest")?;
 
-            let arch = std::env::consts::ARCH;
-            let kernel_asset = format!("kernel-{arch}");
-            let rootfs_asset = format!("rootfs-{arch}.ext4");
-            let initrd_asset = format!("initramfs-{arch}.gz");
-
-            let mut targets: Vec<(String, PathBuf)> = vec![
-                (kernel_asset, config.default_kernel.clone()),
-                (rootfs_asset, husker::default_rootfs_path()),
-            ];
-            if let Some(initrd_dest) = config.default_initrd.clone() {
-                targets.push((initrd_asset, initrd_dest));
-            }
+            let targets = config.image_pull_targets(std::env::consts::ARCH);
 
             // The kernel and initramfs must come from the SAME image release: a
             // stale kernel paired with a freshly downloaded initramfs fails module
@@ -3289,7 +3281,7 @@ async fn image_command(
                     "status": "ok",
                     "action": "image-pull",
                     "kernel": config.default_kernel,
-                    "rootfs": husker::default_rootfs_path(),
+                    "rootfs": config.default_rootfs,
                     "initrd": config.default_initrd,
                 }),
                 "Images pulled.",
@@ -6723,6 +6715,43 @@ mod tests {
                 "/tmp/husker-cascade-test"
             )))
         );
+    }
+
+    /// `image pull` writes every asset to the path the daemon will read it
+    /// from, so a configured rootfs location is the download destination.
+    #[test]
+    fn image_pull_targets_follow_the_configured_paths() {
+        let config = Config {
+            default_kernel: PathBuf::from("/srv/husker/kernels/vmlinux"),
+            default_rootfs: PathBuf::from("/srv/husker/images/alpine.ext4"),
+            default_initrd: Some(PathBuf::from("/srv/husker/images/initramfs.gz")),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.image_pull_targets("x86_64"),
+            vec![
+                (
+                    "kernel-x86_64".to_string(),
+                    PathBuf::from("/srv/husker/kernels/vmlinux")
+                ),
+                (
+                    "rootfs-x86_64.ext4".to_string(),
+                    PathBuf::from("/srv/husker/images/alpine.ext4")
+                ),
+                (
+                    "initramfs-x86_64.gz".to_string(),
+                    PathBuf::from("/srv/husker/images/initramfs.gz")
+                ),
+            ]
+        );
+
+        let without_initrd = Config {
+            default_initrd: None,
+            ..config
+        };
+        let targets = without_initrd.image_pull_targets("aarch64");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[1].0, "rootfs-aarch64.ext4");
     }
 
     #[test]
