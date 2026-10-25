@@ -3965,8 +3965,7 @@ impl ConfigCheckReport {
 /// downloaded, and the boot path drops a missing initrd and starts the VM
 /// without one, so its absence is not a broken configuration.
 fn is_derived_initrd(config: &Config, initrd: &Path) -> bool {
-    initrd == husker::default_initrd_path()
-        || initrd == husker::default_initrd_path_for(&config.data_dir)
+    config.is_derived_path(initrd, husker::default_initrd_path_for)
 }
 
 fn check_regular_file(report: &mut ConfigCheckReport, name: &str, path: &Path) {
@@ -6714,6 +6713,31 @@ mod tests {
             Some(husker::default_initrd_path_for(&PathBuf::from(
                 "/tmp/husker-cascade-test"
             )))
+        );
+    }
+
+    /// A `data_dir` in the config file does not move the serde defaults for
+    /// the image paths, so the cascade must recognise them as derived there
+    /// too; only a path the operator named explicitly stays put.
+    #[test]
+    fn env_override_data_dir_cascades_over_a_data_dir_set_in_the_config_file() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSKER_DATA_DIR", "/tmp/husker-cascade-env");
+        let mut config: Config = toml::from_str(
+            "data_dir = \"/tmp/husker-cascade-toml\"\ndefault_kernel = \"/custom/vmlinux\"\n",
+        )
+        .unwrap();
+        apply_env_overrides(&mut config);
+        let env_dir = PathBuf::from("/tmp/husker-cascade-env");
+        assert_eq!(config.data_dir, env_dir);
+        assert_eq!(config.default_kernel, PathBuf::from("/custom/vmlinux"));
+        assert_eq!(
+            config.default_rootfs,
+            husker::default_rootfs_path_for(&env_dir)
+        );
+        assert_eq!(
+            config.default_initrd,
+            Some(husker::default_initrd_path_for(&env_dir))
         );
     }
 

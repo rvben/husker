@@ -92,6 +92,10 @@ fn config_check_json_reports_parse_failure_without_mixed_prose() {
 /// once a kernel has been downloaded. `vm_lifecycle` drops it when it is absent
 /// and boots without one, so `config check` must not call a fresh install
 /// broken.
+///
+/// The fixture leaves `default_initrd` unset, so it derives from the data dir.
+/// `HUSKER_DATA_DIR` pins that to the fresh directory: as root the platform
+/// default is `/var/lib/husker`, where a provisioned host has a real initramfs.
 #[test]
 fn a_derived_initrd_that_was_never_downloaded_is_not_a_failure() {
     let (dir, config) = valid_config_fixture();
@@ -100,6 +104,7 @@ fn a_derived_initrd_that_was_never_downloaded_is_not_a_failure() {
         .unwrap()
         .env("HOME", &fresh_machine)
         .env("XDG_DATA_HOME", &fresh_machine)
+        .env("HUSKER_DATA_DIR", &fresh_machine)
         .args([
             "--config",
             config.to_str().unwrap(),

@@ -443,6 +443,14 @@ impl Config {
             .unwrap_or_else(|| self.data_dir.clone())
     }
 
+    /// True when `path` is one husker derived for itself rather than one the
+    /// operator named. The serde defaults derive from the platform data dir,
+    /// and a `data_dir` set in the config file does not move them, so a
+    /// derived path is the same file under either directory.
+    pub(crate) fn is_derived_path(&self, path: &Path, derive: fn(&Path) -> PathBuf) -> bool {
+        path == derive(&husker::default_data_dir()) || path == derive(&self.data_dir)
+    }
+
     /// The image-release assets `husker image pull` downloads for `arch`, each
     /// paired with its configured destination. The kernel and initramfs must
     /// stay a matched pair, so callers treat the whole set as one unit.
@@ -484,16 +492,17 @@ pub(crate) fn apply_env_overrides(config: &mut Config) {
         // Cascade the override to kernel/rootfs/initrd paths when they were
         // left at their defaults. Explicit TOML values (which do not match
         // the default-based paths) are preserved.
-        let old_default_kernel = husker::default_kernel_path_for(&config.data_dir);
-        let old_default_rootfs = husker::default_rootfs_path_for(&config.data_dir);
-        let old_default_initrd = husker::default_initrd_path_for(&config.data_dir);
-        if config.default_kernel == old_default_kernel {
+        if config.is_derived_path(&config.default_kernel, husker::default_kernel_path_for) {
             config.default_kernel = husker::default_kernel_path_for(&new_data_dir);
         }
-        if config.default_rootfs == old_default_rootfs {
+        if config.is_derived_path(&config.default_rootfs, husker::default_rootfs_path_for) {
             config.default_rootfs = husker::default_rootfs_path_for(&new_data_dir);
         }
-        if config.default_initrd.as_ref() == Some(&old_default_initrd) {
+        if config
+            .default_initrd
+            .as_deref()
+            .is_some_and(|initrd| config.is_derived_path(initrd, husker::default_initrd_path_for))
+        {
             config.default_initrd = Some(husker::default_initrd_path_for(&new_data_dir));
         }
         config.data_dir = new_data_dir;
