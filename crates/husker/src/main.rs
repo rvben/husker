@@ -73,7 +73,6 @@ fn command_requires_text_output(command: &Commands) -> bool {
             | Commands::Events { follow: true, .. }
             | Commands::Shell { .. }
             | Commands::Logs { follow: true, .. }
-            | Commands::Config { .. }
             | Commands::Setup { .. }
             | Commands::Completions { .. }
             | Commands::GuestAgent
@@ -3985,6 +3984,23 @@ fn check_regular_file(report: &mut ConfigCheckReport, name: &str, path: &Path) {
     }
 }
 
+/// Status of the configured data directory without creating it. `config check`
+/// is a read-only command: the daemon creates its data directory on first
+/// start, so a directory that does not exist yet is a warning, while a path
+/// that exists and is not a directory is a failure the daemon would hit.
+fn data_dir_status(path: &Path) -> (&'static str, &'static str) {
+    if path.is_dir() {
+        ("ok", "")
+    } else if path.exists() {
+        ("fail", "not a directory")
+    } else {
+        (
+            "warn",
+            "not created yet; the daemon creates it on first start",
+        )
+    }
+}
+
 /// Machine-readable config validation. It validates the same effective values
 /// the daemon uses, including environment overrides, and never mixes prose into
 /// stdout before its one JSON document.
@@ -4024,22 +4040,16 @@ fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
     };
     apply_env_overrides(&mut config);
 
-    if config.data_dir.exists() {
-        report.push("data_dir", "ok", config.data_dir.display().to_string());
-    } else {
-        match std::fs::create_dir_all(&config.data_dir) {
-            Ok(()) => report.push(
-                "data_dir",
-                "ok",
-                format!("{}: created", config.data_dir.display()),
-            ),
-            Err(error) => report.push(
-                "data_dir",
-                "fail",
-                format!("{}: {error}", config.data_dir.display()),
-            ),
-        }
-    }
+    let (data_dir_state, data_dir_detail) = data_dir_status(&config.data_dir);
+    report.push(
+        "data_dir",
+        data_dir_state,
+        if data_dir_detail.is_empty() {
+            config.data_dir.display().to_string()
+        } else {
+            format!("{}: {data_dir_detail}", config.data_dir.display())
+        },
+    );
     check_regular_file(&mut report, "default_kernel", &config.default_kernel);
     check_regular_file(&mut report, "default_rootfs", &config.default_rootfs);
     if let Some(initrd) = &config.default_initrd {
@@ -4309,20 +4319,18 @@ fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()
     } else {
         ""
     };
-    if dd.exists() {
-        println!("  data_dir ({}) ... OK{dd_env_hint}", dd.display());
-    } else {
-        match std::fs::create_dir_all(dd) {
-            Ok(()) => {
-                println!(
-                    "  data_dir ({}) ... OK (created){dd_env_hint}",
-                    dd.display()
-                );
-            }
-            Err(e) => {
-                println!("  data_dir ({}) ... FAIL ({e}){dd_env_hint}", dd.display());
-                all_ok = false;
-            }
+    match data_dir_status(dd) {
+        ("ok", _) => println!("  data_dir ({}) ... OK{dd_env_hint}", dd.display()),
+        ("warn", _) => println!(
+            "  data_dir ({}) ... not created yet (the daemon creates it on first start){dd_env_hint}",
+            dd.display()
+        ),
+        (_, detail) => {
+            println!(
+                "  data_dir ({}) ... FAIL ({detail}){dd_env_hint}",
+                dd.display()
+            );
+            all_ok = false;
         }
     }
 
@@ -5929,7 +5937,6 @@ mod tests {
             vec!["husker", "daemon"],
             vec!["husker", "shell", "vm"],
             vec!["husker", "logs", "vm", "--follow"],
-            vec!["husker", "config", "check"],
             vec!["husker", "setup", "storage"],
             vec!["husker", "completions", "bash"],
             vec!["husker", "guest-agent"],
@@ -5970,6 +5977,9 @@ mod tests {
             vec!["husker", "list"],
             vec!["husker", "logs", "vm"],
             vec!["husker", "doctor"],
+            // `husker schema` promises a typed report for `config check`, so a
+            // pipe gets the JSON document, not the prose rendering.
+            vec!["husker", "config", "check"],
         ] {
             let cli = Cli::try_parse_from(args).expect("finite command should parse");
             assert!(!command_requires_text_output(&cli.command));

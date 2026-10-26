@@ -199,3 +199,132 @@ fn config_check_validates_the_effective_environment_override() {
             .ends_with("override-vmlinux")
     );
 }
+
+/// `husker schema` declares `config check` as a typed object, so a pipe gets
+/// that document without an explicit `--output json`.
+#[test]
+fn config_check_emits_the_json_report_when_stdout_is_not_a_terminal() {
+    let (_dir, config) = valid_config_fixture();
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .env_remove("HUSKER_DATA_DIR")
+        .args(["--config", config.to_str().unwrap(), "config", "check"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("piped config check output must be one JSON document");
+    assert_eq!(report["status"], "ok");
+}
+
+/// `config check` is read-only: a data directory that does not exist yet is
+/// reported, not created, in both output modes.
+#[test]
+fn config_check_reports_a_missing_data_dir_without_creating_it() {
+    let (dir, config) = valid_config_fixture();
+    let data_dir = dir.path().join("data");
+    assert!(!data_dir.exists());
+
+    let json = Command::cargo_bin("husker")
+        .unwrap()
+        .env_remove("HUSKER_DATA_DIR")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "json",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    assert!(
+        !data_dir.exists(),
+        "config check --output json created {}",
+        data_dir.display()
+    );
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["status"], "ok");
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "data_dir")
+        .unwrap();
+    assert_eq!(check["status"], "warn");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("not created yet"),
+        "{check}"
+    );
+
+    let text = Command::cargo_bin("husker")
+        .unwrap()
+        .env_remove("HUSKER_DATA_DIR")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "text",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    assert!(
+        !data_dir.exists(),
+        "config check --output text created {}",
+        data_dir.display()
+    );
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains("data_dir") && stdout.contains("not created yet"),
+        "{stdout}"
+    );
+}
+
+/// A data_dir path that exists as a file is the failure the daemon would hit
+/// on start, so the check reports it as one.
+#[test]
+fn config_check_fails_when_the_data_dir_path_is_a_file() {
+    let (dir, config) = valid_config_fixture();
+    fs::write(dir.path().join("data"), b"not a directory").unwrap();
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .env_remove("HUSKER_DATA_DIR")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "json",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "data_dir")
+        .unwrap();
+    assert_eq!(check["status"], "fail");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("not a directory"),
+        "{check}"
+    );
+}
