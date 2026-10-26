@@ -30,7 +30,10 @@ use crate::cli_contract::command_contract;
 use crate::cli_contract::{CliErrorKind, normalize_error_kind, select_fields, structured_output};
 use crate::config::*;
 use crate::daemon::*;
-use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent, DaemonUnreachable};
+use crate::daemon_client::{
+    ApiFailure, DaemonClient, DaemonExecEvent, DaemonUnreachable, HandshakeRefusal,
+    classify_handshake,
+};
 use crate::daemon_target::*;
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::*;
@@ -683,24 +686,11 @@ async fn main() {
     };
     let output = resolve_command_format(cli.output, &cli.command);
     if let Err(e) = run(cli).await {
-        // A connection failure carries the DaemonUnreachable marker; everything
-        // else is a generic client error. API errors (not-found/conflict/denied)
-        // exit earlier via exit_with_error with their own codes. Rendered in the
-        // requested format so `--output json` callers always get parseable errors.
-        let (code, error_kind) = if e.chain().any(|cause| cause.is::<DaemonUnreachable>()) {
-            (exit_code::DAEMON_UNREACHABLE, "daemon_unreachable")
-        } else {
-            (exit_code::GENERAL, "error")
-        };
-        let message = format!("{e:#}");
-        let structured = render_error_envelope(error_kind, &message, None);
-        if output == OutputFormat::Json {
-            eprintln!("{structured}");
-        } else {
-            eprintln!("Error: {message}");
-            eprintln!("{structured}");
-        }
-        std::process::exit(code);
+        // A daemon failure that travelled through `?` keeps its kind and exit
+        // code, a connection failure carries the DaemonUnreachable marker, and
+        // everything else is a generic client error. Rendered in the requested
+        // format so `--output json` callers always get parseable errors.
+        exit_with_error(output, ApiFailure::from_error(&e));
     }
 }
 
@@ -3784,9 +3774,27 @@ async fn run_shell_ws(
             .insert(tungstenite::http::header::AUTHORIZATION, header);
     }
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .context("connecting to daemon WebSocket")?;
+    let (ws_stream, _) = match tokio_tungstenite::connect_async(ws_request).await {
+        Ok(value) => value,
+        Err(tungstenite::Error::Http(response)) => {
+            match classify_handshake(*response, &format!("VM '{name}'")) {
+                HandshakeRefusal::RouteMissing => exit_with_error(
+                    output,
+                    ApiFailure {
+                        message: "the daemon does not serve the interactive shell route".into(),
+                        kind: Some("not_found".into()),
+                        exit_code: exit_code::NOT_FOUND,
+                        hint: Some(
+                            "upgrade the daemon; GET /api-docs/openapi.json lists the routes it serves"
+                                .into(),
+                        ),
+                    },
+                ),
+                HandshakeRefusal::Refused(failure) => exit_with_error(output, failure),
+            }
+        }
+        Err(error) => return Err(error).context("connecting to daemon WebSocket"),
+    };
 
     let (mut ws_sink, mut ws_recv) = ws_stream.split();
 
@@ -3810,14 +3818,13 @@ async fn run_shell_ws(
                 serde_json::from_str(&text).context("invalid server message")?;
             match msg {
                 WsShellOutput::Started => {}
-                WsShellOutput::Error { message } => {
-                    eprintln!("Error: {message}");
-                    std::process::exit(1);
-                }
-                _ => {
-                    eprintln!("Error: unexpected response from server");
-                    std::process::exit(1);
-                }
+                WsShellOutput::Error {
+                    kind,
+                    message,
+                    hint,
+                    status,
+                } => exit_with_error(output, ApiFailure::from_frame(kind, message, hint, status)),
+                _ => exit_with_error(output, "unexpected response from server"),
             }
         }
         Ok(_) => anyhow::bail!("unexpected message type from server"),
@@ -3836,10 +3843,7 @@ async fn run_shell_ws(
     // for interactive CLI tools that use raw stdin.
     match result {
         Ok(exit_code) => std::process::exit(exit_code),
-        Err(e) => {
-            eprintln!("Shell error: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => exit_with_error(output, ApiFailure::from_error(&e)),
     }
 }
 
@@ -3896,8 +3900,8 @@ async fn run_shell_ws_bridge(
                             WsShellOutput::Exit { exit_code } => {
                                 return Ok(exit_code);
                             }
-                            WsShellOutput::Error { message } => {
-                                return Err(anyhow::anyhow!("agent error: {message}"));
+                            WsShellOutput::Error { kind, message, hint, status } => {
+                                return Err(ApiFailure::from_frame(kind, message, hint, status).into());
                             }
                             WsShellOutput::Started => {}
                         }

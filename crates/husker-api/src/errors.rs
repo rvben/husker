@@ -27,6 +27,11 @@ pub struct ErrorResponse {
     pub error: Option<String>,
 }
 
+/// A refused request: the status a REST route answers with and the envelope
+/// it carries. The WebSocket routes report their post-upgrade failures from
+/// the same value, so one status mapping serves both transports.
+pub(crate) type Failure = (StatusCode, Json<ErrorResponse>);
+
 pub(crate) fn error_response(kind: &str, message: impl Into<String>) -> Json<ErrorResponse> {
     let message = message.into();
     Json(ErrorResponse {
@@ -53,7 +58,7 @@ pub(crate) fn error_response_with_hint(
     })
 }
 
-pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
+pub(crate) fn map_error(err: CoreError) -> Failure {
     let (status, kind, message) = match &err {
         CoreError::VmNotFound(_) => (StatusCode::NOT_FOUND, "vm_not_found", err.to_string()),
         CoreError::HostGroupNotFound(_) => (
@@ -234,7 +239,7 @@ fn hint_for(err: &CoreError) -> Option<String> {
     }
 }
 
-pub(crate) fn map_agent_connect_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
+pub(crate) fn map_agent_connect_error(err: CoreError) -> Failure {
     match err {
         CoreError::Vmm(husker_vmm::VmmError::VmNotFound(_))
         | CoreError::Vmm(husker_vmm::VmmError::ProcessError(_))

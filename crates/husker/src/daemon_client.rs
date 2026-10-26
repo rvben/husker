@@ -88,6 +88,106 @@ impl ApiFailure {
             hint: None,
         }
     }
+
+    /// The failure a WebSocket session reported in-band. `status` is the HTTP
+    /// status the REST routes answer with for the same failure, so it selects
+    /// the same exit code. A frame from a daemon older than this contract
+    /// carries neither it nor a kind and stays a general failure.
+    pub(crate) fn from_frame(
+        kind: Option<String>,
+        message: String,
+        hint: Option<String>,
+        status: Option<u16>,
+    ) -> Self {
+        Self {
+            message,
+            kind,
+            exit_code: status.map_or(exit_code::GENERAL, exit_code_for_status),
+            hint,
+        }
+    }
+}
+
+/// The CLI exit code for the status of a refused daemon request.
+fn exit_code_for_status(status: u16) -> i32 {
+    match status {
+        404 => exit_code::NOT_FOUND,
+        409 => exit_code::CONFLICT,
+        401 | 403 => exit_code::DENIED,
+        _ => exit_code::GENERAL,
+    }
+}
+
+/// Decode a refused response into the CLI's failure model: the daemon's
+/// envelope when it sent one, the legacy `error` string or the raw body
+/// otherwise, and a message naming `subject` when the body is empty.
+fn decode_failure(status: reqwest::StatusCode, body: &str, subject: &str) -> ApiFailure {
+    let mut kind = None;
+    let mut hint = None;
+    let message = if body.is_empty() {
+        match status.as_u16() {
+            404 => format!("{subject} not found"),
+            409 => format!("{subject} already exists"),
+            _ => format!("{subject}: {status}"),
+        }
+    } else if let Ok(error) = serde_json::from_str::<ErrorResponse>(body) {
+        kind = Some(error.kind);
+        hint = error.hint;
+        error.message
+    } else {
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(json) => json["error"]
+                .as_str()
+                .map_or_else(|| body.to_string(), String::from),
+            Err(_) => body.to_string(),
+        }
+    };
+    ApiFailure {
+        message,
+        kind,
+        exit_code: exit_code_for_status(status.as_u16()),
+        hint,
+    }
+}
+
+/// Why the daemon refused a WebSocket handshake.
+pub(crate) enum HandshakeRefusal {
+    /// The daemon does not serve the route at all. Nothing reached a handler,
+    /// so a caller with another transport may use that instead.
+    RouteMissing,
+    /// The daemon's answer about this request: the VM is unknown, the token is
+    /// rejected, the caller is denied. Asking again another way would only
+    /// repeat the answer.
+    Refused(ApiFailure),
+}
+
+/// Classify a refused WebSocket handshake.
+///
+/// A daemon that predates a route answers 404 with an empty body or the
+/// `route_not_found` envelope, or 405 `method_not_allowed` when another method
+/// owns the path. A body that is not the daemon's envelope is read the same
+/// way, as a proxy's page for a route nothing serves. Any other answer is
+/// about the request itself.
+pub(crate) fn classify_handshake(
+    response: tungstenite::http::Response<Option<Vec<u8>>>,
+    subject: &str,
+) -> HandshakeRefusal {
+    let status = response.status();
+    let body = response
+        .into_body()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let failure = decode_failure(status, &body, subject);
+    let route_missing = matches!(status.as_u16(), 404 | 405)
+        && matches!(
+            failure.kind.as_deref(),
+            None | Some("route_not_found") | Some("method_not_allowed")
+        );
+    if route_missing {
+        HandshakeRefusal::RouteMissing
+    } else {
+        HandshakeRefusal::Refused(failure)
+    }
 }
 
 impl fmt::Display for ApiFailure {
@@ -283,8 +383,10 @@ impl DaemonClient {
     ///
     /// `Ok(None)` means the selected daemon predates the streaming route; the
     /// caller may safely issue one buffered HTTP exec because no command was
-    /// accepted. Once the upgrade succeeds, every error is terminal so a
-    /// partially executed command is never retried.
+    /// accepted. Any other refusal of the handshake is the daemon's answer
+    /// about this request and is returned as the `ApiFailure` it decodes to.
+    /// Once the upgrade succeeds, every error is terminal so a partially
+    /// executed command is never retried.
     pub(crate) async fn exec_stream<F>(
         &self,
         name: &str,
@@ -311,14 +413,11 @@ impl DaemonClient {
         }
         let (mut ws, _) = match tokio_tungstenite::connect_async(ws_request).await {
             Ok(value) => value,
-            Err(tungstenite::Error::Http(response))
-                if matches!(
-                    response.status(),
-                    tungstenite::http::StatusCode::NOT_FOUND
-                        | tungstenite::http::StatusCode::METHOD_NOT_ALLOWED
-                ) =>
-            {
-                return Ok(None);
+            Err(tungstenite::Error::Http(response)) => {
+                return match classify_handshake(*response, &format!("VM '{name}'")) {
+                    HandshakeRefusal::RouteMissing => Ok(None),
+                    HandshakeRefusal::Refused(failure) => Err(failure.into()),
+                };
             }
             Err(error) => return Err(error).context("connecting to exec WebSocket"),
         };
@@ -349,7 +448,14 @@ impl DaemonClient {
                             on_event(DaemonExecEvent::Stderr(bytes))?;
                         }
                         WsExecOutput::Exit { exit_code } => return Ok(Some(exit_code)),
-                        WsExecOutput::Error { message } => anyhow::bail!("exec failed: {message}"),
+                        WsExecOutput::Error {
+                            kind,
+                            message,
+                            hint,
+                            status,
+                        } => {
+                            return Err(ApiFailure::from_frame(kind, message, hint, status).into());
+                        }
                     }
                 }
                 tungstenite::Message::Close(_) => break,
@@ -602,39 +708,8 @@ impl DaemonClient {
     /// Decode a non-success response into the CLI's stable failure model.
     pub(crate) async fn error(&self, response: reqwest::Response, subject: &str) -> ApiFailure {
         let status = response.status();
-        let exit_code = match status.as_u16() {
-            404 => exit_code::NOT_FOUND,
-            409 => exit_code::CONFLICT,
-            401 | 403 => exit_code::DENIED,
-            _ => exit_code::GENERAL,
-        };
-        let mut kind = None;
-        let mut hint = None;
-        let message = match response.text().await {
-            Ok(body) if !body.is_empty() => {
-                if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
-                    kind = Some(error.kind);
-                    hint = error.hint;
-                    error.message
-                } else {
-                    match serde_json::from_str::<serde_json::Value>(&body) {
-                        Ok(json) => json["error"].as_str().map(String::from).unwrap_or(body),
-                        Err(_) => body,
-                    }
-                }
-            }
-            _ => match status.as_u16() {
-                404 => format!("{subject} not found"),
-                409 => format!("{subject} already exists"),
-                _ => format!("{subject}: {status}"),
-            },
-        };
-        ApiFailure {
-            message,
-            kind,
-            exit_code,
-            hint,
-        }
+        let body = response.text().await.unwrap_or_default();
+        decode_failure(status, &body, subject)
     }
 
     /// Complete an operation whose success response is part of the daemon's
@@ -1100,12 +1175,8 @@ mod tests {
         task.abort();
     }
 
-    #[tokio::test]
-    async fn missing_exec_stream_route_falls_back_before_command_submission() {
-        let app = axum::Router::new();
-        let (base_url, task) = serve(app).await;
-        let client = DaemonClient::new(base_url, None);
-        let request = ExecRequest {
+    fn must_run_once() -> ExecRequest {
+        ExecRequest {
             command: "must-run-once".into(),
             args: Vec::new(),
             working_dir: None,
@@ -1113,11 +1184,18 @@ mod tests {
             secret_env: std::collections::HashMap::new(),
             connect_timeout_secs: None,
             timeout_secs: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_exec_stream_route_falls_back_before_command_submission() {
+        let app = axum::Router::new();
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
         let mut delivered = false;
 
         let exit = client
-            .exec_stream("demo", &request, |_| {
+            .exec_stream("demo", &must_run_once(), |_| {
                 delivered = true;
                 Ok(())
             })
@@ -1127,6 +1205,146 @@ mod tests {
         assert_eq!(exit, None);
         assert!(!delivered);
         task.abort();
+    }
+
+    /// A daemon that serves the envelope on every rejection answers a missing
+    /// route with `route_not_found`; that is still "no such route", not an
+    /// answer about the command, so the buffered fallback remains safe.
+    #[tokio::test]
+    async fn route_not_found_envelope_on_the_handshake_falls_back() {
+        let app = axum::Router::new().fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "kind": "route_not_found",
+                    "message": "no route for GET /v1/vms/demo/exec/stream",
+                })),
+            )
+        });
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let exit = client
+            .exec_stream("demo", &must_run_once(), |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(exit, None);
+        task.abort();
+    }
+
+    /// A 404 for the VM itself is the daemon's answer, not a missing route.
+    /// Falling back would ask the same question over HTTP and get the same
+    /// answer; the failure is returned with its kind and exit code intact.
+    #[tokio::test]
+    async fn refused_handshake_surfaces_the_daemon_failure_without_falling_back() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/exec/stream",
+            get(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "kind": "vm_not_found",
+                        "message": "VM 'demo' not found",
+                    })),
+                )
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let mut delivered = false;
+
+        let error = client
+            .exec_stream("demo", &must_run_once(), |_| {
+                delivered = true;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        let failure = ApiFailure::from_error(&error);
+        assert_eq!(failure.kind.as_deref(), Some("vm_not_found"));
+        assert_eq!(failure.exit_code, exit_code::NOT_FOUND);
+        assert_eq!(failure.message, "VM 'demo' not found");
+        assert!(!delivered);
+        task.abort();
+    }
+
+    /// A proxy in front of an old daemon answers the missing route with its
+    /// own page; a 404 whose body is not the envelope is still a missing route.
+    #[tokio::test]
+    async fn classify_handshake_reads_a_non_envelope_404_as_a_missing_route() {
+        let response = tungstenite::http::Response::builder()
+            .status(404)
+            .body(Some(b"<html>not here</html>".to_vec()))
+            .unwrap();
+        assert!(matches!(
+            classify_handshake(response, "VM 'demo'"),
+            HandshakeRefusal::RouteMissing
+        ));
+
+        let response = tungstenite::http::Response::builder()
+            .status(403)
+            .body(None)
+            .unwrap();
+        let HandshakeRefusal::Refused(failure) = classify_handshake(response, "VM 'demo'") else {
+            panic!("a 403 is the daemon's answer");
+        };
+        assert_eq!(failure.exit_code, exit_code::DENIED);
+        assert_eq!(failure.message, "VM 'demo': 403 Forbidden");
+    }
+
+    /// The in-band error frame carries the REST envelope for the failure, and
+    /// `status` selects the exit code the REST path would have produced.
+    #[tokio::test]
+    async fn exec_stream_error_frame_keeps_the_daemon_kind_and_exit_code() {
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/exec/stream",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(|mut socket| async move {
+                    let _start = socket.recv().await.unwrap().unwrap();
+                    let output = WsExecOutput::Error {
+                        kind: Some("invalid_state".into()),
+                        message: "VM 'demo' is stopped, expected running".into(),
+                        hint: Some("start the VM first".into()),
+                        status: Some(409),
+                    };
+                    socket
+                        .send(Message::Text(
+                            serde_json::to_string(&output).unwrap().into(),
+                        ))
+                        .await
+                        .unwrap();
+                })
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let error = client
+            .exec_stream("demo", &must_run_once(), |_| Ok(()))
+            .await
+            .unwrap_err();
+
+        let failure = ApiFailure::from_error(&error);
+        assert_eq!(failure.kind.as_deref(), Some("invalid_state"));
+        assert_eq!(failure.exit_code, exit_code::CONFLICT);
+        assert_eq!(failure.hint.as_deref(), Some("start the VM first"));
+        assert_eq!(failure.message, "VM 'demo' is stopped, expected running");
+        task.abort();
+    }
+
+    /// A frame from a daemon older than the typed contract carries only the
+    /// message; it stays a general failure instead of inventing a kind.
+    #[test]
+    fn from_frame_without_status_is_a_general_failure() {
+        let failure = ApiFailure::from_frame(None, "exec failed".into(), None, None);
+        assert_eq!(failure.exit_code, exit_code::GENERAL);
+        assert!(failure.kind.is_none());
+        assert_eq!(
+            ApiFailure::from_frame(None, "denied".into(), None, Some(403)).exit_code,
+            exit_code::DENIED
+        );
     }
 
     /// A chunked upload is a burst by construction, so the daemon's own rate

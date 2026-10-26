@@ -7,6 +7,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use husker_core::{BootKind, DaemonProfile, ImageKind, UserdataStatus};
 
+use crate::errors::Failure;
+use crate::extract::Json;
+
 /// API request for VM creation.
 ///
 /// The flattened fields preserve the original `CreateVmRequest` JSON shape.
@@ -332,9 +335,32 @@ pub enum WsExecOutput {
     Exit {
         exit_code: i32,
     },
+    /// The session failed. `kind`, `hint` and `status` mirror the REST error
+    /// envelope for the same failure: `status` is the HTTP status the REST
+    /// routes answer with, so a client applies one status mapping to both
+    /// transports. They are absent only in frames from daemons older than
+    /// this contract.
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
     },
+}
+
+impl WsExecOutput {
+    /// The in-band form of a failure a REST route would answer with directly.
+    pub(crate) fn failure((status, Json(error)): Failure) -> Self {
+        Self::Error {
+            kind: Some(error.kind),
+            message: error.message,
+            hint: error.hint,
+            status: Some(status.as_u16()),
+        }
+    }
 }
 
 // ── File Types ────────────────────────────────────────────────────────
@@ -515,9 +541,35 @@ pub struct LogsQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsShellOutput {
     Started,
-    Data { data: String },
-    Exit { exit_code: i32 },
-    Error { message: String },
+    Data {
+        data: String,
+    },
+    Exit {
+        exit_code: i32,
+    },
+    /// The session failed. The fields mirror the REST error envelope exactly
+    /// as in [`WsExecOutput::Error`].
+    Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+    },
+}
+
+impl WsShellOutput {
+    /// The in-band form of a failure a REST route would answer with directly.
+    pub(crate) fn failure((status, Json(error)): Failure) -> Self {
+        Self::Error {
+            kind: Some(error.kind),
+            message: error.message,
+            hint: error.hint,
+            status: Some(status.as_u16()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -41,6 +41,16 @@
     without an upgrade
   - `route_not_found` (404) and `method_not_allowed` (405, with the `Allow`
     header)
+- The WebSocket routes (`/v1/vms/{name}/exec/stream`, `/v1/vms/{name}/shell`)
+  refuse an unknown VM before the upgrade with the normal 404 `vm_not_found`
+  envelope. A failure after the upgrade cannot change the HTTP status, so it
+  arrives as one text frame `{ "type": "error", "kind", "message", "hint"?,
+  "status" }` and the socket closes: `kind`, `message` and `hint` are the REST
+  envelope for the same failure and `status` is the HTTP status the REST
+  routes answer with, so one status mapping serves both transports. A first
+  frame that is not the text `start` message is reported as
+  `invalid_start_message` (400). Frames from daemons older than this contract
+  carry only `message`.
 
 ## Deprecation workflow
 

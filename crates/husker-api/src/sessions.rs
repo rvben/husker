@@ -15,11 +15,9 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utoipa::OpenApi;
 
-use crate::errors::{error_response_with_hint, map_agent_connect_error, map_error};
+use crate::errors::{Failure, error_response_with_hint, map_agent_connect_error, map_error};
 use crate::extract::{Json, Path, Query, WebSocketUpgrade};
 use crate::{AppState, ErrorResponse, ExecRequest, current_policy};
-
-type Failure = (StatusCode, Json<ErrorResponse>);
 
 async fn connection<B: VmmBackend + 'static>(
     core: &HuskerCore<B>,

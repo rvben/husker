@@ -118,11 +118,64 @@ impl Drop for Fixture {
         self.agent.abort();
     }
 }
+/// A router served on a loopback listener, for the WebSocket routes that an
+/// in-process `oneshot` cannot upgrade.
+struct Served {
+    addr: std::net::SocketAddr,
+    server: tokio::task::JoinHandle<()>,
+}
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+impl Served {
+    /// A WebSocket handshake for `path` carrying the test bearer token.
+    fn ws_request(&self, path: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        let mut request = format!("ws://{}{path}", self.addr)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", "Bearer test-token".parse().unwrap());
+        request
+    }
+    /// Open `path`, send `start` as the first frame and return the socket with
+    /// the first frame the daemon answered.
+    async fn open(
+        &self,
+        path: &str,
+        start: Value,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Value,
+    ) {
+        let (mut ws, _) = tokio_tungstenite::connect_async(self.ws_request(path))
+            .await
+            .unwrap();
+        ws.send(Message::Text(start.to_string().into()))
+            .await
+            .unwrap();
+        let first: Value = match ws.next().await {
+            Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected a text frame, got {other:?}"),
+        };
+        (ws, first)
+    }
+}
+
 impl Fixture {
     async fn new() -> Self {
-        Self::new_with_gate(None).await
+        Self::build(None, Vec::new()).await
     }
     async fn new_with_gate(connect_gate: Option<Arc<ConnectGate>>) -> Self {
+        Self::build(connect_gate, Vec::new()).await
+    }
+    /// Build the fixture around the running `dev` VM plus `extra` records the
+    /// backend knows nothing about (so they can never reach the agent).
+    async fn build(connect_gate: Option<Arc<ConnectGate>>, extra: Vec<VmRecord>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("agent.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -143,6 +196,9 @@ impl Fixture {
         let record = vm_record("dev");
         let state = husker_state::StateStore::open(&temp.path().join("state.sqlite")).unwrap();
         state.insert_vm(&record).unwrap();
+        for record in &extra {
+            state.insert_vm(record).unwrap();
+        }
         let backend = AgentBackend {
             socket,
             connect_gate,
@@ -206,6 +262,17 @@ impl Fixture {
                 serde_json::from_slice(&bytes).unwrap()
             },
         )
+    }
+    async fn serve(&self) -> Served {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_auth(self.core.clone(), test_token());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Served { addr, server }
     }
     async fn finished(&self, id: &str) -> Value {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -672,45 +739,30 @@ async fn shell_applies_the_exec_command_policy_before_contacting_the_guest() {
         exec_denylist: vec!["husker-test-denied-executable".into()],
         ..Default::default()
     });
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = router_with_auth(f.core.clone(), test_token());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let open_shell = |command: &'static str| async move {
-        let mut request = format!("ws://{addr}/v1/vms/dev/shell")
-            .into_client_request()
-            .unwrap();
-        request
-            .headers_mut()
-            .insert("Authorization", "Bearer test-token".parse().unwrap());
-        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        ws.send(Message::Text(
-            json!({ "type": "start", "command": command })
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-        let first: Value = match ws.next().await {
-            Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
-            other => panic!("expected a text frame, got {other:?}"),
-        };
-        (ws, first)
+    let served = f.serve().await;
+    let open_shell = |command: &'static str| {
+        served.open(
+            "/v1/vms/dev/shell",
+            json!({ "type": "start", "command": command }),
+        )
     };
 
     let (mut denied, first) = open_shell("husker-test-denied-executable").await;
+    // The refusal is the REST exec policy envelope, carried in-band.
+    let (status, rest) = f
+        .request(
+            "POST",
+            "/v1/vms/dev/exec",
+            json!({ "command": "husker-test-denied-executable", "args": [] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{rest}");
     assert_eq!(first["type"], "error", "{first}");
-    assert!(
-        first["message"]
-            .as_str()
-            .unwrap()
-            .contains("blocked by execution policy"),
-        "{first}"
-    );
+    assert_eq!(first["kind"], "policy_exec_command_denied", "{first}");
+    assert_eq!(first["kind"], rest["kind"], "{first}");
+    assert_eq!(first["message"], rest["message"], "{first}");
+    assert_eq!(first["hint"], rest["hint"], "{first}");
+    assert_eq!(first["status"], status.as_u16(), "{first}");
     assert!(
         tokio::time::timeout(Duration::from_millis(200), gate.entered.notified())
             .await
@@ -734,7 +786,100 @@ async fn shell_applies_the_exec_command_policy_before_contacting_the_guest() {
         .await
         .expect("an allowed shell connects to the guest agent");
     let _ = allowed.close(None).await;
-    server.abort();
+}
+
+/// Every REST route answers an unknown VM with 404 `vm_not_found`. The
+/// WebSocket routes answer the same way, from the handshake, so a client never
+/// holds an upgraded socket for a VM that does not exist and one status mapping
+/// serves both transports.
+#[tokio::test]
+async fn websocket_routes_refuse_an_unknown_vm_before_the_upgrade() {
+    let f = Fixture::new().await;
+    let served = f.serve().await;
+    let (status, rest) = f
+        .request("POST", "/v1/vms/ghost/exec", json!({ "command": "true" }))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{rest}");
+    assert_eq!(rest["kind"], "vm_not_found", "{rest}");
+
+    for path in ["/v1/vms/ghost/exec/stream", "/v1/vms/ghost/shell"] {
+        let error = tokio_tungstenite::connect_async(served.ws_request(path))
+            .await
+            .expect_err(path);
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("{path}: expected an HTTP refusal, got {error:?}");
+        };
+        assert_eq!(response.status().as_u16(), 404, "{path}");
+        let body = response.into_body().expect(path);
+        let envelope: Value = serde_json::from_slice(&body).expect(path);
+        assert_eq!(envelope["kind"], rest["kind"], "{path}: {envelope}");
+        assert_eq!(envelope["message"], rest["message"], "{path}: {envelope}");
+    }
+}
+
+/// A failure after the upgrade cannot change the HTTP status, so the error
+/// frame carries the REST envelope for the same failure: a client applies the
+/// status and kind it already understands and does not parse messages.
+#[tokio::test]
+async fn exec_stream_reports_a_post_upgrade_failure_with_the_rest_envelope() {
+    let mut halted = vm_record("halted");
+    halted.state = VmLifecycleState::Stopped;
+    let f = Fixture::build(None, vec![halted]).await;
+    let served = f.serve().await;
+    let (status, rest) = f
+        .request("POST", "/v1/vms/halted/exec", json!({ "command": "true" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rest}");
+    assert_eq!(rest["kind"], "invalid_state", "{rest}");
+
+    let (mut ws, first) = served
+        .open(
+            "/v1/vms/halted/exec/stream",
+            json!({ "type": "start", "request": { "command": "true" } }),
+        )
+        .await;
+    assert_eq!(first["type"], "error", "{first}");
+    assert_eq!(first["kind"], rest["kind"], "{first}");
+    assert_eq!(first["message"], rest["message"], "{first}");
+    assert_eq!(first["hint"], rest["hint"], "{first}");
+    assert_eq!(first["status"], status.as_u16(), "{first}");
+    assert!(
+        !matches!(ws.next().await, Some(Ok(Message::Text(_)))),
+        "a failed session gets no further frames"
+    );
+}
+
+/// The first frame must be the text `start` message. Anything else is the
+/// client's mistake and is reported as such, not swallowed by a silent close.
+#[tokio::test]
+async fn websocket_routes_reject_a_malformed_start_frame() {
+    let f = Fixture::new().await;
+    let served = f.serve().await;
+
+    let cases: [(&str, Value); 2] = [
+        ("/v1/vms/dev/exec/stream", json!({ "type": "bogus" })),
+        ("/v1/vms/dev/shell", json!({ "type": "data", "data": "" })),
+    ];
+    for (path, start) in cases {
+        let (_ws, first) = served.open(path, start).await;
+        assert_eq!(first["type"], "error", "{path}: {first}");
+        assert_eq!(first["kind"], "invalid_start_message", "{path}: {first}");
+        assert_eq!(first["status"], 400, "{path}: {first}");
+        assert!(first["hint"].is_string(), "{path}: {first}");
+    }
+
+    for path in ["/v1/vms/dev/exec/stream", "/v1/vms/dev/shell"] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(served.ws_request(path))
+            .await
+            .unwrap();
+        ws.send(Message::Binary(vec![0u8; 4].into())).await.unwrap();
+        let first: Value = match ws.next().await {
+            Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
+            other => panic!("{path}: expected a text frame, got {other:?}"),
+        };
+        assert_eq!(first["kind"], "invalid_start_message", "{path}: {first}");
+        assert_eq!(first["status"], 400, "{path}: {first}");
+    }
 }
 
 /// The read limit bounds one response, so the guest must be asked for no more

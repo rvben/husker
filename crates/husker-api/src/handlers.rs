@@ -9,23 +9,24 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::{HeaderName, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::Response;
 use tracing::{debug, info, warn};
 
 use husker_core::{
-    BootKind, CommitVmImageRequest, CreateHostGroupRequest, CreatePoolRequest, CreateSecretRequest,
-    CreateServiceRequest, CreateSnapshotRequest, CreateVolumeRequest, DiagnosticsReport,
-    ExecStreamEvent, ExportImageRequest, ExportImageResult, HostGroupRecord, HuskerCore,
-    ImageRecord, ImportImageRequest, PoolRecord, RestoreSnapshotRequest, RotateSecretRequest,
-    SecretMetadata, ServiceRecord, ShellEvent, SnapshotRecord, VmExpirationRecord,
-    VmLifecycleState, VmRecord, VolumeRecord,
+    AgentError, BootKind, CommitVmImageRequest, CoreError, CreateHostGroupRequest,
+    CreatePoolRequest, CreateSecretRequest, CreateServiceRequest, CreateSnapshotRequest,
+    CreateVolumeRequest, DiagnosticsReport, ExecStreamEvent, ExportImageRequest, ExportImageResult,
+    HostGroupRecord, HuskerCore, ImageRecord, ImportImageRequest, PoolRecord,
+    RestoreSnapshotRequest, RotateSecretRequest, SecretMetadata, ServiceRecord, ShellEvent,
+    SnapshotRecord, VmExpirationRecord, VmLifecycleState, VmRecord, VolumeRecord,
 };
 use husker_vmm::VmmBackend;
 
 use crate::AppState;
 use crate::dto::*;
 use crate::errors::{
-    ErrorResponse, error_response, error_response_with_hint, map_agent_connect_error, map_error,
+    ErrorResponse, Failure, error_response, error_response_with_hint, map_agent_connect_error,
+    map_error,
 };
 use crate::extract::{Json, Path, Query, WebSocketUpgrade};
 use crate::{ApiPolicy, current_policy, max_vms, metrics};
@@ -1452,16 +1453,7 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
         ),
     )
     .await
-    .map_err(|_| {
-        (
-            StatusCode::REQUEST_TIMEOUT,
-            error_response_with_hint(
-                "exec_timeout",
-                "command execution timed out and the agent did not respond",
-                "increase exec timeout policy or optimize guest command runtime",
-            ),
-        )
-    })?
+    .map_err(|_| exec_timeout())?
     .map_err(|e| map_error(e.into()))?;
     metrics().exec_total.fetch_add(1, Ordering::Relaxed);
     info!(
@@ -1481,7 +1473,55 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
 
 /// Apply execution policy and resolve secret references without duplicating
 /// security-sensitive logic between buffered and streaming transports.
-type BoxedHandlerError = Box<(StatusCode, Json<ErrorResponse>)>;
+type BoxedHandlerError = Box<Failure>;
+
+/// The command, or interactive shell, that the execution policy refuses.
+fn command_denied(command: &str) -> Failure {
+    (
+        StatusCode::FORBIDDEN,
+        error_response_with_hint(
+            "policy_exec_command_denied",
+            format!("command '{command}' is blocked by execution policy"),
+            "adjust exec allow/deny policy",
+        ),
+    )
+}
+
+/// The command outlived its run timeout and the agent never reported an exit,
+/// so the daemon's grace window ended the request.
+fn exec_timeout() -> Failure {
+    (
+        StatusCode::REQUEST_TIMEOUT,
+        error_response_with_hint(
+            "exec_timeout",
+            "command execution timed out and the agent did not respond",
+            "increase exec timeout policy or optimize guest command runtime",
+        ),
+    )
+}
+
+/// The first frame of a streaming session was not the `start` message the
+/// route expects.
+fn invalid_start_message(detail: impl std::fmt::Display) -> Failure {
+    (
+        StatusCode::BAD_REQUEST,
+        error_response_with_hint(
+            "invalid_start_message",
+            format!("invalid start message: {detail}"),
+            "the first frame must be a text `start` message carrying the request",
+        ),
+    )
+}
+
+/// The REST mapping of an agent failure, with the message naming the step of
+/// the streaming session that hit it.
+fn agent_failure(step: &str, error: AgentError) -> Failure {
+    let message = format!("{step}: {error}");
+    let (status, Json(mut response)) = map_error(CoreError::Agent(error));
+    response.message = message.clone();
+    response.error = Some(message);
+    (status, Json(response))
+}
 
 pub(crate) fn resolve_exec_environment<B: VmmBackend + 'static>(
     core: &HuskerCore<B>,
@@ -1489,14 +1529,7 @@ pub(crate) fn resolve_exec_environment<B: VmmBackend + 'static>(
     policy: &ApiPolicy,
 ) -> Result<HashMap<String, String>, BoxedHandlerError> {
     if !exec_command_allowed(&req.command, policy) {
-        return Err(Box::new((
-            StatusCode::FORBIDDEN,
-            error_response_with_hint(
-                "policy_exec_command_denied",
-                format!("command '{}' is blocked by execution policy", req.command),
-                "adjust exec allow/deny policy",
-            ),
-        )));
+        return Err(Box::new(command_denied(&req.command)));
     }
     let mut resolved_env = req.env.clone();
     for (env_key, secret_name) in &req.secret_env {
@@ -1525,65 +1558,56 @@ pub(crate) fn resolve_exec_environment<B: VmmBackend + 'static>(
     tag = "exec",
     params(("name" = String, Path, description = "VM name")),
     responses(
-        (status = 101, description = "WebSocket upgrade for streamed command execution"),
-        (status = 404, description = "VM not found", body = ErrorResponse)
+        (status = 101, description = "WebSocket upgrade for streamed command execution. A failure \
+            after the upgrade arrives as a text frame `{\"type\":\"error\",\"kind\",\"message\",\
+            \"hint\"?,\"status\"}` carrying the ErrorResponse fields and the HTTP status the \
+            buffered exec route answers with for the same failure, then the socket closes"),
+        (status = 404, description = "VM not found, refused before the upgrade", body = ErrorResponse)
     )
 )]
 pub(crate) async fn exec_ws<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
     WebSocketUpgrade(ws): WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Result<Response, Failure> {
+    // An unknown VM is refused as a plain HTTP response, the way every other
+    // route refuses it, so a client never upgrades for a VM that does not exist.
+    let record = core.get_vm(&name).map_err(map_error)?;
     info!(audit = "exec_stream_upgrade", vm = %name);
-    ws.on_upgrade(move |socket| exec_ws_session(core, name, socket))
+    Ok(ws.on_upgrade(move |socket| exec_ws_session(core, record, socket)))
 }
 
 async fn exec_ws_session<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
-    name: String,
+    record: VmRecord,
     mut ws: WebSocket,
 ) {
+    let name = record.name;
     let req = match ws.recv().await {
         Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsExecInput>(&text) {
             Ok(WsExecInput::Start { request }) => request,
             Err(e) => {
-                let _ = send_exec_ws_output(
-                    &mut ws,
-                    &WsExecOutput::Error {
-                        message: format!("invalid start message: {e}"),
-                    },
-                )
-                .await;
+                let _ =
+                    send_exec_ws_output(&mut ws, &WsExecOutput::failure(invalid_start_message(e)))
+                        .await;
                 return;
             }
         },
+        Some(Ok(Message::Binary(_))) => {
+            let _ = send_exec_ws_output(
+                &mut ws,
+                &WsExecOutput::failure(invalid_start_message("expected a text frame")),
+            )
+            .await;
+            return;
+        }
         _ => return,
     };
     let policy = current_policy();
     let resolved_env = match resolve_exec_environment(core.as_ref(), &req, &policy) {
         Ok(env) => env,
-        Err(error) => {
-            let (_, error) = *error;
-            let _ = send_exec_ws_output(
-                &mut ws,
-                &WsExecOutput::Error {
-                    message: error.message.clone(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
-    let record = match core.get_vm(&name).map_err(map_error) {
-        Ok(record) => record,
-        Err((_, error)) => {
-            let _ = send_exec_ws_output(
-                &mut ws,
-                &WsExecOutput::Error {
-                    message: error.message.clone(),
-                },
-            )
-            .await;
+        Err(failure) => {
+            let _ = send_exec_ws_output(&mut ws, &WsExecOutput::failure(*failure)).await;
             return;
         }
     };
@@ -1598,9 +1622,7 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
         Err(error) => {
             let _ = send_exec_ws_output(
                 &mut ws,
-                &WsExecOutput::Error {
-                    message: error.to_string(),
-                },
+                &WsExecOutput::failure(map_agent_connect_error(error)),
             )
             .await;
             return;
@@ -1617,9 +1639,7 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
         Err(error) => {
             let _ = send_exec_ws_output(
                 &mut ws,
-                &WsExecOutput::Error {
-                    message: format!("guest capability check failed: {error}"),
-                },
+                &WsExecOutput::failure(agent_failure("guest capability check failed", error)),
             )
             .await;
             return;
@@ -1681,9 +1701,7 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
             Err(error) => {
                 let _ = send_exec_ws_output(
                     &mut ws,
-                    &WsExecOutput::Error {
-                        message: error.to_string(),
-                    },
+                    &WsExecOutput::failure(map_error(CoreError::Agent(error))),
                 )
                 .await;
             }
@@ -1703,9 +1721,7 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
     {
         let _ = send_exec_ws_output(
             &mut ws,
-            &WsExecOutput::Error {
-                message: error.to_string(),
-            },
+            &WsExecOutput::failure(map_error(CoreError::Agent(error))),
         )
         .await;
         return;
@@ -1737,9 +1753,7 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
                     return Ok::<i32, axum::Error>(exit_code);
                 }
                 Err(error) => {
-                    let output = WsExecOutput::Error {
-                        message: error.to_string(),
-                    };
+                    let output = WsExecOutput::failure(map_error(CoreError::Agent(error)));
                     send_exec_ws_output(&mut ws, &output).await?;
                     return Ok(-1);
                 }
@@ -1754,13 +1768,7 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
         }
         Ok(Err(_)) => {}
         Err(_) => {
-            let _ = send_exec_ws_output(
-                &mut ws,
-                &WsExecOutput::Error {
-                    message: "command execution timed out and the agent did not respond".into(),
-                },
-            )
-            .await;
+            let _ = send_exec_ws_output(&mut ws, &WsExecOutput::failure(exec_timeout())).await;
         }
     }
     let _ = ws.send(Message::Close(None)).await;
@@ -1966,17 +1974,23 @@ pub(crate) async fn write_file_handler<B: VmmBackend + 'static>(
     tag = "shell",
     params(("name" = String, Path, description = "VM name")),
     responses(
-        (status = 101, description = "WebSocket upgrade for interactive shell"),
-        (status = 404, description = "VM not found", body = ErrorResponse)
+        (status = 101, description = "WebSocket upgrade for interactive shell. A failure after \
+            the upgrade arrives as a text frame `{\"type\":\"error\",\"kind\",\"message\",\
+            \"hint\"?,\"status\"}` carrying the ErrorResponse fields and the HTTP status the \
+            REST routes answer with for the same failure, then the socket closes"),
+        (status = 404, description = "VM not found, refused before the upgrade", body = ErrorResponse)
     )
 )]
 pub(crate) async fn shell_ws<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
     WebSocketUpgrade(ws): WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Result<Response, Failure> {
+    // An unknown VM is refused as a plain HTTP response, the way every other
+    // route refuses it, so a client never upgrades for a VM that does not exist.
+    core.get_vm(&name).map_err(map_error)?;
     info!(audit = "shell_upgrade", vm = %name);
-    ws.on_upgrade(move |socket| shell_ws_session(core, name, socket))
+    Ok(ws.on_upgrade(move |socket| shell_ws_session(core, name, socket)))
 }
 
 async fn shell_ws_session<B: VmmBackend + 'static>(
@@ -1995,24 +2009,25 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
             Ok(_) => {
                 let _ = send_ws_output(
                     &mut ws,
-                    &WsShellOutput::Error {
-                        message: "expected 'start' message".into(),
-                    },
+                    &WsShellOutput::failure(invalid_start_message("expected a 'start' message")),
                 )
                 .await;
                 return;
             }
             Err(e) => {
-                let _ = send_ws_output(
-                    &mut ws,
-                    &WsShellOutput::Error {
-                        message: format!("invalid message: {e}"),
-                    },
-                )
-                .await;
+                let _ = send_ws_output(&mut ws, &WsShellOutput::failure(invalid_start_message(e)))
+                    .await;
                 return;
             }
         },
+        Some(Ok(Message::Binary(_))) => {
+            let _ = send_ws_output(
+                &mut ws,
+                &WsShellOutput::failure(invalid_start_message("expected a text frame")),
+            )
+            .await;
+            return;
+        }
         _ => return,
     };
     // An interactive shell runs whatever it is given, so it answers to the
@@ -2023,9 +2038,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
         info!(audit = "shell_denied", vm = %name, command = shell_command);
         let _ = send_ws_output(
             &mut ws,
-            &WsShellOutput::Error {
-                message: format!("command '{shell_command}' is blocked by execution policy"),
-            },
+            &WsShellOutput::failure(command_denied(shell_command)),
         )
         .await;
         return;
@@ -2049,13 +2062,8 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
     {
         Ok(conn) => conn,
         Err(e) => {
-            let _ = send_ws_output(
-                &mut ws,
-                &WsShellOutput::Error {
-                    message: e.to_string(),
-                },
-            )
-            .await;
+            let _ =
+                send_ws_output(&mut ws, &WsShellOutput::failure(map_agent_connect_error(e))).await;
             return;
         }
     };
@@ -2064,9 +2072,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
     if let Err(e) = conn.shell_start(command.as_deref(), cols, rows).await {
         let _ = send_ws_output(
             &mut ws,
-            &WsShellOutput::Error {
-                message: format!("shell start failed: {e}"),
-            },
+            &WsShellOutput::failure(agent_failure("shell start failed", e)),
         )
         .await;
         return;
@@ -2137,9 +2143,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
                         break;
                     }
                     Err(e) => {
-                        let _ = send_ws_output(&mut ws, &WsShellOutput::Error {
-                            message: format!("agent error: {e}"),
-                        }).await;
+                        let _ = send_ws_output(&mut ws, &WsShellOutput::failure(map_error(CoreError::Agent(e)))).await;
                         break;
                     }
                 }
