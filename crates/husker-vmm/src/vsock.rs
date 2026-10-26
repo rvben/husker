@@ -117,4 +117,42 @@ mod tests {
         let err = connect_firecracker_vsock(&sock_path, 52).await.unwrap_err();
         assert!(matches!(err, VsockConnectError::Rejected(52)));
     }
+
+    #[tokio::test]
+    async fn connect_firecracker_vsock_reports_a_malformed_handshake_as_a_read_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("vsock.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+
+        // A reply that is not UTF-8 cannot be an OK line, and it is not a
+        // rejection either: the peer is not speaking the handshake protocol.
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"\xff\n")
+                .await
+                .unwrap();
+        });
+
+        let err = connect_firecracker_vsock(&sock_path, 52).await.unwrap_err();
+        assert!(
+            matches!(err, VsockConnectError::HandshakeRead(_)),
+            "expected a handshake read failure, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_firecracker_vsock_reports_a_missing_socket_as_a_connect_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.vsock");
+
+        let err = connect_firecracker_vsock(&missing, 52).await.unwrap_err();
+        assert!(
+            matches!(err, VsockConnectError::Connect(ref io) if io.kind() == std::io::ErrorKind::NotFound),
+            "expected a connect failure for a missing socket, got {err:?}"
+        );
+    }
 }

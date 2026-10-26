@@ -3,7 +3,7 @@ use husker_agent_proto::{
     ReadFileResponse, ShellExitResponse, WriteFileResponse, base64_decode, read_message,
     write_message,
 };
-use husker_core::agent_client::{AgentClient, AgentConnection, AgentError, ShellEvent};
+use husker_core::agent_client::{AgentConnection, AgentError, ShellEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Spawn the agent handler on a temporary Unix socket and return the socket path.
@@ -27,69 +27,17 @@ async fn spawn_agent() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-/// Spawn a minimal Firecracker-vsock-like Unix listener that responds to CONNECT.
-async fn spawn_vsock_proxy(
-    response_line: &'static [u8],
-) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("firecracker.vsock");
-    let listener = tokio::net::UnixListener::bind(&path).unwrap();
-
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 128];
-        let _ = stream.read(&mut buf).await.unwrap();
-        stream.write_all(response_line).await.unwrap();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    (dir, path)
-}
-
-/// Spawn a vsock proxy that accepts one or more CONNECT handshakes and then
-/// answers a single Ping request per connection.
-async fn spawn_vsock_ping_proxy(
-    ping_outcomes: Vec<bool>,
-) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("firecracker.vsock");
-    let listener = tokio::net::UnixListener::bind(&path).unwrap();
-
-    tokio::spawn(async move {
-        for should_pong in ping_outcomes {
-            let (mut stream, _) = listener.accept().await.unwrap();
-
-            let mut handshake = [0u8; 128];
-            let _ = stream.read(&mut handshake).await.unwrap();
-            stream.write_all(b"OK 123\n").await.unwrap();
-
-            let request: AgentRequest = read_message(&mut stream).await.unwrap().unwrap();
-            assert!(matches!(request, AgentRequest::Ping));
-
-            if should_pong {
-                write_message(&mut stream, &AgentResponse::Pong)
-                    .await
-                    .unwrap();
-            } else {
-                write_message(
-                    &mut stream,
-                    &AgentResponse::Error(ErrorResponse::new("not ready yet")),
-                )
-                .await
-                .unwrap();
-            }
-        }
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    (dir, path)
+/// Open a typed connection to the agent listening on `path`, the way the
+/// daemon does once its backend has handed it a stream.
+async fn connect(path: &std::path::Path) -> AgentConnection<tokio::net::UnixStream> {
+    AgentConnection::new(tokio::net::UnixStream::connect(path).await.unwrap())
 }
 
 #[tokio::test]
 async fn client_ping() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
     conn.ping().await.unwrap();
 }
 
@@ -97,7 +45,7 @@ async fn client_ping() {
 async fn client_exec() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
     let result = conn
         .exec("echo", &["hello world"], None, &[])
         .await
@@ -111,7 +59,7 @@ async fn client_exec() {
 async fn client_exec_with_env_and_workdir() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
     let result = conn
         .exec(
             "sh",
@@ -136,7 +84,7 @@ async fn client_exec_with_env_and_workdir() {
 async fn client_exec_failure() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
     let result = conn
         .exec("sh", &["-c", "exit 42"], None, &[])
         .await
@@ -147,7 +95,7 @@ async fn client_exec_failure() {
 #[tokio::test]
 async fn client_exec_stream_preserves_binary_chunks_and_exit_status() {
     let (_dir, path) = spawn_agent().await;
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
     conn.exec_stream_start(
         "sh",
         &["-c", "printf '\\001\\377'; printf err >&2; exit 9"],
@@ -182,7 +130,7 @@ async fn client_write_and_read_file() {
 
     let data = b"binary data \x00\x01\x02\xff";
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let bytes_written = conn
         .write_file(&file_path_str, data, None, false)
@@ -198,7 +146,7 @@ async fn client_write_and_read_file() {
 async fn client_read_nonexistent_file() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
     let result = conn.read_file("/nonexistent/path/12345").await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -209,7 +157,7 @@ async fn client_read_nonexistent_file() {
 async fn client_multiple_operations() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     // Ping
     conn.ping().await.unwrap();
@@ -237,88 +185,6 @@ async fn agent_connection_from_raw_stream() {
 
     let result = conn.exec("echo", &["raw"], None, &[]).await.unwrap();
     assert_eq!(result.stdout.trim(), "raw");
-}
-
-#[tokio::test]
-async fn connect_maps_rejected_vsock_handshake() {
-    let (_dir, path) = spawn_vsock_proxy(b"ERR nope\n").await;
-    let err = match AgentClient::connect(&path, 52).await {
-        Ok(_) => panic!("expected connect rejection"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, AgentError::VsockConnectRejected(52)));
-}
-
-#[tokio::test]
-async fn connect_accepts_ok_vsock_handshake() {
-    let (_dir, path) = spawn_vsock_proxy(b"OK 123\n").await;
-    let connected = AgentClient::connect(&path, 52).await;
-    assert!(connected.is_ok());
-}
-
-#[tokio::test]
-async fn connect_invalid_utf8_handshake_maps_connection_error() {
-    let (_dir, path) = spawn_vsock_proxy(b"\xff\n").await;
-    let err = match AgentClient::connect(&path, 52).await {
-        Ok(_) => panic!("expected invalid handshake failure"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, AgentError::Connection(_)));
-}
-
-#[tokio::test]
-async fn connect_unix_missing_socket_maps_connection_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("missing.sock");
-    let err = match AgentClient::connect_unix(&missing).await {
-        Ok(_) => panic!("expected unix connect error"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, AgentError::Connection(_)));
-}
-
-#[tokio::test]
-async fn connect_missing_vsock_socket_maps_connection_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("missing.firecracker.vsock");
-    let err = match AgentClient::connect(&missing, 52).await {
-        Ok(_) => panic!("expected vsock connect error"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, AgentError::Connection(_)));
-}
-
-#[tokio::test]
-async fn wait_ready_retries_until_ping_succeeds() {
-    let (_dir, path) = spawn_vsock_ping_proxy(vec![false, true]).await;
-    let start = std::time::Instant::now();
-    let result = AgentClient::wait_ready(&path, 52, std::time::Duration::from_secs(2)).await;
-    assert!(result.is_ok());
-    assert!(
-        start.elapsed() >= std::time::Duration::from_millis(90),
-        "expected at least one backoff sleep before success"
-    );
-}
-
-#[tokio::test]
-async fn wait_ready_ping_error_after_deadline_returns_ping_error() {
-    let (_dir, path) = spawn_vsock_ping_proxy(vec![false]).await;
-    let err = match AgentClient::wait_ready(&path, 52, std::time::Duration::ZERO).await {
-        Ok(_) => panic!("expected wait_ready ping failure"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, AgentError::Agent(msg) if msg == "not ready yet"));
-}
-
-#[tokio::test]
-async fn wait_ready_connect_error_after_deadline_returns_connect_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("missing.firecracker.vsock");
-    let err = match AgentClient::wait_ready(&missing, 52, std::time::Duration::ZERO).await {
-        Ok(_) => panic!("expected wait_ready connect failure"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, AgentError::Connection(_)));
 }
 
 #[tokio::test]
@@ -725,7 +591,7 @@ async fn shell_resize_sends_dimensions() {
 async fn guest_info_returns_addresses() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
     let info = conn.guest_info().await.expect("guest_info");
     // The host agent returns its own non-loopback IPv4 addresses.
     // In CI there is always at least one.
@@ -852,12 +718,7 @@ async fn tunnel_relays_binary_guest_loopback_and_eof() {
         assert_eq!(bytes, [0, 255, 128, 42]);
         stream.write_all(&bytes).await.unwrap();
     });
-    let mut tunnel = AgentClient::connect_unix(&path)
-        .await
-        .unwrap()
-        .tunnel(port)
-        .await
-        .unwrap();
+    let mut tunnel = connect(&path).await.tunnel(port).await.unwrap();
     tunnel.write_all(&[0, 255, 128, 42]).await.unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(
@@ -869,13 +730,7 @@ async fn tunnel_relays_binary_guest_loopback_and_eof() {
     .unwrap();
     assert_eq!(response, [0, 255, 128, 42]);
     task.await.unwrap();
-    let error = AgentClient::connect_unix(&path)
-        .await
-        .unwrap()
-        .tunnel(0)
-        .await
-        .err()
-        .unwrap();
+    let error = connect(&path).await.tunnel(0).await.err().unwrap();
     assert!(error.to_string().contains("nonzero"));
 }
 #[tokio::test]

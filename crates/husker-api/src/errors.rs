@@ -244,8 +244,6 @@ pub(crate) fn map_agent_connect_error(err: CoreError) -> Failure {
         CoreError::Vmm(husker_vmm::VmmError::VmNotFound(_))
         | CoreError::Vmm(husker_vmm::VmmError::ProcessError(_))
         | CoreError::Vmm(husker_vmm::VmmError::ApiError(_))
-        | CoreError::Agent(husker_core::AgentError::Connection(_))
-        | CoreError::Agent(husker_core::AgentError::VsockConnectRejected(_))
         | CoreError::Agent(husker_core::AgentError::NotReady { .. }) => (
             StatusCode::SERVICE_UNAVAILABLE,
             error_response_with_hint(

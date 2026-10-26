@@ -8,10 +8,16 @@
 //! - Error recovery after failed operations
 //! - File write with permissions
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use husker_core::ShellEvent;
-use husker_core::agent_client::{AgentClient, AgentConnection};
+use husker_core::agent_client::AgentConnection;
+
+/// Open a typed connection to the agent listening on `path`, the way the
+/// daemon does once its backend has handed it a stream.
+async fn connect(path: &Path) -> AgentConnection<tokio::net::UnixStream> {
+    AgentConnection::new(tokio::net::UnixStream::connect(path).await.unwrap())
+}
 
 /// Spawn the agent handler on a temporary Unix socket.
 async fn spawn_agent() -> (tempfile::TempDir, PathBuf) {
@@ -63,8 +69,8 @@ async fn concurrent_connections_are_independent() {
     let (_dir, path) = spawn_agent().await;
 
     // Open two independent connections
-    let mut conn1 = AgentClient::connect_unix(&path).await.unwrap();
-    let mut conn2 = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn1 = connect(&path).await;
+    let mut conn2 = connect(&path).await;
 
     // Both should be able to ping independently
     conn1.ping().await.unwrap();
@@ -86,7 +92,7 @@ async fn many_concurrent_pings() {
     for _ in 0..10 {
         let path = path.clone();
         handles.push(tokio::spawn(async move {
-            let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+            let mut conn = connect(&path).await;
             conn.ping().await.unwrap();
         }));
     }
@@ -108,7 +114,7 @@ async fn write_and_read_large_file() {
     // 256 KiB of patterned binary data
     let data: Vec<u8> = (0..262_144).map(|i| (i % 251) as u8).collect();
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let bytes_written = conn
         .write_file(&file_path_str, &data, None, false)
@@ -128,7 +134,7 @@ async fn write_and_read_empty_file() {
     let file_path = file_dir.path().join("empty.bin");
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let bytes_written = conn
         .write_file(&file_path_str, &[], None, false)
@@ -160,7 +166,7 @@ async fn write_file_chunked_via_agent_connection_round_trips_at_client_layer() {
         "test data must not be an exact multiple of the chunk size"
     );
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let mut total_written = 0u64;
     for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
@@ -183,7 +189,7 @@ async fn write_file_chunked_via_agent_connection_round_trips_at_client_layer() {
 async fn connection_recovers_after_failed_read() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     // Try to read a nonexistent file (should fail)
     let result = conn.read_file("/nonexistent/path/12345").await;
@@ -203,7 +209,7 @@ async fn connection_recovers_after_failed_read() {
 async fn connection_recovers_after_failed_exec() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     // Execute a nonexistent command (agent returns error response)
     let result = conn.exec("nonexistent_cmd_xyz_999", &[], None, &[]).await;
@@ -232,7 +238,7 @@ async fn sequential_file_operations() {
     let file_path = file_dir.path().join("sequential.txt");
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     // Write initial content
     conn.write_file(&file_path_str, b"version 1", None, false)
@@ -260,7 +266,7 @@ async fn interleaved_exec_and_file_ops() {
     let (_dir, path) = spawn_agent().await;
     let file_dir = tempfile::tempdir().unwrap();
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     // Write a script via file API
     let script_path = file_dir.path().join("test.sh");
@@ -295,7 +301,7 @@ async fn write_file_with_permissions() {
     let file_path = file_dir.path().join("perms.sh");
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     conn.write_file(&file_path_str, b"#!/bin/sh\necho perms", Some(0o755), false)
         .await
@@ -319,7 +325,7 @@ async fn binary_data_with_all_byte_values() {
     // Every possible byte value (0x00 through 0xFF)
     let data: Vec<u8> = (0..=255).collect();
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     conn.write_file(&file_path_str, &data, None, false)
         .await
@@ -362,7 +368,7 @@ async fn raw_stream_connection_full_workflow() {
 async fn exec_with_multiple_env_vars() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let result = conn
         .exec(
@@ -382,7 +388,7 @@ async fn exec_with_multiple_env_vars() {
 async fn exec_with_special_characters_in_args() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let result = conn
         .exec(
@@ -405,7 +411,7 @@ async fn exec_with_special_characters_in_args() {
 async fn exec_captures_stderr() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let result = conn
         .exec("sh", &["-c", "echo error-output >&2"], None, &[])
@@ -421,7 +427,7 @@ async fn exec_captures_stderr() {
 async fn exec_mixed_stdout_stderr() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     let result = conn
         .exec(
@@ -444,7 +450,7 @@ async fn exec_mixed_stdout_stderr() {
 async fn shell_start_and_echo_via_cat() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     if !shell_start_or_skip(&mut conn, Some("cat")).await {
         return;
@@ -474,7 +480,7 @@ async fn shell_start_and_echo_via_cat() {
 async fn shell_with_echo_command() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     // `echo` with no args outputs a newline and exits
     if !shell_start_or_skip(&mut conn, Some("echo")).await {
@@ -502,7 +508,7 @@ async fn shell_with_echo_command() {
 async fn shell_exit_code() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     if !shell_start_or_skip(&mut conn, Some("sh")).await {
         return;
@@ -525,7 +531,7 @@ async fn shell_exit_code() {
 async fn shell_resize_does_not_disrupt_session() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     if !shell_start_or_skip(&mut conn, Some("cat")).await {
         return;
@@ -559,7 +565,7 @@ async fn shell_resize_does_not_disrupt_session() {
 async fn shell_nonexistent_command_returns_error() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     match conn
         .shell_start(Some("nonexistent_cmd_xyz_999"), 80, 24)
@@ -600,7 +606,7 @@ async fn shell_nonexistent_command_returns_error() {
 async fn shell_bidirectional_data_exchange() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     if !shell_start_or_skip(&mut conn, Some("sh")).await {
         return;
@@ -639,7 +645,7 @@ async fn shell_bidirectional_data_exchange() {
 async fn shell_start_sends_term_env() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     if !shell_start_or_skip(&mut conn, Some("sh")).await {
         return;
@@ -682,7 +688,7 @@ async fn shell_start_sends_term_env() {
 async fn shell_session_survives_idle_period() {
     let (_dir, path) = spawn_agent().await;
 
-    let mut conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut conn = connect(&path).await;
 
     if !shell_start_or_skip(&mut conn, Some("cat")).await {
         return;
@@ -720,13 +726,13 @@ async fn concurrent_shell_and_exec() {
     let (_dir, path) = spawn_agent().await;
 
     // Start a long-running shell on one connection
-    let mut shell_conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut shell_conn = connect(&path).await;
     if !shell_start_or_skip(&mut shell_conn, Some("cat")).await {
         return;
     }
 
     // Run exec on a separate connection while shell is active
-    let mut exec_conn = AgentClient::connect_unix(&path).await.unwrap();
+    let mut exec_conn = connect(&path).await;
     let result = exec_conn
         .exec("echo", &["concurrent_ok"], None, &[])
         .await

@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Duration;
 
 use husker_agent_proto::{
@@ -11,10 +10,6 @@ use tracing::{debug, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
-    #[error("connection failed: {0}")]
-    Connection(std::io::Error),
-    #[error("vsock CONNECT rejected by Firecracker (port {0})")]
-    VsockConnectRejected(u32),
     #[error("protocol error: {0}")]
     Protocol(#[from] husker_agent_proto::ProtocolError),
     #[error("unexpected response from agent")]
@@ -129,87 +124,6 @@ pub struct RangedRead {
     /// mid-transfer by contents of the same length. `None` when the agent or
     /// the guest filesystem does not report one: unknown, not "unchanged".
     pub modified_nanos: Option<u64>,
-}
-
-/// Factory for creating agent connections.
-pub struct AgentClient;
-
-impl AgentClient {
-    /// Connect to the agent via Firecracker's vsock UDS proxy.
-    ///
-    /// Firecracker exposes guest vsock as a Unix domain socket. To connect to a
-    /// specific guest port, the host must:
-    /// 1. Connect to the UDS at `vsock_uds_path`
-    /// 2. Send `CONNECT {port}\n`
-    /// 3. Read the response — `OK {local_port}\n` on success
-    ///
-    /// After the handshake, the stream is transparently bridged to the guest.
-    pub async fn connect(
-        vsock_uds_path: &Path,
-        port: u32,
-    ) -> Result<AgentConnection<tokio::net::UnixStream>, AgentError> {
-        let stream = husker_vmm::vsock::connect_firecracker_vsock(vsock_uds_path, port)
-            .await
-            .map_err(|e| match e {
-                husker_vmm::vsock::VsockConnectError::Rejected(port) => {
-                    AgentError::VsockConnectRejected(port)
-                }
-                husker_vmm::vsock::VsockConnectError::Connect(e)
-                | husker_vmm::vsock::VsockConnectError::HandshakeWrite(e)
-                | husker_vmm::vsock::VsockConnectError::HandshakeRead(e) => {
-                    AgentError::Connection(e)
-                }
-                husker_vmm::vsock::VsockConnectError::HandshakeTimeout(d) => {
-                    AgentError::Connection(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("vsock handshake timed out after {d:?}"),
-                    ))
-                }
-            })?;
-        Ok(AgentConnection::new(stream))
-    }
-
-    /// Connect to the agent via a Unix socket path directly.
-    pub async fn connect_unix(
-        path: &Path,
-    ) -> Result<AgentConnection<tokio::net::UnixStream>, AgentError> {
-        let stream = tokio::net::UnixStream::connect(path)
-            .await
-            .map_err(AgentError::Connection)?;
-        Ok(AgentConnection::new(stream))
-    }
-
-    /// Wait for the agent to become ready, retrying ping with backoff.
-    pub async fn wait_ready(
-        vsock_uds_path: &Path,
-        port: u32,
-        timeout: Duration,
-    ) -> Result<AgentConnection<tokio::net::UnixStream>, AgentError> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut interval = Duration::from_millis(100);
-
-        loop {
-            match Self::connect(vsock_uds_path, port).await {
-                Ok(mut conn) => match conn.ping().await {
-                    Ok(()) => return Ok(conn),
-                    Err(_) if tokio::time::Instant::now() < deadline => {}
-                    Err(e) => return Err(e),
-                },
-                Err(_) if tokio::time::Instant::now() < deadline => {}
-                Err(e) => return Err(e),
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                return Err(AgentError::NotReady {
-                    timeout,
-                    detail: String::new(),
-                });
-            }
-
-            tokio::time::sleep(interval).await;
-            interval = (interval * 2).min(Duration::from_secs(2));
-        }
-    }
 }
 
 /// A typed connection to a guest agent.

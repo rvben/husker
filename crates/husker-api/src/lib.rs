@@ -2624,8 +2624,13 @@ mod tests {
 
     #[test]
     fn map_agent_connect_error_returns_service_unavailable_with_hint() {
-        let (status, body) = map_agent_connect_error(CoreError::Agent(
-            husker_core::AgentError::Connection(std::io::Error::other("dial failed")),
+        // The shape the Firecracker backend reports while the guest has not
+        // yet opened the agent's vsock port: the VMM answers the CONNECT
+        // handshake with a rejection, which the backend wraps as a process
+        // error carrying the handshake failure's message.
+        let rejected = husker_vmm::vsock::VsockConnectError::Rejected(52);
+        let (status, body) = map_agent_connect_error(CoreError::Vmm(
+            husker_vmm::VmmError::ProcessError(rejected.to_string()),
         ));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -2637,6 +2642,18 @@ mod tests {
         );
         assert_eq!(payload.error.as_deref(), Some(payload.message.as_str()));
         assert!(payload.message.contains("agent not ready:"));
+        assert!(payload.message.contains("vsock CONNECT rejected (port 52)"));
+    }
+
+    #[test]
+    fn map_agent_connect_error_treats_a_not_ready_agent_as_service_unavailable() {
+        let (status, body) =
+            map_agent_connect_error(CoreError::Agent(husker_core::AgentError::NotReady {
+                timeout: std::time::Duration::from_secs(30),
+                detail: String::new(),
+            }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.kind, "agent_not_ready");
     }
 
     #[test]

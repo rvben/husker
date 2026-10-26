@@ -54,9 +54,7 @@ pub struct VmPage {
     pub total: usize,
 }
 
-pub use agent_client::{
-    AgentClient, AgentConnection, AgentError, ExecResult, ExecStreamEvent, ShellEvent,
-};
+pub use agent_client::{AgentConnection, AgentError, ExecResult, ExecStreamEvent, ShellEvent};
 pub use diagnostics::{DRAIN_STOP_TIMEOUT, DrainReport};
 #[cfg(feature = "linux-net")]
 pub use oci_materializer::{
