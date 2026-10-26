@@ -1473,19 +1473,28 @@ mod tests {
     // These are fast, hermetic tests (tempdir + one qemu-img invocation), so they
     // run by default rather than being #[ignore]d like the VM-boot e2e tests: when
     // qemu-img is present (CI) they provide real coverage, and they skip cleanly on
-    // dev hosts that lack it.
-    fn qemu_img_available() -> bool {
-        std::process::Command::new("qemu-img")
+    // dev hosts that lack it. CI sets HUSKER_REQUIRE_QEMU_IMG so a runner that
+    // lost qemu-img fails the test instead of silently skipping the coverage.
+    fn skip_without_qemu_img(test: &str) -> bool {
+        let available = std::process::Command::new("qemu-img")
             .arg("--version")
             .output()
             .map(|o| o.status.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if available {
+            return false;
+        }
+        assert!(
+            std::env::var_os("HUSKER_REQUIRE_QEMU_IMG").is_none(),
+            "{test}: qemu-img not installed but HUSKER_REQUIRE_QEMU_IMG is set"
+        );
+        eprintln!("skipping {test}: qemu-img not installed");
+        true
     }
 
     #[tokio::test]
     async fn resize_disk_grows_a_raw_file() {
-        if !qemu_img_available() {
-            eprintln!("skipping resize_disk_grows_a_raw_file: qemu-img not installed");
+        if skip_without_qemu_img("resize_disk_grows_a_raw_file") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1509,8 +1518,7 @@ mod tests {
     /// must not let qemu-img probe the format and chase that name.
     #[tokio::test]
     async fn resize_disk_treats_a_raw_disk_with_a_qcow2_header_as_raw() {
-        if !qemu_img_available() {
-            eprintln!("skipping: qemu-img not installed");
+        if skip_without_qemu_img("resize_disk_treats_a_raw_disk_with_a_qcow2_header_as_raw") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1530,8 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn resize_disk_errors_on_missing_file() {
-        if !qemu_img_available() {
-            eprintln!("skipping resize_disk_errors_on_missing_file: qemu-img not installed");
+        if skip_without_qemu_img("resize_disk_errors_on_missing_file") {
             return;
         }
         let err = resize_disk(
@@ -1700,8 +1707,7 @@ mod tests {
 
     #[test]
     fn validate_cloud_image_accepts_a_qemu_img_image() {
-        if !qemu_img_available() {
-            eprintln!("skipping: qemu-img not installed");
+        if skip_without_qemu_img("validate_cloud_image_accepts_a_qemu_img_image") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1716,8 +1722,9 @@ mod tests {
 
     #[test]
     fn validate_cloud_image_rejects_qemu_img_images_that_reference_other_files() {
-        if !qemu_img_available() {
-            eprintln!("skipping: qemu-img not installed");
+        if skip_without_qemu_img(
+            "validate_cloud_image_rejects_qemu_img_images_that_reference_other_files",
+        ) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1831,8 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn qcow2_virtual_size_reads_size() {
-        if !qemu_img_available() {
-            eprintln!("skipping: qemu-img not installed");
+        if skip_without_qemu_img("qcow2_virtual_size_reads_size") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1848,8 +1854,7 @@ mod tests {
 
     #[test]
     fn convert_qcow2_to_raw_produces_raw() {
-        if !qemu_img_available() {
-            eprintln!("skipping: qemu-img not installed");
+        if skip_without_qemu_img("convert_qcow2_to_raw_produces_raw") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();

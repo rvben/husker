@@ -5950,15 +5950,19 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
     async fn cloud_image_conversion_failure_rolls_back_vm_dir() {
-        // qemu-img is required; skip cleanly if unavailable (dev hosts without it).
-        fn qemu_img_available() -> bool {
-            std::process::Command::new("qemu-img")
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
-        if !qemu_img_available() {
+        // qemu-img is required; skip cleanly on dev hosts without it. CI sets
+        // HUSKER_REQUIRE_QEMU_IMG so a runner that lost qemu-img fails here
+        // instead of silently skipping the rollback coverage.
+        let qemu_img_available = std::process::Command::new("qemu-img")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !qemu_img_available {
+            assert!(
+                std::env::var_os("HUSKER_REQUIRE_QEMU_IMG").is_none(),
+                "qemu-img not installed but HUSKER_REQUIRE_QEMU_IMG is set"
+            );
             eprintln!(
                 "skipping cloud_image_conversion_failure_rolls_back_vm_dir: qemu-img not installed"
             );
