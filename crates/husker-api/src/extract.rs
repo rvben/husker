@@ -14,17 +14,18 @@
 
 use std::error::Error as _;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::{FromRequest, FromRequestParts, Request};
+use axum::extract::{FromRef, FromRequest, FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::current_policy;
+use crate::ApiPolicy;
 use crate::errors::{error_response, error_response_with_hint};
 
 /// A request the API refused before any handler ran, carrying the status axum
@@ -54,9 +55,12 @@ impl IntoResponse for Rejection {
 #[derive(Debug)]
 pub(crate) struct Json<T>(pub T);
 
+/// The state must carry the router's policy: a body that is too large is
+/// reported against the limit this router enforces, read from that policy.
 impl<S, T> FromRequest<S> for Json<T>
 where
     S: Send + Sync,
+    Arc<ApiPolicy>: FromRef<S>,
     T: DeserializeOwned,
 {
     type Rejection = Rejection;
@@ -64,7 +68,10 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Rejection> {
         match axum::Json::<T>::from_request(request, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(json_rejection(rejection)),
+            Err(rejection) => Err(json_rejection(
+                rejection,
+                Arc::<ApiPolicy>::from_ref(state).max_request_bytes,
+            )),
         }
     }
 }
@@ -145,7 +152,7 @@ where
     }
 }
 
-fn json_rejection(rejection: JsonRejection) -> Rejection {
+fn json_rejection(rejection: JsonRejection, max_request_bytes: usize) -> Rejection {
     let status = rejection.status();
     let (kind, message, hint) = match &rejection {
         JsonRejection::JsonSyntaxError(_) => ("invalid_json", rejection.body_text(), None),
@@ -158,10 +165,7 @@ fn json_rejection(rejection: JsonRejection) -> Rejection {
         // rather than the request's shape, so name the setting and its value.
         JsonRejection::BytesRejection(_) if status == StatusCode::PAYLOAD_TOO_LARGE => (
             "payload_too_large",
-            format!(
-                "request body exceeds the {} byte limit",
-                current_policy().max_request_bytes
-            ),
+            format!("request body exceeds the {max_request_bytes} byte limit"),
             Some(
                 "split the transfer into smaller requests, or raise max_request_bytes in the daemon's api policy",
             ),

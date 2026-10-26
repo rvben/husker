@@ -30,27 +30,45 @@ pub async fn serve() -> Result<()> {
         warn!("cgroup self-limit not applied: {e}");
     }
 
+    // The limits are read once here and shared by every connection, so what
+    // the agent enforces is fixed at startup and visible in its log.
+    let limits = crate::AgentLimits::from_env();
+    info!(
+        "exec timeout {}s, max read {} bytes",
+        limits.exec_timeout.as_secs(),
+        limits.max_read_bytes
+    );
+
     // Transport selection:
     // 1. HUSKER_AGENT_SOCKET env var -> Unix socket (dev/testing)
     // 2. otherwise vsock port 52 (production Linux and macOS guests)
     if let Ok(path) = std::env::var("HUSKER_AGENT_SOCKET") {
-        listen_unix(&path).await
+        listen_unix(&path, limits).await
     } else {
-        listen_vsock().await
+        listen_vsock(limits).await
     }
 }
 
-async fn listen_unix(path: &str) -> Result<()> {
+/// Serve one accepted connection with the process-wide session store.
+fn serve_connection<S>(stream: S, limits: crate::AgentLimits)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let sessions = crate::sessions::store().clone();
+        if let Err(e) = crate::handle_connection_with(stream, sessions, limits).await {
+            error!("connection error: {e}");
+        }
+    });
+}
+
+async fn listen_unix(path: &str, limits: crate::AgentLimits) -> Result<()> {
     info!("listening on Unix socket: {path}");
     let listener = tokio::net::UnixListener::bind(path).context("binding Unix socket")?;
 
     loop {
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            if let Err(e) = crate::handle_connection(stream).await {
-                error!("connection error: {e}");
-            }
-        });
+        serve_connection(stream, limits);
     }
 }
 
@@ -74,7 +92,7 @@ fn vsock_bind_error(port: u32, err: std::io::Error) -> anyhow::Error {
 }
 
 #[cfg(target_os = "linux")]
-async fn listen_vsock() -> Result<()> {
+async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
     use tokio_vsock::VsockListener;
 
     let port = husker_agent_proto::AGENT_VSOCK_PORT;
@@ -86,11 +104,7 @@ async fn listen_vsock() -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("vsock connection from CID {}", addr.cid());
-        tokio::spawn(async move {
-            if let Err(e) = crate::handle_connection(stream).await {
-                error!("connection error: {e}");
-            }
-        });
+        serve_connection(stream, limits);
     }
 }
 
@@ -100,7 +114,7 @@ async fn listen_vsock() -> Result<()> {
 /// the agent as a `UnixStream` (it only reads and writes, which is
 /// family-agnostic for stream sockets).
 #[cfg(target_os = "macos")]
-async fn listen_vsock() -> Result<()> {
+async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let port = husker_agent_proto::AGENT_VSOCK_PORT;
@@ -177,11 +191,7 @@ async fn listen_vsock() -> Result<()> {
                 }
             };
         info!("vsock connection accepted");
-        tokio::spawn(async move {
-            if let Err(e) = crate::handle_connection(stream).await {
-                error!("connection error: {e}");
-            }
-        });
+        serve_connection(stream, limits);
     }
 }
 
@@ -233,7 +243,7 @@ fn vsock_bind_error(port: u32, err: std::io::Error) -> anyhow::Error {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-async fn listen_vsock() -> Result<()> {
+async fn listen_vsock(_limits: crate::AgentLimits) -> Result<()> {
     anyhow::bail!("vsock is only available on Linux and macOS; set HUSKER_AGENT_SOCKET for dev use")
 }
 

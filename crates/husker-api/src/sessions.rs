@@ -17,7 +17,7 @@ use utoipa::OpenApi;
 
 use crate::errors::{Failure, error_response_with_hint, map_agent_connect_error, map_error};
 use crate::extract::{Json, Path, Query, WebSocketUpgrade};
-use crate::{AppState, ErrorResponse, ExecRequest, current_policy};
+use crate::{ApiPolicy, ErrorResponse, ExecRequest, SharedCore};
 
 async fn connection<B: VmmBackend + 'static>(
     core: &HuskerCore<B>,
@@ -112,14 +112,15 @@ fn session_error(error: AgentError) -> Failure {
         (status = 502, body = ErrorResponse, description = "Guest failed to start the session"),
         (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn start<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
     Path(name): Path<String>,
     Json(request): Json<ExecRequest>,
 ) -> Result<(StatusCode, Json<SessionInfo>), Failure> {
     // Acceptance transfers the whole start/monitor handoff to the daemon.
     // A cancelled HTTP future must not orphan a successfully detached guest
     // command without its host idle guard.
-    tokio::spawn(start_owned(core, name, request))
+    tokio::spawn(start_owned(core, policy, name, request))
         .await
         .map_err(|error| {
             (
@@ -134,11 +135,11 @@ pub(crate) async fn start<B: VmmBackend + 'static>(
 }
 
 async fn start_owned<B: VmmBackend + 'static>(
-    core: AppState<B>,
+    core: SharedCore<B>,
+    policy: Arc<ApiPolicy>,
     name: String,
     request: ExecRequest,
 ) -> Result<(StatusCode, Json<SessionInfo>), Failure> {
-    let policy = current_policy();
     let env = crate::handlers::resolve_exec_environment(core.as_ref(), &request, &policy)
         .map_err(|e| *e)?;
     let timeout_secs = request
@@ -249,7 +250,7 @@ async fn start_owned<B: VmmBackend + 'static>(
         (status = 502, body = ErrorResponse, description = "Guest failed to list sessions"),
         (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn list<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<SessionInfo>>, Failure> {
     Ok(Json(
@@ -269,7 +270,7 @@ pub(crate) async fn list<B: VmmBackend + 'static>(
         (status = 502, body = ErrorResponse, description = "Guest failed to read the session"),
         (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn get<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<SessionInfo>, Failure> {
     Ok(Json(
@@ -295,7 +296,7 @@ pub(crate) struct Cursor {
         (status = 502, body = ErrorResponse, description = "Guest failed to read the session log"),
         (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn events<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path((name, id)): Path<(String, String)>,
     Query(cursor): Query<Cursor>,
 ) -> Result<Json<SessionEventsResponse>, Failure> {
@@ -316,7 +317,7 @@ pub(crate) async fn events<B: VmmBackend + 'static>(
         (status = 502, body = ErrorResponse, description = "Guest failed to cancel the session"),
         (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn cancel<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<SessionInfo>, Failure> {
     Ok(Json(
@@ -337,7 +338,7 @@ pub(crate) async fn cancel<B: VmmBackend + 'static>(
         (status = 502, body = ErrorResponse, description = "Guest failed to remove the session"),
         (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn remove<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<StatusCode, Failure> {
     connection(&core, &name, None)
@@ -357,7 +358,7 @@ pub(crate) async fn remove<B: VmmBackend + 'static>(
         (status = 502, body = ErrorResponse, description = "Nothing on the guest accepted the connection"),
         (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn tunnel<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path((name, port)): Path<(String, u16)>,
     WebSocketUpgrade(ws): WebSocketUpgrade,
 ) -> Result<Response, Failure> {

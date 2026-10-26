@@ -31,7 +31,56 @@ use husker_agent_proto::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
-/// Handle a single connection, processing requests until the stream closes.
+/// The per-request ceilings the agent enforces: how long an exec may run when
+/// the request names no timeout, and how many bytes one `ReadFile` response
+/// may carry. The serving process reads them from the environment once at
+/// startup ([`AgentLimits::from_env`]) and hands the same value to every
+/// connection, so a limit is a property of the agent that was started, never
+/// of whichever request happens to run next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentLimits {
+    /// Ceiling on a single exec whose request carries no `timeout_secs`.
+    pub exec_timeout: std::time::Duration,
+    /// Ceiling on bytes returned by a single `ReadFile` response. Keeps the
+    /// agent's peak memory bounded even when the host asks for a large file.
+    pub max_read_bytes: u64,
+}
+
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            exec_timeout: std::time::Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECS),
+            max_read_bytes: DEFAULT_MAX_READ_BYTES,
+        }
+    }
+}
+
+impl AgentLimits {
+    /// The limits for this process: the defaults, with
+    /// `HUSKER_AGENT_EXEC_TIMEOUT_SECS` and `HUSKER_AGENT_MAX_READ_BYTES`
+    /// overriding where set to a number.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let number = |key: &str| lookup(key).and_then(|value| value.parse::<u64>().ok());
+        let defaults = Self::default();
+        Self {
+            exec_timeout: number("HUSKER_AGENT_EXEC_TIMEOUT_SECS")
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(defaults.exec_timeout),
+            max_read_bytes: number("HUSKER_AGENT_MAX_READ_BYTES")
+                .unwrap_or(defaults.max_read_bytes),
+        }
+    }
+}
+
+/// Handle a single connection with the process-wide session store and the
+/// default limits, processing requests until the stream closes. The entry
+/// point for embedders and tests that need a plain guest agent; the serving
+/// process uses [`handle_connection_with`] so every connection shares the
+/// limits it was started with.
 ///
 /// Generic over the stream type so it works with both Unix sockets (dev/test)
 /// and vsock streams (production in-VM).
@@ -39,14 +88,16 @@ pub async fn handle_connection<S>(stream: S) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handle_connection_with_sessions(stream, sessions::store().clone()).await
+    handle_connection_with(stream, sessions::store().clone(), AgentLimits::default()).await
 }
 
-/// Serve a connection using an explicitly owned session store. All connections
-/// for one guest must share this store; useful for isolated integration tests.
-pub async fn handle_connection_with_sessions<S>(
+/// Serve a connection using an explicitly owned session store and explicit
+/// limits. All connections for one guest must share the store; an isolated
+/// integration test gives each guest its own store and its own limits.
+pub async fn handle_connection_with<S>(
     mut stream: S,
     sessions: std::sync::Arc<SessionStore>,
+    limits: AgentLimits,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -87,14 +138,14 @@ where
             }
             AgentRequest::ExecStream(req) => {
                 // Streaming exec owns the connection until the command exits.
-                return handle_exec_stream(&mut stream, req).await;
+                return handle_exec_stream(&mut stream, req, limits).await;
             }
             AgentRequest::ShellStart(req) => {
                 // Shell takes over the connection — no more request/response loop
                 return handle_shell(&mut stream, req).await;
             }
             other => {
-                let response = handle_request_with_sessions(other, &sessions).await;
+                let response = handle_request_with_sessions(other, &sessions, limits).await;
                 write_message(&mut stream, &response).await?;
             }
         }
@@ -104,11 +155,11 @@ where
 /// Run a non-interactive command while forwarding stdout and stderr as bounded,
 /// binary-safe frames. Each write is awaited, so a slow host naturally applies
 /// backpressure without unbounded guest memory growth.
-async fn handle_exec_stream<S>(stream: &mut S, req: ExecRequest) -> Result<()>
+async fn handle_exec_stream<S>(stream: &mut S, req: ExecRequest, limits: AgentLimits) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (mut cmd, timeout) = match build_exec_command(&req) {
+    let (mut cmd, timeout) = match build_exec_command(&req, limits.exec_timeout) {
         Ok(value) => value,
         Err(error) => {
             write_message(stream, &AgentResponse::Error(error)).await?;
@@ -350,13 +401,10 @@ where
 }
 
 /// Default ceiling on how long a single `Exec` command may run before the
-/// agent kills the child and returns a timeout error. Overridable via the
-/// `HUSKER_AGENT_EXEC_TIMEOUT_SECS` env var (primarily for tests).
+/// agent kills the child and returns a timeout error.
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 600;
 
-/// Default ceiling on bytes returned by a single `ReadFile` response. Keeps
-/// the agent's peak memory bounded even when the host asks for a large file.
-/// Overridable via `HUSKER_AGENT_MAX_READ_BYTES`.
+/// Default ceiling on bytes returned by a single `ReadFile` response.
 const DEFAULT_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Memory ceiling written to the agent's own cgroup leaf. `memory.high`
@@ -409,11 +457,15 @@ fn escape_agent_cgroup() {
 const AGENT_EXEC_HARD_MAX_SECS: u64 = 24 * 60 * 60;
 
 /// The run timeout for an exec: the request's value (clamped to a sane range) or
-/// the agent default ([`exec_timeout`]) when the request specifies none.
-fn resolve_exec_timeout(requested: Option<u64>) -> std::time::Duration {
+/// `default_timeout` (the agent's [`AgentLimits::exec_timeout`]) when the
+/// request specifies none.
+fn resolve_exec_timeout(
+    requested: Option<u64>,
+    default_timeout: std::time::Duration,
+) -> std::time::Duration {
     match requested {
         Some(secs) => std::time::Duration::from_secs(secs.clamp(1, AGENT_EXEC_HARD_MAX_SECS)),
-        None => exec_timeout(),
+        None => default_timeout,
     }
 }
 
@@ -561,21 +613,6 @@ async fn run_exec_with_capture(
             })
         }
     }
-}
-
-fn exec_timeout() -> std::time::Duration {
-    let secs = std::env::var("HUSKER_AGENT_EXEC_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS);
-    std::time::Duration::from_secs(secs)
-}
-
-fn max_read_bytes() -> u64 {
-    std::env::var("HUSKER_AGENT_MAX_READ_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_READ_BYTES)
 }
 
 /// Fallback `PATH` for imported images whose OCI config declares none, matching
@@ -749,11 +786,13 @@ fn resolve_command_env(
     }
 }
 
-/// Build the child process shared by buffered and streaming exec paths.
+/// Build the child process shared by buffered and streaming exec paths, with
+/// the timeout it runs under: the request's own, or `default_timeout`.
 fn build_exec_command(
     req: &ExecRequest,
+    default_timeout: std::time::Duration,
 ) -> Result<(tokio::process::Command, std::time::Duration), ErrorResponse> {
-    let timeout = resolve_exec_timeout(req.timeout_secs);
+    let timeout = resolve_exec_timeout(req.timeout_secs, default_timeout);
     let plan = plan_exec(req, oci_runtime_config()).map_err(ErrorResponse::new)?;
     let mut cmd = tokio::process::Command::new(&plan.program);
     cmd.args(&plan.args)
@@ -775,17 +814,18 @@ fn build_exec_command(
 
 #[cfg(test)]
 async fn handle_request(request: AgentRequest) -> AgentResponse {
-    handle_request_with_sessions(request, sessions::store()).await
+    handle_request_with_sessions(request, sessions::store(), AgentLimits::default()).await
 }
 
 async fn handle_request_with_sessions(
     request: AgentRequest,
     sessions: &std::sync::Arc<SessionStore>,
+    limits: AgentLimits,
 ) -> AgentResponse {
     let session_result = match &request {
         AgentRequest::SessionStart(req) => Some(
             sessions
-                .start(req.clone())
+                .start(req.clone(), limits.exec_timeout)
                 .await
                 .map(AgentResponse::Session),
         ),
@@ -846,7 +886,7 @@ async fn handle_request_with_sessions(
         },
 
         AgentRequest::Exec(req) => {
-            let (cmd, timeout) = match build_exec_command(&req) {
+            let (cmd, timeout) = match build_exec_command(&req, limits.exec_timeout) {
                 Ok(value) => value,
                 Err(error) => return AgentResponse::Error(error),
             };
@@ -880,7 +920,7 @@ async fn handle_request_with_sessions(
                             )));
                         }
                     };
-                    let max = max_read_bytes();
+                    let max = limits.max_read_bytes;
                     // A request for more than the ceiling is clamped rather
                     // than refused: the host discovers the real size from
                     // total_size and comes back for the rest. Only an
@@ -1352,16 +1392,56 @@ mod tests {
 
     #[test]
     fn resolve_exec_timeout_clamps_request_else_uses_default() {
+        let default_timeout = std::time::Duration::from_secs(600);
         // A requested timeout is used, clamped to [1, hard max].
-        assert_eq!(resolve_exec_timeout(Some(120)).as_secs(), 120);
-        assert_eq!(resolve_exec_timeout(Some(0)).as_secs(), 1, "floor at 1s");
         assert_eq!(
-            resolve_exec_timeout(Some(u64::MAX)).as_secs(),
+            resolve_exec_timeout(Some(120), default_timeout).as_secs(),
+            120
+        );
+        assert_eq!(
+            resolve_exec_timeout(Some(0), default_timeout).as_secs(),
+            1,
+            "floor at 1s"
+        );
+        assert_eq!(
+            resolve_exec_timeout(Some(u64::MAX), default_timeout).as_secs(),
             AGENT_EXEC_HARD_MAX_SECS,
             "ceiling at the hard max"
         );
-        // None falls back to the agent default (600s without the env override).
-        assert_eq!(resolve_exec_timeout(None), exec_timeout());
+        // None falls back to the agent's configured default, whatever it is.
+        assert_eq!(resolve_exec_timeout(None, default_timeout), default_timeout);
+        let other = std::time::Duration::from_secs(7);
+        assert_eq!(resolve_exec_timeout(None, other), other);
+    }
+
+    #[test]
+    fn agent_limits_default_to_the_constants() {
+        let limits = AgentLimits::default();
+        assert_eq!(limits.exec_timeout.as_secs(), DEFAULT_EXEC_TIMEOUT_SECS);
+        assert_eq!(limits.max_read_bytes, DEFAULT_MAX_READ_BYTES);
+    }
+
+    #[test]
+    fn agent_limits_take_numeric_overrides_and_ignore_the_rest() {
+        let unset = AgentLimits::from_lookup(|_| None);
+        assert_eq!(unset, AgentLimits::default());
+
+        let set = AgentLimits::from_lookup(|key| match key {
+            "HUSKER_AGENT_EXEC_TIMEOUT_SECS" => Some("1".into()),
+            "HUSKER_AGENT_MAX_READ_BYTES" => Some("64".into()),
+            _ => None,
+        });
+        assert_eq!(set.exec_timeout, std::time::Duration::from_secs(1));
+        assert_eq!(set.max_read_bytes, 64);
+
+        // A value that is not a number leaves that limit at its default
+        // rather than disabling or zeroing it.
+        let garbage = AgentLimits::from_lookup(|key| match key {
+            "HUSKER_AGENT_EXEC_TIMEOUT_SECS" => Some("soon".into()),
+            "HUSKER_AGENT_MAX_READ_BYTES" => Some("".into()),
+            _ => None,
+        });
+        assert_eq!(garbage, AgentLimits::default());
     }
 
     #[test]
@@ -1448,6 +1528,7 @@ mod tests {
                 id: "00000000-0000-0000-0000-000000000000".into(),
             },
             &store,
+            AgentLimits::default(),
         )
         .await;
         let AgentResponse::Error(error) = response else {
@@ -1461,6 +1542,7 @@ mod tests {
                 id: "not-a-session-id".into(),
             },
             &store,
+            AgentLimits::default(),
         )
         .await;
         let AgentResponse::Error(error) = response else {

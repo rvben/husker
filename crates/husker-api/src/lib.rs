@@ -2,9 +2,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use axum::extract::FromRef;
 use serde::{Deserialize, Serialize};
 use utoipa::OpenApi;
 use utoipa::ToSchema;
@@ -15,8 +16,42 @@ use husker_core::{
     DaemonProfile, DiagnosticsReport, EgressRuleRequest, ExportImageRequest, HuskerCore,
     ImportImageRequest, RestoreSnapshotRequest, RotateSecretRequest,
 };
+use husker_vmm::VmmBackend;
 
-type AppState<B> = Arc<HuskerCore<B>>;
+/// The core a handler drives, shared with every other handler of the router.
+pub(crate) type SharedCore<B> = Arc<HuskerCore<B>>;
+
+/// Everything a request handler can extract from its router: the core and the
+/// policy the router was built with. A handler names the piece it needs
+/// (`State<SharedCore<B>>`, `State<Arc<ApiPolicy>>`) and axum projects it
+/// out through [`FromRef`]. The policy lives here rather than in a process
+/// global so two routers in one process, such as two test fixtures, never
+/// read each other's limits.
+pub(crate) struct AppState<B: VmmBackend> {
+    core: SharedCore<B>,
+    policy: Arc<ApiPolicy>,
+}
+
+impl<B: VmmBackend> Clone for AppState<B> {
+    fn clone(&self) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+            policy: Arc::clone(&self.policy),
+        }
+    }
+}
+
+impl<B: VmmBackend> FromRef<AppState<B>> for SharedCore<B> {
+    fn from_ref(state: &AppState<B>) -> Self {
+        Arc::clone(&state.core)
+    }
+}
+
+impl<B: VmmBackend> FromRef<AppState<B>> for Arc<ApiPolicy> {
+    fn from_ref(state: &AppState<B>) -> Self {
+        Arc::clone(&state.policy)
+    }
+}
 
 mod dto;
 mod errors;
@@ -30,8 +65,8 @@ pub use errors::ErrorResponse;
 pub use handlers::{MAX_EXEC_CONNECT_TIMEOUT_SECS, resolve_exec_connect_timeout};
 pub use husker_agent_proto::{SessionEvent, SessionEventsResponse, SessionInfo, SessionState};
 pub use router::{
-    BearerToken, EmptyBearerToken, metrics_router, router, router_with_auth, serve, serve_metrics,
-    serve_with_auth,
+    BearerToken, EmptyBearerToken, metrics_router, router, router_with_auth, router_with_policy,
+    serve_metrics, serve_with_auth,
 };
 
 use handlers::*;
@@ -68,6 +103,11 @@ pub struct ApiPolicy {
     /// Host paths allowed as virtiofs mount sources. Empty means deny all mounts.
     #[serde(default)]
     pub allowed_mount_host_paths: Vec<String>,
+    /// VMs the daemon admits before `create` is refused, so one client cannot
+    /// exhaust host CPU and memory by creating VMs without bound. `None` means
+    /// unlimited.
+    #[serde(default)]
+    pub max_vms: Option<usize>,
 }
 
 impl Default for ApiPolicy {
@@ -85,6 +125,7 @@ impl Default for ApiPolicy {
             exec_denylist: Vec::new(),
             exec_env_allowlist: Vec::new(),
             allowed_mount_host_paths: Vec::new(),
+            max_vms: None,
         }
     }
 }
@@ -140,14 +181,6 @@ pub(crate) struct SlidingWindowRateLimiter {
 }
 
 impl SlidingWindowRateLimiter {
-    #[cfg(test)]
-    fn clear(&self) {
-        self.events
-            .lock()
-            .expect("rate limiter lock poisoned")
-            .clear();
-    }
-
     /// Record one request against `key`, or reject it and say when the window
     /// next has room. A rejected request is deliberately not recorded, so
     /// retrying while limited cannot push that moment further away.
@@ -176,29 +209,31 @@ impl SlidingWindowRateLimiter {
     }
 }
 
-static API_POLICY: OnceLock<RwLock<ApiPolicy>> = OnceLock::new();
-static API_METRICS: OnceLock<ApiMetrics> = OnceLock::new();
-static RATE_LIMITER: OnceLock<SlidingWindowRateLimiter> = OnceLock::new();
-pub(crate) static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-/// Max VMs the daemon will admit before rejecting `create` (0 = unlimited).
-/// Set from config at startup; bounds host resource use by a single client.
-static MAX_VMS: AtomicU64 = AtomicU64::new(0);
-
-/// Set the max-VMs admission limit (`None` = unlimited).
-pub fn set_max_vms(max: Option<usize>) {
-    MAX_VMS.store(
-        max.unwrap_or(0) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+/// The rate limit one router applies to its sensitive routes: the policy's
+/// per-minute allowance and the window the requests are counted in. Owned by
+/// the router, so the count a limit is checked against is the count of
+/// requests that router served.
+#[derive(Debug)]
+pub(crate) struct SensitiveRateLimit {
+    per_minute: u32,
+    limiter: SlidingWindowRateLimiter,
 }
 
-/// The configured max-VMs admission limit, or `None` if unlimited.
-pub(crate) fn max_vms() -> Option<usize> {
-    match MAX_VMS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        n => Some(n as usize),
+impl SensitiveRateLimit {
+    pub(crate) fn new(per_minute: u32) -> Self {
+        Self {
+            per_minute,
+            limiter: SlidingWindowRateLimiter::default(),
+        }
+    }
+
+    pub(crate) fn check(&self, key: &str) -> RateLimitDecision {
+        self.limiter.check(key, self.per_minute)
     }
 }
+
+static API_METRICS: OnceLock<ApiMetrics> = OnceLock::new();
+pub(crate) static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ── OpenAPI ───────────────────────────────────────────────────────────
 
@@ -359,27 +394,8 @@ pub(crate) struct ApiDoc;
 )]
 pub(crate) struct PortForwardApiDoc;
 
-fn policy_lock() -> &'static RwLock<ApiPolicy> {
-    API_POLICY.get_or_init(|| RwLock::new(ApiPolicy::default()))
-}
-
 pub(crate) fn metrics() -> &'static ApiMetrics {
     API_METRICS.get_or_init(ApiMetrics::new)
-}
-
-pub(crate) fn rate_limiter() -> &'static SlidingWindowRateLimiter {
-    RATE_LIMITER.get_or_init(SlidingWindowRateLimiter::default)
-}
-
-pub(crate) fn current_policy() -> ApiPolicy {
-    policy_lock()
-        .read()
-        .expect("api policy lock poisoned")
-        .clone()
-}
-
-pub fn set_policy(policy: ApiPolicy) {
-    *policy_lock().write().expect("api policy lock poisoned") = policy;
 }
 
 #[cfg(test)]
@@ -387,7 +403,6 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
-    use std::sync::OnceLock;
 
     use axum::body::Body;
     use axum::http::Request;
@@ -581,11 +596,6 @@ mod tests {
             },
             std::path::PathBuf::from("/tmp/husker-test/run"),
         )
-    }
-
-    fn policy_test_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[tokio::test]
@@ -1291,8 +1301,13 @@ mod tests {
         };
         let core = make_core(state, storage, PathBuf::from("/tmp/husker-maxvms-test/run"));
 
-        set_max_vms(Some(1));
-        let app = router(core);
+        let app = router_with_policy(
+            core,
+            ApiPolicy {
+                max_vms: Some(1),
+                ..ApiPolicy::default()
+            },
+        );
         let body = serde_json::json!({
             "name": "over-limit",
             "kernel_path": "/nonexistent/vmlinux",
@@ -1307,9 +1322,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // Reset the global before asserting so a failure never leaks the limit to
-        // other tests sharing the process under `cargo test`.
-        set_max_vms(None);
         let status = response.status();
         let json = response_json(response).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -1654,13 +1666,13 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_policy_denied_returns_403() {
-        let _guard = policy_test_lock().lock().await;
-        set_policy(ApiPolicy {
-            allowed_read_paths: vec!["/safe".into()],
-            ..ApiPolicy::default()
-        });
-
-        let app = router(test_core());
+        let app = router_with_policy(
+            test_core(),
+            ApiPolicy {
+                allowed_read_paths: vec!["/safe".into()],
+                ..ApiPolicy::default()
+            },
+        );
         let body = serde_json::json!({ "path": "/etc/passwd" });
         let response = app
             .oneshot(
@@ -1675,19 +1687,17 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let json = response_json(response).await;
         assert_eq!(json["kind"], "policy_read_path_denied");
-
-        set_policy(ApiPolicy::default());
     }
 
     #[tokio::test]
     async fn write_file_policy_denied_returns_403() {
-        let _guard = policy_test_lock().lock().await;
-        set_policy(ApiPolicy {
-            allowed_write_paths: vec!["/safe".into()],
-            ..ApiPolicy::default()
-        });
-
-        let app = router(test_core());
+        let app = router_with_policy(
+            test_core(),
+            ApiPolicy {
+                allowed_write_paths: vec!["/safe".into()],
+                ..ApiPolicy::default()
+            },
+        );
         let body = serde_json::json!({
             "path": "/etc/passwd",
             "data": husker_agent_proto::base64_encode(b"x"),
@@ -1706,19 +1716,17 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let json = response_json(response).await;
         assert_eq!(json["kind"], "policy_write_path_denied");
-
-        set_policy(ApiPolicy::default());
     }
 
     #[tokio::test]
     async fn write_file_too_large_returns_413() {
-        let _guard = policy_test_lock().lock().await;
-        set_policy(ApiPolicy {
-            max_file_write_bytes: 1,
-            ..ApiPolicy::default()
-        });
-
-        let app = router(test_core());
+        let app = router_with_policy(
+            test_core(),
+            ApiPolicy {
+                max_file_write_bytes: 1,
+                ..ApiPolicy::default()
+            },
+        );
         let body = serde_json::json!({
             "path": "/tmp/output.bin",
             "data": husker_agent_proto::base64_encode(b"xy"),
@@ -1737,8 +1745,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let json = response_json(response).await;
         assert_eq!(json["kind"], "write_file_too_large");
-
-        set_policy(ApiPolicy::default());
     }
 
     /// A minimal `VmRecord`: `running`, `firecracker`, no idle policy set by
@@ -1877,7 +1883,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_allows_public_health_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
             .await
@@ -1889,7 +1895,7 @@ mod tests {
     async fn auth_enabled_rejects_read_without_token() {
         // SEC-3 regression: list/detail reads leak guest_ip/pid/rootfs_path, so on a
         // token-protected daemon they must require the token (previously public).
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         for path in ["/v1/vms", "/v1/pools", "/v1/diagnostics", "/v1/profiles"] {
             let response = app
                 .clone()
@@ -1917,7 +1923,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_mutating_endpoint_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(
                 Request::post("/v1/vms/nonexistent/stop")
@@ -1937,7 +1943,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_accepts_valid_token_for_mutating_endpoint() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(
                 Request::post("/v1/vms/nonexistent/stop")
@@ -1953,7 +1959,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_requires_token_for_shell_endpoint() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(
                 Request::get("/v1/vms/nonexistent/shell")
@@ -1967,7 +1973,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_logs_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(
                 Request::get("/v1/vms/any/logs")
@@ -1981,7 +1987,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_metrics_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
             .await
@@ -1991,7 +1997,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_service_mutation_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let body = serde_json::json!({ "name": "default" });
         let response = app
             .oneshot(
@@ -2007,7 +2013,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_snapshot_mutation_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let body = serde_json::json!({ "name": "snap-1", "vm": "vm-a" });
         let response = app
             .oneshot(
@@ -2023,7 +2029,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_image_mutation_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let body = serde_json::json!({
             "name": "ubuntu-base",
             "source_path": "/tmp/source.ext4"
@@ -2042,7 +2048,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_volume_delete_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(
                 Request::delete("/v1/volumes/data")
@@ -2056,7 +2062,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_volume_create_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let body = serde_json::json!({ "name": "data", "size_mib": 1024 });
         let response = app
             .oneshot(
@@ -2072,7 +2078,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_secret_read_without_token() {
-        let app = router_with_auth(test_core(), secret_token());
+        let app = router_with_auth(test_core(), ApiPolicy::default(), secret_token());
         let response = app
             .oneshot(Request::get("/v1/secrets").body(Body::empty()).unwrap())
             .await
@@ -2232,18 +2238,19 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_middleware_ignores_x_forwarded_for() {
-        let _guard = policy_test_lock().lock().await;
-        rate_limiter().clear();
-        set_policy(ApiPolicy {
-            sensitive_rate_limit_per_minute: 2,
-            ..ApiPolicy::default()
-        });
-
+        // One router, so every request counts against the same window.
+        let app = router_with_policy(
+            test_core(),
+            ApiPolicy {
+                sensitive_rate_limit_per_minute: 2,
+                ..ApiPolicy::default()
+            },
+        );
         let body = serde_json::json!({ "path": "/safe/ok" });
-        let mk = || router(test_core());
 
         for xff in ["1.1.1.1", "2.2.2.2"] {
-            let response = mk()
+            let response = app
+                .clone()
                 .oneshot(
                     Request::post("/v1/vms/any/files/read")
                         .header("content-type", "application/json")
@@ -2260,7 +2267,7 @@ mod tests {
             );
         }
 
-        let response = mk()
+        let response = app
             .oneshot(
                 Request::post("/v1/vms/any/files/read")
                     .header("content-type", "application/json")
@@ -2275,9 +2282,6 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "spoofed x-forwarded-for must not evade the rate limiter"
         );
-
-        rate_limiter().clear();
-        set_policy(ApiPolicy::default());
     }
 
     /// A rate-limited client that is told nothing can only guess when to come
@@ -2285,13 +2289,13 @@ mod tests {
     /// says so in the header the standard reserves for it.
     #[tokio::test]
     async fn rate_limited_response_says_when_to_retry() {
-        let _guard = policy_test_lock().lock().await;
-        rate_limiter().clear();
-        set_policy(ApiPolicy {
-            sensitive_rate_limit_per_minute: 1,
-            ..ApiPolicy::default()
-        });
-
+        let app = router_with_policy(
+            test_core(),
+            ApiPolicy {
+                sensitive_rate_limit_per_minute: 1,
+                ..ApiPolicy::default()
+            },
+        );
         let body = serde_json::json!({ "path": "/safe/ok" });
         let request = || {
             Request::post("/v1/vms/any/files/read")
@@ -2299,10 +2303,10 @@ mod tests {
                 .body(Body::from(serde_json::to_string(&body).unwrap()))
                 .unwrap()
         };
-        let accepted = router(test_core()).oneshot(request()).await.unwrap();
+        let accepted = app.clone().oneshot(request()).await.unwrap();
         assert_ne!(accepted.status(), StatusCode::TOO_MANY_REQUESTS);
 
-        let limited = router(test_core()).oneshot(request()).await.unwrap();
+        let limited = app.oneshot(request()).await.unwrap();
 
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = limited
@@ -2321,9 +2325,6 @@ mod tests {
             (56..=60).contains(&retry_after),
             "the header must carry the real deadline, not a placeholder: {retry_after}"
         );
-
-        rate_limiter().clear();
-        set_policy(ApiPolicy::default());
     }
 
     #[test]

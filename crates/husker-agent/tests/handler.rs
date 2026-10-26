@@ -1,3 +1,4 @@
+use husker_agent::AgentLimits;
 use husker_agent_proto::{
     AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, ShellDataRequest,
     ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode, base64_encode,
@@ -6,8 +7,16 @@ use husker_agent_proto::{
 
 /// Spawn the agent handler on a temporary Unix socket and return a connected client stream.
 async fn spawn_agent() -> tokio::net::UnixStream {
+    spawn_agent_with(AgentLimits::default()).await
+}
+
+/// Spawn an agent that enforces `limits`, on its own session store, and
+/// return a connected client stream. Each test's agent is independent, so a
+/// lowered limit here affects nobody else, however the tests are scheduled.
+async fn spawn_agent_with(limits: AgentLimits) -> tokio::net::UnixStream {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("agent.sock");
+    let sessions = husker_agent::SessionStore::new(dir.path().join("sessions"));
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
 
     // Leak the tempdir so it lives for the test duration
@@ -15,7 +24,9 @@ async fn spawn_agent() -> tokio::net::UnixStream {
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        husker_agent::handle_connection(stream).await.unwrap();
+        husker_agent::handle_connection_with(stream, sessions, limits)
+            .await
+            .unwrap();
     });
 
     tokio::net::UnixStream::connect(&path).await.unwrap()
@@ -191,13 +202,12 @@ async fn exec_stream_delivers_output_before_exit_and_keeps_stderr_separate() {
 
 #[tokio::test]
 async fn exec_times_out_on_long_running_command() {
-    // Safety: test is serialized by `serial_test`-free convention here because
-    // no other test reads this env var, and they all use commands that finish
-    // in milliseconds.
-    unsafe {
-        std::env::set_var("HUSKER_AGENT_EXEC_TIMEOUT_SECS", "1");
-    }
-    let mut stream = spawn_agent().await;
+    // The request names no timeout, so the agent's own default applies.
+    let mut stream = spawn_agent_with(AgentLimits {
+        exec_timeout: std::time::Duration::from_secs(1),
+        ..AgentLimits::default()
+    })
+    .await;
 
     let request = AgentRequest::Exec(ExecRequest {
         command: "sleep".into(),
@@ -209,9 +219,6 @@ async fn exec_times_out_on_long_running_command() {
     write_message(&mut stream, &request).await.unwrap();
 
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
-    unsafe {
-        std::env::remove_var("HUSKER_AGENT_EXEC_TIMEOUT_SECS");
-    }
     // A timed-out exec returns the conventional 124 exit code with whatever
     // output the command produced, plus a note - never a bare error that drops it.
     match response {
@@ -477,16 +484,13 @@ async fn write_file_chunked_round_trip_with_non_multiple_boundary() {
 /// for the remainder and a truncated answer would look like the file. A caller
 /// that asks for a byte range is served, clamped to the ceiling, and told the
 /// real size so it can come back for the rest.
-///
-/// Both halves live in one test because they share the ceiling env var, which
-/// is process-global; splitting them would race.
 #[tokio::test]
 async fn read_file_refuses_a_whole_oversized_file_but_serves_a_range_of_it() {
-    // Safety: no other test reads this env var concurrently.
-    unsafe {
-        std::env::set_var("HUSKER_AGENT_MAX_READ_BYTES", "64");
-    }
-    let mut stream = spawn_agent().await;
+    let mut stream = spawn_agent_with(AgentLimits {
+        max_read_bytes: 64,
+        ..AgentLimits::default()
+    })
+    .await;
 
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("big.bin");
@@ -568,10 +572,6 @@ async fn read_file_refuses_a_whole_oversized_file_but_serves_a_range_of_it() {
         content[32..96],
         "an offset-only read returns the ceiling's worth of bytes from the offset"
     );
-
-    unsafe {
-        std::env::remove_var("HUSKER_AGENT_MAX_READ_BYTES");
-    }
 
     assert_eq!(reported_total, Some(128));
     assert_eq!(

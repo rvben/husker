@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use husker_api::{BearerToken, VmResponse, metrics_router, router};
+use husker_api::{ApiPolicy, BearerToken, VmResponse, metrics_router, router, router_with_policy};
 use husker_core::{BackendKind, BootKind, HuskerCore, NetworkMode, UserdataStatus};
 use husker_state::VmLifecycleState;
 
@@ -844,24 +844,22 @@ async fn create_vm_without_content_type_returns_unsupported_media_type() {
     );
 }
 
+/// The body limit is the router's own, so a lowered one here touches no other
+/// test's router, and the refusal names the limit this router enforces rather
+/// than the default.
 #[tokio::test]
 async fn create_vm_over_the_body_limit_returns_413_with_the_limit_in_the_message() {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            husker_api::set_policy(husker_api::ApiPolicy::default());
-        }
-    }
-    let _reset = Reset;
-    husker_api::set_policy(husker_api::ApiPolicy {
-        max_request_bytes: 64,
-        ..Default::default()
-    });
-    // The router reads the limit when it is built.
-    let app = router(test_core());
+    let limit = 1024;
+    let app = router_with_policy(
+        test_core(),
+        ApiPolicy {
+            max_request_bytes: limit,
+            ..ApiPolicy::default()
+        },
+    );
     let body = serde_json::json!({
         "name": "test-vm",
-        "kernel_path": format!("/{}", "k".repeat(64)),
+        "kernel_path": format!("/{}", "k".repeat(limit)),
         "rootfs_path": "/nonexistent/rootfs.ext4"
     });
     let response = app
@@ -875,7 +873,10 @@ async fn create_vm_over_the_body_limit_returns_413_with_the_limit_in_the_message
         .unwrap();
 
     let json = rejected(response, StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large").await;
-    assert_eq!(json["message"], "request body exceeds the 64 byte limit");
+    assert_eq!(
+        json["message"],
+        format!("request body exceeds the {limit} byte limit")
+    );
     assert!(
         json["hint"].as_str().unwrap().contains("max_request_bytes"),
         "{json}"

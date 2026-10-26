@@ -428,22 +428,6 @@ pub(crate) async fn start_daemon(
 
     let runtime_dir = storage.runtime_dir();
     let db_path = storage.db_path();
-    let api_policy = husker_api::ApiPolicy {
-        max_request_bytes: config.api_max_request_bytes,
-        max_file_read_bytes: config.api_max_file_read_bytes,
-        max_file_write_bytes: config.api_max_file_write_bytes,
-        sensitive_rate_limit_per_minute: config.api_sensitive_rate_limit_per_minute,
-        allowed_read_paths: config.allowed_read_paths.clone(),
-        allowed_write_paths: config.allowed_write_paths.clone(),
-        allowed_mount_host_paths: config.allowed_mount_host_paths.clone(),
-        exec_timeout_secs: config.exec_timeout_secs,
-        exec_timeout_max_secs: config.exec_timeout_max_secs,
-        exec_allowlist: config.exec_allowlist.clone(),
-        exec_denylist: config.exec_denylist.clone(),
-        exec_env_allowlist: config.exec_env_allowlist.clone(),
-    };
-    husker_api::set_policy(api_policy);
-    husker_api::set_max_vms(config.max_vms);
 
     std::fs::create_dir_all(&runtime_dir).context("creating runtime directory")?;
     restrict_dir_permissions(&runtime_dir);
@@ -809,6 +793,7 @@ async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
 struct DaemonRuntimeConfig {
     listen: SocketAddr,
     api_token: Option<BearerToken>,
+    api_policy: husker_api::ApiPolicy,
     metrics_listen: Option<SocketAddr>,
     metrics_token: Option<BearerToken>,
     service_reconcile_enabled: bool,
@@ -826,6 +811,21 @@ impl DaemonRuntimeConfig {
         Self {
             listen,
             api_token: auth.api_token,
+            api_policy: husker_api::ApiPolicy {
+                max_request_bytes: config.api_max_request_bytes,
+                max_file_read_bytes: config.api_max_file_read_bytes,
+                max_file_write_bytes: config.api_max_file_write_bytes,
+                sensitive_rate_limit_per_minute: config.api_sensitive_rate_limit_per_minute,
+                allowed_read_paths: config.allowed_read_paths.clone(),
+                allowed_write_paths: config.allowed_write_paths.clone(),
+                allowed_mount_host_paths: config.allowed_mount_host_paths.clone(),
+                exec_timeout_secs: config.exec_timeout_secs,
+                exec_timeout_max_secs: config.exec_timeout_max_secs,
+                exec_allowlist: config.exec_allowlist.clone(),
+                exec_denylist: config.exec_denylist.clone(),
+                exec_env_allowlist: config.exec_env_allowlist.clone(),
+                max_vms: config.max_vms,
+            },
             metrics_listen: config.metrics_listen,
             metrics_token: auth.metrics_token,
             service_reconcile_enabled: config.service_reconcile_enabled,
@@ -1160,9 +1160,14 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
     }
 
     let serve = async {
-        husker_api::serve_with_auth(Arc::clone(&core), config.listen, config.api_token)
-            .await
-            .context("serving daemon API")
+        husker_api::serve_with_auth(
+            Arc::clone(&core),
+            config.api_policy,
+            config.listen,
+            config.api_token,
+        )
+        .await
+        .context("serving daemon API")
     };
     let drain = async {
         core.quiesce_shutdown_ingress();

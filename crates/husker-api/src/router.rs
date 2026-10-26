@@ -23,8 +23,8 @@ use husker_vmm::VmmBackend;
 use crate::errors::error_response_with_hint;
 use crate::handlers::*;
 use crate::{
-    ApiDoc, PortForwardApiDoc, REQUEST_COUNTER, RateLimitDecision, current_policy, metrics,
-    rate_limiter,
+    ApiDoc, ApiPolicy, AppState, PortForwardApiDoc, REQUEST_COUNTER, RateLimitDecision,
+    SensitiveRateLimit, metrics,
 };
 
 pub(crate) fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'static str> {
@@ -103,20 +103,34 @@ impl std::fmt::Debug for BearerToken {
 
 // ── Router ────────────────────────────────────────────────────────────
 
-/// Build the API router.
+/// Build the API router with the default policy and no authentication.
 pub fn router<B: VmmBackend + 'static>(core: Arc<HuskerCore<B>>) -> Router {
-    router_with_auth(core, None)
+    router_with_policy(core, ApiPolicy::default())
+}
+
+/// Build an unauthenticated API router that enforces `policy`.
+pub fn router_with_policy<B: VmmBackend + 'static>(
+    core: Arc<HuskerCore<B>>,
+    policy: ApiPolicy,
+) -> Router {
+    router_with_auth(core, policy, None)
 }
 
 /// Build the API router with optional bearer token authentication.
 ///
-/// When `auth_token` is set, every route except `/v1/health` and the static
-/// API docs requires `Authorization: Bearer <token>`.
+/// The router owns `policy`: its request limits, rate limit and exec rules
+/// apply to this router's requests and to nothing else in the process. When
+/// `auth_token` is set, every route except `/v1/health` and the static API
+/// docs requires `Authorization: Bearer <token>`.
 pub fn router_with_auth<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
+    policy: ApiPolicy,
     auth_token: Option<BearerToken>,
 ) -> Router {
-    let policy = current_policy();
+    let max_request_bytes = policy.max_request_bytes;
+    let rate_limit = Arc::new(SensitiveRateLimit::new(
+        policy.sensitive_rate_limit_per_minute,
+    ));
     let router = Router::new()
         .route(
             "/v1/vms/{name}/sessions",
@@ -251,27 +265,27 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
     };
 
     router
-        .layer(DefaultBodyLimit::max(policy.max_request_bytes))
-        .layer(axum::middleware::from_fn(rate_limit_middleware))
+        .layer(DefaultBodyLimit::max(max_request_bytes))
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limit,
+            rate_limit_middleware,
+        ))
         .layer(axum::middleware::from_fn(trace_request))
-        .with_state(core)
+        .with_state(AppState {
+            core,
+            policy: Arc::new(policy),
+        })
 }
 
-/// Start the API server with graceful shutdown on SIGINT/SIGTERM.
-pub async fn serve<B: VmmBackend + 'static>(
-    core: Arc<HuskerCore<B>>,
-    addr: SocketAddr,
-) -> std::io::Result<()> {
-    serve_with_auth(core, addr, None).await
-}
-
-/// Start the API server with optional bearer token authentication.
+/// Start the API server with graceful shutdown on SIGINT/SIGTERM, enforcing
+/// `policy` and, when `auth_token` is set, bearer token authentication.
 pub async fn serve_with_auth<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
+    policy: ApiPolicy,
     addr: SocketAddr,
     auth_token: Option<BearerToken>,
 ) -> std::io::Result<()> {
-    let app = router_with_auth(core, auth_token);
+    let app = router_with_auth(core, policy, auth_token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "husker daemon listening");
 
@@ -421,10 +435,10 @@ async fn trace_request(
 }
 
 async fn rate_limit_middleware(
+    State(limit): State<Arc<SensitiveRateLimit>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let policy = current_policy();
     if let Some(kind) = is_rate_limited_route(req.method(), req.uri().path()) {
         let client = req
             .extensions()
@@ -432,9 +446,7 @@ async fn rate_limit_middleware(
             .map(|ci| ci.0.ip().to_string())
             .unwrap_or_else(|| "unknown".into());
         let key = format!("{kind}:{client}");
-        if let RateLimitDecision::Limited { retry_after } =
-            rate_limiter().check(&key, policy.sensitive_rate_limit_per_minute)
-        {
+        if let RateLimitDecision::Limited { retry_after } = limit.check(&key) {
             metrics().rate_limited_total.fetch_add(1, Ordering::Relaxed);
             // Whole seconds, rounded up, is what the header can carry; never
             // zero, which would invite the caller into a tight retry loop.

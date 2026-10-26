@@ -7,7 +7,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use husker_api::{BearerToken, router_with_auth};
+use husker_agent::AgentLimits;
+use husker_api::{ApiPolicy, BearerToken, router_with_auth};
 use husker_core::{BackendKind, BootKind, HuskerCore, NetworkMode};
 use husker_state::{VmLifecycleState, VmRecord};
 use husker_vmm::{BackendSelection, CreatedVm, VmConfig, VmInfo, VmState, VmmBackend, VmmError};
@@ -108,9 +109,23 @@ fn vm_record(name: &str) -> VmRecord {
     }
 }
 
+/// What a fixture is built with. Each fixture owns its router policy and its
+/// guest agent's limits, so a test that lowers a limit affects only its own
+/// daemon and guest, however the tests are scheduled.
+#[derive(Default)]
+struct FixtureOptions {
+    connect_gate: Option<Arc<ConnectGate>>,
+    /// VM records the backend knows nothing about, so they can never reach
+    /// the agent.
+    extra: Vec<VmRecord>,
+    policy: ApiPolicy,
+    agent_limits: AgentLimits,
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     core: Arc<HuskerCore<AgentBackend>>,
+    policy: ApiPolicy,
     agent: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -168,14 +183,24 @@ impl Served {
 
 impl Fixture {
     async fn new() -> Self {
-        Self::build(None, Vec::new()).await
+        Self::build(FixtureOptions::default()).await
     }
     async fn new_with_gate(connect_gate: Option<Arc<ConnectGate>>) -> Self {
-        Self::build(connect_gate, Vec::new()).await
+        Self::build(FixtureOptions {
+            connect_gate,
+            ..FixtureOptions::default()
+        })
+        .await
     }
-    /// Build the fixture around the running `dev` VM plus `extra` records the
-    /// backend knows nothing about (so they can never reach the agent).
-    async fn build(connect_gate: Option<Arc<ConnectGate>>, extra: Vec<VmRecord>) -> Self {
+    /// Build the fixture around the running `dev` VM, served by a guest agent
+    /// on a local socket with its own session store.
+    async fn build(options: FixtureOptions) -> Self {
+        let FixtureOptions {
+            connect_gate,
+            extra,
+            policy,
+            agent_limits,
+        } = options;
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("agent.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -187,7 +212,9 @@ impl Fixture {
                     client = listener.accept() => {
                         let (stream, _) = client.unwrap();
                         let sessions = sessions.clone();
-                        clients.spawn(async move { let _ = husker_agent::handle_connection_with_sessions(stream, sessions).await; });
+                        clients.spawn(async move {
+                            let _ = husker_agent::handle_connection_with(stream, sessions, agent_limits).await;
+                        });
                     }
                     _ = clients.join_next(), if !clients.is_empty() => {}
                 }
@@ -236,11 +263,12 @@ impl Fixture {
         Self {
             _temp: temp,
             core,
+            policy,
             agent,
         }
     }
     async fn request(&self, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
-        let response = router_with_auth(self.core.clone(), test_token())
+        let response = router_with_auth(self.core.clone(), self.policy.clone(), test_token())
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -268,7 +296,7 @@ impl Fixture {
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router_with_auth(self.core.clone(), test_token());
+        let app = router_with_auth(self.core.clone(), self.policy.clone(), test_token());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -393,7 +421,7 @@ async fn cancelled_http_start_still_hands_off_guest_session_and_idle_monitor() {
         release: tokio::sync::Semaphore::new(0),
     });
     let f = Fixture::new_with_gate(Some(gate.clone())).await;
-    let app = router_with_auth(f.core.clone(), test_token());
+    let app = router_with_auth(f.core.clone(), f.policy.clone(), test_token());
     let request = Request::builder()
         .method("POST")
         .uri("/v1/vms/dev/sessions")
@@ -438,7 +466,7 @@ async fn cancelled_http_start_still_hands_off_guest_session_and_idle_monitor() {
 #[tokio::test]
 async fn session_and_tunnel_routes_require_auth() {
     let f = Fixture::new().await;
-    let app = router_with_auth(f.core.clone(), test_token());
+    let app = router_with_auth(f.core.clone(), f.policy.clone(), test_token());
     for (method, path) in [
         ("POST", "/v1/vms/dev/sessions"),
         ("GET", "/v1/vms/dev/sessions"),
@@ -496,7 +524,7 @@ async fn authenticated_tunnel_preserves_http_without_exposing_daemon_token() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router_with_auth(f.core.clone(), test_token());
+    let app = router_with_auth(f.core.clone(), f.policy.clone(), test_token());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -637,7 +665,7 @@ async fn preview_drains_both_directions_when_guest_writes_before_reading() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router_with_auth(f.core.clone(), test_token());
+    let app = router_with_auth(f.core.clone(), f.policy.clone(), test_token());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -682,18 +710,14 @@ async fn preview_drains_both_directions_when_guest_writes_before_reading() {
 
 #[tokio::test]
 async fn detached_commands_apply_execution_policy_before_contacting_guest() {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            husker_api::set_policy(husker_api::ApiPolicy::default());
-        }
-    }
-    let f = Fixture::new().await;
-    let _reset = Reset;
-    husker_api::set_policy(husker_api::ApiPolicy {
-        exec_denylist: vec!["husker-test-denied-executable".into()],
-        ..Default::default()
-    });
+    let f = Fixture::build(FixtureOptions {
+        policy: ApiPolicy {
+            exec_denylist: vec!["husker-test-denied-executable".into()],
+            ..ApiPolicy::default()
+        },
+        ..FixtureOptions::default()
+    })
+    .await;
     let (status, error) = f
         .request(
             "POST",
@@ -798,22 +822,19 @@ async fn write_file_appends_chunks_on_a_guest_that_supports_append() {
 
 #[tokio::test]
 async fn shell_applies_the_exec_command_policy_before_contacting_the_guest() {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            husker_api::set_policy(husker_api::ApiPolicy::default());
-        }
-    }
     let gate = Arc::new(ConnectGate {
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Semaphore::new(1),
     });
-    let f = Fixture::new_with_gate(Some(gate.clone())).await;
-    let _reset = Reset;
-    husker_api::set_policy(husker_api::ApiPolicy {
-        exec_denylist: vec!["husker-test-denied-executable".into()],
-        ..Default::default()
-    });
+    let f = Fixture::build(FixtureOptions {
+        connect_gate: Some(gate.clone()),
+        policy: ApiPolicy {
+            exec_denylist: vec!["husker-test-denied-executable".into()],
+            ..ApiPolicy::default()
+        },
+        ..FixtureOptions::default()
+    })
+    .await;
     let served = f.serve().await;
     let open_shell = |command: &'static str| {
         served.open(
@@ -899,7 +920,11 @@ async fn websocket_routes_refuse_an_unknown_vm_before_the_upgrade() {
 async fn exec_stream_reports_a_post_upgrade_failure_with_the_rest_envelope() {
     let mut halted = vm_record("halted");
     halted.state = VmLifecycleState::Stopped;
-    let f = Fixture::build(None, vec![halted]).await;
+    let f = Fixture::build(FixtureOptions {
+        extra: vec![halted],
+        ..FixtureOptions::default()
+    })
+    .await;
     let served = f.serve().await;
     let (status, rest) = f
         .request("POST", "/v1/vms/halted/exec", json!({ "command": "true" }))
@@ -965,18 +990,14 @@ async fn websocket_routes_reject_a_malformed_start_frame() {
 /// agent error, not the policy refusal a client branches on to start chunking.
 #[tokio::test]
 async fn read_file_detects_an_oversized_file_without_transferring_it() {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            husker_api::set_policy(husker_api::ApiPolicy::default());
-        }
-    }
-    let f = Fixture::new().await;
-    let _reset = Reset;
-    husker_api::set_policy(husker_api::ApiPolicy {
-        max_file_read_bytes: 1024,
-        ..Default::default()
-    });
+    let f = Fixture::build(FixtureOptions {
+        policy: ApiPolicy {
+            max_file_read_bytes: 1024,
+            ..ApiPolicy::default()
+        },
+        ..FixtureOptions::default()
+    })
+    .await;
     let total: u64 = 20 * 1024 * 1024;
     let path = f._temp.path().join("large.bin");
     std::fs::File::create(&path)
@@ -1016,18 +1037,14 @@ async fn read_file_detects_an_oversized_file_without_transferring_it() {
 /// notice the short answer itself rather than serve a prefix as the file.
 #[tokio::test]
 async fn read_file_refuses_a_prefix_when_the_guest_ceiling_cuts_a_whole_file_read_short() {
-    // The agent runs in this process and reads its ceiling per request. The
-    // variable is process-global, which nextest's one-process-per-test keeps
-    // from leaking into other tests.
-    unsafe { std::env::set_var("HUSKER_AGENT_MAX_READ_BYTES", "65536") };
-    struct Unset;
-    impl Drop for Unset {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var("HUSKER_AGENT_MAX_READ_BYTES") };
-        }
-    }
-    let _unset = Unset;
-    let f = Fixture::new().await;
+    let f = Fixture::build(FixtureOptions {
+        agent_limits: AgentLimits {
+            max_read_bytes: 65536,
+            ..AgentLimits::default()
+        },
+        ..FixtureOptions::default()
+    })
+    .await;
     let path = f._temp.path().join("medium.bin");
     let content: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(&path, &content).unwrap();

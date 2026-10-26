@@ -22,14 +22,14 @@ use husker_core::{
 };
 use husker_vmm::VmmBackend;
 
-use crate::AppState;
+use crate::SharedCore;
 use crate::dto::*;
 use crate::errors::{
     ErrorResponse, Failure, error_response, error_response_with_hint, map_agent_connect_error,
     map_error,
 };
 use crate::extract::{Json, Path, Query, WebSocketUpgrade};
-use crate::{ApiPolicy, current_policy, max_vms, metrics};
+use crate::{ApiPolicy, metrics};
 
 /// Default agent-readiness wait for exec when the caller does not specify one.
 pub(crate) const DEFAULT_EXEC_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -147,7 +147,7 @@ pub(crate) fn exec_env_allowed(env: &HashMap<String, String>, policy: &ApiPolicy
     )
 )]
 pub(crate) async fn health<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Json<HealthResponse> {
     let (total, running, state_db_ok) = match core.list_vms() {
         Ok(vms) => {
@@ -231,7 +231,7 @@ pub(crate) async fn health<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_profiles<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Json<ProfilesResponse> {
     Json(ProfilesResponse {
         profiles: core.profiles().clone(),
@@ -253,7 +253,7 @@ const DIAGNOSTICS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 )]
 /// GET /v1/diagnostics - host-side health checks (reflink, free space, backend).
 pub(crate) async fn diagnostics<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Json<DiagnosticsReport> {
     // build_diagnostics does blocking fs IO (the reflink probe); run it off the
     // async executor under a timeout. Served from a short-TTL cache shared with
@@ -287,7 +287,7 @@ pub(crate) async fn diagnostics<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn metrics_handler<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> String {
     // Cheap unrefreshed read - metrics deliberately mirrors the /health path
     // and does not trigger per-VM liveness checks.
@@ -441,7 +441,7 @@ fn escape_prometheus_label(s: &str) -> String {
     )
 )]
 pub(crate) async fn list_host_groups<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Result<Json<Vec<HostGroupResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let groups = core.list_host_groups().map_err(map_error)?;
     Ok(Json(
@@ -463,7 +463,7 @@ pub(crate) async fn list_host_groups<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn create_host_group<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<CreateHostGroupRequest>,
 ) -> Result<(StatusCode, Json<HostGroupResponse>), (StatusCode, Json<ErrorResponse>)> {
     let group = core.create_host_group(req).map_err(map_error)?;
@@ -481,7 +481,7 @@ pub(crate) async fn create_host_group<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_host_group<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<HostGroupResponse>, (StatusCode, Json<ErrorResponse>)> {
     let group = core.get_host_group(&name).map_err(map_error)?;
@@ -499,7 +499,7 @@ pub(crate) async fn get_host_group<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn delete_host_group<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_host_group(&name).map_err(map_error)?;
@@ -516,7 +516,7 @@ pub(crate) async fn delete_host_group<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_services<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Result<Json<Vec<ServiceResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let services = core.list_services().map_err(map_error)?;
     Ok(Json(
@@ -540,7 +540,7 @@ pub(crate) async fn list_services<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn create_service<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<(StatusCode, Json<ServiceMutationResponse>), (StatusCode, Json<ErrorResponse>)> {
     let (service, outcome) = core.create_service(req).await.map_err(map_error)?;
@@ -564,7 +564,7 @@ pub(crate) async fn create_service<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_service<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<ServiceDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
     let service = core.get_service(&name).map_err(map_error)?;
@@ -600,7 +600,7 @@ pub(crate) async fn get_service<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn delete_service<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<ServiceDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
     let outcome = core.delete_service(&name).await.map_err(map_error)?;
@@ -623,7 +623,7 @@ pub(crate) async fn delete_service<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn scale_service<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<ScaleServiceRequest>,
 ) -> Result<Json<ServiceMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -647,7 +647,7 @@ pub(crate) async fn scale_service<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_images<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Result<Json<Vec<ImageResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let images = core.list_images().map_err(map_error)?;
     Ok(Json(
@@ -670,7 +670,7 @@ pub(crate) async fn list_images<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn import_image<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<ImportImageRequest>,
 ) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
     let image = core.import_image(req).await.map_err(map_error)?;
@@ -689,7 +689,7 @@ pub(crate) async fn import_image<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn import_oci_image<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<ImportOciRequest>,
 ) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
     let image = core
@@ -713,7 +713,7 @@ pub(crate) async fn import_oci_image<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn commit_vm_image<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(vm_name): Path<String>,
     Json(req): Json<CommitVmImageRequest>,
 ) -> Result<(StatusCode, Json<ImageResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -735,7 +735,7 @@ pub(crate) async fn commit_vm_image<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_image<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<ImageResponse>, (StatusCode, Json<ErrorResponse>)> {
     let image = core.get_image(&name).map_err(map_error)?;
@@ -753,7 +753,7 @@ pub(crate) async fn get_image<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn delete_image<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_image(&name).await.map_err(map_error)?;
@@ -770,7 +770,7 @@ pub(crate) async fn delete_image<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_volumes<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Result<Json<Vec<VolumeResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let volumes = core.list_volumes().map_err(map_error)?;
     Ok(Json(
@@ -793,7 +793,7 @@ pub(crate) async fn list_volumes<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn create_volume<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<CreateVolumeApiRequest>,
 ) -> Result<(StatusCode, Json<VolumeResponse>), (StatusCode, Json<ErrorResponse>)> {
     let volume = core
@@ -817,7 +817,7 @@ pub(crate) async fn create_volume<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_volume<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<VolumeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let volume = core.get_volume(&name).map_err(map_error)?;
@@ -836,7 +836,7 @@ pub(crate) async fn get_volume<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn delete_volume<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_volume(&name).await.map_err(map_error)?;
@@ -856,7 +856,7 @@ pub(crate) async fn delete_volume<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn export_image<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<ExportImageRequest>,
 ) -> Result<(StatusCode, Json<ExportImageResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -874,7 +874,7 @@ pub(crate) async fn export_image<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_secrets<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Result<Json<Vec<SecretResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let secrets = core.list_secrets().map_err(map_error)?;
     Ok(Json(
@@ -897,7 +897,7 @@ pub(crate) async fn list_secrets<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn create_secret<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<CreateSecretRequest>,
 ) -> Result<(StatusCode, Json<SecretResponse>), (StatusCode, Json<ErrorResponse>)> {
     let secret = core.create_secret(req).map_err(map_error)?;
@@ -915,7 +915,7 @@ pub(crate) async fn create_secret<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_secret<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<SecretResponse>, (StatusCode, Json<ErrorResponse>)> {
     let secret = core.get_secret(&name).map_err(map_error)?;
@@ -934,7 +934,7 @@ pub(crate) async fn get_secret<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn reveal_secret<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<RevealedSecretResponse>, (StatusCode, Json<ErrorResponse>)> {
     let revealed = core.reveal_secret(&name).map_err(map_error)?;
@@ -958,7 +958,7 @@ pub(crate) async fn reveal_secret<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn rotate_secret<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<RotateSecretRequest>,
 ) -> Result<Json<SecretResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -977,7 +977,7 @@ pub(crate) async fn rotate_secret<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn delete_secret<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_secret(&name).map_err(map_error)?;
@@ -994,7 +994,7 @@ pub(crate) async fn delete_secret<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_snapshots<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Result<Json<Vec<SnapshotResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let snapshots = core.list_snapshots().map_err(map_error)?;
     Ok(Json(
@@ -1018,7 +1018,7 @@ pub(crate) async fn list_snapshots<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn create_snapshot<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<(StatusCode, Json<SnapshotResponse>), (StatusCode, Json<ErrorResponse>)> {
     let snapshot = core.create_snapshot(req).await.map_err(map_error)?;
@@ -1036,7 +1036,7 @@ pub(crate) async fn create_snapshot<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_snapshot<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<SnapshotResponse>, (StatusCode, Json<ErrorResponse>)> {
     let snapshot = core.get_snapshot(&name).map_err(map_error)?;
@@ -1054,7 +1054,7 @@ pub(crate) async fn get_snapshot<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn delete_snapshot<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.delete_snapshot(&name).await.map_err(map_error)?;
@@ -1075,7 +1075,7 @@ pub(crate) async fn delete_snapshot<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn restore_snapshot<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<RestoreSnapshotRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -1102,7 +1102,7 @@ pub(crate) async fn restore_snapshot<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_vms<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Query(query): Query<ListVmsQuery>,
 ) -> Result<([(HeaderName, String); 1], Json<Vec<VmResponse>>), (StatusCode, Json<ErrorResponse>)> {
     let page = core
@@ -1144,10 +1144,10 @@ pub(crate) async fn list_vms<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn create_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
     Json(req): Json<CreateVmApiRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let policy = current_policy();
     let CreateVmApiRequest {
         vm,
         expires_after_secs,
@@ -1156,7 +1156,7 @@ pub(crate) async fn create_vm<B: VmmBackend + 'static>(
 
     // Admission control: cap the number of VMs a client can create so a single
     // caller cannot exhaust host CPU/memory by creating VMs without bound.
-    if let Some(max) = max_vms() {
+    if let Some(max) = policy.max_vms {
         let current = core.list_vms().map(|v| v.len()).unwrap_or(0);
         if current >= max {
             return Err((
@@ -1238,7 +1238,7 @@ pub(crate) async fn create_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<VmResponse>, (StatusCode, Json<ErrorResponse>)> {
     let record = core.get_vm_refreshed(&name).await.map_err(map_error)?;
@@ -1258,7 +1258,7 @@ pub(crate) async fn get_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn stop_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.stop_vm(&name).await.map_err(map_error)?;
@@ -1277,7 +1277,7 @@ pub(crate) async fn stop_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn pause_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.pause_vm(&name).await.map_err(map_error)?;
@@ -1296,7 +1296,7 @@ pub(crate) async fn pause_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn resume_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.resume_vm(&name).await.map_err(map_error)?;
@@ -1317,7 +1317,7 @@ pub(crate) async fn resume_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn set_balloon<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<BalloonRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
@@ -1339,7 +1339,7 @@ pub(crate) async fn set_balloon<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn suspend_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.suspend_vm(&name).await.map_err(map_error)?;
@@ -1359,7 +1359,7 @@ pub(crate) async fn suspend_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn fork_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<ForkRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -1381,7 +1381,7 @@ pub(crate) async fn fork_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn destroy_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.destroy_vm(&name).await.map_err(map_error)?;
@@ -1401,11 +1401,11 @@ pub(crate) async fn destroy_vm<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
     Path(name): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let policy = current_policy();
     let resolved_env =
         resolve_exec_environment(core.as_ref(), &req, &policy).map_err(|error| *error)?;
     info!(
@@ -1563,7 +1563,8 @@ pub(crate) fn resolve_exec_environment<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn exec_ws<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
     Path(name): Path<String>,
     WebSocketUpgrade(ws): WebSocketUpgrade,
 ) -> Result<Response, Failure> {
@@ -1571,11 +1572,12 @@ pub(crate) async fn exec_ws<B: VmmBackend + 'static>(
     // route refuses it, so a client never upgrades for a VM that does not exist.
     let record = core.get_vm(&name).map_err(map_error)?;
     info!(audit = "exec_stream_upgrade", vm = %name);
-    Ok(ws.on_upgrade(move |socket| exec_ws_session(core, record, socket)))
+    Ok(ws.on_upgrade(move |socket| exec_ws_session(core, policy, record, socket)))
 }
 
 async fn exec_ws_session<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
+    policy: Arc<ApiPolicy>,
     record: VmRecord,
     mut ws: WebSocket,
 ) {
@@ -1600,7 +1602,6 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
         }
         _ => return,
     };
-    let policy = current_policy();
     let resolved_env = match resolve_exec_environment(core.as_ref(), &req, &policy) {
         Ok(env) => env,
         Err(failure) => {
@@ -1791,11 +1792,11 @@ async fn send_exec_ws_output(ws: &mut WebSocket, output: &WsExecOutput) -> Resul
     )
 )]
 pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
     Path(name): Path<String>,
     Json(req): Json<ReadFileRequest>,
 ) -> Result<Json<ReadFileResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let policy = current_policy();
     if !is_allowed_guest_path(&req.path, &policy.allowed_read_paths) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1899,11 +1900,11 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn write_file_handler<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
     Path(name): Path<String>,
     Json(req): Json<WriteFileRequest>,
 ) -> Result<Json<WriteFileResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let policy = current_policy();
     if !is_allowed_guest_path(&req.path, &policy.allowed_write_paths) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1979,7 +1980,8 @@ pub(crate) async fn write_file_handler<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn shell_ws<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
     Path(name): Path<String>,
     WebSocketUpgrade(ws): WebSocketUpgrade,
 ) -> Result<Response, Failure> {
@@ -1987,11 +1989,12 @@ pub(crate) async fn shell_ws<B: VmmBackend + 'static>(
     // route refuses it, so a client never upgrades for a VM that does not exist.
     core.get_vm(&name).map_err(map_error)?;
     info!(audit = "shell_upgrade", vm = %name);
-    Ok(ws.on_upgrade(move |socket| shell_ws_session(core, name, socket)))
+    Ok(ws.on_upgrade(move |socket| shell_ws_session(core, policy, name, socket)))
 }
 
 async fn shell_ws_session<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
+    policy: Arc<ApiPolicy>,
     name: String,
     mut ws: WebSocket,
 ) {
@@ -2031,7 +2034,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
     // same execution policy as exec: an operator who allowlists or denylists
     // commands must be able to keep the shell out with the same lists.
     let shell_command = command.as_deref().unwrap_or("/bin/sh");
-    if !exec_command_allowed(shell_command, &current_policy()) {
+    if !exec_command_allowed(shell_command, &policy) {
         info!(audit = "shell_denied", vm = %name, command = shell_command);
         let _ = send_ws_output(
             &mut ws,
@@ -2179,7 +2182,7 @@ async fn send_ws_output(ws: &mut WebSocket, msg: &WsShellOutput) -> Result<(), a
     )
 )]
 pub(crate) async fn get_ready<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<ReadyResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Refresh liveness first so a VM whose process exited on its own has its
@@ -2205,7 +2208,7 @@ pub(crate) async fn get_ready<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_guest_info<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<GuestInfoResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut conn = core
@@ -2239,7 +2242,7 @@ const LOG_MAX_READ_BYTES: u64 = 1024 * 1024;
     )
 )]
 pub(crate) async fn get_logs<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Query(params): Query<LogsQuery>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
@@ -2493,7 +2496,7 @@ pub(crate) fn tail_lines(content: &str, n: u64) -> String {
     )
 )]
 pub(crate) async fn add_port_forward_handler<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<AddPortForwardRequest>,
 ) -> Result<(StatusCode, Json<PortForwardResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -2533,7 +2536,7 @@ pub(crate) async fn add_port_forward_handler<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_port_forwards_handler<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<PortForwardResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let forwards = core.list_port_forwards(&name).map_err(map_error)?;
@@ -2565,7 +2568,7 @@ pub(crate) async fn list_port_forwards_handler<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn remove_port_forward_handler<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path((name, host_port)): Path<(String, u16)>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     core.remove_port_forward(&name, host_port)
@@ -2588,7 +2591,7 @@ pub(crate) async fn remove_port_forward_handler<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn list_pools<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
 ) -> Result<Json<Vec<PoolResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let pools = core.list_pools().map_err(map_error)?;
     Ok(Json(pools.into_iter().map(pool_to_response).collect()))
@@ -2606,7 +2609,7 @@ pub(crate) async fn list_pools<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn create_pool<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Json(req): Json<CreatePoolRequest>,
 ) -> Result<(StatusCode, Json<PoolResponse>), (StatusCode, Json<ErrorResponse>)> {
     let pool = core.create_pool(req).await.map_err(map_error)?;
@@ -2624,7 +2627,7 @@ pub(crate) async fn create_pool<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn get_pool<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<PoolResponse>, (StatusCode, Json<ErrorResponse>)> {
     let pool = core.get_pool(&name).map_err(map_error)?;
@@ -2642,7 +2645,7 @@ pub(crate) async fn get_pool<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn delete_pool<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<PoolDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
     core.delete_pool(&name).await.map_err(map_error)?;
@@ -2661,7 +2664,7 @@ pub(crate) async fn delete_pool<B: VmmBackend + 'static>(
     )
 )]
 pub(crate) async fn checkout_pool<B: VmmBackend + 'static>(
-    State(core): State<AppState<B>>,
+    State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
     Json(req): Json<CheckoutPoolRequest>,
 ) -> Result<(StatusCode, Json<VmResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -2710,7 +2713,7 @@ fn outcome_to_response(o: husker_core::ReconcileOutcome) -> ReconcileOutcomeResp
 }
 
 fn service_to_response<B: VmmBackend + 'static>(
-    core: &AppState<B>,
+    core: &SharedCore<B>,
     r: ServiceRecord,
 ) -> ServiceResponse {
     let current_instances = core

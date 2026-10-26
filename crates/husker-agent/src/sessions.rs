@@ -239,20 +239,24 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    /// Start a session running `request`, under the request's own timeout or
+    /// `default_timeout` when it carries none.
     pub(crate) async fn start(
         self: &Arc<Self>,
         request: SessionStartRequest,
+        default_timeout: Duration,
     ) -> Result<SessionInfo, SessionError> {
         // Once accepted, guest ownership includes the start transaction itself.
         // Dropping a client request cannot strand an active-map entry or kill a
         // child between spawn, durable status publication and worker handoff.
         let store = self.clone();
-        tokio::spawn(async move { store.start_owned(request).await }).await?
+        tokio::spawn(async move { store.start_owned(request, default_timeout).await }).await?
     }
 
     async fn start_owned(
         self: &Arc<Self>,
         request: SessionStartRequest,
+        default_timeout: Duration,
     ) -> Result<SessionInfo, SessionError> {
         ensure!(
             request.exec.command.len() <= 4096,
@@ -283,8 +287,9 @@ impl SessionStore {
                 use std::os::unix::fs::PermissionsExt;
                 tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await?;
             }
-            let (mut command, timeout) = super::build_exec_command(&request.exec)
-                .map_err(|e| anyhow::anyhow!(e.message))?;
+            let (mut command, timeout) =
+                super::build_exec_command(&request.exec, default_timeout)
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
             command.process_group(0)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
@@ -506,6 +511,10 @@ mod tests {
 
     const ID: &str = "12345678-1234-1234-1234-123456789abc";
 
+    /// The default exec timeout these tests start sessions under. Every
+    /// request here names its own timeout, so the value never applies.
+    const TIMEOUT: Duration = Duration::from_secs(600);
+
     fn request(command: &str) -> SessionStartRequest {
         SessionStartRequest {
             id: ID.into(),
@@ -538,7 +547,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path().into());
         store
-            .start(request("sleep 0.05; printf '\\377done'; printf error >&2"))
+            .start(
+                request("sleep 0.05; printf '\\377done'; printf error >&2"),
+                TIMEOUT,
+            )
             .await
             .unwrap();
         let info = finished(&store).await;
@@ -569,14 +581,14 @@ mod tests {
     async fn cancellation_and_timeout_report_distinct_outcomes() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path().into());
-        store.start(request("sleep 60")).await.unwrap();
+        store.start(request("sleep 60"), TIMEOUT).await.unwrap();
         assert!(store.remove(ID).await.is_err());
         store.cancel(ID).await.unwrap();
         assert_eq!(finished(&store).await.state, SessionState::Cancelled);
         store.remove(ID).await.unwrap();
         let mut req = request("sleep 60");
         req.exec.timeout_secs = Some(1);
-        store.start(req).await.unwrap();
+        store.start(req, TIMEOUT).await.unwrap();
         assert_eq!(finished(&store).await.state, SessionState::TimedOut);
     }
 
@@ -585,7 +597,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path().into());
         store
-            .start(request("head -c 5000000 /dev/zero"))
+            .start(request("head -c 5000000 /dev/zero"), TIMEOUT)
             .await
             .unwrap();
         let info = finished(&store).await;
@@ -604,7 +616,8 @@ mod tests {
         let store = SessionStore::new(temp.path().into());
         let creation = store.creation.lock().await;
         let owned = store.clone();
-        let client = tokio::spawn(async move { owned.start(request("printf accepted")).await });
+        let client =
+            tokio::spawn(async move { owned.start(request("printf accepted"), TIMEOUT).await });
         tokio::task::yield_now().await;
         client.abort();
         drop(creation);
@@ -631,7 +644,7 @@ mod tests {
     async fn oversized_and_unterminated_log_records_are_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path().into());
-        store.start(request("printf hello")).await.unwrap();
+        store.start(request("printf hello"), TIMEOUT).await.unwrap();
         finished(&store).await;
         let path = temp.path().join(ID).join("events.jsonl");
         let complete = tokio::fs::read(&path).await.unwrap();
@@ -684,16 +697,16 @@ mod tests {
         ));
         let mut bad = request("true");
         bad.exec.command = "/no/such/program".into();
-        let spawn_failure = store.start(bad).await.unwrap_err();
+        let spawn_failure = store.start(bad, TIMEOUT).await.unwrap_err();
         assert!(matches!(spawn_failure, SessionError::Other(_)));
         assert!(
             format!("{spawn_failure:#}").starts_with("starting session command: "),
             "unexpected spawn failure: {spawn_failure:#}"
         );
         assert!(!temp.path().join(ID).exists());
-        store.start(request("sleep 60")).await.unwrap();
+        store.start(request("sleep 60"), TIMEOUT).await.unwrap();
         assert!(matches!(
-            store.start(request("true")).await,
+            store.start(request("true"), TIMEOUT).await,
             Err(SessionError::IdExists)
         ));
         assert!(matches!(store.remove(ID).await, Err(SessionError::Running)));
