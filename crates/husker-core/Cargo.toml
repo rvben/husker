@@ -31,6 +31,7 @@ uuid = { workspace = true }
 serde_json = { workspace = true }
 utoipa = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
+if-addrs = { workspace = true }
 ring = "0.17"
 parking_lot = "0.12"
 

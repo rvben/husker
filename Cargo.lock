@@ -1162,6 +1162,7 @@ dependencies = [
  "husker-storage",
  "husker-types",
  "husker-vmm",
+ "if-addrs",
  "libc",
  "parking_lot",
  "ring",

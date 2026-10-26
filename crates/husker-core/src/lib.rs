@@ -28,7 +28,6 @@ mod suspend;
 mod vm_lifecycle;
 mod volumes;
 
-#[cfg(feature = "linux-net")]
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -504,18 +503,96 @@ fn validate_resource_name(kind: &str, name: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Whether an agent-reported guest IPv4 is a plausible unicast address for the
-/// host to dial or DNAT to. The guest agent runs inside an untrusted (potentially
-/// compromised) workload, so its self-reported address must be validated before
-/// the host acts on it: otherwise a malicious guest could report `127.0.0.1` and
-/// make a later `port forward` dial/DNAT to the host's own loopback services.
-/// Rejects loopback, link-local, multicast, unspecified (`0.0.0.0`) and broadcast.
-fn is_plausible_guest_ip(ip: &std::net::Ipv4Addr) -> bool {
-    !(ip.is_loopback()
+/// One IPv4 address the host holds on an interface, with its netmask: the
+/// subnet a guest attached to that interface would live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostLink {
+    pub(crate) ip: Ipv4Addr,
+    pub(crate) netmask: Ipv4Addr,
+}
+
+impl HostLink {
+    /// Whether `ip` lies in this link's subnet. An interface that reports no
+    /// netmask (`0.0.0.0`) covers only its own address: a zero mask would
+    /// otherwise put every address of the internet on the link.
+    fn covers(&self, ip: &Ipv4Addr) -> bool {
+        let mask = u32::from(self.netmask);
+        if mask == 0 {
+            return *ip == self.ip;
+        }
+        (u32::from(*ip) & mask) == (u32::from(self.ip) & mask)
+    }
+}
+
+/// The host's IPv4 interface addresses other than loopback: the links a guest
+/// could be attached to.
+fn host_ipv4_links() -> std::io::Result<Vec<HostLink>> {
+    Ok(if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter_map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(HostLink {
+                ip: v4.ip,
+                netmask: v4.netmask,
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Why an agent-reported guest IPv4 is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuestIpRejection {
+    /// Loopback, link-local, multicast, unspecified or broadcast.
+    Reserved,
+    /// One of the host's own addresses.
+    HostOwned,
+    /// Not in the subnet of any host interface.
+    OffLink,
+}
+
+impl std::fmt::Display for GuestIpRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Reserved => {
+                "a reserved address (loopback, link-local, multicast, unspecified or broadcast)"
+            }
+            Self::HostOwned => "one of the host's own addresses",
+            Self::OffLink => "not in the subnet of any host interface",
+        })
+    }
+}
+
+/// Check an agent-reported guest IPv4 before the host dials or forwards to it.
+///
+/// The guest agent runs inside an untrusted, possibly compromised workload, so
+/// the address it reports as its own is a claim. The host acts on that claim
+/// every time a port forward connects to `guest_ip:guest_port`, so a false
+/// one would turn the VM's forwards into a relay. The address is accepted only
+/// when it is a plain unicast address, is not one of the host's own addresses
+/// (which would reach the host's services through its LAN or NAT-gateway
+/// address, the same thing the loopback refusal prevents) and lies in the
+/// subnet of a host interface, where a VM's virtual NIC can actually sit.
+/// Another machine on one of those subnets remains nameable; the guest can
+/// reach such machines directly through NAT, so the forward adds no access.
+pub(crate) fn check_guest_ip(
+    ip: &Ipv4Addr,
+    host_links: &[HostLink],
+) -> Result<(), GuestIpRejection> {
+    if ip.is_loopback()
         || ip.is_multicast()
         || ip.is_unspecified()
         || ip.is_broadcast()
-        || ip.is_link_local())
+        || ip.is_link_local()
+    {
+        return Err(GuestIpRejection::Reserved);
+    }
+    if host_links.iter().any(|link| link.ip == *ip) {
+        return Err(GuestIpRejection::HostOwned);
+    }
+    if !host_links.iter().any(|link| link.covers(ip)) {
+        return Err(GuestIpRejection::OffLink);
+    }
+    Ok(())
 }
 
 /// Map an OCI/Docker reference to a deterministic catalog image name, so repeat
@@ -2599,30 +2676,123 @@ mod tests {
         }
     }
 
+    fn host_links(spec: &[(&str, &str)]) -> Vec<HostLink> {
+        spec.iter()
+            .map(|(ip, netmask)| HostLink {
+                ip: ip.parse().unwrap(),
+                netmask: netmask.parse().unwrap(),
+            })
+            .collect()
+    }
+
+    /// A macOS host as VZ NAT sees it: the vmnet gateway on bridge100 and the
+    /// LAN uplink on en0.
+    fn vz_host_links() -> Vec<HostLink> {
+        host_links(&[
+            ("192.168.64.1", "255.255.255.0"),
+            ("192.0.2.10", "255.255.255.0"),
+        ])
+    }
+
+    fn check(ip: &str, links: &[HostLink]) -> Result<(), GuestIpRejection> {
+        check_guest_ip(&ip.parse().unwrap(), links)
+    }
+
     #[test]
-    fn plausible_guest_ip_accepts_lan_and_nat_addresses() {
-        // Typical VZ NAT and private-range guest addresses.
-        for ip in ["192.168.64.2", "10.0.2.15", "172.20.0.3", "198.51.100.7"] {
-            assert!(
-                is_plausible_guest_ip(&ip.parse().unwrap()),
-                "{ip} should be accepted"
+    fn guest_ip_in_a_host_links_subnet_is_accepted() {
+        let links = vz_host_links();
+        for ip in ["192.168.64.2", "192.168.64.254", "192.0.2.77"] {
+            assert_eq!(check(ip, &links), Ok(()), "{ip} sits on a host link");
+        }
+    }
+
+    #[test]
+    fn guest_ip_that_is_one_of_the_hosts_addresses_is_rejected() {
+        // A compromised guest reporting the host's LAN or NAT-gateway address
+        // would make every port forward dial the host's own services, the
+        // same thing the loopback refusal prevents.
+        let links = vz_host_links();
+        for ip in ["192.168.64.1", "192.0.2.10"] {
+            assert_eq!(
+                check(ip, &links),
+                Err(GuestIpRejection::HostOwned),
+                "{ip} is the host's own address"
             );
         }
     }
 
     #[test]
-    fn plausible_guest_ip_rejects_untrustworthy_addresses() {
-        // A compromised guest could report any of these; the host must not act on them.
+    fn guest_ip_outside_every_host_subnet_is_rejected() {
+        let links = vz_host_links();
+        // Private, documentation and public ranges alike: a VM's NIC cannot sit
+        // on a subnet the host has no interface on. 192.168.65.2 differs from
+        // the NAT link only beyond its /24, so it proves the netmask is applied.
+        for ip in ["10.0.2.15", "172.20.0.3", "198.51.100.7", "192.168.65.2"] {
+            assert_eq!(
+                check(ip, &links),
+                Err(GuestIpRejection::OffLink),
+                "{ip} is on no host link"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_ip_reserved_addresses_are_rejected_whatever_the_host_links() {
+        // Links that would cover each reserved address, including one with no
+        // netmask at all: the reserved check comes before any link check.
+        let links = host_links(&[
+            ("127.0.0.1", "255.0.0.0"),
+            ("169.254.1.1", "255.255.0.0"),
+            ("224.0.0.9", "240.0.0.0"),
+            ("10.0.0.1", "0.0.0.0"),
+        ]);
         for ip in [
-            "127.0.0.1",       // loopback -> would redirect port forwards to host services
+            "127.0.0.1",       // loopback
             "0.0.0.0",         // unspecified
             "255.255.255.255", // broadcast
             "169.254.10.1",    // link-local
             "224.0.0.1",       // multicast
         ] {
-            assert!(
-                !is_plausible_guest_ip(&ip.parse().unwrap()),
-                "{ip} must be rejected"
+            assert_eq!(
+                check(ip, &links),
+                Err(GuestIpRejection::Reserved),
+                "{ip} is reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn host_link_without_a_netmask_covers_only_its_own_address() {
+        // if-addrs reports 0.0.0.0 when an interface has no netmask; read as a
+        // mask it would put the whole internet on that link.
+        let links = host_links(&[("10.0.0.1", "0.0.0.0")]);
+        assert_eq!(check("10.0.0.1", &links), Err(GuestIpRejection::HostOwned));
+        for ip in ["10.0.0.2", "203.0.113.5"] {
+            assert_eq!(check(ip, &links), Err(GuestIpRejection::OffLink), "{ip}");
+        }
+    }
+
+    #[test]
+    fn host_links_come_from_real_interfaces_and_are_refused_as_guest_ips() {
+        // The production gatherer against this host: loopback is left out, and
+        // every address the host holds is refused as a guest's.
+        let links = host_ipv4_links().expect("host interfaces are listable");
+        assert!(
+            !links.is_empty(),
+            "the host has at least one non-loopback IPv4 interface"
+        );
+        for link in &links {
+            assert!(!link.ip.is_loopback(), "{} is loopback", link.ip);
+            let expected = if link.ip.is_link_local() {
+                GuestIpRejection::Reserved
+            } else {
+                GuestIpRejection::HostOwned
+            };
+            assert_eq!(
+                check_guest_ip(&link.ip, &links),
+                Err(expected),
+                "{} is the host's own address",
+                link.ip
             );
         }
     }

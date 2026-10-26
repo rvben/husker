@@ -59,14 +59,27 @@ impl<B: VmmBackend> HuskerCore<B> {
             return;
         };
 
-        // The agent's reported address is untrusted guest input. Validate it before
-        // persisting, so the host never later dials or DNATs to loopback/link-local/
-        // multicast/etc. off the back of a compromised guest.
+        // The agent's reported address is untrusted guest input. Check it against
+        // the host's own interfaces before persisting, so a compromised guest
+        // cannot point the VM's port forwards at the host's services or at an
+        // address outside the links a VM can sit on. A report that cannot be
+        // checked is dropped; the next read asks the agent again.
         let parsed = match ip.parse::<std::net::Ipv4Addr>() {
-            Ok(addr) if is_plausible_guest_ip(&addr) => addr,
             Ok(addr) => {
-                warn!(name = %vm.name, reported = %addr, "discover_guest_ip: agent reported an implausible guest IP (loopback/link-local/multicast/unspecified/broadcast); ignoring");
-                return;
+                let host_links = match host_ipv4_links() {
+                    Ok(links) => links,
+                    Err(e) => {
+                        warn!(name = %vm.name, reported = %addr, error = %e, "discover_guest_ip: cannot list the host's interfaces to check the reported guest IP; ignoring it");
+                        return;
+                    }
+                };
+                match check_guest_ip(&addr, &host_links) {
+                    Ok(()) => addr,
+                    Err(reason) => {
+                        warn!(name = %vm.name, reported = %addr, %reason, "discover_guest_ip: agent reported an untrustworthy guest IP; ignoring");
+                        return;
+                    }
+                }
             }
             Err(e) => {
                 warn!(name = %vm.name, reported = %ip, error = %e, "discover_guest_ip: agent reported an unparseable IPv4; ignoring");
