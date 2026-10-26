@@ -3899,6 +3899,7 @@ async fn run_shell_ws(
         command: command.map(String::from),
         cols,
         rows,
+        connect_timeout_secs: None,
     })?;
     ws_sink
         .send(tungstenite::Message::Text(start_msg.into()))

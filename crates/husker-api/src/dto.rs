@@ -379,6 +379,10 @@ pub struct ReadFileRequest {
     /// the guest agent's own ceiling allows.
     #[serde(default)]
     pub len: Option<u64>,
+    /// Seconds to wait for the guest agent to become reachable, with the same
+    /// boot-mode default and range as `ExecRequest.connect_timeout_secs`.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -418,6 +422,10 @@ pub struct WriteFileRequest {
     /// existed still decodes and keeps today's truncate-and-write behavior.
     #[serde(default)]
     pub append: bool,
+    /// Seconds to wait for the guest agent to become reachable, with the same
+    /// boot-mode default and range as `ExecRequest.connect_timeout_secs`.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -458,6 +466,10 @@ pub enum WsShellInput {
         cols: u16,
         #[serde(default = "default_rows")]
         rows: u16,
+        /// Seconds to wait for the guest agent to become reachable, with the
+        /// same boot-mode default and range as `ExecRequest.connect_timeout_secs`.
+        #[serde(default)]
+        connect_timeout_secs: Option<u64>,
     },
     Data {
         data: String,

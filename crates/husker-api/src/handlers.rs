@@ -36,9 +36,9 @@ pub(crate) const DEFAULT_EXEC_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Upper bound so a caller cannot pin an exec connection open indefinitely.
 pub const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
 
-/// Resolve the exec agent-connect timeout: boot-mode-aware default when
-/// unset (UEFI/cloud VMs boot far slower than microVMs), clamped to
-/// `[1, MAX_EXEC_CONNECT_TIMEOUT_SECS]` otherwise.
+/// Resolve the agent-connect timeout of a request that talks to the guest:
+/// boot-mode-aware default when unset (UEFI/cloud VMs boot far slower than
+/// microVMs), clamped to `[1, MAX_EXEC_CONNECT_TIMEOUT_SECS]` otherwise.
 ///
 /// Firmware-booted guests ("uefi", "efi" and "macos") wait as long as the
 /// core readiness default for their boot mode, since all of them run a full OS
@@ -53,6 +53,26 @@ pub fn resolve_exec_connect_timeout(requested: Option<u64>, boot_kind: BootKind)
         .unwrap_or(default)
         .clamp(1, MAX_EXEC_CONNECT_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// Connect to the guest agent of `name`, waiting for it to come up for as
+/// long as the request allows: the caller's `connect_timeout_secs` when given,
+/// otherwise the default for the VM's boot mode.
+///
+/// Every route that talks to the agent connects through here, so a file copy,
+/// a shell or a guest-info query issued right after `create` waits for a
+/// slow-booting guest exactly as `exec` does, and a client has the same
+/// override on each of them.
+pub(crate) async fn agent_connection<B: VmmBackend + 'static>(
+    core: &HuskerCore<B>,
+    name: &str,
+    requested_timeout: Option<u64>,
+) -> Result<husker_core::AgentConnection<B::VsockStream>, Failure> {
+    let vm = core.get_vm(name).map_err(map_error)?;
+    let timeout = resolve_exec_connect_timeout(requested_timeout, vm.boot_mode);
+    core.agent_connect_ready(name, timeout)
+        .await
+        .map_err(map_agent_connect_error)
 }
 
 /// Resolve the exec execution bound: the daemon default when unset, the
@@ -1417,17 +1437,10 @@ pub(crate) async fn exec_vm<B: VmmBackend + 'static>(
         secret_count = req.secret_env.len(),
         has_working_dir = req.working_dir.is_some()
     );
-    let record = core.get_vm(&name).map_err(map_error)?;
     // Race-tolerant connect: exec callers often hit the agent within a second
     // or two of VM boot, before the guest has bound vsock port 52. A short
     // retry window eliminates the need for client-side polling.
-    let mut conn = core
-        .agent_connect_ready(
-            &name,
-            resolve_exec_connect_timeout(req.connect_timeout_secs, record.boot_mode),
-        )
-        .await
-        .map_err(map_agent_connect_error)?;
+    let mut conn = agent_connection(core.as_ref(), &name, req.connect_timeout_secs).await?;
     let args: Vec<&str> = req.args.iter().map(String::as_str).collect();
     let env: Vec<(&str, &str)> = resolved_env
         .iter()
@@ -1570,18 +1583,17 @@ pub(crate) async fn exec_ws<B: VmmBackend + 'static>(
 ) -> Result<Response, Failure> {
     // An unknown VM is refused as a plain HTTP response, the way every other
     // route refuses it, so a client never upgrades for a VM that does not exist.
-    let record = core.get_vm(&name).map_err(map_error)?;
+    core.get_vm(&name).map_err(map_error)?;
     info!(audit = "exec_stream_upgrade", vm = %name);
-    Ok(ws.on_upgrade(move |socket| exec_ws_session(core, policy, record, socket)))
+    Ok(ws.on_upgrade(move |socket| exec_ws_session(core, policy, name, socket)))
 }
 
 async fn exec_ws_session<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
     policy: Arc<ApiPolicy>,
-    record: VmRecord,
+    name: String,
     mut ws: WebSocket,
 ) {
-    let name = record.name;
     let req = match ws.recv().await {
         Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsExecInput>(&text) {
             Ok(WsExecInput::Start { request }) => request,
@@ -1609,20 +1621,10 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
             return;
         }
     };
-    let mut conn = match core
-        .agent_connect_ready(
-            &name,
-            resolve_exec_connect_timeout(req.connect_timeout_secs, record.boot_mode),
-        )
-        .await
-    {
+    let mut conn = match agent_connection(core.as_ref(), &name, req.connect_timeout_secs).await {
         Ok(conn) => conn,
-        Err(error) => {
-            let _ = send_exec_ws_output(
-                &mut ws,
-                &WsExecOutput::failure(map_agent_connect_error(error)),
-            )
-            .await;
+        Err(failure) => {
+            let _ = send_exec_ws_output(&mut ws, &WsExecOutput::failure(failure)).await;
             return;
         }
     };
@@ -1808,10 +1810,7 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
         ));
     }
     info!(audit = "read_file_request", vm = %name, path = %req.path);
-    let mut conn = core
-        .agent_connect(&name)
-        .await
-        .map_err(map_agent_connect_error)?;
+    let mut conn = agent_connection(core.as_ref(), &name, req.connect_timeout_secs).await?;
     // The limit bounds one response, so the guest is asked for one byte past
     // it and no more: an oversized file then costs a single extra byte to
     // detect instead of a transfer up to the agent's own ceiling that is
@@ -1946,10 +1945,7 @@ pub(crate) async fn write_file_handler<B: VmmBackend + 'static>(
             ),
         ));
     }
-    let mut conn = core
-        .agent_connect(&name)
-        .await
-        .map_err(map_agent_connect_error)?;
+    let mut conn = agent_connection(core.as_ref(), &name, req.connect_timeout_secs).await?;
     let bytes_written = conn
         .write_file(&req.path, &data, req.mode, req.append)
         .await
@@ -1999,13 +1995,14 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
     mut ws: WebSocket,
 ) {
     // Wait for the Start message from the client.
-    let (command, cols, rows) = match ws.recv().await {
+    let (command, cols, rows, connect_timeout_secs) = match ws.recv().await {
         Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsShellInput>(&text) {
             Ok(WsShellInput::Start {
                 command,
                 cols,
                 rows,
-            }) => (command, cols, rows),
+                connect_timeout_secs,
+            }) => (command, cols, rows, connect_timeout_secs),
             Ok(_) => {
                 let _ = send_ws_output(
                     &mut ws,
@@ -2056,14 +2053,10 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
 
     // Connect to the guest agent via bounded readiness wait so an interactive
     // shell opened immediately after VM creation does not race the agent bind.
-    let mut conn = match core
-        .agent_connect_ready(&name, std::time::Duration::from_secs(30))
-        .await
-    {
+    let mut conn = match agent_connection(core.as_ref(), &name, connect_timeout_secs).await {
         Ok(conn) => conn,
-        Err(e) => {
-            let _ =
-                send_ws_output(&mut ws, &WsShellOutput::failure(map_agent_connect_error(e))).await;
+        Err(failure) => {
+            let _ = send_ws_output(&mut ws, &WsShellOutput::failure(failure)).await;
             return;
         }
     };
@@ -2211,10 +2204,7 @@ pub(crate) async fn get_guest_info<B: VmmBackend + 'static>(
     State(core): State<SharedCore<B>>,
     Path(name): Path<String>,
 ) -> Result<Json<GuestInfoResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut conn = core
-        .agent_connect(&name)
-        .await
-        .map_err(map_agent_connect_error)?;
+    let mut conn = agent_connection(core.as_ref(), &name, None).await?;
     let info = conn.guest_info().await.map_err(|e| map_error(e.into()))?;
     Ok(Json(GuestInfoResponse {
         ipv4: info.ipv4,

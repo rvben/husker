@@ -295,6 +295,36 @@ async fn openapi_error_response_schema_is_stable() {
     }
 }
 
+/// Every request that talks to the guest agent takes the same optional wait
+/// for the agent to come up, so a client that learned `connect_timeout_secs`
+/// on `exec` can apply it to a file transfer or a shell.
+#[tokio::test]
+async fn openapi_offers_the_agent_connect_timeout_on_every_agent_request() {
+    let doc = fetch_openapi().await;
+    let schemas = doc["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas must be an object");
+    for name in ["ExecRequest", "ReadFileRequest", "WriteFileRequest"] {
+        let properties = schemas[name]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}.properties must be an object"));
+        assert!(
+            properties.contains_key("connect_timeout_secs"),
+            "{name} lacks connect_timeout_secs"
+        );
+    }
+    let start = schemas["WsShellInput"]["oneOf"]
+        .as_array()
+        .expect("WsShellInput must be a tagged union")
+        .iter()
+        .find(|variant| variant["properties"]["type"]["enum"] == serde_json::json!(["start"]))
+        .expect("WsShellInput must have a start variant");
+    assert!(
+        start["properties"].get("connect_timeout_secs").is_some(),
+        "the shell start message lacks connect_timeout_secs: {start}"
+    );
+}
+
 #[tokio::test]
 async fn openapi_ports_tag_is_cross_platform() {
     let doc = fetch_openapi().await;

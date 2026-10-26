@@ -514,6 +514,7 @@ impl DaemonClient {
             path: path.to_string(),
             offset,
             len,
+            connect_timeout_secs: None,
         };
         let subject = format!("VM '{name}'");
         let response = self
@@ -606,6 +607,7 @@ impl DaemonClient {
                         data: husker_agent_proto::base64_encode(data),
                         mode,
                         append: false,
+                        connect_timeout_secs: None,
                     },
                 )
                 .await?
@@ -632,6 +634,7 @@ impl DaemonClient {
                         data: husker_agent_proto::base64_encode(chunk),
                         mode,
                         append: index > 0,
+                        connect_timeout_secs: None,
                     },
                 )
                 .await?
@@ -1443,6 +1446,7 @@ mod tests {
             data: husker_agent_proto::base64_encode(b"hello"),
             mode: None,
             append: false,
+            connect_timeout_secs: None,
         };
 
         let response = client.write_file("demo", &request).await.unwrap();
@@ -1486,6 +1490,7 @@ mod tests {
             data: husker_agent_proto::base64_encode(b"hello"),
             mode: None,
             append: false,
+            connect_timeout_secs: None,
         };
 
         let error = client.write_file("demo", &request).await.unwrap_err();
@@ -1561,6 +1566,7 @@ mod tests {
             data: husker_agent_proto::base64_encode(b"hello"),
             mode: None,
             append: false,
+            connect_timeout_secs: None,
         };
 
         let error = client.write_file("demo", &request).await.unwrap_err();

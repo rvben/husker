@@ -109,12 +109,26 @@ fn vm_record(name: &str) -> VmRecord {
     }
 }
 
+/// When the fixture's guest agent starts listening. A VM is `running` from
+/// the moment its process starts, but its agent only listens once the guest
+/// has booted, so a request issued right after `create` finds no agent yet.
+#[derive(Clone, Copy, Default)]
+enum AgentStart {
+    #[default]
+    Immediate,
+    /// Listens this long after the fixture is built, like a guest still booting.
+    After(Duration),
+    /// Never listens, like a guest whose boot hangs.
+    Never,
+}
+
 /// What a fixture is built with. Each fixture owns its router policy and its
 /// guest agent's limits, so a test that lowers a limit affects only its own
 /// daemon and guest, however the tests are scheduled.
 #[derive(Default)]
 struct FixtureOptions {
     connect_gate: Option<Arc<ConnectGate>>,
+    agent_start: AgentStart,
     /// VM records the backend knows nothing about, so they can never reach
     /// the agent.
     extra: Vec<VmRecord>,
@@ -197,15 +211,30 @@ impl Fixture {
     async fn build(options: FixtureOptions) -> Self {
         let FixtureOptions {
             connect_gate,
+            agent_start,
             extra,
             policy,
             agent_limits,
         } = options;
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("agent.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // An agent that is up from the start listens before the fixture is
+        // handed out, so no request can race the bind.
+        let listener = match agent_start {
+            AgentStart::Immediate => Some(tokio::net::UnixListener::bind(&socket).unwrap()),
+            AgentStart::After(_) | AgentStart::Never => None,
+        };
+        let agent_socket = socket.clone();
         let sessions = husker_agent::SessionStore::new(temp.path().join("sessions"));
         let agent = tokio::spawn(async move {
+            let listener = if let Some(listener) = listener {
+                listener
+            } else if let AgentStart::After(delay) = agent_start {
+                tokio::time::sleep(delay).await;
+                tokio::net::UnixListener::bind(&agent_socket).unwrap()
+            } else {
+                return;
+            };
             let mut clients = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
@@ -1078,4 +1107,137 @@ async fn read_file_refuses_a_prefix_when_the_guest_ceiling_cuts_a_whole_file_rea
             .extend(husker_agent_proto::base64_decode(body["data"].as_str().unwrap()).unwrap());
     }
     assert_eq!(assembled, content);
+}
+
+/// How long the late-agent fixtures wait before listening: past the first two
+/// readiness attempts (at 0 and 200 ms), so a route that connects only once
+/// fails and a route that keeps trying succeeds on its third attempt.
+const LATE_AGENT: Duration = Duration::from_millis(400);
+
+/// Every route that talks to the guest agent waits for it with the boot-mode
+/// default, exactly as `exec` does, so a file transfer or a guest-info query
+/// issued right after `create` succeeds once the guest is up instead of
+/// failing on the first refused connection.
+#[tokio::test]
+async fn file_and_guest_info_routes_wait_for_a_guest_that_is_still_booting() {
+    type Body = fn(&std::path::Path) -> Value;
+    let cases: [(&str, &str, Body); 3] = [
+        (
+            "POST",
+            "/v1/vms/dev/files/write",
+            |path| json!({ "path": path, "data": husker_agent_proto::base64_encode(b"late") }),
+        ),
+        (
+            "POST",
+            "/v1/vms/dev/files/read",
+            |path| json!({ "path": path }),
+        ),
+        ("GET", "/v1/vms/dev/guest-info", |_| Value::Null),
+    ];
+    for (method, route, body) in cases {
+        let f = Fixture::build(FixtureOptions {
+            agent_start: AgentStart::After(LATE_AGENT),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let path = f._temp.path().join("late.txt");
+        std::fs::write(&path, b"late").unwrap();
+        let started = tokio::time::Instant::now();
+        let (status, answer) = f.request(method, route, body(&path)).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {answer}");
+        assert!(
+            started.elapsed() >= LATE_AGENT,
+            "{route}: answered before the agent listened, the fixture did not delay it"
+        );
+    }
+}
+
+/// The shell waits for the agent like every other route: a `husker shell`
+/// right after `create` lands in the guest once it is up.
+#[tokio::test]
+async fn shell_waits_for_a_guest_that_is_still_booting() {
+    let f = Fixture::build(FixtureOptions {
+        agent_start: AgentStart::After(LATE_AGENT),
+        ..FixtureOptions::default()
+    })
+    .await;
+    let served = f.serve().await;
+    let started = tokio::time::Instant::now();
+    let (mut ws, first) = served
+        .open(
+            "/v1/vms/dev/shell",
+            json!({ "type": "start", "command": "cat" }),
+        )
+        .await;
+    assert_eq!(first["type"], "started", "{first}");
+    assert!(
+        started.elapsed() >= LATE_AGENT,
+        "the shell started before the agent listened, the fixture did not delay it"
+    );
+    let _ = ws.close(None).await;
+}
+
+/// A client that cannot wait for the default says so per request, on the file
+/// routes and the shell as on `exec`: an agent that is not up within
+/// `connect_timeout_secs` is reported with the `agent_not_ready` envelope that
+/// `exec` uses, in the time the client asked for.
+#[tokio::test]
+async fn file_routes_and_shell_honour_the_requested_agent_connect_timeout() {
+    let f = Fixture::build(FixtureOptions {
+        agent_start: AgentStart::Never,
+        ..FixtureOptions::default()
+    })
+    .await;
+    let (status, exec) = f
+        .request(
+            "POST",
+            "/v1/vms/dev/exec",
+            json!({ "command": "true", "connect_timeout_secs": 1 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{exec}");
+    assert_eq!(exec["kind"], "agent_not_ready", "{exec}");
+
+    let cases = [
+        (
+            "/v1/vms/dev/files/read",
+            json!({ "path": "/never-read", "connect_timeout_secs": 1 }),
+        ),
+        (
+            "/v1/vms/dev/files/write",
+            json!({ "path": "/never-written", "data": "", "connect_timeout_secs": 1 }),
+        ),
+    ];
+    for (route, body) in cases {
+        let started = tokio::time::Instant::now();
+        let (status, answer) = f.request("POST", route, body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}: {answer}");
+        assert_eq!(answer["kind"], exec["kind"], "{route}: {answer}");
+        assert_eq!(answer["message"], exec["message"], "{route}: {answer}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{route}: the request outlived the 1 s connect timeout it asked for"
+        );
+    }
+
+    let served = f.serve().await;
+    let started = tokio::time::Instant::now();
+    let (mut ws, first) = served
+        .open(
+            "/v1/vms/dev/shell",
+            json!({ "type": "start", "connect_timeout_secs": 1 }),
+        )
+        .await;
+    assert_eq!(first["type"], "error", "{first}");
+    assert_eq!(first["kind"], exec["kind"], "{first}");
+    assert_eq!(first["message"], exec["message"], "{first}");
+    assert_eq!(first["status"], status.as_u16(), "{first}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the shell outlived the 1 s connect timeout it asked for"
+    );
+    assert!(
+        !matches!(ws.next().await, Some(Ok(Message::Text(_)))),
+        "a shell that never reached the guest gets no further frames"
+    );
 }

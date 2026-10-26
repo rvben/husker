@@ -9,27 +9,16 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use husker_agent_proto::{AgentErrorCode, SessionEventsResponse, SessionInfo, SessionStartRequest};
-use husker_core::{AgentConnection, AgentError, HuskerCore};
+use husker_core::{AgentError, HuskerCore};
 use husker_vmm::VmmBackend;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utoipa::OpenApi;
 
-use crate::errors::{Failure, error_response_with_hint, map_agent_connect_error, map_error};
+use crate::errors::{Failure, error_response_with_hint, map_error};
 use crate::extract::{Json, Path, Query, WebSocketUpgrade};
+use crate::handlers::agent_connection;
 use crate::{ApiPolicy, ErrorResponse, ExecRequest, SharedCore};
-
-async fn connection<B: VmmBackend + 'static>(
-    core: &HuskerCore<B>,
-    name: &str,
-    requested_timeout: Option<u64>,
-) -> Result<AgentConnection<B::VsockStream>, Failure> {
-    let vm = core.get_vm(name).map_err(map_error)?;
-    let timeout = crate::handlers::resolve_exec_connect_timeout(requested_timeout, vm.boot_mode);
-    core.agent_connect_ready(name, timeout)
-        .await
-        .map_err(map_agent_connect_error)
-}
 
 /// The REST answer for a session or preview request the guest side could not
 /// serve. Classified refusals map by their code; a refusal without one is a
@@ -146,7 +135,7 @@ async fn start_owned<B: VmmBackend + 'static>(
         .timeout_secs
         .unwrap_or(policy.exec_timeout_secs)
         .clamp(1, policy.exec_timeout_max_secs.clamp(1, 86400));
-    let mut conn = connection(&core, &name, request.connect_timeout_secs).await?;
+    let mut conn = agent_connection(&core, &name, request.connect_timeout_secs).await?;
     let session = conn
         .session_start(SessionStartRequest {
             id: uuid::Uuid::new_v4().to_string(),
@@ -254,7 +243,7 @@ pub(crate) async fn list<B: VmmBackend + 'static>(
     Path(name): Path<String>,
 ) -> Result<Json<Vec<SessionInfo>>, Failure> {
     Ok(Json(
-        connection(&core, &name, None)
+        agent_connection(&core, &name, None)
             .await?
             .session_list()
             .await
@@ -274,7 +263,7 @@ pub(crate) async fn get<B: VmmBackend + 'static>(
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<SessionInfo>, Failure> {
     Ok(Json(
-        connection(&core, &name, None)
+        agent_connection(&core, &name, None)
             .await?
             .session_get(&id)
             .await
@@ -301,7 +290,7 @@ pub(crate) async fn events<B: VmmBackend + 'static>(
     Query(cursor): Query<Cursor>,
 ) -> Result<Json<SessionEventsResponse>, Failure> {
     Ok(Json(
-        connection(&core, &name, None)
+        agent_connection(&core, &name, None)
             .await?
             .session_events(&id, cursor.after)
             .await
@@ -321,7 +310,7 @@ pub(crate) async fn cancel<B: VmmBackend + 'static>(
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<SessionInfo>, Failure> {
     Ok(Json(
-        connection(&core, &name, None)
+        agent_connection(&core, &name, None)
             .await?
             .session_cancel(&id)
             .await
@@ -341,7 +330,7 @@ pub(crate) async fn remove<B: VmmBackend + 'static>(
     State(core): State<SharedCore<B>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<StatusCode, Failure> {
-    connection(&core, &name, None)
+    agent_connection(&core, &name, None)
         .await?
         .session_remove(&id)
         .await
@@ -387,7 +376,7 @@ pub(crate) async fn tunnel<B: VmmBackend + 'static>(
                 ),
             )
         })?;
-    let conn = connection(&core, &name, None).await?;
+    let conn = agent_connection(&core, &name, None).await?;
     // The agent client bounds the connect itself and reports a deadline as
     // `NotReady`, so no second timer races it here.
     let stream = conn.tunnel(port).await.map_err(session_error)?;
