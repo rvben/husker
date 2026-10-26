@@ -9,9 +9,20 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-/// Maximum apparent size accepted from a flattened OCI filesystem tree.
-/// This is a decompression-bomb guard in addition to the compressed blob cap.
+/// Maximum apparent size accepted from a flattened OCI filesystem tree. The
+/// import charges unpacked archive bytes against this limit while extracting,
+/// and the flattened tree is measured again afterwards, which also covers tar
+/// sparse entries that unpack to more than their archive bytes.
 const MAX_ROOTFS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Caps on one import: the registry may serve at most this many compressed
+/// bytes (config and layers together, charged as they arrive), and the layers
+/// may unpack to at most `MAX_ROOTFS_BYTES` between them, so a decompression
+/// bomb stops at the limit instead of filling the disk.
+const IMPORT_LIMITS: husker_oci::ImportLimits = husker_oci::ImportLimits {
+    max_download_bytes: 2 * 1024 * 1024 * 1024,
+    max_unpacked_bytes: MAX_ROOTFS_BYTES,
+};
 
 pub type OciMaterializationFuture<'a> = Pin<
     Box<dyn Future<Output = Result<MaterializedOciImage, OciMaterializationError>> + Send + 'a>,
@@ -82,14 +93,20 @@ impl OciImageMaterializer for LocalOciImageMaterializer {
             }
             let architecture = oci_architecture(std::env::consts::ARCH)?;
             let work = tempfile::tempdir().map_err(OciMaterializationError::WorkDirectory)?;
+            let spool_dir = work.path().join("blobs");
             let rootfs_dir = work.path().join("rootfs");
-            let image_config =
-                husker_oci::pull_and_flatten(request.reference, architecture, &rootfs_dir)
-                    .await
-                    .map_err(|source| OciMaterializationError::Pull {
-                        reference: request.reference.to_string(),
-                        source,
-                    })?;
+            let image_config = husker_oci::pull_and_flatten(
+                request.reference,
+                architecture,
+                &spool_dir,
+                &rootfs_dir,
+                IMPORT_LIMITS,
+            )
+            .await
+            .map_err(|source| OciMaterializationError::Pull {
+                reference: request.reference.to_string(),
+                source,
+            })?;
 
             materialize_flattened_rootfs(
                 &rootfs_dir,

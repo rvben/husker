@@ -9,7 +9,10 @@ and the guest kernel provides container namespaces and cgroups.
 
 Use `husker job <oci-image>` when one OCI image already contains the command you
 want to run. Husker imports the image into a bootable rootfs and gives the job a
-dedicated VM without starting a container daemon.
+dedicated VM without starting a container daemon. An import is bounded: the
+registry may send at most 2 GiB of compressed blobs, and the layers may unpack
+to at most 8 GiB between them. A pull that crosses either limit fails with an
+error naming the limit.
 
 Use Docker inside a VM when the workload itself needs Docker-compatible APIs,
 builds container images, launches multiple containers, or tests Compose and

@@ -1,7 +1,9 @@
 //! Flatten OCI image layers into a single directory tree, honouring overlay
 //! whiteouts (`.wh.<name>` deletions and `.wh..wh..opq` opaque directories).
 
+use std::cell::Cell;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -44,40 +46,119 @@ pub fn classify_entry(path: &str) -> (WhiteoutKind, String) {
     }
 }
 
-/// Flatten gzip-compressed layer blobs (base layer first) into `dest`, applying
-/// each layer's overlay whiteouts in order.
-pub fn flatten_layers(layers: &[Vec<u8>], dest: &Path) -> Result<(), OciError> {
+/// Flatten compressed layer blobs (base layer first) into `dest`, applying each
+/// layer's overlay whiteouts in order. Between them the layers may unpack to at
+/// most `max_unpacked_bytes` of archive data: extraction stops at that point,
+/// so an image that decompresses to far more than its download size cannot
+/// fill the disk.
+pub fn flatten_layers<R: Read>(
+    layers: impl IntoIterator<Item = R>,
+    dest: &Path,
+    max_unpacked_bytes: u64,
+) -> Result<(), OciError> {
     fs::create_dir_all(dest)?;
+    let budget = UnpackBudget::new(max_unpacked_bytes);
     for layer in layers {
-        apply_layer(layer, dest)?;
+        apply_layer(layer, dest, &budget)?;
     }
     Ok(())
+}
+
+/// Archive bytes unpacked so far for one image, shared by all of its layers.
+/// The read that takes the total past the limit fails, which stops the archive
+/// mid-entry; `apply_layer` then reports the limit instead of the read error.
+struct UnpackBudget {
+    used: Cell<u64>,
+    limit: u64,
+}
+
+impl UnpackBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            used: Cell::new(0),
+            limit,
+        }
+    }
+
+    fn charge(&self, bytes: u64) -> io::Result<()> {
+        self.used.set(self.used.get().saturating_add(bytes));
+        if self.exceeded() {
+            return Err(io::Error::other("unpacked bytes over the import limit"));
+        }
+        Ok(())
+    }
+
+    fn exceeded(&self) -> bool {
+        self.used.get() > self.limit
+    }
+}
+
+/// A decompressed layer stream that charges every byte to the image's budget.
+struct Metered<'a, R> {
+    inner: R,
+    budget: &'a UnpackBudget,
+}
+
+impl<R: Read> Read for Metered<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.budget.charge(n as u64)?;
+        Ok(n)
+    }
 }
 
 /// Decompress a layer blob, detecting the codec by magic bytes: gzip (`1f 8b`)
 /// or zstd (`28 b5 2f fd`). Anything else is rejected. zstd uses the pure-Rust
 /// `ruzstd` decoder (no C dependency).
-fn decompress_layer(blob: &[u8]) -> Result<Box<dyn std::io::Read + '_>, OciError> {
-    if blob.starts_with(&[0x1f, 0x8b]) {
-        Ok(Box::new(GzDecoder::new(blob)))
-    } else if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        let decoder = ruzstd::decoding::StreamingDecoder::new(blob)
+fn decompress_layer<'a, R: Read + 'a>(mut blob: R) -> Result<Box<dyn Read + 'a>, OciError> {
+    let mut magic = [0u8; 4];
+    if let Err(e) = blob.read_exact(&mut magic) {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            return Err(unsupported_compression());
+        }
+        return Err(e.into());
+    }
+    // The magic bytes belong to the stream; put them back in front of the rest.
+    let stream = io::Cursor::new(magic).chain(blob);
+    if magic.starts_with(&[0x1f, 0x8b]) {
+        Ok(Box::new(GzDecoder::new(stream)))
+    } else if magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(stream)
             .map_err(|e| OciError::Extract(format!("zstd decode: {e}")))?;
         Ok(Box::new(decoder))
     } else {
-        Err(OciError::Extract(
-            "unsupported layer compression (expected gzip or zstd)".into(),
-        ))
+        Err(unsupported_compression())
     }
 }
 
-fn apply_layer(blob: &[u8], dest: &Path) -> Result<(), OciError> {
-    let reader = decompress_layer(blob)?;
+fn unsupported_compression() -> OciError {
+    OciError::Extract("unsupported layer compression (expected gzip or zstd)".into())
+}
+
+fn apply_layer<R: Read>(blob: R, dest: &Path, budget: &UnpackBudget) -> Result<(), OciError> {
+    let reader = Metered {
+        inner: decompress_layer(blob)?,
+        budget,
+    };
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_overwrite(true);
     let real_dest = fs::canonicalize(dest)?;
 
+    let result = unpack_entries(&mut archive, dest, &real_dest);
+    if budget.exceeded() {
+        return Err(OciError::UnpackedTooLarge {
+            limit: budget.limit,
+        });
+    }
+    result
+}
+
+fn unpack_entries<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    real_dest: &Path,
+) -> Result<(), OciError> {
     for entry in archive
         .entries()
         .map_err(|e| OciError::Extract(e.to_string()))?
@@ -103,15 +184,14 @@ fn apply_layer(blob: &[u8], dest: &Path) -> Result<(), OciError> {
                     .map_err(|e| OciError::Extract(format!("unpack {path}: {e}")))?;
             }
             (WhiteoutKind::Whiteout, target) => {
-                if let Some(target) = resolve_inside_rootfs(dest, &real_dest, Path::new(&target))? {
+                if let Some(target) = resolve_inside_rootfs(dest, real_dest, Path::new(&target))? {
                     remove_path(&target);
                 }
             }
             (WhiteoutKind::OpaqueDir, dir) => {
                 if dir.is_empty() {
                     clear_dir(dest);
-                } else if let Some(dir) = resolve_inside_rootfs(dest, &real_dest, Path::new(&dir))?
-                {
+                } else if let Some(dir) = resolve_inside_rootfs(dest, real_dest, Path::new(&dir))? {
                     clear_dir(&dir);
                 }
             }
@@ -211,6 +291,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// A budget none of the fixtures in this module reaches.
+    const ROOMY: u64 = 64 * 1024 * 1024;
+
+    /// Flatten in-memory layers under the roomy budget.
+    fn flatten(layers: &[Vec<u8>], dest: &Path) -> Result<(), OciError> {
+        flatten_layers(layers.iter().map(Vec::as_slice), dest, ROOMY)
+    }
+
     #[test]
     fn classify_regular_whiteout_and_opaque() {
         assert_eq!(
@@ -280,10 +368,77 @@ mod tests {
         // Modern docker buildx defaults to zstd; husker must flatten it like gzip.
         let layer = zstd_layer(&[("app/hello.txt", b"zstd-content")]);
         let dir = tempfile::tempdir().unwrap();
-        flatten_layers(&[layer], dir.path()).unwrap();
+        flatten(&[layer], dir.path()).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("app/hello.txt")).unwrap(),
             "zstd-content"
+        );
+    }
+
+    #[test]
+    fn a_blob_that_is_neither_gzip_nor_zstd_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for blob in [&b""[..], b"\x1f", b"plain tar bytes, no compression"] {
+            let err = flatten(&[blob.to_vec()], dir.path()).unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported layer compression"),
+                "{blob:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unpack_budget_is_cumulative_across_layers() {
+        // Two 10 KiB layers under a 15 KiB budget: either fits on its own, the
+        // second takes the image past the limit.
+        let payload = vec![b'x'; 10 * 1024];
+        let lower = gz_layer(&[("a.bin", &payload)]);
+        let upper = gz_layer(&[("b.bin", &payload)]);
+        let limit = 15 * 1024;
+
+        let alone = tempfile::tempdir().unwrap();
+        flatten_layers([upper.as_slice()], alone.path(), limit).unwrap();
+
+        let both = tempfile::tempdir().unwrap();
+        let err =
+            flatten_layers([lower.as_slice(), upper.as_slice()], both.path(), limit).unwrap_err();
+        assert!(
+            matches!(err, OciError::UnpackedTooLarge { limit: l } if l == limit),
+            "got: {err}"
+        );
+        assert_eq!(
+            fs::read(both.path().join("a.bin")).unwrap(),
+            payload,
+            "the layer within budget was applied in full"
+        );
+    }
+
+    #[test]
+    fn unpack_stops_inside_an_oversized_entry() {
+        // A layer that is tiny compressed but unpacks to far more than the
+        // budget is cut off while streaming, not measured after it has been
+        // written out in full.
+        let payload = vec![0u8; 4 * 1024 * 1024];
+        let layer = gz_layer(&[("bomb.bin", &payload)]);
+        assert!(
+            layer.len() < 64 * 1024,
+            "fixture compresses to {} bytes",
+            layer.len()
+        );
+        let limit = 256 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = flatten_layers([layer.as_slice()], dir.path(), limit).unwrap_err();
+        assert!(
+            matches!(err, OciError::UnpackedTooLarge { limit: l } if l == limit),
+            "got: {err}"
+        );
+        let written = fs::metadata(dir.path().join("bomb.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            written < 2 * limit,
+            "extraction stopped near the limit, not after {written} bytes"
         );
     }
 
@@ -353,7 +508,7 @@ mod tests {
         let upper = gz_layer(&[("a/.wh.precious.txt", b"")]);
 
         let dest = tempfile::tempdir().unwrap();
-        let err = flatten_layers(&[lower, upper], dest.path()).unwrap_err();
+        let err = flatten(&[lower, upper], dest.path()).unwrap_err();
         assert!(
             err.to_string().contains("resolves outside the rootfs"),
             "the escaping layer is rejected, got: {err}"
@@ -377,7 +532,7 @@ mod tests {
         let upper = gz_layer(&[("a/.wh.x.txt", b"")]);
 
         let dest = tempfile::tempdir().unwrap();
-        flatten_layers(&[lower, upper], dest.path()).unwrap();
+        flatten(&[lower, upper], dest.path()).unwrap();
         assert!(
             !dest.path().join("b/x.txt").exists(),
             "whiteout applied through the inner symlink"
@@ -392,7 +547,7 @@ mod tests {
     fn whiteout_under_a_missing_directory_is_a_no_op() {
         let only = gz_layer(&[("nope/.wh.x.txt", b""), ("ok.txt", b"ok")]);
         let dest = tempfile::tempdir().unwrap();
-        flatten_layers(&[only], dest.path()).unwrap();
+        flatten(&[only], dest.path()).unwrap();
         assert_eq!(
             fs::read_to_string(dest.path().join("ok.txt")).unwrap(),
             "ok"
@@ -412,7 +567,7 @@ mod tests {
         let upper = gz_layer(&[("a/sub/.wh..wh..opq", b"")]);
 
         let dest = tempfile::tempdir().unwrap();
-        let err = flatten_layers(&[lower, upper], dest.path()).unwrap_err();
+        let err = flatten(&[lower, upper], dest.path()).unwrap_err();
         assert!(
             err.to_string().contains("resolves outside the rootfs"),
             "the escaping layer is rejected, got: {err}"
@@ -430,7 +585,7 @@ mod tests {
         let top = gz_layer(&[("app/keep.txt", b"new"), ("app/.wh.gone.txt", b"")]);
 
         let dir = tempfile::tempdir().unwrap();
-        flatten_layers(&[base, top], dir.path()).unwrap();
+        flatten(&[base, top], dir.path()).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.path().join("app/keep.txt")).unwrap(),

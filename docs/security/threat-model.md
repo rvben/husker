@@ -8,6 +8,7 @@ Last updated: 2026-10-26
 - Core lifecycle/state engine (`crates/husker-core`, `crates/husker-state`)
 - Guest agent channel (`crates/husker-agent`, `crates/husker-agent-proto`)
 - Host networking and port-forward path (`crates/husker-net`, Linux only)
+- OCI image import (`crates/husker-oci`)
 
 ## Assets
 
@@ -31,6 +32,8 @@ Last updated: 2026-10-26
 | Tampering/DoS | State/network drift after crash/restart | Startup reconciliation of persisted port forwards; idempotent lifecycle ops | Core startup reconciliation + lifecycle tests |
 | Spoofing | A compromised guest reports another address as its own (the host's LAN or NAT-gateway address, a public address) so that the VM's port forwards dial it | An agent-reported address is accepted only when it is plain unicast, not one of the host's own addresses and in the subnet of a host interface; anything else is logged and ignored. Another machine on such a subnet stays nameable, which adds nothing the guest cannot reach through NAT already | `husker-core` guest IP check unit tests |
 | Spoofing / Elevation of Privilege | A guest's outbound connection on a forwarded port, or transit traffic the host routes for another network, is rewritten by a port forward's DNAT rule | The DNAT rule matches only packets that enter from outside the guest bridge and are addressed to a host-local address (`iifname != <bridge>`, `fib daddr type local`) | `husker-net` port-forward rule unit tests; bridge E2E |
+| Denial of Service | A hostile or oversized OCI image exhausts memory or disk during import (giant blobs, a decompression bomb, an unbounded manifest or error body) | Blobs stream to a spool file and are charged against a 2 GiB download cap as they arrive (declared sizes are checked first but not trusted); layers unpack under an 8 GiB cumulative budget that stops extraction mid-stream; the flattened tree is measured again before the ext4 image is built; manifest, token and error responses are read up to a fixed size | `husker-oci` budget unit tests and mock-registry tests; `husker-core` materializer size test |
+| Information Disclosure / Spoofing | A registry's error response is echoed into husker's own error, letting a hostile registry plant text in logs and API responses | Only the OCI error document's codes and messages (printable characters, bounded count and length) or the HTTP reason phrase are reported | `husker-oci` error-detail unit tests and mock-registry tests |
 
 ## Residual risk
 
@@ -57,6 +60,13 @@ Last updated: 2026-10-26
   can read or write; the in-daemon checks (absolute, no `..`, no trailing
   symlink, format validation, the lexical mount allowlist) guard against
   mistakes, not against a hostile token holder (ADR-0009).
+- The registry an import talks to is named by the caller (`oci://host/...`),
+  so a token holder can make the daemon issue GET requests to any reachable
+  host under `/v2/...` and `/token`, following that host's redirects (reqwest
+  drops the bearer token on a cross-host redirect). Manifests are only parsed
+  and a blob is discarded unless its digest matches, so no fetched content is
+  acted on. Like host paths, this lies within the token holder's trust domain
+  (ADR-0009).
 - `--yes` on destructive CLI commands is a UX guard, not a security control: it
   is enforced client-side only, so a direct HTTP `DELETE` bypasses it.
 - Host hardening remains deployment-dependent (system user, service manager, firewall).
