@@ -3931,3 +3931,204 @@ mod kernel_args_composition {
         );
     }
 }
+
+/// macOS guests boot from per-VM clones of an installed bundle. These drive
+/// the create path end to end against the mock VMM; the machine identifier is
+/// the one real Virtualization.framework call, so they run on macOS hosts only.
+#[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
+mod macos_guests {
+    use super::*;
+    use husker_core::macos_guest::macos_images_dir;
+    use husker_vmm::BootMode;
+    use husker_vmm::macos_bundle::{
+        AUX_FILE, DISK_FILE, MACHINE_IDENTIFIER_FILE, MACOS_BUNDLE_FORMAT, MacOsBundle,
+        MacOsBundleManifest,
+    };
+
+    const DISK_BYTES: &[u8] = b"installed macOS disk";
+    const AUX_BYTES: &[u8] = b"auxiliary storage";
+
+    /// A provisioned bundle named `name` under the data dir, with contents
+    /// that tell a clone from the original.
+    fn install_bundle(data_dir: &Path, name: &str) -> MacOsBundle {
+        let dir = macos_images_dir(data_dir).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = MacOsBundle::new(dir);
+        bundle
+            .write_manifest(&MacOsBundleManifest {
+                format: MACOS_BUNDLE_FORMAT,
+                build: "25A354".into(),
+                os_version: "26.0.1".into(),
+                disk_size_bytes: 64 << 30,
+                min_cpus: 2,
+                min_memory_mib: 4096,
+                agent_provisioned: true,
+            })
+            .unwrap();
+        std::fs::write(bundle.disk_path(), DISK_BYTES).unwrap();
+        std::fs::write(bundle.aux_path(), AUX_BYTES).unwrap();
+        std::fs::write(bundle.hardware_model_path(), b"hardware model").unwrap();
+        bundle
+    }
+
+    fn macos_core(tmp: &tempfile::TempDir) -> (Arc<HuskerCore<MockVmm>>, MockVmm, StorageConfig) {
+        let data_dir = tmp.path().join("data");
+        let runtime_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let storage = StorageConfig {
+            data_dir: data_dir.clone(),
+            state_dir: data_dir,
+        };
+        let mock = MockVmm::new();
+        let core = build_core(
+            mock.clone(),
+            StateStore::open_memory().unwrap(),
+            &storage.data_dir,
+            &runtime_dir,
+        );
+        (core, mock, storage)
+    }
+
+    fn macos_request(name: &str, image: &str) -> CreateVmRequest {
+        CreateVmRequest {
+            name: name.into(),
+            macos_image: Some(image.into()),
+            ..Default::default()
+        }
+    }
+
+    /// The success path: both bundle disks are cloned into the VM dir, the VM
+    /// gets its own machine identifier, the VMM boots from the clones with the
+    /// bundle's hardware model, and the persisted record carries the macOS
+    /// boot mode with the bundle as its provenance.
+    #[tokio::test]
+    async fn create_clones_the_bundle_and_boots_from_the_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, mock, storage) = macos_core(&tmp);
+        let bundle = install_bundle(&storage.data_dir, "tahoe");
+
+        let record = core
+            .create_vm(macos_request("mac1", "tahoe"))
+            .await
+            .expect("create succeeds from a provisioned bundle");
+
+        let vm_dir = storage.vm_dir("mac1");
+        let disk = vm_dir.join(DISK_FILE);
+        let aux = vm_dir.join(AUX_FILE);
+        let machine_identifier = vm_dir.join(MACHINE_IDENTIFIER_FILE);
+        assert_eq!(std::fs::read(&disk).unwrap(), DISK_BYTES);
+        assert_eq!(std::fs::read(&aux).unwrap(), AUX_BYTES);
+        assert!(
+            !std::fs::read(&machine_identifier).unwrap().is_empty(),
+            "a VZ machine identifier is written for the VM"
+        );
+        std::fs::write(&disk, b"the guest wrote here").unwrap();
+        assert_eq!(
+            std::fs::read(bundle.disk_path()).unwrap(),
+            DISK_BYTES,
+            "the bundle stays pristine when a VM's clone changes"
+        );
+
+        let cfg = mock.last_config().await.expect("VmConfig was captured");
+        assert_eq!(
+            cfg.boot,
+            BootMode::MacOs {
+                auxiliary_storage: aux,
+                hardware_model: bundle.hardware_model_path(),
+                machine_identifier,
+            }
+        );
+        assert_eq!(cfg.rootfs_path, disk, "the VM boots its own disk clone");
+        assert_eq!(
+            cfg.kernel_path,
+            PathBuf::new(),
+            "a macOS guest has no kernel"
+        );
+        assert_eq!(cfg.initrd_path, None);
+        assert_eq!(
+            (cfg.vcpu_count, cfg.mem_size_mib),
+            (4, 8192),
+            "desktop-class default shape"
+        );
+        assert_eq!(cfg.vsock_cid, record.vsock_cid);
+        assert!(cfg.host_shares.is_empty());
+        assert_eq!(cfg.volume_path, None);
+
+        let persisted = core.get_vm("mac1").unwrap();
+        assert_eq!(persisted.id, record.id);
+        assert_eq!(persisted.boot_mode, BootKind::MacOs);
+        assert_eq!(persisted.vmm, BackendKind::AppleVz);
+        assert_eq!(persisted.state, VmLifecycleState::Running);
+        assert_eq!(persisted.kernel_path, "");
+        assert_eq!(
+            persisted.rootfs_path,
+            bundle.dir().display().to_string(),
+            "provenance: the bundle the VM was cloned from"
+        );
+        assert_eq!((persisted.vcpu_count, persisted.mem_size_mib), (4, 8192));
+        assert_eq!(persisted.network, NetworkMode::Nat);
+        assert_eq!(persisted.tap_device, None);
+        assert_eq!(persisted.volume, None);
+
+        assert!(
+            bundle.try_lock(true).unwrap().is_some(),
+            "the shared bundle lock is released once the clones exist"
+        );
+    }
+
+    /// An explicit shape reaches the VMM and the record, and one below the
+    /// image's minimum is refused before a VM dir, a clone or a record exists.
+    #[tokio::test]
+    async fn create_honours_an_explicit_shape_and_refuses_one_below_the_minimum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, mock, storage) = macos_core(&tmp);
+        install_bundle(&storage.data_dir, "tahoe");
+
+        let err = core
+            .create_vm(CreateVmRequest {
+                vcpu_count: Some(1),
+                ..macos_request("small", "tahoe")
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidArgument(m) if m.contains("at least 2 vCPUs")),
+            "{err:?}"
+        );
+        assert!(!storage.vm_dir("small").exists(), "nothing was allocated");
+        assert!(core.list_vms().unwrap().is_empty());
+        assert!(
+            mock.last_config().await.is_none(),
+            "the VMM was never asked"
+        );
+
+        let record = core
+            .create_vm(CreateVmRequest {
+                vcpu_count: Some(6),
+                mem_size_mib: Some(12288),
+                ..macos_request("big", "tahoe")
+            })
+            .await
+            .unwrap();
+        let cfg = mock.last_config().await.unwrap();
+        assert_eq!((cfg.vcpu_count, cfg.mem_size_mib), (6, 12288));
+        assert_eq!((record.vcpu_count, record.mem_size_mib), (6, 12288));
+    }
+
+    /// Apple VZ refuses to run two macOS VMs with the same machine
+    /// identifier, so every VM cloned from a bundle gets a fresh one.
+    #[tokio::test]
+    async fn vms_from_one_bundle_get_distinct_machine_identifiers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, _mock, storage) = macos_core(&tmp);
+        install_bundle(&storage.data_dir, "tahoe");
+
+        for name in ["mac1", "mac2"] {
+            core.create_vm(macos_request(name, "tahoe")).await.unwrap();
+        }
+        let identifier =
+            |name: &str| std::fs::read(storage.vm_dir(name).join(MACHINE_IDENTIFIER_FILE)).unwrap();
+        assert_ne!(identifier("mac1"), identifier("mac2"));
+    }
+}
