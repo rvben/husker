@@ -2,7 +2,7 @@
 //! whiteouts (`.wh.<name>` deletions and `.wh..wh..opq` opaque directories).
 
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
@@ -76,6 +76,7 @@ fn apply_layer(blob: &[u8], dest: &Path) -> Result<(), OciError> {
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_overwrite(true);
+    let real_dest = fs::canonicalize(dest)?;
 
     for entry in archive
         .entries()
@@ -101,18 +102,66 @@ fn apply_layer(blob: &[u8], dest: &Path) -> Result<(), OciError> {
                     .unpack_in(dest)
                     .map_err(|e| OciError::Extract(format!("unpack {path}: {e}")))?;
             }
-            (WhiteoutKind::Whiteout, target) => remove_path(&dest.join(target)),
+            (WhiteoutKind::Whiteout, target) => {
+                if let Some(target) = resolve_inside_rootfs(dest, &real_dest, Path::new(&target))? {
+                    remove_path(&target);
+                }
+            }
             (WhiteoutKind::OpaqueDir, dir) => {
-                let d = if dir.is_empty() {
-                    dest.to_path_buf()
-                } else {
-                    dest.join(dir)
-                };
-                clear_dir(&d);
+                if dir.is_empty() {
+                    clear_dir(dest);
+                } else if let Some(dir) = resolve_inside_rootfs(dest, &real_dest, Path::new(&dir))?
+                {
+                    clear_dir(&dir);
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Resolve the directory containing `relative` (a whiteout target or an opaque
+/// directory) and re-join the final component, so a whiteout acts on the same
+/// place a regular entry of the same layer would land. Intermediate symlinks
+/// that stay inside the rootfs are followed, exactly as `tar` does for regular
+/// entries; one that leads outside rejects the layer, because an untrusted
+/// image must never delete host files. The final component is deliberately
+/// not resolved: `remove_path` and `clear_dir` refuse to traverse a symlink
+/// there. `None` means the containing directory does not exist, so there is
+/// nothing to delete.
+fn resolve_inside_rootfs(
+    dest: &Path,
+    real_dest: &Path,
+    relative: &Path,
+) -> Result<Option<PathBuf>, OciError> {
+    let Some(name) = relative.file_name() else {
+        return Ok(None);
+    };
+    let parent = dest.join(relative.parent().unwrap_or(Path::new("")));
+    let real_parent = match fs::canonicalize(&parent) {
+        Ok(p) => p,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(OciError::Extract(format!(
+                "resolve layer entry {}: {e}",
+                relative.display()
+            )));
+        }
+    };
+    if !real_parent.starts_with(real_dest) {
+        return Err(OciError::Extract(format!(
+            "layer entry {} resolves outside the rootfs",
+            relative.display()
+        )));
+    }
+    Ok(Some(real_parent.join(name)))
 }
 
 /// Reject absolute paths and any `..`/root/prefix component (path traversal).
@@ -264,6 +313,114 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dest.path().join("link2")).unwrap();
         clear_dir(&dest.path().join("link2"));
         assert!(precious.exists(), "clear_dir must not traverse a symlink");
+    }
+
+    /// Build a gzipped tar layer whose first entry is the symlink
+    /// `link_name -> target`, followed by regular files.
+    fn gz_layer_with_symlink(link_name: &str, target: &Path, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            builder.append_link(&mut link, link_name, target).unwrap();
+            for (name, data) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn whiteout_does_not_delete_through_an_intermediate_symlink() {
+        // Layer 1 plants `a -> <outside the rootfs>`; layer 2 whiteouts
+        // `a/precious.txt`. Resolving the whiteout path through the symlink
+        // would delete a host file.
+        let outside = tempfile::tempdir().unwrap();
+        let precious = outside.path().join("precious.txt");
+        fs::write(&precious, b"keep").unwrap();
+
+        let lower = gz_layer_with_symlink("a", outside.path(), &[]);
+        let upper = gz_layer(&[("a/.wh.precious.txt", b"")]);
+
+        let dest = tempfile::tempdir().unwrap();
+        let err = flatten_layers(&[lower, upper], dest.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves outside the rootfs"),
+            "the escaping layer is rejected, got: {err}"
+        );
+        assert!(
+            precious.exists(),
+            "a whiteout under a symlinked directory must not reach outside the rootfs"
+        );
+    }
+
+    #[test]
+    fn whiteout_follows_a_symlink_that_stays_inside_the_rootfs() {
+        // Positive control for the escape check: `a -> b` inside the rootfs is
+        // followed, so `a/.wh.x` deletes `b/x` exactly where a regular entry
+        // `a/x` from the same layer would have landed.
+        let lower = gz_layer_with_symlink(
+            "a",
+            Path::new("b"),
+            &[("b/x.txt", b"gone"), ("b/keep.txt", b"keep")],
+        );
+        let upper = gz_layer(&[("a/.wh.x.txt", b"")]);
+
+        let dest = tempfile::tempdir().unwrap();
+        flatten_layers(&[lower, upper], dest.path()).unwrap();
+        assert!(
+            !dest.path().join("b/x.txt").exists(),
+            "whiteout applied through the inner symlink"
+        );
+        assert!(
+            dest.path().join("b/keep.txt").exists(),
+            "siblings untouched"
+        );
+    }
+
+    #[test]
+    fn whiteout_under_a_missing_directory_is_a_no_op() {
+        let only = gz_layer(&[("nope/.wh.x.txt", b""), ("ok.txt", b"ok")]);
+        let dest = tempfile::tempdir().unwrap();
+        flatten_layers(&[only], dest.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.path().join("ok.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn opaque_marker_does_not_clear_through_an_intermediate_symlink() {
+        // Same shape with an opaque-directory marker: `a/sub/.wh..wh..opq`
+        // where `a` is a symlink must not empty the real directory it points at.
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("sub")).unwrap();
+        let precious = outside.path().join("sub").join("precious.txt");
+        fs::write(&precious, b"keep").unwrap();
+
+        let lower = gz_layer_with_symlink("a", outside.path(), &[]);
+        let upper = gz_layer(&[("a/sub/.wh..wh..opq", b"")]);
+
+        let dest = tempfile::tempdir().unwrap();
+        let err = flatten_layers(&[lower, upper], dest.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves outside the rootfs"),
+            "the escaping layer is rejected, got: {err}"
+        );
+        assert!(
+            precious.exists(),
+            "an opaque marker under a symlinked directory must not clear a host directory"
+        );
     }
 
     #[test]
