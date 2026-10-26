@@ -27,6 +27,7 @@ mod sessions;
 
 pub use dto::*;
 pub use errors::ErrorResponse;
+pub use handlers::{MAX_EXEC_CONNECT_TIMEOUT_SECS, resolve_exec_connect_timeout};
 pub use husker_agent_proto::{SessionEvent, SessionEventsResponse, SessionInfo, SessionState};
 pub use router::{
     BearerToken, EmptyBearerToken, metrics_router, router, router_with_auth, serve, serve_metrics,

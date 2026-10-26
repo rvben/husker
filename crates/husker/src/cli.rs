@@ -2,6 +2,47 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use husker_core::BootKind;
+
+// Help for the timeout flags quotes the defaults the daemon applies, computed
+// by the same functions the daemon runs, so a changed default or a new boot
+// mode changes the help with it.
+
+/// The per-boot-mode readiness defaults as a phrase. Firmware-booted guests
+/// run a full OS first boot before the agent starts and wait longer.
+fn ready_defaults(default_for: impl Fn(BootKind) -> u64) -> String {
+    format!(
+        "{}, or {} for UEFI/cloud VMs and {} for macOS guests",
+        default_for(BootKind::DirectKernel),
+        default_for(BootKind::Uefi),
+        default_for(BootKind::MacOs)
+    )
+}
+
+fn exec_connect_timeout_help() -> String {
+    format!(
+        "Seconds to wait for the guest agent to become reachable before failing \
+         (server default: {}; at most {})",
+        ready_defaults(|kind| husker_api::resolve_exec_connect_timeout(None, kind).as_secs()),
+        husker_api::MAX_EXEC_CONNECT_TIMEOUT_SECS
+    )
+}
+
+fn exec_run_timeout_help() -> String {
+    format!(
+        "Maximum seconds the command may run (server default: {}, clamped to the \
+         daemon's exec_timeout_max_secs, {} unless configured)",
+        crate::config::default_exec_timeout_secs(),
+        crate::config::default_exec_timeout_max_secs()
+    )
+}
+
+fn wait_timeout_help() -> String {
+    format!(
+        "Maximum seconds to wait (default: {})",
+        ready_defaults(|kind| husker_core::default_ready_timeout(kind).as_secs())
+    )
+}
 
 #[derive(Parser)]
 #[command(
@@ -342,14 +383,10 @@ pub(crate) enum Commands {
         #[arg(long = "secret")]
         secret: Vec<String>,
 
-        /// Seconds to wait for the guest agent to become reachable before
-        /// failing (server default: 30, or 180 for UEFI/cloud VMs)
-        #[arg(long)]
+        #[arg(long, help = exec_connect_timeout_help())]
         connect_timeout: Option<u64>,
 
-        /// Maximum seconds the command may run (server default: 30, clamped
-        /// to the daemon's exec_timeout_max_secs)
-        #[arg(long)]
+        #[arg(long, help = exec_run_timeout_help())]
         timeout: Option<u64>,
 
         /// Command and arguments (after --)
@@ -625,8 +662,7 @@ pub(crate) enum Commands {
     Wait {
         /// VM name
         name: String,
-        /// Maximum seconds to wait (default: 120, or 180 for UEFI/cloud VMs)
-        #[arg(long)]
+        #[arg(long, help = wait_timeout_help())]
         timeout: Option<u64>,
     },
 
@@ -1776,3 +1812,74 @@ pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
     CommandContract::object("doctor", Effects::ReadOnly, DOCTOR_OUTPUT),
     CommandContract::unsupported("completions", Effects::ReadOnly),
 ];
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use husker_core::BootKind;
+
+    use super::Cli;
+
+    /// The whole numbers a help text mentions, so a default of 30 is not
+    /// satisfied by a 300 elsewhere in the sentence.
+    fn numbers_in(help: &str) -> Vec<u64> {
+        help.split(|c: char| !c.is_ascii_digit())
+            .filter(|digits| !digits.is_empty())
+            .map(|digits| digits.parse().unwrap())
+            .collect()
+    }
+
+    fn help_of(command: &clap::Command, arg: &str) -> String {
+        command
+            .get_arguments()
+            .find(|a| a.get_id() == arg)
+            .unwrap_or_else(|| panic!("`{}` has no `{arg}` argument", command.get_name()))
+            .get_help()
+            .unwrap_or_else(|| panic!("`{}` {arg} has no help", command.get_name()))
+            .to_string()
+    }
+
+    /// Every default the daemon applies to a timeout flag is named in that
+    /// flag's help, for every boot mode, so a changed default or a new boot
+    /// mode cannot leave the help describing a wait the daemon no longer uses.
+    #[test]
+    fn timeout_help_names_every_default_the_daemon_applies() {
+        let root = Cli::command();
+        let exec = root.find_subcommand("exec").unwrap();
+
+        let connect = numbers_in(&help_of(exec, "connect_timeout"));
+        for kind in BootKind::ALL {
+            let secs = husker_api::resolve_exec_connect_timeout(None, kind).as_secs();
+            assert!(
+                connect.contains(&secs),
+                "exec --connect-timeout help omits the {kind:?} default of {secs}s: {connect:?}"
+            );
+        }
+        let max = husker_api::MAX_EXEC_CONNECT_TIMEOUT_SECS;
+        assert!(
+            connect.contains(&max),
+            "exec --connect-timeout help omits the {max}s ceiling: {connect:?}"
+        );
+
+        let run = numbers_in(&help_of(exec, "timeout"));
+        let default = crate::config::default_exec_timeout_secs();
+        let max = crate::config::default_exec_timeout_max_secs();
+        assert!(
+            run.contains(&default),
+            "exec --timeout help omits the daemon default of {default}s: {run:?}"
+        );
+        assert!(
+            run.contains(&max),
+            "exec --timeout help omits the default ceiling of {max}s: {run:?}"
+        );
+
+        let wait = numbers_in(&help_of(root.find_subcommand("wait").unwrap(), "timeout"));
+        for kind in BootKind::ALL {
+            let secs = husker_core::default_ready_timeout(kind).as_secs();
+            assert!(
+                wait.contains(&secs),
+                "wait --timeout help omits the {kind:?} default of {secs}s: {wait:?}"
+            );
+        }
+    }
+}

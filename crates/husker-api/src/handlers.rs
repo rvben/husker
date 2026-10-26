@@ -34,7 +34,7 @@ use crate::{ApiPolicy, current_policy, max_vms, metrics};
 /// Default agent-readiness wait for exec when the caller does not specify one.
 pub(crate) const DEFAULT_EXEC_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Upper bound so a caller cannot pin an exec connection open indefinitely.
-pub(crate) const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
+pub const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
 
 /// Resolve the exec agent-connect timeout: boot-mode-aware default when
 /// unset (UEFI/cloud VMs boot far slower than microVMs), clamped to
@@ -43,10 +43,7 @@ pub(crate) const MAX_EXEC_CONNECT_TIMEOUT_SECS: u64 = 600;
 /// Firmware-booted guests ("uefi", "efi" and "macos") wait as long as the
 /// core readiness default for their boot mode, since all of them run a full OS
 /// first boot before the agent starts.
-pub(crate) fn resolve_exec_connect_timeout(
-    requested: Option<u64>,
-    boot_kind: BootKind,
-) -> Duration {
+pub fn resolve_exec_connect_timeout(requested: Option<u64>, boot_kind: BootKind) -> Duration {
     let default = if boot_kind.uses_firmware() {
         husker_core::default_ready_timeout(boot_kind).as_secs()
     } else {

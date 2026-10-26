@@ -315,11 +315,11 @@ fn default_api_sensitive_rate_limit_per_minute() -> u32 {
     120
 }
 
-fn default_exec_timeout_secs() -> u64 {
+pub(crate) fn default_exec_timeout_secs() -> u64 {
     30
 }
 
-fn default_exec_timeout_max_secs() -> u64 {
+pub(crate) fn default_exec_timeout_max_secs() -> u64 {
     3600
 }
 
