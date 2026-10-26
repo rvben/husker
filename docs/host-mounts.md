@@ -73,8 +73,16 @@ Paths are matched as exact prefixes: a configured path of `/home/ci/workspace`
 allows any sub-path under it. Paths outside the allowlist are rejected by the
 daemon before the VM starts.
 
+The match is lexical: the requested path is normalised (`.` components
+dropped, `..` refused) and compared to the configured entries, and symlinks
+are not resolved. The host path must also be absolute and must not itself be
+a symlink. What the daemon can ultimately share is bounded by the permissions
+of the user it runs as, so the allowlist scopes what an operator may request
+rather than confining a hostile caller; see ADR-0009 for the trust model.
+
 For untrusted or agentic jobs, mount only the paths the job strictly needs. Do
-not add broad directories like `/home` or `/` to the allowlist.
+not add broad directories like `/home` or `/` to the allowlist, and list real
+directories rather than symlinks to them.
 
 ## Volume auto-mount and durable teardown
 

@@ -1,7 +1,7 @@
 # ADR-0002: API Authentication Model
 
 - Status: Accepted
-- Date: 2026-02-16 (amended 2026-08-17)
+- Date: 2026-02-16 (amended 2026-08-17 and 2026-10-26)
 
 ## Context
 
@@ -14,6 +14,15 @@ Mutating VM control endpoints are high-impact and unsafe to expose unauthenticat
   - public endpoint: `/v1/health`
   - protected when configured: every other API, metrics, and WebSocket endpoint
 - Keep auth simple and operator-friendly for local/self-hosted workflows.
+- A loopback bind without a token is accepted. Loopback is a host boundary,
+  not a user boundary: every local account that can open a TCP connection to
+  the port has full control of the daemon, and a TCP listener cannot learn the
+  peer's user id to tell accounts apart. The daemon does not try to; on a host
+  with more than one interactive or service account, configure `api_token`
+  even for a loopback bind.
+- A configured token must have content. A blank `api_token` or
+  `metrics_token` (from the config file, the environment, or `--api-token`)
+  is a start-up error, never "no authentication".
 - Define one daemon as one trust domain. The shared token is intentionally not a
   user identity and Husker does not provide tenant ownership or RBAC.
 - Keep TLS, client-certificate verification, and service identities at a reverse

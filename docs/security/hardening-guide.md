@@ -4,6 +4,9 @@
 
 - Keep daemon on loopback whenever possible:
   - `husker daemon --listen 127.0.0.1:7777`
+- Loopback is reachable by every local account on the host, and the daemon
+  cannot tell them apart over TCP. On a host with more than one interactive or
+  service account, set `api_token` even for a loopback bind.
 - If remote bind is required:
   - use `--allow-remote` explicitly
   - set `api_token` in config
@@ -32,7 +35,25 @@
   - `exec_env_allowlist`
   - `exec_timeout_secs`
 
-## 4. Abuse controls
+## 4. Host filesystem paths
+
+- Requests name host files: VM images and kernels, import sources, export
+  destinations and `--mount` hosts. The daemon opens them as its own user, and
+  that user's permissions are the boundary (ADR-0009). Run the daemon as a
+  dedicated account that owns the data directory and nothing it should not
+  read, clone or write.
+- Keep images and kernels inside the data directory (`husker images pull`,
+  `husker images import`) so the paths a caller can name are the ones you
+  intend.
+- Opt mounts in narrowly with `allowed_mount_host_paths`; the empty default
+  denies every mount. The match is a lexical prefix check after normalisation
+  and does not resolve symlinks, so list the real directories and keep
+  symlinks out of them. Do not list `/home` or `/`.
+- Import, export and mount paths must be absolute, contain no `..` and not
+  end in a symlink, and an export never overwrites an existing file. These are
+  mistake guards, not a sandbox.
+
+## 5. Abuse controls
 
 - Keep endpoint rate limits enabled:
   - `api_sensitive_rate_limit_per_minute = 120` (or lower for shared deployments)
@@ -41,13 +62,15 @@
   - `api_max_file_read_bytes`
   - `api_max_file_write_bytes`
 
-## 5. Linux host posture
+## 6. Host posture
 
 - Run daemon as a dedicated non-login service account where possible.
 - Grant only required capabilities for networking (`CAP_NET_ADMIN`) on Linux deployments that need bridge/NAT.
 - Restrict filesystem write access to data/runtime directories only.
+- On macOS the daemon runs as the logged-in user and can reach every file that
+  user can; the loopback bind and the bearer token are the controls there.
 
-## 6. Network topology recommendations
+## 7. Network topology recommendations
 
 - Preferred: local daemon behind SSH tunnel or private service mesh.
 - Remote control plane: terminate TLS at a reverse proxy, optionally require
@@ -63,7 +86,7 @@
   smallest practical destination/port set. Plain `nat` is unrestricted egress.
   See [Per-VM egress policies](egress-policies.md).
 
-## 7. Logging and monitoring
+## 8. Logging and monitoring
 
 - Collect API logs with request IDs (`x-request-id`).
 - Alert on:
@@ -71,7 +94,7 @@
   - repeated auth failures
   - repeated policy denials
 
-## 8. Dependency and supply chain controls
+## 9. Dependency and supply chain controls
 
 - Enforce CI gates:
   - `make deny`

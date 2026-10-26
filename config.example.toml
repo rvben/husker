@@ -105,7 +105,9 @@
 # allowed_read_paths = ["/tmp", "/var/log"]
 # allowed_write_paths = ["/tmp", "/var/tmp"]
 # Host directories that may be bind-mounted into guests via --mount.
-# Empty list denies all bind mounts (secure default).
+# Empty list denies all bind mounts (secure default). Entries match as lexical
+# prefixes without resolving symlinks; the daemon's own file permissions are the
+# hard boundary (see docs/adr/0009-host-path-trust-model.md).
 # allowed_mount_host_paths = ["/srv/husker-work", "/data/shared"]
 
 # Exec policy controls.
