@@ -1620,158 +1620,147 @@ pub(crate) async fn exec_ws<B: VmmBackend + 'static>(
     Ok(ws.on_upgrade(move |socket| exec_ws_session(core, policy, name, socket)))
 }
 
+/// How a streamed exec session ends. The daemon closes the socket after every
+/// one of these, so a client reading to the close frame never waits on a
+/// session the daemon has already given up on.
+enum ExecWsEnd {
+    /// The command exited and the client holds its exit frame.
+    Exited(i32),
+    /// The daemon refused or lost the command before an exit; the client is
+    /// still owed the failure frame.
+    Failed(Failure),
+    /// The client left, before a start frame or while output was being
+    /// delivered, so there is nobody left to tell.
+    PeerGone,
+}
+
 async fn exec_ws_session<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
     policy: Arc<ApiPolicy>,
     name: String,
     mut ws: WebSocket,
 ) {
+    match run_exec_ws(core.as_ref(), &policy, &name, &mut ws).await {
+        ExecWsEnd::Exited(exit_code) => {
+            metrics().exec_total.fetch_add(1, Ordering::Relaxed);
+            info!(audit = "exec_stream_result", vm = %name, exit_code);
+        }
+        ExecWsEnd::Failed(failure) => {
+            let _ = send_exec_ws_output(&mut ws, &WsExecOutput::failure(failure)).await;
+        }
+        ExecWsEnd::PeerGone => {}
+    }
+    let _ = ws.send(Message::Close(None)).await;
+}
+
+/// Run one streamed exec session up to, but not including, the close frame.
+/// Both guest generations share the daemon's grace window: the run timeout
+/// the guest agent enforces itself plus the allowance for its exit report,
+/// after which an agent that never answers ends the session with
+/// `exec_timeout` instead of holding the socket open.
+async fn run_exec_ws<B: VmmBackend + 'static>(
+    core: &HuskerCore<B>,
+    policy: &ApiPolicy,
+    name: &str,
+    ws: &mut WebSocket,
+) -> ExecWsEnd {
     let req = match ws.recv().await {
         Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsExecInput>(&text) {
             Ok(WsExecInput::Start { request }) => request,
-            Err(e) => {
-                let _ =
-                    send_exec_ws_output(&mut ws, &WsExecOutput::failure(invalid_start_message(e)))
-                        .await;
-                return;
-            }
+            Err(e) => return ExecWsEnd::Failed(invalid_start_message(e)),
         },
         Some(Ok(Message::Binary(_))) => {
-            let _ = send_exec_ws_output(
-                &mut ws,
-                &WsExecOutput::failure(invalid_start_message("expected a text frame")),
-            )
-            .await;
-            return;
+            return ExecWsEnd::Failed(invalid_start_message("expected a text frame"));
         }
-        _ => return,
+        _ => return ExecWsEnd::PeerGone,
     };
-    let resolved_env = match resolve_exec_environment(core.as_ref(), &req, &policy) {
+    let resolved_env = match resolve_exec_environment(core, &req, policy) {
         Ok(env) => env,
-        Err(failure) => {
-            let _ = send_exec_ws_output(&mut ws, &WsExecOutput::failure(*failure)).await;
-            return;
-        }
+        Err(failure) => return ExecWsEnd::Failed(*failure),
     };
-    let mut conn = match agent_connection(core.as_ref(), &name, req.connect_timeout_secs).await {
+    let mut conn = match agent_connection(core, name, req.connect_timeout_secs).await {
         Ok(conn) => conn,
-        Err(failure) => {
-            let _ = send_exec_ws_output(&mut ws, &WsExecOutput::failure(failure)).await;
-            return;
-        }
+        Err(failure) => return ExecWsEnd::Failed(failure),
     };
     let args: Vec<&str> = req.args.iter().map(String::as_str).collect();
     let env: Vec<(&str, &str)> = resolved_env
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let run_timeout = resolve_exec_run_timeout(req.timeout_secs, &policy);
+    let run_timeout = resolve_exec_run_timeout(req.timeout_secs, policy);
     let guest_version = match conn.guest_info().await {
         Ok(info) => info.protocol_version,
         Err(error) => {
-            let _ = send_exec_ws_output(
-                &mut ws,
-                &WsExecOutput::failure(agent_failure("guest capability check failed", error)),
-            )
-            .await;
-            return;
+            return ExecWsEnd::Failed(agent_failure("guest capability check failed", error));
         }
     };
-
-    if guest_version < husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM {
-        // Compatibility for VMs created from older images: the transport still
-        // works, but output arrives as two final chunks after completion.
-        if send_exec_ws_output(
-            &mut ws,
-            &WsExecOutput::Started {
+    let grace = run_timeout + Duration::from_secs(30);
+    let run = async {
+        if guest_version < husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM {
+            // Compatibility for VMs created from older images: the transport
+            // still works, but output arrives as two final chunks after
+            // completion.
+            let started = WsExecOutput::Started {
                 streaming: Some(false),
                 guest_protocol_version: Some(guest_version),
-            },
-        )
-        .await
-        .is_err()
-        {
-            return;
+            };
+            if send_exec_ws_output(ws, &started).await.is_err() {
+                return ExecWsEnd::PeerGone;
+            }
+            let result = match conn
+                .exec_with_timeout(
+                    &req.command,
+                    &args,
+                    req.working_dir.as_deref(),
+                    &env,
+                    Some(run_timeout.as_secs()),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => return ExecWsEnd::Failed(map_error(CoreError::Agent(error))),
+            };
+            let mut outputs = Vec::with_capacity(3);
+            if !result.stdout.is_empty() {
+                outputs.push(WsExecOutput::Stdout {
+                    data: husker_agent_proto::base64_encode(result.stdout.as_bytes()),
+                });
+            }
+            if !result.stderr.is_empty() {
+                outputs.push(WsExecOutput::Stderr {
+                    data: husker_agent_proto::base64_encode(result.stderr.as_bytes()),
+                });
+            }
+            outputs.push(WsExecOutput::Exit {
+                exit_code: result.exit_code,
+            });
+            for output in &outputs {
+                if send_exec_ws_output(ws, output).await.is_err() {
+                    return ExecWsEnd::PeerGone;
+                }
+            }
+            return ExecWsEnd::Exited(result.exit_code);
         }
-        let result = conn
-            .exec_with_timeout(
+
+        if let Err(error) = conn
+            .exec_stream_start(
                 &req.command,
                 &args,
                 req.working_dir.as_deref(),
                 &env,
                 Some(run_timeout.as_secs()),
             )
-            .await;
-        match result {
-            Ok(result) => {
-                if !result.stdout.is_empty() {
-                    let _ = send_exec_ws_output(
-                        &mut ws,
-                        &WsExecOutput::Stdout {
-                            data: husker_agent_proto::base64_encode(result.stdout.as_bytes()),
-                        },
-                    )
-                    .await;
-                }
-                if !result.stderr.is_empty() {
-                    let _ = send_exec_ws_output(
-                        &mut ws,
-                        &WsExecOutput::Stderr {
-                            data: husker_agent_proto::base64_encode(result.stderr.as_bytes()),
-                        },
-                    )
-                    .await;
-                }
-                let _ = send_exec_ws_output(
-                    &mut ws,
-                    &WsExecOutput::Exit {
-                        exit_code: result.exit_code,
-                    },
-                )
-                .await;
-            }
-            Err(error) => {
-                let _ = send_exec_ws_output(
-                    &mut ws,
-                    &WsExecOutput::failure(map_error(CoreError::Agent(error))),
-                )
-                .await;
-            }
+            .await
+        {
+            return ExecWsEnd::Failed(map_error(CoreError::Agent(error)));
         }
-        return;
-    }
-
-    if let Err(error) = conn
-        .exec_stream_start(
-            &req.command,
-            &args,
-            req.working_dir.as_deref(),
-            &env,
-            Some(run_timeout.as_secs()),
-        )
-        .await
-    {
-        let _ = send_exec_ws_output(
-            &mut ws,
-            &WsExecOutput::failure(map_error(CoreError::Agent(error))),
-        )
-        .await;
-        return;
-    }
-    if send_exec_ws_output(
-        &mut ws,
-        &WsExecOutput::Started {
+        let started = WsExecOutput::Started {
             streaming: Some(true),
             guest_protocol_version: Some(guest_version),
-        },
-    )
-    .await
-    .is_err()
-    {
-        return;
-    }
-    let grace = run_timeout + Duration::from_secs(30);
-    let bridge = async {
+        };
+        if send_exec_ws_output(ws, &started).await.is_err() {
+            return ExecWsEnd::PeerGone;
+        }
         loop {
             let output = match conn.exec_stream_recv().await {
                 Ok(ExecStreamEvent::Stdout(data)) => WsExecOutput::Stdout {
@@ -1781,29 +1770,26 @@ async fn exec_ws_session<B: VmmBackend + 'static>(
                     data: husker_agent_proto::base64_encode(&data),
                 },
                 Ok(ExecStreamEvent::Exit(exit_code)) => {
-                    send_exec_ws_output(&mut ws, &WsExecOutput::Exit { exit_code }).await?;
-                    return Ok::<i32, axum::Error>(exit_code);
+                    return if send_exec_ws_output(ws, &WsExecOutput::Exit { exit_code })
+                        .await
+                        .is_ok()
+                    {
+                        ExecWsEnd::Exited(exit_code)
+                    } else {
+                        ExecWsEnd::PeerGone
+                    };
                 }
-                Err(error) => {
-                    let output = WsExecOutput::failure(map_error(CoreError::Agent(error)));
-                    send_exec_ws_output(&mut ws, &output).await?;
-                    return Ok(-1);
-                }
+                Err(error) => return ExecWsEnd::Failed(map_error(CoreError::Agent(error))),
             };
-            send_exec_ws_output(&mut ws, &output).await?;
+            if send_exec_ws_output(ws, &output).await.is_err() {
+                return ExecWsEnd::PeerGone;
+            }
         }
     };
-    match tokio::time::timeout(grace, bridge).await {
-        Ok(Ok(exit_code)) => {
-            metrics().exec_total.fetch_add(1, Ordering::Relaxed);
-            info!(audit = "exec_stream_result", vm = %name, exit_code);
-        }
-        Ok(Err(_)) => {}
-        Err(_) => {
-            let _ = send_exec_ws_output(&mut ws, &WsExecOutput::failure(exec_timeout())).await;
-        }
+    match tokio::time::timeout(grace, run).await {
+        Ok(end) => end,
+        Err(_) => ExecWsEnd::Failed(exec_timeout()),
     }
-    let _ = ws.send(Message::Close(None)).await;
 }
 
 async fn send_exec_ws_output(ws: &mut WebSocket, output: &WsExecOutput) -> Result<(), axum::Error> {

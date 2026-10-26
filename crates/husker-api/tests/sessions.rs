@@ -122,6 +122,62 @@ enum AgentStart {
     Never,
 }
 
+/// A guest agent from before streamed exec. It reports an old protocol
+/// version and answers a buffered exec with one fixed outcome, so the
+/// daemon's compatibility path is driven without an old agent binary.
+#[derive(Clone)]
+struct LegacyGuest {
+    protocol_version: u32,
+    exec: LegacyExec,
+}
+#[derive(Clone)]
+enum LegacyExec {
+    /// The command ran to this result.
+    Ran {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    /// The agent refused the command with this message.
+    Refused(String),
+}
+
+/// Answer one daemon connection the way a legacy guest agent does.
+async fn serve_legacy_guest(mut stream: tokio::net::UnixStream, guest: LegacyGuest) {
+    use husker_agent_proto::{AgentRequest, AgentResponse, read_message, write_message};
+    while let Ok(Some(request)) = read_message::<AgentRequest, _>(&mut stream).await {
+        let response = match request {
+            AgentRequest::Ping => AgentResponse::Pong,
+            AgentRequest::GuestInfo => {
+                AgentResponse::GuestInfo(husker_agent_proto::GuestInfoResponse {
+                    ipv4: Vec::new(),
+                    protocol_version: guest.protocol_version,
+                })
+            }
+            AgentRequest::Exec(_) => match &guest.exec {
+                LegacyExec::Ran {
+                    exit_code,
+                    stdout,
+                    stderr,
+                } => AgentResponse::Exec(husker_agent_proto::ExecResponse {
+                    exit_code: *exit_code,
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                }),
+                LegacyExec::Refused(message) => {
+                    AgentResponse::Error(husker_agent_proto::ErrorResponse::new(message.clone()))
+                }
+            },
+            other => AgentResponse::Error(husker_agent_proto::ErrorResponse::new(format!(
+                "a legacy guest does not answer {other:?}"
+            ))),
+        };
+        if write_message(&mut stream, &response).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// What a fixture is built with. Each fixture owns its router policy and its
 /// guest agent's limits, so a test that lowers a limit affects only its own
 /// daemon and guest, however the tests are scheduled.
@@ -134,6 +190,8 @@ struct FixtureOptions {
     extra: Vec<VmRecord>,
     policy: ApiPolicy,
     agent_limits: AgentLimits,
+    /// Serve the `dev` VM with this legacy guest instead of the real agent.
+    legacy_guest: Option<LegacyGuest>,
 }
 
 struct Fixture {
@@ -147,6 +205,26 @@ impl Drop for Fixture {
         self.agent.abort();
     }
 }
+type WsClient =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Every text frame up to the daemon's close frame, which must arrive: a
+/// session that ends without one leaves the client waiting on a socket the
+/// daemon has already abandoned.
+async fn text_frames_until_close(ws: &mut WsClient) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the daemon ends the session");
+        match frame {
+            Some(Ok(Message::Text(text))) => frames.push(serde_json::from_str(&text).unwrap()),
+            Some(Ok(Message::Close(_))) => return frames,
+            other => panic!("expected a text or close frame, got {other:?}"),
+        }
+    }
+}
+
 /// A router served on a loopback listener, for the WebSocket routes that an
 /// in-process `oneshot` cannot upgrade.
 struct Served {
@@ -171,16 +249,7 @@ impl Served {
     }
     /// Open `path`, send `start` as the first frame and return the socket with
     /// the first frame the daemon answered.
-    async fn open(
-        &self,
-        path: &str,
-        start: Value,
-    ) -> (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        Value,
-    ) {
+    async fn open(&self, path: &str, start: Value) -> (WsClient, Value) {
         let (mut ws, _) = tokio_tungstenite::connect_async(self.ws_request(path))
             .await
             .unwrap();
@@ -215,6 +284,7 @@ impl Fixture {
             extra,
             policy,
             agent_limits,
+            legacy_guest,
         } = options;
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("agent.sock");
@@ -241,8 +311,14 @@ impl Fixture {
                     client = listener.accept() => {
                         let (stream, _) = client.unwrap();
                         let sessions = sessions.clone();
+                        let legacy_guest = legacy_guest.clone();
                         clients.spawn(async move {
-                            let _ = husker_agent::handle_connection_with(stream, sessions, agent_limits).await;
+                            match legacy_guest {
+                                Some(guest) => serve_legacy_guest(stream, guest).await,
+                                None => {
+                                    let _ = husker_agent::handle_connection_with(stream, sessions, agent_limits).await;
+                                }
+                            }
                         });
                     }
                     _ = clients.join_next(), if !clients.is_empty() => {}
@@ -972,10 +1048,88 @@ async fn exec_stream_reports_a_post_upgrade_failure_with_the_rest_envelope() {
     assert_eq!(first["message"], rest["message"], "{first}");
     assert_eq!(first["hint"], rest["hint"], "{first}");
     assert_eq!(first["status"], status.as_u16(), "{first}");
+    let rest = text_frames_until_close(&mut ws).await;
     assert!(
-        !matches!(ws.next().await, Some(Ok(Message::Text(_)))),
-        "a failed session gets no further frames"
+        rest.is_empty(),
+        "a failed session gets no frames after the error: {rest:?}"
     );
+}
+
+/// A guest from before streamed exec still serves the stream route: the
+/// daemon runs the command buffered and replays the output as two final
+/// chunks. The session ends the way a streamed one does, with the daemon's
+/// close frame, so one client reads both guest generations to the same end.
+#[tokio::test]
+async fn exec_stream_replays_a_buffered_run_for_a_legacy_guest_and_closes() {
+    let f = Fixture::build(FixtureOptions {
+        legacy_guest: Some(LegacyGuest {
+            protocol_version: 3,
+            exec: LegacyExec::Ran {
+                exit_code: 7,
+                stdout: "legacy out".into(),
+                stderr: "legacy err".into(),
+            },
+        }),
+        ..FixtureOptions::default()
+    })
+    .await;
+    let served = f.serve().await;
+    let (mut ws, first) = served
+        .open(
+            "/v1/vms/dev/exec/stream",
+            json!({ "type": "start", "request": { "command": "true" } }),
+        )
+        .await;
+    assert_eq!(
+        first,
+        json!({ "type": "started", "streaming": false, "guest_protocol_version": 3 }),
+        "{first}"
+    );
+    let frames = text_frames_until_close(&mut ws).await;
+    assert_eq!(
+        frames,
+        vec![
+            json!({ "type": "stdout", "data": husker_agent_proto::base64_encode(b"legacy out") }),
+            json!({ "type": "stderr", "data": husker_agent_proto::base64_encode(b"legacy err") }),
+            json!({ "type": "exit", "exit_code": 7 }),
+        ]
+    );
+}
+
+/// A legacy guest's refusal arrives after the start frame with the envelope
+/// the buffered route answers for the same refusal, and the session still
+/// ends with the daemon's close frame.
+#[tokio::test]
+async fn exec_stream_closes_after_a_legacy_guest_refuses_the_command() {
+    let f = Fixture::build(FixtureOptions {
+        legacy_guest: Some(LegacyGuest {
+            protocol_version: 3,
+            exec: LegacyExec::Refused("no such program in this guest".into()),
+        }),
+        ..FixtureOptions::default()
+    })
+    .await;
+    let served = f.serve().await;
+    let (status, rest) = f
+        .request("POST", "/v1/vms/dev/exec", json!({ "command": "true" }))
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{rest}");
+    assert_eq!(rest["kind"], "agent_error", "{rest}");
+
+    let (mut ws, first) = served
+        .open(
+            "/v1/vms/dev/exec/stream",
+            json!({ "type": "start", "request": { "command": "true" } }),
+        )
+        .await;
+    assert_eq!(first["type"], "started", "{first}");
+    assert_eq!(first["streaming"], false, "{first}");
+    let frames = text_frames_until_close(&mut ws).await;
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0]["type"], "error", "{frames:?}");
+    assert_eq!(frames[0]["kind"], rest["kind"], "{frames:?}");
+    assert_eq!(frames[0]["message"], rest["message"], "{frames:?}");
+    assert_eq!(frames[0]["status"], status.as_u16(), "{frames:?}");
 }
 
 /// The first frame must be the text `start` message. Anything else is the
