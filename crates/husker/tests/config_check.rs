@@ -414,6 +414,9 @@ fn a_host_tool_is_found_in_path_without_being_run() {
 
 /// The daemon keeps the file's backend when `HUSKER_VMM` names an unknown
 /// one, so the check reports the ignored override rather than crediting it.
+/// The config loader also logs the ignored value, and that log line belongs
+/// on stderr as plain text: stdout is the JSON document, parsed whole, and
+/// stderr is not a terminal here.
 #[cfg(all(feature = "linux-net", target_os = "linux"))]
 #[test]
 fn an_unknown_vmm_override_is_reported_as_ignored() {
@@ -431,7 +434,10 @@ fn an_unknown_vmm_override_is_reported_as_ignored() {
         ])
         .output()
         .unwrap();
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("stdout is not one JSON document ({error}):\n{stdout}"));
     let vmm = report["checks"]
         .as_array()
         .unwrap()
@@ -445,6 +451,14 @@ fn an_unknown_vmm_override_is_reported_as_ignored() {
         "{message}"
     );
     assert!(vmm.get("env_override").is_none(), "{vmm}");
+    assert!(
+        stderr.contains("HUSKER_VMM"),
+        "the ignored override must be logged on stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "a captured log must carry no escape codes:\n{stderr:?}"
+    );
 }
 
 /// `husker schema` declares `config check` as a typed object, so a pipe gets

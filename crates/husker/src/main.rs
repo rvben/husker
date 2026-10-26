@@ -738,11 +738,17 @@ fn build_vm_request_body(
 }
 #[tokio::main]
 async fn main() {
+    // Diagnostics go to stderr. Stdout carries the command's result, which
+    // under `--output json` is one document the caller parses whole, so a log
+    // line ahead of it would break the document. Colour only when stderr is a
+    // terminal, so a captured log (a journal, a redirected file) stays plain.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("husker=info".parse().expect("static directive")),
         )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
     // Use try_parse so clap parse errors go through our structured-error
