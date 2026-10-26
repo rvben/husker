@@ -4324,14 +4324,53 @@ fn check_effective_config(config: &Config, report: &mut ConfigCheckReport) {
     let mut profile_names: Vec<&String> = config.profiles.keys().collect();
     profile_names.sort();
     for name in profile_names {
-        let problems = profile_problems(&config.profiles[name.as_str()]);
-        let (status, message) = if problems.is_empty() {
-            (CheckStatus::Ok, "valid".to_string())
-        } else {
-            (CheckStatus::Fail, problems.join("; "))
-        };
+        let (status, message) = profile_check(&config.profiles[name.as_str()], &config.data_dir);
         report.push(format!("profile.{name}"), status, message, None);
     }
+}
+
+/// A profile is valid when every value it sets is well-formed and every file
+/// it names exists. A `rootfs` is judged the way `run --profile` resolves it:
+/// an existing path or a pulled image under `<data_dir>/images` is a file
+/// check; a path-shaped value that does not exist is a failure; any other
+/// name is a catalog image or an OCI reference the daemon resolves, which the
+/// check reports rather than verifying, since the catalog lives in the daemon.
+fn profile_check(profile: &Profile, data_dir: &Path) -> (CheckStatus, String) {
+    let rootfs = profile_rootfs(profile, data_dir);
+    let problems = profile_problems(profile, rootfs.as_ref());
+    if !problems.is_empty() {
+        return (CheckStatus::Fail, problems.join("; "));
+    }
+    let mut message = "valid".to_string();
+    if let Some(ProfileRootfs::DaemonResolved(name)) = &rootfs {
+        message.push_str(&format!(
+            "; rootfs {name} is a catalog image or OCI reference, resolved by the daemon"
+        ));
+    }
+    (CheckStatus::Ok, message)
+}
+
+/// How `run --profile` treats a profile's `rootfs`.
+enum ProfileRootfs {
+    /// An existing path, as given or under `<data_dir>/images`.
+    File,
+    /// A path-shaped value that does not exist.
+    Missing(PathBuf),
+    /// A catalog image name or OCI reference the daemon resolves.
+    DaemonResolved(String),
+}
+
+fn profile_rootfs(profile: &Profile, data_dir: &Path) -> Option<ProfileRootfs> {
+    let resolved = husker::resolve_rootfs_arg(profile.rootfs.clone()?, data_dir);
+    if resolved.exists() {
+        return Some(ProfileRootfs::File);
+    }
+    let name = resolved.to_string_lossy().into_owned();
+    Some(if husker_core::looks_like_path(&name) {
+        ProfileRootfs::Missing(resolved)
+    } else {
+        ProfileRootfs::DaemonResolved(name)
+    })
 }
 
 /// The Linux host side: the selected backend and its binaries, the network
@@ -4464,7 +4503,7 @@ fn check_host_backend(config: &Config, report: &mut ConfigCheckReport) {
 }
 
 /// Everything wrong with a profile, in the order its keys are checked.
-fn profile_problems(profile: &Profile) -> Vec<String> {
+fn profile_problems(profile: &Profile, rootfs: Option<&ProfileRootfs>) -> Vec<String> {
     let mut problems = Vec::new();
     for key in &profile.ssh_keys {
         let path = expand_tilde(key);
@@ -4472,10 +4511,10 @@ fn profile_problems(profile: &Profile) -> Vec<String> {
             problems.push(format!("ssh key {} not found", path.display()));
         }
     }
-    for path in [&profile.rootfs, &profile.kernel, &profile.initrd]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(ProfileRootfs::Missing(path)) = rootfs {
+        problems.push(format!("rootfs {} not found", path.display()));
+    }
+    for path in [&profile.kernel, &profile.initrd].into_iter().flatten() {
         if !path.exists() {
             problems.push(format!("{} not found", path.display()));
         }

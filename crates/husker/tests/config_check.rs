@@ -609,3 +609,56 @@ fn config_check_validates_a_profile_vmm_against_the_backend_table() {
     assert!(message.contains("unknown vmm 'xen'"), "{message}");
     assert!(message.contains("firecracker, qemu"), "{message}");
 }
+
+/// A profile's `rootfs` is judged the way `run --profile` resolves it: an
+/// existing path or a pulled image under `<data_dir>/images` is a file, a
+/// path-shaped value that does not exist is a failure, and a bare name or an
+/// OCI reference is the daemon's to resolve against its image catalog, so it
+/// is reported rather than failed as a missing file.
+#[test]
+fn a_profile_rootfs_is_judged_the_way_run_resolves_it() {
+    let (dir, config) = valid_config_fixture();
+    let images = dir.path().join("data").join("images");
+    fs::create_dir_all(&images).unwrap();
+    fs::write(images.join("pulled.ext4"), b"rootfs").unwrap();
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str(
+        "\n[profiles.catalog]\nrootfs = \"rust\"\n\n[profiles.oci]\nrootfs = \"python:3.12-alpine\"\n\n[profiles.pulled]\nrootfs = \"pulled.ext4\"\n\n[profiles.typo]\nrootfs = \"/srv/images/missing.ext4\"\n",
+    );
+    fs::write(&config, contents).unwrap();
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "json",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    let checks = report["checks"].as_array().unwrap();
+    let find = |name: &str| checks.iter().find(|check| check["name"] == name).unwrap();
+    let catalog = find("profile.catalog");
+    assert_eq!(catalog["status"], "ok", "{report}");
+    assert_eq!(
+        catalog["message"],
+        "valid; rootfs rust is a catalog image or OCI reference, resolved by the daemon"
+    );
+    let oci = find("profile.oci");
+    assert_eq!(oci["status"], "ok", "{report}");
+    assert_eq!(
+        oci["message"],
+        "valid; rootfs python:3.12-alpine is a catalog image or OCI reference, resolved by the daemon"
+    );
+    let pulled = find("profile.pulled");
+    assert_eq!(pulled["status"], "ok", "{report}");
+    assert_eq!(pulled["message"], "valid");
+    let typo = find("profile.typo");
+    assert_eq!(typo["status"], "fail", "{report}");
+    assert_eq!(typo["message"], "rootfs /srv/images/missing.ext4 not found");
+}

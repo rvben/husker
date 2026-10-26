@@ -211,6 +211,8 @@
 # Named presets selected with `husker run --profile <name>` (and job/service).
 # Every field is optional; a field left out falls back to the CLI flag or the
 # daemon default. Unknown keys are rejected, so a typo fails loudly.
+# `rootfs` takes what `husker run` takes: a path, a pulled image name, a
+# catalog image name, or an OCI reference; the daemon resolves the last two.
 #
 # [profiles.web]
 # cpus = 2

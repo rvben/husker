@@ -613,8 +613,11 @@ fn oci_ref_to_catalog_name(reference: &str) -> String {
 }
 
 /// Whether a `run`/`job` rootfs argument is path-shaped (so a typo'd path is
-/// reported as a missing file, not mistaken for an image reference).
-fn looks_like_path(arg: &str) -> bool {
+/// reported as a missing file, not mistaken for an image reference). Anything
+/// else that is not an existing file is a catalog image name or an OCI
+/// reference, which the daemon resolves against its image catalog. The CLI's
+/// configuration check applies the same rule to a profile's `rootfs`.
+pub fn looks_like_path(arg: &str) -> bool {
     arg.starts_with('/') || arg.starts_with("./") || arg.starts_with("../")
 }
 
