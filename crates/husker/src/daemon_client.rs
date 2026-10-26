@@ -71,10 +71,14 @@ pub(crate) struct ApiFailure {
     /// classified into it when the failure is built, so the kind the
     /// envelope reports and the exit code cannot disagree.
     pub(crate) kind: CliErrorKind,
-    /// The kind the daemon named, kept for the CLI's own handling of one
+    /// The kind the daemon named, kept for the CLI's own handling of a
     /// specific refusal. Absent for a failure the CLI raised itself or a
     /// daemon answer that carried no envelope.
     pub(crate) daemon_kind: Option<String>,
+    /// The fields of the daemon's refusal, when its kind carries any (a VM in
+    /// the wrong state names the state). The CLI chooses its own remedies
+    /// from these, never from the words of the message.
+    pub(crate) details: Option<serde_json::Value>,
     pub(crate) hint: Option<String>,
 }
 
@@ -89,6 +93,20 @@ impl ApiFailure {
         });
     }
 
+    /// Whether the daemon refused the request under `kind`.
+    pub(crate) fn refused_as(&self, kind: &str) -> bool {
+        self.daemon_kind.as_deref() == Some(kind)
+    }
+
+    /// The lifecycle state the daemon refused the request for, when it
+    /// refused the request because of the VM's state and said which.
+    pub(crate) fn refused_vm_state(&self) -> Option<&str> {
+        if !self.refused_as("invalid_state") {
+            return None;
+        }
+        self.details.as_ref()?.get("actual")?.as_str()
+    }
+
     /// A failure the CLI raises itself, filed under one of its own error
     /// kinds.
     pub(crate) fn with_kind(
@@ -100,6 +118,7 @@ impl ApiFailure {
             message: message.into(),
             kind,
             daemon_kind: None,
+            details: None,
             hint,
         }
     }
@@ -134,6 +153,7 @@ impl ApiFailure {
             message,
             kind: CliErrorKind::from_daemon(kind.as_deref(), status),
             daemon_kind: kind,
+            details: None,
             hint,
         }
     }
@@ -144,6 +164,7 @@ impl ApiFailure {
 /// otherwise, and a message naming `subject` when the body is empty.
 fn decode_failure(status: reqwest::StatusCode, body: &str, subject: &str) -> ApiFailure {
     let mut daemon_kind = None;
+    let mut details = None;
     let mut hint = None;
     let message = if body.is_empty() {
         match status.as_u16() {
@@ -153,6 +174,7 @@ fn decode_failure(status: reqwest::StatusCode, body: &str, subject: &str) -> Api
         }
     } else if let Ok(error) = serde_json::from_str::<ErrorResponse>(body) {
         daemon_kind = Some(error.kind);
+        details = error.details.map(|details| *details);
         hint = error.hint;
         error.message
     } else {
@@ -167,6 +189,7 @@ fn decode_failure(status: reqwest::StatusCode, body: &str, subject: &str) -> Api
         message,
         kind: CliErrorKind::from_daemon(daemon_kind.as_deref(), Some(status.as_u16())),
         daemon_kind,
+        details,
         hint,
     }
 }
@@ -929,6 +952,85 @@ mod tests {
         assert_eq!(failure.kind, CliErrorKind::Conflict);
         assert_eq!(failure.message, "VM is busy");
         assert_eq!(failure.hint.as_deref(), Some("stop it first"));
+        assert!(failure.details.is_none());
+        assert!(failure.refused_as("vm_conflict"));
+        assert!(!failure.refused_as("invalid_state"));
+        assert!(failure.refused_vm_state().is_none());
+        task.abort();
+    }
+
+    /// A VM in the wrong state is refused as `invalid_state` with the state
+    /// in the details. That is where the CLI reads it from: the same state
+    /// in the message alone, or details under another kind, name no state.
+    #[tokio::test]
+    async fn error_reads_the_refused_vm_state_from_the_details() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/wrong-state",
+                get(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "kind": "invalid_state",
+                            "message": "VM 'stopped-worker' is suspended, expected running",
+                            "details": {
+                                "vm": "stopped-worker",
+                                "actual": "suspended",
+                                "expected": "running"
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/message-only",
+                get(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "kind": "invalid_state",
+                            "message": "VM 'vm' is stopped, expected running"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/other-kind",
+                get(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "kind": "volume_attached",
+                            "message": "volume 'data' is attached to VM 'vm'",
+                            "details": {"actual": "stopped"}
+                        })),
+                    )
+                }),
+            );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let response = client.send(client.get("/v1/wrong-state")).await.unwrap();
+        let failure = client.error(response, "VM 'stopped-worker'").await;
+        assert_eq!(failure.kind, CliErrorKind::Conflict);
+        assert_eq!(failure.refused_vm_state(), Some("suspended"));
+        assert_eq!(
+            failure.details,
+            Some(json!({
+                "vm": "stopped-worker",
+                "actual": "suspended",
+                "expected": "running"
+            }))
+        );
+
+        let response = client.send(client.get("/v1/message-only")).await.unwrap();
+        let failure = client.error(response, "VM 'vm'").await;
+        assert!(failure.refused_as("invalid_state"));
+        assert!(failure.refused_vm_state().is_none());
+
+        let response = client.send(client.get("/v1/other-kind")).await.unwrap();
+        let failure = client.error(response, "VM 'vm'").await;
+        assert!(failure.refused_vm_state().is_none());
         task.abort();
     }
 

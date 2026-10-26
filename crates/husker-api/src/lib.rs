@@ -2692,6 +2692,38 @@ mod tests {
         assert!(hint.contains("restart the daemon"), "{hint}");
     }
 
+    /// A VM in the wrong state is reported with its fields in `details`, so a
+    /// client picks its remedy by the state and never by the words of the
+    /// message. Every other refusal stays without details.
+    #[test]
+    fn map_error_reports_a_wrong_vm_state_with_its_fields_as_details() {
+        let (status, body) = map_error(CoreError::InvalidState {
+            name: "stopped-worker".into(),
+            actual: "creating".into(),
+            expected: "running".into(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let payload = body.0;
+        assert_eq!(payload.kind, "invalid_state");
+        assert_eq!(
+            payload.message,
+            "VM 'stopped-worker' is creating, expected running"
+        );
+        assert_eq!(
+            payload.details.as_deref(),
+            Some(&serde_json::json!({
+                "vm": "stopped-worker",
+                "actual": "creating",
+                "expected": "running",
+            }))
+        );
+        assert!(payload.hint.is_none());
+
+        let (_, body) = map_error(CoreError::VmAlreadyExists("vm".into()));
+        assert!(body.0.details.is_none());
+    }
+
     #[test]
     fn map_agent_connect_error_falls_back_for_non_agent_errors() {
         let (status, _) = map_agent_connect_error(CoreError::VmNotFound("vm".into()));

@@ -45,7 +45,10 @@
   - `kind`
   - `message`
   - optional `hint`
-  - optional `details`
+  - optional `details`, an object whose fields depend on `kind`:
+    `invalid_state` carries `vm`, `actual` and `expected` (the VM's state and
+    the state the request needed), so a client chooses its remedy from the
+    state rather than from the words of the message
   - backward-compatible alias `error`
 - Requests the API refuses before a handler runs use the same schema. Their
   status codes are the HTTP conventions and their kinds are stable:

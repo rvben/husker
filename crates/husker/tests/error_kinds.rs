@@ -365,14 +365,25 @@ async fn text_output_prints_the_hint_on_its_own_line() {
     assert!(printed_hint.contains("`husker daemon`"), "{printed_hint}");
 }
 
+/// The daemon's refusal of a lifecycle command for a VM in the wrong state,
+/// as `map_error` renders `CoreError::InvalidState`.
+fn wrong_state(vm: &str, actual: &str, expected: &str) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        serde_json::json!({
+            "kind": "invalid_state",
+            "message": format!("VM '{vm}' is {actual}, expected {expected}"),
+            "details": {"vm": vm, "actual": actual, "expected": expected},
+        })
+        .to_string(),
+    )
+}
+
 #[tokio::test]
 async fn a_hint_the_cli_adds_keeps_the_daemons_message_intact() {
     let fixture = Fixture::start(|method, target| {
         if method == "POST" && target == "/v1/vms/vm/pause" {
-            (
-                StatusCode::CONFLICT,
-                r#"{"kind":"vm_not_running","message":"VM 'vm' is stopped"}"#.into(),
-            )
+            wrong_state("vm", "stopped", "running")
         } else {
             no_route(method, target)
         }
@@ -382,12 +393,58 @@ async fn a_hint_the_cli_adds_keeps_the_daemons_message_intact() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(3), "{stderr}");
     let error = &envelope(&output)["error"];
-    assert_eq!(error["kind"], "vm_not_running", "{stderr}");
-    assert_eq!(error["message"], "VM 'vm' is stopped", "{stderr}");
+    assert_eq!(error["kind"], "conflict", "{stderr}");
+    assert_eq!(
+        error["message"], "VM 'vm' is stopped, expected running",
+        "{stderr}"
+    );
     assert_eq!(
         error["hint"], "start the VM first with `husker run`",
         "{stderr}"
     );
+}
+
+/// The remedy is chosen by the state the daemon's details name. A VM whose
+/// name mentions a state, refused for being in another, gets no advice for
+/// the state in its name; a refusal that names no state gets none at all.
+#[tokio::test]
+async fn a_state_remedy_follows_the_refusal_details_not_the_message() {
+    let fixture = Fixture::start(|method, target| {
+        match (method, target) {
+        ("POST", "/v1/vms/stopped-worker/resume") => {
+            wrong_state("stopped-worker", "creating", "paused or suspended")
+        }
+        ("POST", "/v1/vms/vm/suspend") => (
+            StatusCode::CONFLICT,
+            r#"{"kind":"invalid_state","message":"VM 'vm' is stopped, expected running or paused"}"#
+                .into(),
+        ),
+        _ => no_route(method, target),
+    }
+    })
+    .await;
+
+    let output = fixture
+        .husker(&["--output", "json", "resume", "stopped-worker"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(
+        error["message"], "VM 'stopped-worker' is creating, expected paused or suspended",
+        "{stderr}"
+    );
+    assert!(error.get("hint").is_none(), "{stderr}");
+
+    let output = fixture.husker(&["--output", "json", "suspend", "vm"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(
+        error["message"], "VM 'vm' is stopped, expected running or paused",
+        "{stderr}"
+    );
+    assert!(error.get("hint").is_none(), "{stderr}");
 }
 
 /// A daemon that refuses VM creation with `kind`, as it does for a request
@@ -459,6 +516,58 @@ async fn a_daemon_400_kind_the_cli_does_not_list_is_still_invalid_usage() {
         "the status classifies a kind outside the CLI vocabulary: {stderr}"
     );
     assert!(output.stdout.is_empty());
+}
+
+/// A VM name already taken gets the way to free it. The CLI recognises that
+/// refusal by its kind: another conflict whose message happens to say
+/// "already exists" is not it.
+#[tokio::test]
+async fn a_taken_vm_name_is_told_how_to_free_it() {
+    let fixture = Fixture::start(|method, target| {
+        if method == "POST" && target == "/v1/vms" {
+            (
+                StatusCode::CONFLICT,
+                r#"{"kind":"vm_already_exists","message":"VM 'vm' already exists"}"#.into(),
+            )
+        } else {
+            no_route(method, target)
+        }
+    })
+    .await;
+    let output = fixture
+        .husker(&["--output", "json", "run", "--vmm", "qemu", "--name", "vm"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["kind"], "conflict", "{stderr}");
+    assert_eq!(error["message"], "VM 'vm' already exists", "{stderr}");
+    assert_eq!(
+        error["hint"],
+        "if it is suspended, resume it with `husker resume vm`; \
+         otherwise stop or destroy it first with `husker destroy vm`",
+        "{stderr}"
+    );
+
+    let fixture = Fixture::start(|method, target| {
+        if method == "POST" && target == "/v1/vms" {
+            (
+                StatusCode::CONFLICT,
+                r#"{"kind":"image_already_exists","message":"image 'vm' already exists"}"#.into(),
+            )
+        } else {
+            no_route(method, target)
+        }
+    })
+    .await;
+    let output = fixture
+        .husker(&["--output", "json", "run", "--vmm", "qemu", "--name", "vm"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["message"], "image 'vm' already exists", "{stderr}");
+    assert!(error.get("hint").is_none(), "{stderr}");
 }
 
 #[tokio::test]

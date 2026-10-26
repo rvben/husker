@@ -1044,7 +1044,7 @@ async fn run(cli: Cli) -> Result<()> {
 
             if !resp.status().is_success() {
                 let mut full = client.error(resp, &format!("VM '{name}'")).await;
-                if full.message.contains("already exists") {
+                if full.refused_as("vm_already_exists") {
                     full.add_hint(format!(
                         "if it is suspended, resume it with `husker resume {name}`; \
                          otherwise stop or destroy it first with `husker destroy {name}`"
@@ -1283,11 +1283,10 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Stopped VM: {name}"),
                 );
             } else {
-                let mut msg = client.error(resp, &format!("VM '{name}'")).await;
-                if msg.message.contains("stopped") {
-                    msg.add_hint("the VM is already stopped; nothing to do");
-                }
-                exit_with_error(output, msg);
+                // The daemon stops a stopped or suspended VM as a no-op, so a
+                // refusal here is a VM still being created or torn down, which
+                // no command of the caller's resolves.
+                exit_with_error(output, client.error(resp, &format!("VM '{name}'")).await);
             }
             Ok(())
         }
@@ -1309,9 +1308,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 let mut msg = client.error(resp, &format!("VM '{name}'")).await;
-                if msg.message.contains("stopped") {
-                    msg.add_hint("start the VM first with `husker run`");
-                }
+                add_state_remedy(&mut msg, &name);
                 exit_with_error(output, msg);
             }
             Ok(())
@@ -1334,11 +1331,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 let mut msg = client.error(resp, &format!("VM '{name}'")).await;
-                if msg.message.contains("stopped") {
-                    msg.add_hint("start the VM first with `husker run`");
-                } else if msg.message.contains("running") {
-                    msg.add_hint("the VM is already running; nothing to resume");
-                }
+                add_state_remedy(&mut msg, &name);
                 exit_with_error(output, msg);
             }
             Ok(())
@@ -1362,9 +1355,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 let mut msg = client.error(resp, &format!("VM '{name}'")).await;
-                if msg.message.contains("stopped") {
-                    msg.add_hint("the VM must be running to suspend; start it with `husker run`");
-                }
+                add_state_remedy(&mut msg, &name);
                 exit_with_error(output, msg);
             }
             Ok(())
@@ -3744,18 +3735,40 @@ fn render_text_exec_event(event: DaemonExecEvent) -> Result<()> {
 /// WebSocket is never opened for a VM the daemon would turn away and the
 /// remedy is named.
 fn shell_refusal(name: &str, state: &str, auto_resume: Option<bool>) -> Option<ApiFailure> {
-    let hint = match state {
+    match state {
         "running" => return None,
         "suspended" if auto_resume != Some(false) => return None,
-        "stopped" => Some("start the VM first with `husker run`".to_string()),
-        "paused" | "suspended" => Some(format!("resume the VM first with `husker resume {name}`")),
-        _ => None,
-    };
+        _ => {}
+    }
     Some(ApiFailure::with_kind(
         CliErrorKind::VmNotRunning,
         format!("VM '{name}' is {state}, expected running"),
-        hint,
+        state_remedy(name, state),
     ))
+}
+
+/// The command that brings a VM in `state` to running, for the states the
+/// caller can act on. A VM still being created, failed, or in the middle of a
+/// suspend has no such command, so the daemon's message stands alone.
+fn state_remedy(name: &str, state: &str) -> Option<String> {
+    match state {
+        "stopped" => Some("start the VM first with `husker run`".to_string()),
+        "paused" | "suspended" => Some(format!("resume the VM first with `husker resume {name}`")),
+        _ => None,
+    }
+}
+
+/// Add the remedy for a lifecycle command the daemon refused because of the
+/// VM's state. The state comes from the refusal's details, never from the
+/// words of its message, so a VM whose name mentions a state gets no wrong
+/// advice and a refusal for another reason gets none at all.
+fn add_state_remedy(failure: &mut ApiFailure, name: &str) {
+    if let Some(hint) = failure
+        .refused_vm_state()
+        .and_then(|state| state_remedy(name, state))
+    {
+        failure.add_hint(hint);
+    }
 }
 
 /// Run an interactive shell session inside a VM.
@@ -5123,6 +5136,53 @@ mod tests {
         let creating = shell_refusal("vm", "creating", None).unwrap();
         assert_eq!(creating.kind, CliErrorKind::VmNotRunning);
         assert!(creating.hint.is_none());
+    }
+
+    /// A daemon refusal for a VM in the wrong state names the state in its
+    /// details; the remedy follows that state and nothing else.
+    #[test]
+    fn a_state_remedy_follows_the_refused_state_in_the_details() {
+        let refusal = |kind: Option<&str>, details: Option<serde_json::Value>| ApiFailure {
+            message: "VM 'stopped-worker' is creating, expected running".into(),
+            kind: CliErrorKind::Conflict,
+            daemon_kind: kind.map(str::to_string),
+            details,
+            hint: Some("from the daemon".into()),
+        };
+        let details = |actual: &str| {
+            Some(serde_json::json!({
+                "vm": "stopped-worker",
+                "actual": actual,
+                "expected": "running",
+            }))
+        };
+
+        let mut stopped = refusal(Some("invalid_state"), details("stopped"));
+        add_state_remedy(&mut stopped, "stopped-worker");
+        assert_eq!(
+            stopped.hint.as_deref(),
+            Some("from the daemon; start the VM first with `husker run`")
+        );
+
+        let mut suspended = refusal(Some("invalid_state"), details("suspended"));
+        add_state_remedy(&mut suspended, "stopped-worker");
+        assert_eq!(
+            suspended.hint.as_deref(),
+            Some("from the daemon; resume the VM first with `husker resume stopped-worker`")
+        );
+
+        // A state without a command of the caller's, a refusal without
+        // details (the message mentions a state only through the VM's name),
+        // and a refusal under another kind all leave the daemon's hint alone.
+        for mut unchanged in [
+            refusal(Some("invalid_state"), details("creating")),
+            refusal(Some("invalid_state"), None),
+            refusal(Some("vm_already_exists"), details("stopped")),
+            refusal(None, details("stopped")),
+        ] {
+            add_state_remedy(&mut unchanged, "stopped-worker");
+            assert_eq!(unchanged.hint.as_deref(), Some("from the daemon"));
+        }
     }
 
     #[test]

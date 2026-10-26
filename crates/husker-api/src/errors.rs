@@ -17,9 +17,11 @@ pub struct ErrorResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
-    /// Boxed so the error half of every handler's `Result` stays small: a
-    /// `serde_json::Value` inline puts the `Err` variant over the size clippy
-    /// flags, and this field is a schema placeholder that is rarely set.
+    /// The fields of the refusal, for a consumer that acts on them rather
+    /// than on the message: `invalid_state` carries `vm`, `actual` and
+    /// `expected`. Boxed so the error half of every handler's `Result` stays
+    /// small: a `serde_json::Value` inline puts the `Err` variant over the
+    /// size clippy flags, and most kinds carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Box<serde_json::Value>>,
     // Backward-compatible alias kept for existing clients/tests.
@@ -33,14 +35,7 @@ pub struct ErrorResponse {
 pub(crate) type Failure = (StatusCode, Json<ErrorResponse>);
 
 pub(crate) fn error_response(kind: &str, message: impl Into<String>) -> Json<ErrorResponse> {
-    let message = message.into();
-    Json(ErrorResponse {
-        kind: kind.to_string(),
-        message: message.clone(),
-        hint: None,
-        details: None,
-        error: Some(message),
-    })
+    envelope(kind, message.into(), None, None)
 }
 
 pub(crate) fn error_response_with_hint(
@@ -48,12 +43,20 @@ pub(crate) fn error_response_with_hint(
     message: impl Into<String>,
     hint: impl Into<String>,
 ) -> Json<ErrorResponse> {
-    let message = message.into();
+    envelope(kind, message.into(), Some(hint.into()), None)
+}
+
+fn envelope(
+    kind: &str,
+    message: String,
+    hint: Option<String>,
+    details: Option<serde_json::Value>,
+) -> Json<ErrorResponse> {
     Json(ErrorResponse {
         kind: kind.to_string(),
         message: message.clone(),
-        hint: Some(hint.into()),
-        details: None,
+        hint,
+        details: details.map(Box::new),
         error: Some(message),
     })
 }
@@ -224,9 +227,28 @@ pub(crate) fn map_error(err: CoreError) -> Failure {
             err.to_string(),
         ),
     };
-    match hint_for(&err) {
-        Some(hint) => (status, error_response_with_hint(kind, message, hint)),
-        None => (status, error_response(kind, message)),
+    (
+        status,
+        envelope(kind, message, hint_for(&err), details_for(&err)),
+    )
+}
+
+/// The fields of a refusal a consumer can act on without parsing the message.
+/// A VM in the wrong state names the VM, the state it is in and the state the
+/// request needed; the client chooses its remedy by the state, not by the
+/// words of the message.
+fn details_for(err: &CoreError) -> Option<serde_json::Value> {
+    match err {
+        CoreError::InvalidState {
+            name,
+            actual,
+            expected,
+        } => Some(serde_json::json!({
+            "vm": name,
+            "actual": actual,
+            "expected": expected,
+        })),
+        _ => None,
     }
 }
 
