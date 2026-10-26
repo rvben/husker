@@ -8,9 +8,10 @@ rust-version.workspace = true
 [features]
 default = ["linux-net"]
 linux-net = ["husker-net", "dep:tempfile"]
-utoipa = ["dep:utoipa"]
+utoipa = ["dep:utoipa", "husker-types/utoipa"]
 
 [dependencies]
+husker-types = { workspace = true }
 husker-vmm = { workspace = true }
 husker-net = { workspace = true, optional = true }
 husker-cloudinit = { workspace = true }

@@ -158,6 +158,49 @@ async fn openapi_lists_every_logs_query_parameter() {
     );
 }
 
+/// Whether a property schema refers to the named component, directly or
+/// through the wrapper utoipa emits for an optional field.
+fn refers_to(property: &serde_json::Value, component: &str) -> bool {
+    serde_json::to_string(property)
+        .unwrap()
+        .contains(&format!("\"#/components/schemas/{component}\""))
+}
+
+#[tokio::test]
+async fn openapi_types_the_vocabulary_enums() {
+    let doc = fetch_openapi().await;
+    let schemas = &doc["components"]["schemas"];
+
+    for (component, values) in [
+        ("BootKind", vec!["direct", "uefi", "efi", "macos"]),
+        (
+            "UserdataStatus",
+            vec!["pending", "running", "completed", "failed", "interrupted"],
+        ),
+        ("ImageKind", vec!["rootfs", "cloud-image"]),
+    ] {
+        assert_eq!(
+            schemas[component]["enum"],
+            serde_json::json!(values),
+            "{component} must enumerate its wire values"
+        );
+    }
+
+    let vm = &schemas["VmResponse"]["properties"];
+    assert!(
+        refers_to(&vm["boot_mode"], "BootKind"),
+        "{}",
+        vm["boot_mode"]
+    );
+    assert!(
+        refers_to(&vm["userdata_status"], "UserdataStatus"),
+        "{}",
+        vm["userdata_status"]
+    );
+    let image = &schemas["ImageResponse"]["properties"];
+    assert!(refers_to(&image["kind"], "ImageKind"), "{}", image["kind"]);
+}
+
 #[tokio::test]
 async fn openapi_error_response_schema_is_stable() {
     let doc = fetch_openapi().await;

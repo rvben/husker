@@ -40,10 +40,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub use husker_state::{
-    BackendKind, BootKind, HostGroupRecord, ImageKind, ImageRecord, NetworkMode, PoolRecord,
-    SecretRecord, ServiceRecord, SnapshotRecord, StateError, UserdataStatus, VmExpirationRecord,
-    VmLifecycleState, VmRecord, VolumeRecord,
+    HostGroupRecord, ImageRecord, PoolRecord, SecretRecord, ServiceRecord, SnapshotRecord,
+    StateError, VmExpirationRecord, VmLifecycleState, VmRecord, VolumeRecord,
 };
+pub use husker_types::{BackendKind, BootKind, ImageKind, NetworkMode, UserdataStatus};
 pub use husker_vmm::{VmInfo, VmState};
 
 /// One page of the VM list together with the size of the whole fleet, so a

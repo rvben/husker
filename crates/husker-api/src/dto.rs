@@ -38,10 +38,8 @@ pub struct VmResponse {
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>, example = "pending")]
     pub userdata_status: Option<UserdataStatus>,
     pub vmm: String,
-    #[schema(value_type = String, example = "direct")]
     pub boot_mode: BootKind,
     /// Source rootfs (direct boot) or cloud image (UEFI boot) this VM was
     /// created from. Empty when unknown.
@@ -190,7 +188,6 @@ pub struct ImageResponse {
     pub file_path: String,
     pub format: String,
     /// Image kind: "rootfs" (direct-kernel boot) or "cloud-image" (UEFI/OVMF boot).
-    #[schema(value_type = String, example = "rootfs")]
     pub kind: ImageKind,
     /// PID 1 override inherited by derived direct-kernel images.
     #[serde(skip_serializing_if = "Option::is_none")]

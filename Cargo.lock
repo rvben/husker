@@ -1160,6 +1160,7 @@ dependencies = [
  "husker-oci",
  "husker-state",
  "husker-storage",
+ "husker-types",
  "husker-vmm",
  "libc",
  "parking_lot",
@@ -1244,6 +1245,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "utoipa",
 ]
 
 [[package]]

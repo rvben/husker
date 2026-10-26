@@ -56,6 +56,7 @@ impl std::str::FromStr for BackendKind {
 /// and API serialization. The stable wire values are `direct`, `uefi`, `efi`,
 /// and `macos`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum BootKind {
     #[default]
@@ -117,6 +118,7 @@ impl std::str::FromStr for BootKind {
 
 /// The artifact shape stored in the managed image catalog.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum ImageKind {
     #[default]
@@ -164,6 +166,7 @@ impl std::str::FromStr for ImageKind {
 /// finishes in a terminal state. `Interrupted` means host lifecycle action or
 /// daemon loss ended execution before the script produced an exit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum UserdataStatus {
     Pending,
