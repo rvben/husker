@@ -304,7 +304,6 @@ pub(crate) fn max_vms() -> Option<usize> {
         GuestInfoResponse,
         ProfilesResponse,
         DaemonProfile,
-        LogsQuery,
         WsShellInput,
         WsShellOutput,
         WsExecInput,

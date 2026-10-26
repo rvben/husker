@@ -495,17 +495,21 @@ pub struct ListVmsQuery {
 
 // ── Logs Types ───────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Query parameters of `GET /v1/vms/{name}/logs`.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LogsQuery {
+    /// Stream the log as it grows instead of returning a snapshot.
     #[serde(default)]
     pub follow: bool,
+    /// Return only the last N lines.
     pub tail: Option<u64>,
     /// Serve the captured userdata script output instead of the serial console.
     #[serde(default)]
     pub userdata: bool,
     /// Log source: "serial" (default), "boot", or "userdata". Takes precedence
     /// over `userdata` when set.
-    #[schema(example = "serial")]
+    #[param(example = "serial")]
     pub source: Option<String>,
 }
 

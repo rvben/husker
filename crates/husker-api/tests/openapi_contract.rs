@@ -130,6 +130,35 @@ async fn openapi_contains_critical_paths() {
 }
 
 #[tokio::test]
+async fn openapi_lists_every_logs_query_parameter() {
+    let doc = fetch_openapi().await;
+    let parameters = doc["paths"]["/v1/vms/{name}/logs"]["get"]["parameters"]
+        .as_array()
+        .expect("logs GET must declare parameters");
+    let mut listed: Vec<(&str, &str, bool)> = parameters
+        .iter()
+        .map(|parameter| {
+            (
+                parameter["name"].as_str().unwrap(),
+                parameter["in"].as_str().unwrap(),
+                parameter["required"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect();
+    listed.sort_unstable();
+    assert_eq!(
+        listed,
+        vec![
+            ("follow", "query", false),
+            ("name", "path", true),
+            ("source", "query", false),
+            ("tail", "query", false),
+            ("userdata", "query", false),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn openapi_error_response_schema_is_stable() {
     let doc = fetch_openapi().await;
     let schemas = doc["components"]["schemas"]

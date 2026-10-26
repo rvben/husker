@@ -2230,8 +2230,7 @@ const LOG_MAX_READ_BYTES: u64 = 1024 * 1024;
     tag = "logs",
     params(
         ("name" = String, Path, description = "VM name"),
-        ("follow" = Option<bool>, Query, description = "Follow log output"),
-        ("tail" = Option<u64>, Query, description = "Show last N lines")
+        LogsQuery
     ),
     responses(
         (status = 200, description = "Serial console output", content_type = "text/plain"),
