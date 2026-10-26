@@ -253,7 +253,7 @@ pub(crate) enum Commands {
         /// Number of VMs to skip
         #[arg(long, default_value_t = 0)]
         offset: u32,
-        /// Comma-separated list of fields to include in output
+        /// Comma-separated list of fields to include in JSON output
         #[arg(long)]
         fields: Option<String>,
     },

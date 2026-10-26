@@ -204,6 +204,53 @@ pub(crate) fn command_contract(path: &str) -> Option<&'static CommandContract> {
         .find(|contract| contract.path == path)
 }
 
+/// A `--fields` selection named something the command's contract does not
+/// declare.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UnknownField {
+    pub(crate) name: String,
+    pub(crate) valid: Vec<&'static str>,
+}
+
+impl UnknownField {
+    pub(crate) fn message(&self) -> String {
+        if self.name.is_empty() {
+            "--fields contains an empty field name".to_string()
+        } else {
+            format!("unknown field `{}` in --fields", self.name)
+        }
+    }
+
+    pub(crate) fn hint(&self) -> String {
+        format!("valid fields: {}", self.valid.join(", "))
+    }
+}
+
+/// Resolve a comma-separated `--fields` selection against the item fields the
+/// command's contract declares, keeping the caller's order. Names are trimmed;
+/// an empty name (`name,` or `,name`) is reported rather than silently dropped.
+pub(crate) fn select_fields(path: &str, spec: &str) -> Result<Vec<&'static str>, UnknownField> {
+    let valid: Vec<&'static str> = command_contract(path)
+        .unwrap_or_else(|| panic!("missing CLI contract for command '{path}'"))
+        .clispec_fields()
+        .iter()
+        .map(|field| field.name)
+        .collect();
+    spec.split(',')
+        .map(str::trim)
+        .map(|name| {
+            valid
+                .iter()
+                .copied()
+                .find(|known| *known == name)
+                .ok_or_else(|| UnknownField {
+                    name: name.to_string(),
+                    valid: valid.clone(),
+                })
+        })
+        .collect()
+}
+
 pub(crate) fn structured_output<T: Serialize>(path: &str, value: &T) -> Result<serde_json::Value> {
     let value = serde_json::to_value(value).context("serializing structured CLI output")?;
     validate_output(path, &value)?;
@@ -452,5 +499,28 @@ mod tests {
         validate_output("exec", &examples[2]).unwrap();
         assert_eq!(examples[3]["error"]["kind"], "not_found");
         assert!(examples[3]["error"]["message"].is_string());
+    }
+
+    #[test]
+    fn select_fields_keeps_the_requested_order_and_rejects_unknown_names() {
+        assert_eq!(
+            select_fields("list", " state ,name").unwrap(),
+            vec!["state", "name"]
+        );
+
+        let unknown = select_fields("list", "name,nosuchfield").unwrap_err();
+        assert_eq!(unknown.name, "nosuchfield");
+        assert_eq!(unknown.message(), "unknown field `nosuchfield` in --fields");
+        assert!(
+            unknown
+                .hint()
+                .starts_with("valid fields: id, name, state, ")
+        );
+        assert!(unknown.hint().contains("boot_mode"));
+
+        assert_eq!(
+            select_fields("list", "name,").unwrap_err().message(),
+            "--fields contains an empty field name"
+        );
     }
 }

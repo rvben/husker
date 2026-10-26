@@ -27,7 +27,7 @@ mod vm_creation;
 use crate::cli::*;
 #[cfg(test)]
 use crate::cli_contract::command_contract;
-use crate::cli_contract::{normalize_error_kind, structured_output};
+use crate::cli_contract::{CliErrorKind, normalize_error_kind, select_fields, structured_output};
 use crate::config::*;
 use crate::daemon::*;
 use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent, DaemonUnreachable};
@@ -1032,6 +1032,20 @@ async fn run(cli: Cli) -> Result<()> {
             offset,
             fields,
         } => {
+            // Resolve the field selection first so a typo fails before any round trip.
+            let fields = fields.as_deref().map(|spec| {
+                select_fields("list", spec).unwrap_or_else(|unknown| {
+                    exit_with_error(
+                        output,
+                        ApiFailure {
+                            message: unknown.message(),
+                            kind: Some(CliErrorKind::InvalidUsage.name().into()),
+                            exit_code: CliErrorKind::InvalidUsage.exit_code(),
+                            hint: Some(unknown.hint()),
+                        },
+                    )
+                })
+            });
             let client = target.daemon().clone();
             let url = format!("/v1/vms?limit={limit}&offset={offset}");
             // When the daemon is unreachable, return an empty list so agents and
@@ -1064,22 +1078,22 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let fmt = resolve_format(output);
             if fmt == OutputFormat::Json {
-                // Apply field filtering when --fields is specified.
-                let filtered: Vec<serde_json::Value> = if let Some(ref f) = fields {
-                    let field_names: Vec<&str> = f.split(',').map(str::trim).collect();
-                    vms.iter()
+                // Keep only the selected fields when --fields is given.
+                let filtered: Vec<serde_json::Value> = match &fields {
+                    Some(names) => vms
+                        .iter()
                         .map(|vm| {
-                            let mut obj = serde_json::Map::new();
-                            for name in &field_names {
-                                if let Some(v) = vm.get(*name) {
-                                    obj.insert((*name).to_string(), v.clone());
-                                }
-                            }
-                            serde_json::Value::Object(obj)
+                            names
+                                .iter()
+                                .filter_map(|name| {
+                                    vm.get(*name)
+                                        .map(|value| ((*name).to_string(), value.clone()))
+                                })
+                                .collect::<serde_json::Map<_, _>>()
+                                .into()
                         })
-                        .collect()
-                } else {
-                    vms.clone()
+                        .collect(),
+                    None => vms.clone(),
                 };
                 print_output(
                     output,

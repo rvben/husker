@@ -98,9 +98,9 @@ impl Fixture {
         }
     }
 
-    /// Run `husker list` with the given output format and return its stdout.
-    async fn run(&self, format: &str, args: &[&str]) -> String {
-        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_husker"))
+    /// Run `husker list` with the given output format against the stub daemon.
+    async fn invoke(&self, format: &str, args: &[&str]) -> std::process::Output {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_husker"))
             .args(["--api-url", &self.url, "--output", format, "--config"])
             .arg(self.temp.path().join("config.toml"))
             .arg("list")
@@ -113,7 +113,12 @@ impl Fixture {
             .env("HUSKER_DATA_DIR", self.temp.path().join("data"))
             .output()
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Run `husker list`, require success and return its stdout.
+    async fn run(&self, format: &str, args: &[&str]) -> String {
+        let output = self.invoke(format, args).await;
         assert!(
             output.status.success(),
             "{}",
@@ -160,6 +165,30 @@ async fn list_prints_the_page_a_paging_daemon_returns() {
 async fn list_cuts_the_page_itself_for_a_daemon_that_returns_the_whole_fleet() {
     let fixture = Fixture::new(false).await;
     assert_second_vm_is_the_page(&fixture).await;
+}
+
+#[tokio::test]
+async fn list_rejects_an_unknown_field_before_asking_the_daemon() {
+    let fixture = Fixture::new(true).await;
+
+    let output = fixture
+        .invoke("json", &["--fields", "name,nosuchfield"])
+        .await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope: Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+    assert_eq!(envelope["error"]["kind"], "invalid_usage");
+    assert_eq!(
+        envelope["error"]["message"],
+        "unknown field `nosuchfield` in --fields"
+    );
+    let hint = envelope["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with("valid fields: id, name, state, "),
+        "{hint}"
+    );
+    assert!(fixture.requests().is_empty());
 }
 
 #[tokio::test]
