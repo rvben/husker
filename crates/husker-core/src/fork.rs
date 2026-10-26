@@ -320,12 +320,21 @@ impl<B: VmmBackend> HuskerCore<B> {
             })?;
             match attempt {
                 Ok(()) => return Ok(()),
-                // The agent connected but did not understand the reconfigure
-                // request (EOF / wrong reply): it predates `ReconfigureNetwork`
-                // and is too old for fork. Retrying for the full 10s deadline
-                // cannot help, so fail fast with an actionable message instead of
-                // an opaque "unexpected response from agent" after a long stall.
-                Err(CoreError::Agent(AgentError::UnexpectedResponse)) => {
+                // The agent connected but does not implement the restore or
+                // reconfigure request: a current agent says so with the
+                // `unsupported_request` code, an older one closes the
+                // connection or answers with the wrong reply. Either way it
+                // predates `ReconfigureNetwork` and is too old for fork.
+                // Retrying for the full 10s deadline cannot help, so fail fast
+                // with an actionable message instead of an opaque agent error
+                // after a long stall.
+                Err(CoreError::Agent(
+                    AgentError::UnexpectedResponse
+                    | AgentError::Rejected {
+                        code: husker_agent_proto::AgentErrorCode::UnsupportedRequest,
+                        ..
+                    },
+                )) => {
                     return Err(CoreError::InvalidArgument(
                         "fork requires live network reconfiguration, but the guest \
                          agent does not support it; rebuild the source VM's rootfs \
@@ -334,7 +343,11 @@ impl<B: VmmBackend> HuskerCore<B> {
                             .into(),
                     ));
                 }
-                Err(CoreError::Agent(AgentError::Agent(message))) => {
+                // Any other refusal the agent spelled out is deterministic:
+                // the same request gets the same answer, so retrying is a stall.
+                Err(CoreError::Agent(
+                    AgentError::Agent(message) | AgentError::Rejected { message, .. },
+                )) => {
                     return Err(CoreError::InvalidArgument(message));
                 }
                 Err(e) => {

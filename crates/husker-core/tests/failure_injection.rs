@@ -564,9 +564,14 @@ impl VmmBackend for FailingVmm {
             return Err(VmmError::VmNotFound(id));
         }
         let (host, mut guest) = tokio::net::UnixStream::pair().unwrap();
+        // A guest agent that cannot decode `ReconfigureNetwork` answers it
+        // with the classified refusal a current agent sends for a request it
+        // does not implement, and keeps the connection open.
+        let reconfigure_unsupported = self.should_fail("agent_reconfigure_network");
         tokio::spawn(async move {
             use husker_agent_proto::{
-                AgentRequest, AgentResponse, GuestInfoResponse, ReconfigureNetworkResponse,
+                AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, GuestInfoResponse,
+                ReconfigureNetworkResponse,
             };
             while let Ok(Some(request)) =
                 husker_agent_proto::read_message::<AgentRequest, _>(&mut guest).await
@@ -579,6 +584,13 @@ impl VmmBackend for FailingVmm {
                     AgentRequest::RestoreGuest(request) => {
                         assert!(request.require_vmgenid);
                         AgentResponse::GuestRestored
+                    }
+                    AgentRequest::ReconfigureNetwork(_) if reconfigure_unsupported => {
+                        AgentResponse::Error(ErrorResponse {
+                            message: "unsupported request: unknown variant `ReconfigureNetwork`"
+                                .into(),
+                            code: Some(AgentErrorCode::UnsupportedRequest),
+                        })
                     }
                     AgentRequest::ReconfigureNetwork(request) => {
                         AgentResponse::ReconfigureNetwork(ReconfigureNetworkResponse {
@@ -1205,6 +1217,51 @@ async fn fork_inherits_deny_all_and_installs_firewall_before_network_attachment(
             b"source disk"
         );
     }
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn fork_fails_fast_when_the_guest_agent_cannot_reconfigure_its_network() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = husker_state::StateStore::open_memory().unwrap();
+    let source = core_with_vm("source", "suspended", &[])
+        .get_vm("source")
+        .unwrap();
+    state.insert_vm(&source).unwrap();
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_vmm(
+        tmp.path(),
+        state,
+        network.clone(),
+        FailingVmm::new(&["agent_reconfigure_network"]),
+    );
+    std::fs::create_dir_all(tmp.path().join("vms/source")).unwrap();
+    std::fs::write(tmp.path().join("vms/source/rootfs.ext4"), b"source disk").unwrap();
+
+    let started = std::time::Instant::now();
+    let result = core.fork_vm("source", "clone").await;
+    let elapsed = started.elapsed();
+
+    match result {
+        Err(CoreError::InvalidArgument(message)) => assert!(
+            message.contains("fork requires live network reconfiguration"),
+            "unexpected refusal: {message}"
+        ),
+        other => panic!("expected an invalid-argument refusal, got {other:?}"),
+    }
+    // The agent's refusal is deterministic, so the fork must report it at
+    // once instead of retrying it until the 10 s restoration deadline.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "fork took {elapsed:?} to report an agent that cannot reconfigure"
+    );
+    assert!(network.taps.lock().await.is_empty());
+    assert!(core.get_vm("clone").is_err());
+    assert!(!tmp.path().join("vms/clone").exists());
+    assert_eq!(
+        core.get_vm("source").unwrap().state,
+        husker_state::VmLifecycleState::Suspended
+    );
 }
 
 #[cfg(feature = "linux-net")]

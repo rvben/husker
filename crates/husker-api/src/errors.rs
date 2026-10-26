@@ -166,6 +166,19 @@ pub(crate) fn map_error(err: CoreError) -> Failure {
             "guest_append_unsupported",
             err.to_string(),
         ),
+        // The guest agent decoded the frame but implements no such request:
+        // the image predates the feature, the same remedy as above.
+        CoreError::Agent(husker_core::AgentError::Rejected {
+            code: husker_agent_proto::AgentErrorCode::UnsupportedRequest,
+            message,
+        }) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "guest_capability_missing",
+            format!(
+                "the guest agent does not implement this request ({message}); rebuild or \
+                 re-import the VM's image with the current guest agent"
+            ),
+        ),
         CoreError::Io(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "io_error",

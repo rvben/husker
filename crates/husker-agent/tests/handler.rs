@@ -1,9 +1,10 @@
 use husker_agent::AgentLimits;
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, ShellDataRequest,
+    AgentErrorCode, AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, ShellDataRequest,
     ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode, base64_encode,
     read_message, write_message,
 };
+use tokio::io::AsyncWriteExt;
 
 /// Spawn the agent handler on a temporary Unix socket and return a connected client stream.
 async fn spawn_agent() -> tokio::net::UnixStream {
@@ -827,6 +828,66 @@ async fn multiple_operations_on_one_connection() {
         .unwrap();
     let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
     assert!(matches!(response, AgentResponse::Pong));
+}
+
+/// Write one length-prefixed frame carrying `json` as-is, so the test can
+/// send what no `AgentRequest` of this build encodes.
+async fn write_raw_frame(stream: &mut tokio::net::UnixStream, json: &[u8]) {
+    stream
+        .write_all(&(json.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(json).await.unwrap();
+}
+
+/// A host newer than the guest asks for a request this agent does not
+/// implement, or sends a shape this protocol version does not know. The
+/// agent must answer with the refusal class the host branches on and keep
+/// the connection: closing it turned every such mismatch into a bare
+/// connection error, and the host's later requests on the same connection
+/// into failures with no cause.
+#[tokio::test]
+async fn an_unknown_request_is_answered_and_the_connection_stays_open() {
+    let mut stream = spawn_agent().await;
+
+    for frame in [
+        br#"{"type":"NoSuchRequest"}"#.as_slice(),
+        br#"{"type":"Exec"}"#.as_slice(),
+    ] {
+        write_raw_frame(&mut stream, frame).await;
+        let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+        match response {
+            AgentResponse::Error(error) => {
+                assert_eq!(
+                    error.code,
+                    Some(AgentErrorCode::UnsupportedRequest),
+                    "{error:?}"
+                );
+                assert!(
+                    error.message.starts_with("unsupported request: "),
+                    "{error:?}"
+                );
+            }
+            other => panic!("expected a classified refusal, got {other:?}"),
+        }
+    }
+
+    write_message(&mut stream, &AgentRequest::Ping)
+        .await
+        .unwrap();
+    let response: AgentResponse = read_message(&mut stream).await.unwrap().unwrap();
+    assert!(matches!(response, AgentResponse::Pong), "{response:?}");
+}
+
+/// A frame whose payload is not JSON is a corrupt transport, not a request
+/// the agent lacks: no refusal is sent and the connection closes.
+#[tokio::test]
+async fn a_frame_that_is_not_json_closes_the_connection() {
+    let mut stream = spawn_agent().await;
+
+    write_raw_frame(&mut stream, b"not json").await;
+    let closed = read_message::<AgentResponse, _>(&mut stream).await.unwrap();
+    assert!(closed.is_none(), "expected end of stream, got {closed:?}");
 }
 
 #[tokio::test]

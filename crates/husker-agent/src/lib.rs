@@ -24,9 +24,9 @@ use anyhow::Result;
 use husker_agent_proto::{
     AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ExecResponse,
     ExecStreamData, ExecStreamExit, GuestInfoResponse, OCI_CONFIG_PATH, OciRuntimeConfig,
-    ReadFileResponse, ReconfigureNetworkRequest, ReconfigureNetworkResponse, ShellDataResponse,
-    ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode, base64_encode,
-    read_message, write_message,
+    ProtocolError, ReadFileResponse, ReconfigureNetworkRequest, ReconfigureNetworkResponse,
+    ShellDataResponse, ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode,
+    base64_encode, read_message, write_message,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
@@ -103,9 +103,31 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let request: Option<AgentRequest> = read_message(&mut stream).await?;
-        let Some(request) = request else {
-            return Ok(());
+        let request: AgentRequest = match read_message(&mut stream).await {
+            Ok(Some(request)) => request,
+            Ok(None) => return Ok(()),
+            // The frame decoded as JSON but not as a request this agent
+            // implements: a newer host asking for something this build lacks,
+            // or a shape this protocol version does not know. The payload was
+            // read in full, so the stream sits at a frame boundary and the
+            // connection keeps serving; the host gets a classified refusal it
+            // can act on instead of a closed socket. A frame that is not JSON
+            // at all is a corrupt transport, not a capability gap, and still
+            // closes the connection.
+            Err(ProtocolError::Json(error))
+                if error.classify() == serde_json::error::Category::Data =>
+            {
+                write_message(
+                    &mut stream,
+                    &AgentResponse::Error(ErrorResponse {
+                        message: format!("unsupported request: {error}"),
+                        code: Some(AgentErrorCode::UnsupportedRequest),
+                    }),
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         };
 
         match request {

@@ -254,6 +254,42 @@ async fn exec_maps_agent_error_response() {
     server_task.await.unwrap();
 }
 
+/// A guest agent that does not implement the request it was sent reports a
+/// code beside its message. The code has to reach the caller on every
+/// request, not only on the session ones: it is what the API turns into
+/// "refresh the image" instead of an internal error.
+#[tokio::test]
+async fn exec_keeps_the_code_of_a_classified_refusal() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let _req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        write_message(
+            &mut server,
+            &serde_json::json!({
+                "type": "Error",
+                "message": "unsupported request: unknown variant `Exec`",
+                "code": "unsupported_request",
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.exec("echo", &["x"], None, &[]).await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AgentError::Rejected {
+                code: AgentErrorCode::UnsupportedRequest,
+                message
+            } if message.starts_with("unsupported request: ")
+        ),
+        "{err:?}"
+    );
+    server_task.await.unwrap();
+}
+
 #[tokio::test]
 async fn exec_rejects_unexpected_response_variant() {
     let (client, mut server) = tokio::io::duplex(2048);

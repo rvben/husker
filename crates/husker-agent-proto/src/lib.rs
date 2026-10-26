@@ -303,6 +303,9 @@ pub enum AgentErrorCode {
     SessionIdExists,
     /// Nothing on the guest accepted the tunnel's loopback connection.
     TunnelConnectFailed,
+    /// The request could not be decoded as one this agent implements: a type
+    /// it does not know, or a shape its protocol version does not know.
+    UnsupportedRequest,
     /// A code this host does not know.
     #[serde(other)]
     Unknown,
@@ -800,6 +803,11 @@ mod tests {
             AgentResponse::Error(back) => assert_eq!(back.code, Some(AgentErrorCode::Unknown)),
             other => panic!("expected Error, got {other:?}"),
         }
+
+        // The wire name of a request the agent cannot decode is what a host
+        // branches on to tell "refresh the image" from a guest-side failure.
+        let unsupported = serde_json::to_value(AgentErrorCode::UnsupportedRequest).unwrap();
+        assert_eq!(unsupported, "unsupported_request");
     }
 
     #[test]

@@ -2600,6 +2600,30 @@ mod tests {
         );
     }
 
+    /// A guest agent that decodes a frame but implements no such request is
+    /// a property of the VM's image, like the two cases above: the status
+    /// must not invite a retry, the kind is the one every missing guest
+    /// feature reports, and the message carries the agent's own words plus
+    /// the fix. Before the agent classified this, the connection was simply
+    /// closed and the API answered 500 `agent_error`.
+    #[test]
+    fn map_error_reports_a_request_the_guest_cannot_decode_as_not_implemented() {
+        let (status, body) = map_error(CoreError::Agent(husker_core::AgentError::Rejected {
+            code: husker_agent_proto::AgentErrorCode::UnsupportedRequest,
+            message: "unsupported request: unknown variant `Later`".into(),
+        }));
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+
+        let payload = body.0;
+        assert_eq!(payload.kind, "guest_capability_missing");
+        assert!(
+            payload.message.contains("unknown variant `Later`")
+                && payload.message.contains("rebuild or re-import"),
+            "the message must carry the agent's reason and name the fix: {}",
+            payload.message
+        );
+    }
+
     /// A name whose interrupted creation still holds host resources is a
     /// conflict the operator resolves on the host, not an internal error. The
     /// hint has to say where to look, since the message alone names only the VM.

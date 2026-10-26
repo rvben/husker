@@ -52,17 +52,28 @@ pub enum AgentError {
     },
 }
 
-/// Classify a session or tunnel refusal. The agent's own code wins; without
-/// one, the message is matched against the phrases that protocol 5 agents
-/// from husker 0.4.51 and 0.4.52 send, which predate the code field.
-fn session_refusal(error: ErrorResponse) -> AgentError {
-    match error.code.or_else(|| legacy_session_code(&error.message)) {
+/// Classify a refusal by the code the agent reports. An agent that sends a
+/// code means a class the host can act on, such as a request this guest's
+/// agent does not implement; one that sends only a message means a failure
+/// described by its wording alone.
+fn refusal(error: ErrorResponse) -> AgentError {
+    match error.code {
         Some(code) => AgentError::Rejected {
             code,
             message: error.message,
         },
         None => AgentError::Agent(error.message),
     }
+}
+
+/// Classify a session or tunnel refusal. The agent's own code wins; without
+/// one, the message is matched against the phrases that protocol 5 agents
+/// from husker 0.4.51 and 0.4.52 send, which predate the code field.
+fn session_refusal(mut error: ErrorResponse) -> AgentError {
+    if error.code.is_none() {
+        error.code = legacy_session_code(&error.message);
+    }
+    refusal(error)
 }
 
 /// The refusal phrases of session-capable agents built before the code field
@@ -204,7 +215,7 @@ where
             .ok_or(AgentError::UnexpectedResponse)?
         {
             AgentResponse::GuestRestored => Ok(true),
-            AgentResponse::Error(error) => Err(AgentError::Agent(error.message)),
+            AgentResponse::Error(error) => Err(refusal(error)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -314,7 +325,7 @@ where
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
             AgentResponse::Pong => Ok(()),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -332,7 +343,7 @@ where
                 warn_on_protocol_mismatch(info.protocol_version);
                 Ok(info)
             }
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -363,7 +374,7 @@ where
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
             AgentResponse::ReconfigureNetwork(_) => Ok(()),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -412,7 +423,7 @@ where
                 stdout: r.stdout,
                 stderr: r.stderr,
             }),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -445,7 +456,7 @@ where
             .ok_or(AgentError::UnexpectedResponse)?
         {
             AgentResponse::ExecStarted => Ok(()),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -463,7 +474,7 @@ where
                 .map(ExecStreamEvent::Stderr)
                 .map_err(|e| AgentError::Agent(format!("base64 decode failed: {e}"))),
             AgentResponse::ExecExit(exit) => Ok(ExecStreamEvent::Exit(exit.exit_code)),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -523,7 +534,7 @@ where
                     modified_nanos: r.modified_nanos,
                 })
             }
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -567,7 +578,7 @@ where
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
             AgentResponse::WriteFile(r) => Ok(r.bytes_written),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -595,7 +606,7 @@ where
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
             AgentResponse::ShellStarted => Ok(()),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -621,7 +632,7 @@ where
                 Ok(ShellEvent::Data(data))
             }
             AgentResponse::ShellExit(r) => Ok(ShellEvent::Exit(r.exit_code)),
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }

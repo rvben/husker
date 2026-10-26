@@ -80,7 +80,11 @@
   - `session_conflict` (409): the retention limit is reached, the session is
     still running, or a generated id collided; the `hint` says which
   - `session_capacity_exhausted` (429): too many running sessions
-  - `guest_capability_missing` (501): the guest agent predates sessions
+  - `guest_capability_missing` (501): the guest agent predates sessions, or
+    reports that it does not implement the request it was sent (an agent
+    from 0.4.53 or newer answers such a request with the code
+    `unsupported_request` and keeps the connection; older agents close it,
+    which the daemon reports as an agent error)
   - `preview_unreachable` (502): nothing on the guest accepted the tunnel
     connection
   - `session_failed` (502): a guest-side failure without a class, with the

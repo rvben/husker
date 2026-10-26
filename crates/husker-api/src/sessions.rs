@@ -80,6 +80,13 @@ fn session_error(error: AgentError) -> Failure {
                 "nothing on the guest accepted the connection; start the application on that \
                  port, or check which port it listens on",
             ),
+            // The guest agent decoded the frame but implements no such
+            // request: the same remedy as an agent that predates sessions.
+            AgentErrorCode::UnsupportedRequest => (
+                StatusCode::NOT_IMPLEMENTED,
+                "guest_capability_missing",
+                "rebuild or re-import the VM's image with the current guest agent",
+            ),
             AgentErrorCode::Unknown => UNCLASSIFIED,
         },
         _ => UNCLASSIFIED,
@@ -511,6 +518,11 @@ mod tests {
                 rejected(AgentErrorCode::TunnelConnectFailed),
                 StatusCode::BAD_GATEWAY,
                 "preview_unreachable",
+            ),
+            (
+                rejected(AgentErrorCode::UnsupportedRequest),
+                StatusCode::NOT_IMPLEMENTED,
+                "guest_capability_missing",
             ),
             (
                 rejected(AgentErrorCode::Unknown),
