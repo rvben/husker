@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
 use husker_agent_proto::{
-    SessionEvent, SessionEventsResponse, SessionInfo, SessionStartRequest, SessionState,
-    base64_encode,
+    AgentErrorCode, SessionEvent, SessionEventsResponse, SessionInfo, SessionStartRequest,
+    SessionState, base64_encode,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
@@ -36,6 +36,78 @@ fn now() -> u64 {
         .as_secs()
 }
 
+/// Why the store refused a request. The classified variants reach the host
+/// as an [`AgentErrorCode`] beside the message; everything else is a failure
+/// the message alone describes.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("invalid session id")]
+    InvalidId,
+    #[error("session not found")]
+    NotFound,
+    #[error("too many running sessions (limit {MAX_RUNNING})")]
+    TooManyRunning,
+    #[error("session retention limit reached; remove finished sessions")]
+    RetentionLimitReached,
+    #[error("session retention limit exceeded")]
+    RetentionLimitExceeded,
+    #[error("cancel the running session before removing it")]
+    Running,
+    #[error("session id already exists")]
+    IdExists,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl SessionError {
+    /// The classification sent to the host, `None` for an unclassified failure.
+    pub fn code(&self) -> Option<AgentErrorCode> {
+        Some(match self {
+            Self::InvalidId => AgentErrorCode::InvalidSessionId,
+            Self::NotFound => AgentErrorCode::SessionNotFound,
+            Self::TooManyRunning => AgentErrorCode::TooManyRunningSessions,
+            Self::RetentionLimitReached | Self::RetentionLimitExceeded => {
+                AgentErrorCode::SessionRetentionLimit
+            }
+            Self::Running => AgentErrorCode::SessionRunning,
+            Self::IdExists => AgentErrorCode::SessionIdExists,
+            Self::Other(_) => return None,
+        })
+    }
+}
+
+impl From<std::io::Error> for SessionError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+
+impl From<serde_json::Error> for SessionError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+
+impl From<tokio::task::JoinError> for SessionError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self::Other(error.into())
+    }
+}
+
+/// An unclassified refusal: the message is all the host learns about it.
+fn unclassified(message: &'static str) -> SessionError {
+    SessionError::Other(anyhow::anyhow!(message))
+}
+
+/// Return `error` from the enclosing function unless `condition` holds.
+macro_rules! ensure {
+    ($condition:expr, $error:expr $(,)?) => {
+        if !$condition {
+            return Err($error);
+        }
+    };
+}
+
 impl SessionStore {
     /// Create an isolated guest session store. Tests use a temporary directory.
     pub fn new(root: PathBuf) -> Arc<Self> {
@@ -46,7 +118,7 @@ impl SessionStore {
         })
     }
 
-    fn directory(&self, id: &str) -> Result<PathBuf> {
+    fn directory(&self, id: &str) -> Result<PathBuf, SessionError> {
         let bytes = id.as_bytes();
         ensure!(
             bytes.len() == 36
@@ -57,17 +129,17 @@ impl SessionStore {
                         b.is_ascii_hexdigit()
                     }
                 }),
-            "invalid session id"
+            SessionError::InvalidId
         );
         Ok(self.root.join(id))
     }
 
-    async fn save(&self, info: &SessionInfo) -> Result<()> {
+    async fn save(&self, info: &SessionInfo) -> Result<(), SessionError> {
         let dir = self.directory(&info.id)?;
         let bytes = serde_json::to_vec(info)?;
         ensure!(
             bytes.len() <= MAX_STATUS_BYTES as usize,
-            "session status exceeds limit"
+            unclassified("session status exceeds limit")
         );
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let temporary = dir.join(format!(
@@ -83,13 +155,13 @@ impl SessionStore {
         Ok(())
     }
 
-    async fn read_status(&self, id: &str) -> Result<SessionInfo> {
+    async fn read_status(&self, id: &str) -> Result<SessionInfo, SessionError> {
         let path = self.directory(id)?.join("status.json");
         let file = tokio::fs::File::open(path).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!("session not found")
+                SessionError::NotFound
             } else {
-                anyhow::Error::new(error).context("reading session status")
+                SessionError::Other(anyhow::Error::new(error).context("reading session status"))
             }
         })?;
         let mut bytes = Vec::new();
@@ -98,12 +170,12 @@ impl SessionStore {
             .await?;
         ensure!(
             bytes.len() <= MAX_STATUS_BYTES as usize,
-            "session status exceeds limit"
+            unclassified("session status exceeds limit")
         );
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    pub(crate) async fn get(&self, id: &str) -> Result<SessionInfo> {
+    pub(crate) async fn get(&self, id: &str) -> Result<SessionInfo, SessionError> {
         let mut info = self.read_status(id).await?;
         // An agent restart cannot reconstruct Tokio's process handles. Preserve
         // the log but report the interruption rather than claiming it is live.
@@ -121,12 +193,12 @@ impl SessionStore {
         Ok(info)
     }
 
-    pub(crate) async fn list(&self) -> Result<Vec<SessionInfo>> {
+    pub(crate) async fn list(&self) -> Result<Vec<SessionInfo>, SessionError> {
         let _creation = self.creation.lock().await;
         self.list_entries().await
     }
 
-    async fn list_entries(&self) -> Result<Vec<SessionInfo>> {
+    async fn list_entries(&self) -> Result<Vec<SessionInfo>, SessionError> {
         let mut entries = match tokio::fs::read_dir(&self.root).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -149,7 +221,9 @@ impl SessionStore {
                     };
                     ensure!(
                         empty,
-                        "incomplete session has retained output; inspect the guest session directory"
+                        unclassified(
+                            "incomplete session has retained output; inspect the guest session directory"
+                        )
                     );
                     tokio::fs::remove_dir_all(entry.path()).await?;
                     continue;
@@ -157,7 +231,7 @@ impl SessionStore {
                 sessions.push(self.get(&entry.file_name().to_string_lossy()).await?);
                 ensure!(
                     sessions.len() <= MAX_SESSIONS,
-                    "session retention limit exceeded"
+                    SessionError::RetentionLimitExceeded
                 );
             }
         }
@@ -168,7 +242,7 @@ impl SessionStore {
     pub(crate) async fn start(
         self: &Arc<Self>,
         request: SessionStartRequest,
-    ) -> Result<SessionInfo> {
+    ) -> Result<SessionInfo, SessionError> {
         // Once accepted, guest ownership includes the start transaction itself.
         // Dropping a client request cannot strand an active-map entry or kill a
         // child between spawn, durable status publication and worker handoff.
@@ -176,26 +250,34 @@ impl SessionStore {
         tokio::spawn(async move { store.start_owned(request).await }).await?
     }
 
-    async fn start_owned(self: &Arc<Self>, request: SessionStartRequest) -> Result<SessionInfo> {
+    async fn start_owned(
+        self: &Arc<Self>,
+        request: SessionStartRequest,
+    ) -> Result<SessionInfo, SessionError> {
         ensure!(
             request.exec.command.len() <= 4096,
-            "session command exceeds limit"
+            unclassified("session command exceeds limit")
         );
         let _creation = self.creation.lock().await;
         let dir = self.directory(&request.id)?;
         ensure!(
             self.active.lock().unwrap().len() < MAX_RUNNING,
-            "too many running sessions (limit {MAX_RUNNING})"
+            SessionError::TooManyRunning
         );
         ensure!(
             self.list_entries().await?.len() < MAX_SESSIONS,
-            "session retention limit reached; remove finished sessions"
+            SessionError::RetentionLimitReached
         );
         tokio::fs::create_dir_all(&self.root).await?;
         tokio::fs::create_dir(&dir)
             .await
-            .context("session id already exists")?;
-        let start = async {
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::AlreadyExists => SessionError::IdExists,
+                _ => SessionError::Other(
+                    anyhow::Error::new(error).context("creating the session directory"),
+                ),
+            })?;
+        let start: Result<SessionInfo, SessionError> = async {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -242,7 +324,7 @@ impl SessionStore {
         start
     }
 
-    pub(crate) async fn cancel(&self, id: &str) -> Result<SessionInfo> {
+    pub(crate) async fn cancel(&self, id: &str) -> Result<SessionInfo, SessionError> {
         let info = self.get(id).await?;
         if let Some(sender) = self
             .active
@@ -256,23 +338,24 @@ impl SessionStore {
         Ok(info)
     }
 
-    pub(crate) async fn remove(&self, id: &str) -> Result<()> {
+    pub(crate) async fn remove(&self, id: &str) -> Result<(), SessionError> {
         let _creation = self.creation.lock().await;
         let info = self.get(id).await?;
-        ensure!(
-            info.state != SessionState::Running,
-            "cancel the running session before removing it"
-        );
+        ensure!(info.state != SessionState::Running, SessionError::Running);
         tokio::fs::remove_dir_all(self.directory(id)?).await?;
         Ok(())
     }
 
-    pub(crate) async fn events(&self, id: &str, after: u64) -> Result<SessionEventsResponse> {
+    pub(crate) async fn events(
+        &self,
+        id: &str,
+        after: u64,
+    ) -> Result<SessionEventsResponse, SessionError> {
         let session = self.get(id).await?;
         let file = tokio::fs::File::open(self.directory(id)?.join("events.jsonl")).await?;
         ensure!(
             file.metadata().await?.len() <= MAX_LOG_BYTES,
-            "session log exceeds limit"
+            unclassified("session log exceeds limit")
         );
         let mut reader = BufReader::new(file.take(MAX_LOG_BYTES));
         let mut events = Vec::new();
@@ -284,7 +367,10 @@ impl SessionStore {
                 .take(MAX_RECORD_BYTES)
                 .read_until(b'\n', &mut line)
                 .await?;
-            ensure!(n < MAX_RECORD_BYTES as usize, "session event exceeds limit");
+            ensure!(
+                n < MAX_RECORD_BYTES as usize,
+                unclassified("session event exceeds limit")
+            );
             // Ignore an in-progress append until its terminating newline appears.
             if line.last() != Some(&b'\n') {
                 break;
@@ -292,7 +378,7 @@ impl SessionStore {
             let event: SessionEvent = serde_json::from_slice(&line)?;
             ensure!(
                 event.sequence == previous + 1 && event.sequence <= MAX_EVENTS,
-                "invalid session event sequence"
+                unclassified("invalid session event sequence")
             );
             previous = event.sequence;
             if event.sequence > after {
@@ -332,7 +418,7 @@ async fn run(
     mut cancelled: oneshot::Receiver<()>,
     mut log: tokio::fs::File,
     outcome: &mut SessionInfo,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let mut stdout = child.stdout.take().context("missing session stdout")?;
     let mut stderr = child.stderr.take().context("missing session stderr")?;
     let mut out_buf = [0u8; 8192];
@@ -588,14 +674,87 @@ mod tests {
     async fn paths_duplicates_and_spawn_failures_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path().into());
-        assert!(store.get("../../etc/passwd").await.is_err());
+        assert!(matches!(
+            store.get("../../etc/passwd").await,
+            Err(SessionError::InvalidId)
+        ));
+        assert!(matches!(
+            store.get("00000000-0000-0000-0000-000000000000").await,
+            Err(SessionError::NotFound)
+        ));
         let mut bad = request("true");
         bad.exec.command = "/no/such/program".into();
-        assert!(store.start(bad).await.is_err());
+        let spawn_failure = store.start(bad).await.unwrap_err();
+        assert!(matches!(spawn_failure, SessionError::Other(_)));
+        assert!(
+            format!("{spawn_failure:#}").starts_with("starting session command: "),
+            "unexpected spawn failure: {spawn_failure:#}"
+        );
         assert!(!temp.path().join(ID).exists());
         store.start(request("sleep 60")).await.unwrap();
-        assert!(store.start(request("true")).await.is_err());
+        assert!(matches!(
+            store.start(request("true")).await,
+            Err(SessionError::IdExists)
+        ));
+        assert!(matches!(store.remove(ID).await, Err(SessionError::Running)));
         store.cancel(ID).await.unwrap();
         finished(&store).await;
+    }
+
+    #[test]
+    fn classified_refusals_keep_their_wire_codes_and_messages() {
+        // Daemons from husker 0.4.51 and 0.4.52 classify a refusal by its
+        // message, so the message of every coded variant is part of the wire
+        // contract for as long as those daemons run.
+        let cases = [
+            (
+                SessionError::InvalidId,
+                AgentErrorCode::InvalidSessionId,
+                "invalid session id",
+            ),
+            (
+                SessionError::NotFound,
+                AgentErrorCode::SessionNotFound,
+                "session not found",
+            ),
+            (
+                SessionError::TooManyRunning,
+                AgentErrorCode::TooManyRunningSessions,
+                "too many running sessions (limit 16)",
+            ),
+            (
+                SessionError::RetentionLimitReached,
+                AgentErrorCode::SessionRetentionLimit,
+                "session retention limit reached; remove finished sessions",
+            ),
+            (
+                SessionError::RetentionLimitExceeded,
+                AgentErrorCode::SessionRetentionLimit,
+                "session retention limit exceeded",
+            ),
+            (
+                SessionError::Running,
+                AgentErrorCode::SessionRunning,
+                "cancel the running session before removing it",
+            ),
+            (
+                SessionError::IdExists,
+                AgentErrorCode::SessionIdExists,
+                "session id already exists",
+            ),
+        ];
+        for (error, code, message) in cases {
+            assert_eq!(error.code(), Some(code), "{error}");
+            assert_eq!(error.to_string(), message);
+        }
+        let other = unclassified("session log exceeds limit");
+        assert_eq!(other.code(), None);
+        assert_eq!(format!("{other:#}"), "session log exceeds limit");
+        let chained = SessionError::Other(
+            anyhow::Error::new(std::io::Error::other("disk gone"))
+                .context("reading session status"),
+        );
+        assert_eq!(chained.code(), None);
+        assert_eq!(format!("{chained:#}"), "reading session status: disk gone");
     }
 }

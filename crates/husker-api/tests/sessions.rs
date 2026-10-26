@@ -343,12 +343,16 @@ async fn detached_session_reconnect_logs_cancel_and_remove() {
         .request("DELETE", &format!("/v1/vms/dev/sessions/{id}"), Value::Null)
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(
-        f.request("GET", &format!("/v1/vms/dev/sessions/{id}"), Value::Null)
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
+    let (status, body) = f
+        .request("GET", &format!("/v1/vms/dev/sessions/{id}"), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["kind"], "session_not_found", "{body}");
+    let (status, body) = f
+        .request("GET", "/v1/vms/dev/sessions/not-a-session-id", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["kind"], "invalid_session_id", "{body}");
     let (_, info) = f
         .request(
             "POST",
@@ -357,12 +361,11 @@ async fn detached_session_reconnect_logs_cancel_and_remove() {
         )
         .await;
     let id = info["id"].as_str().unwrap();
-    assert_eq!(
-        f.request("DELETE", &format!("/v1/vms/dev/sessions/{id}"), Value::Null)
-            .await
-            .0,
-        StatusCode::CONFLICT
-    );
+    let (status, body) = f
+        .request("DELETE", &format!("/v1/vms/dev/sessions/{id}"), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["kind"], "session_conflict", "{body}");
     assert_eq!(
         f.request(
             "POST",
@@ -537,6 +540,78 @@ async fn authenticated_tunnel_preserves_http_without_exposing_daemon_token() {
     assert!(request.starts_with(b"GET /asset?version=2 HTTP/1.1"));
     assert!(!String::from_utf8_lossy(&request).contains("test-token"));
     server.abort();
+}
+
+/// The monitor polls a detached session once a second. A session that
+/// finishes and is removed between two polls answers the next poll with
+/// `session_not_found`; the monitor must read that as the end of the session
+/// and release the idle guard now, not after its 30 s loss-of-contact grace.
+#[tokio::test]
+async fn monitor_releases_the_idle_guard_when_a_finished_session_is_removed() {
+    let f = Fixture::new().await;
+    let (status, info) = f
+        .request(
+            "POST",
+            "/v1/vms/dev/sessions",
+            json!({ "command": "sleep", "args": ["0.3"], "timeout_secs": 5 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{info}");
+    let id = info["id"].as_str().unwrap();
+    let vm_id = f.core.get_vm("dev").unwrap().id;
+    assert!(f.core.active_session_count(vm_id) > 0);
+    f.finished(id).await;
+    let (status, body) = f
+        .request("DELETE", &format!("/v1/vms/dev/sessions/{id}"), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f.core.active_session_count(vm_id) > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the monitor releases the idle guard once the session is gone");
+}
+
+/// A tunnel to a port nothing listens on is refused from the handshake with
+/// its own kind, so a preview client can tell "start your application" apart
+/// from a guest-side failure it can only inspect.
+#[tokio::test]
+async fn tunnel_to_a_closed_guest_port_is_refused_before_the_upgrade() {
+    let f = Fixture::new().await;
+    let served = f.serve().await;
+    let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+
+    let path = format!("/v1/vms/dev/tunnel/{port}");
+    let error = tokio_tungstenite::connect_async(served.ws_request(&path))
+        .await
+        .expect_err("nothing listens on the port");
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("expected an HTTP refusal, got {error:?}");
+    };
+    assert_eq!(response.status().as_u16(), 502);
+    let body = response
+        .into_body()
+        .expect("the refusal carries the envelope");
+    let envelope: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope["kind"], "preview_unreachable", "{envelope}");
+    assert!(
+        envelope["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("start the application")),
+        "{envelope}"
+    );
+    let vm_id = f.core.get_vm("dev").unwrap().id;
+    assert_eq!(
+        f.core.active_session_count(vm_id),
+        0,
+        "a refused tunnel leaves no active session behind"
+    );
 }
 
 #[tokio::test]

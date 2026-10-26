@@ -22,11 +22,11 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ExecResponse, ExecStreamData,
-    ExecStreamExit, GuestInfoResponse, OCI_CONFIG_PATH, OciRuntimeConfig, ReadFileResponse,
-    ReconfigureNetworkRequest, ReconfigureNetworkResponse, ShellDataResponse, ShellExitResponse,
-    ShellStartRequest, WriteFileResponse, base64_decode, base64_encode, read_message,
-    write_message,
+    AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ExecResponse,
+    ExecStreamData, ExecStreamExit, GuestInfoResponse, OCI_CONFIG_PATH, OciRuntimeConfig,
+    ReadFileResponse, ReconfigureNetworkRequest, ReconfigureNetworkResponse, ShellDataResponse,
+    ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode, base64_encode,
+    read_message, write_message,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
@@ -62,9 +62,7 @@ where
                 if port == 0 {
                     write_message(
                         &mut stream,
-                        &AgentResponse::Error(ErrorResponse {
-                            message: "tunnel port must be nonzero".into(),
-                        }),
+                        &AgentResponse::Error(ErrorResponse::new("tunnel port must be nonzero")),
                     )
                     .await?;
                     return Ok(());
@@ -79,6 +77,7 @@ where
                             &mut stream,
                             &AgentResponse::Error(ErrorResponse {
                                 message: format!("guest-loopback connection failed: {error}"),
+                                code: Some(AgentErrorCode::TunnelConnectFailed),
                             }),
                         )
                         .await?
@@ -124,9 +123,7 @@ where
         Err(e) => {
             write_message(
                 stream,
-                &AgentResponse::Error(ErrorResponse {
-                    message: format!("exec failed: {e}"),
-                }),
+                &AgentResponse::Error(ErrorResponse::new(format!("exec failed: {e}"))),
             )
             .await?;
             return Ok(());
@@ -220,9 +217,7 @@ where
     let (mut master, slave) = match pty::Pty::open(req.cols, req.rows) {
         Ok(pair) => pair,
         Err(e) => {
-            let resp = AgentResponse::Error(ErrorResponse {
-                message: format!("failed to open PTY: {e}"),
-            });
+            let resp = AgentResponse::Error(ErrorResponse::new(format!("failed to open PTY: {e}")));
             write_message(stream, &resp).await?;
             return Ok(());
         }
@@ -272,9 +267,8 @@ where
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let resp = AgentResponse::Error(ErrorResponse {
-                message: format!("failed to start shell: {e}"),
-            });
+            let resp =
+                AgentResponse::Error(ErrorResponse::new(format!("failed to start shell: {e}")));
             write_message(stream, &resp).await?;
             return Ok(());
         }
@@ -508,9 +502,7 @@ async fn run_exec_with_capture(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return AgentResponse::Error(ErrorResponse {
-                message: format!("exec failed: {e}"),
-            });
+            return AgentResponse::Error(ErrorResponse::new(format!("exec failed: {e}")));
         }
     };
     let stdout = child.stdout.take().expect("piped stdout");
@@ -548,9 +540,7 @@ async fn run_exec_with_capture(
                 stderr: finalize(&err_buf, &err_trunc),
             })
         }
-        Ok(Err(e)) => AgentResponse::Error(ErrorResponse {
-            message: format!("exec failed: {e}"),
-        }),
+        Ok(Err(e)) => AgentResponse::Error(ErrorResponse::new(format!("exec failed: {e}"))),
         Err(_) => {
             let _ = child.start_kill();
             // Flush whatever buffered before the kill closes the pipes, then
@@ -764,7 +754,7 @@ fn build_exec_command(
     req: &ExecRequest,
 ) -> Result<(tokio::process::Command, std::time::Duration), ErrorResponse> {
     let timeout = resolve_exec_timeout(req.timeout_secs);
-    let plan = plan_exec(req, oci_runtime_config()).map_err(|message| ErrorResponse { message })?;
+    let plan = plan_exec(req, oci_runtime_config()).map_err(ErrorResponse::new)?;
     let mut cmd = tokio::process::Command::new(&plan.program);
     cmd.args(&plan.args)
         .current_dir(&plan.current_dir)
@@ -826,6 +816,7 @@ async fn handle_request_with_sessions(
     if let Some(result) = session_result {
         return result.unwrap_or_else(|error| {
             AgentResponse::Error(ErrorResponse {
+                code: error.code(),
                 message: format!("{error:#}"),
             })
         });
@@ -834,7 +825,7 @@ async fn handle_request_with_sessions(
         AgentRequest::Ping => AgentResponse::Pong,
         AgentRequest::RestoreGuest(request) => match restore::reconcile(&request) {
             Ok(()) => AgentResponse::GuestRestored,
-            Err(message) => AgentResponse::Error(ErrorResponse { message }),
+            Err(message) => AgentResponse::Error(ErrorResponse::new(message)),
         },
 
         AgentRequest::GuestInfo => match if_addrs::get_if_addrs() {
@@ -851,9 +842,7 @@ async fn handle_request_with_sessions(
                     protocol_version: husker_agent_proto::PROTOCOL_VERSION,
                 })
             }
-            Err(e) => AgentResponse::Error(ErrorResponse {
-                message: format!("get_if_addrs failed: {e}"),
-            }),
+            Err(e) => AgentResponse::Error(ErrorResponse::new(format!("get_if_addrs failed: {e}"))),
         },
 
         AgentRequest::Exec(req) => {
@@ -886,9 +875,9 @@ async fn handle_request_with_sessions(
                             (m.len(), modified)
                         }
                         Err(e) => {
-                            return AgentResponse::Error(ErrorResponse {
-                                message: format!("read failed: {e}"),
-                            });
+                            return AgentResponse::Error(ErrorResponse::new(format!(
+                                "read failed: {e}"
+                            )));
                         }
                     };
                     let max = max_read_bytes();
@@ -907,9 +896,10 @@ async fn handle_request_with_sessions(
                     if req.offset > 0
                         && let Err(e) = file.seek(std::io::SeekFrom::Start(req.offset)).await
                     {
-                        return AgentResponse::Error(ErrorResponse {
-                            message: format!("read failed: seeking to {}: {e}", req.offset),
-                        });
+                        return AgentResponse::Error(ErrorResponse::new(format!(
+                            "read failed: seeking to {}: {e}",
+                            req.offset
+                        )));
                     }
                     // One byte past the allowance distinguishes "filled the
                     // window" from "hit the ceiling" for the unranged case.
@@ -919,11 +909,9 @@ async fn handle_request_with_sessions(
                         Ok(_) => {
                             if data.len() as u64 > want {
                                 if !ranged {
-                                    return AgentResponse::Error(ErrorResponse {
-                                        message: format!(
-                                            "read failed: file exceeds max read size of {max} bytes"
-                                        ),
-                                    });
+                                    return AgentResponse::Error(ErrorResponse::new(format!(
+                                        "read failed: file exceeds max read size of {max} bytes"
+                                    )));
                                 }
                                 data.truncate(want as usize);
                             }
@@ -936,14 +924,12 @@ async fn handle_request_with_sessions(
                                 modified_nanos,
                             })
                         }
-                        Err(e) => AgentResponse::Error(ErrorResponse {
-                            message: format!("read failed: {e}"),
-                        }),
+                        Err(e) => {
+                            AgentResponse::Error(ErrorResponse::new(format!("read failed: {e}")))
+                        }
                     }
                 }
-                Err(e) => AgentResponse::Error(ErrorResponse {
-                    message: format!("read failed: {e}"),
-                }),
+                Err(e) => AgentResponse::Error(ErrorResponse::new(format!("read failed: {e}"))),
             }
         }
 
@@ -951,9 +937,9 @@ async fn handle_request_with_sessions(
             let data = match base64_decode(&req.data) {
                 Ok(d) => d,
                 Err(e) => {
-                    return AgentResponse::Error(ErrorResponse {
-                        message: format!("base64 decode failed: {e}"),
-                    });
+                    return AgentResponse::Error(ErrorResponse::new(format!(
+                        "base64 decode failed: {e}"
+                    )));
                 }
             };
             let len = data.len() as u64;
@@ -980,9 +966,9 @@ async fn handle_request_with_sessions(
                         // append or a read-back can race ahead of bytes that never
                         // landed.
                         if let Err(e) = file.flush().await {
-                            return AgentResponse::Error(ErrorResponse {
-                                message: format!("write failed: {e}"),
-                            });
+                            return AgentResponse::Error(ErrorResponse::new(format!(
+                                "write failed: {e}"
+                            )));
                         }
                         #[cfg(unix)]
                         if let Some(mode) = req.mode {
@@ -996,20 +982,19 @@ async fn handle_request_with_sessions(
                                 .set_permissions(std::fs::Permissions::from_mode(mode))
                                 .await
                             {
-                                return AgentResponse::Error(ErrorResponse {
-                                    message: format!("set mode on {} failed: {e}", req.path),
-                                });
+                                return AgentResponse::Error(ErrorResponse::new(format!(
+                                    "set mode on {} failed: {e}",
+                                    req.path
+                                )));
                             }
                         }
                         AgentResponse::WriteFile(WriteFileResponse { bytes_written: len })
                     }
-                    Err(e) => AgentResponse::Error(ErrorResponse {
-                        message: format!("write failed: {e}"),
-                    }),
+                    Err(e) => {
+                        AgentResponse::Error(ErrorResponse::new(format!("write failed: {e}")))
+                    }
                 },
-                Err(e) => AgentResponse::Error(ErrorResponse {
-                    message: format!("write failed: {e}"),
-                }),
+                Err(e) => AgentResponse::Error(ErrorResponse::new(format!("write failed: {e}"))),
             }
         }
 
@@ -1018,9 +1003,9 @@ async fn handle_request_with_sessions(
                 interface: req.interface,
                 ipv4: req.ipv4,
             }),
-            Err(e) => AgentResponse::Error(ErrorResponse {
-                message: format!("reconfigure-network failed: {e}"),
-            }),
+            Err(e) => AgentResponse::Error(ErrorResponse::new(format!(
+                "reconfigure-network failed: {e}"
+            ))),
         },
 
         AgentRequest::Shutdown => {
@@ -1044,9 +1029,9 @@ async fn handle_request_with_sessions(
         | AgentRequest::ExecStream(_)
         | AgentRequest::ShellStart(_)
         | AgentRequest::ShellData(_)
-        | AgentRequest::ShellResize(_) => AgentResponse::Error(ErrorResponse {
-            message: "shell messages are not valid outside a shell session".into(),
-        }),
+        | AgentRequest::ShellResize(_) => AgentResponse::Error(ErrorResponse::new(
+            "shell messages are not valid outside a shell session",
+        )),
     }
 }
 
@@ -1452,5 +1437,36 @@ mod tests {
             matches!(response, AgentResponse::ShuttingDown),
             "expected ShuttingDown, got {response:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn session_refusals_carry_their_code_beside_the_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(SessionStore::new(temp.path().into()));
+        let response = handle_request_with_sessions(
+            AgentRequest::SessionGet {
+                id: "00000000-0000-0000-0000-000000000000".into(),
+            },
+            &store,
+        )
+        .await;
+        let AgentResponse::Error(error) = response else {
+            panic!("expected an error, got {response:?}");
+        };
+        assert_eq!(error.code, Some(AgentErrorCode::SessionNotFound));
+        assert_eq!(error.message, "session not found");
+
+        let response = handle_request_with_sessions(
+            AgentRequest::SessionRemove {
+                id: "not-a-session-id".into(),
+            },
+            &store,
+        )
+        .await;
+        let AgentResponse::Error(error) = response else {
+            panic!("expected an error, got {response:?}");
+        };
+        assert_eq!(error.code, Some(AgentErrorCode::InvalidSessionId));
+        assert_eq!(error.message, "invalid session id");
     }
 }

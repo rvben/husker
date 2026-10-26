@@ -158,6 +158,79 @@ async fn openapi_lists_every_logs_query_parameter() {
     );
 }
 
+/// The session and preview routes answer refusals from the guest agent with
+/// their own statuses; a consumer branching on them must find each one in
+/// the contract, not just the success case.
+#[tokio::test]
+async fn openapi_documents_every_session_error_status() {
+    let doc = fetch_openapi().await;
+    let expectations: [(&str, &str, &[&str]); 7] = [
+        (
+            "/v1/vms/{name}/sessions",
+            "post",
+            &["201", "403", "404", "409", "429", "501", "502", "503"],
+        ),
+        (
+            "/v1/vms/{name}/sessions",
+            "get",
+            &["200", "404", "409", "501", "502", "503"],
+        ),
+        (
+            "/v1/vms/{name}/sessions/{id}",
+            "get",
+            &["200", "400", "404", "501", "502", "503"],
+        ),
+        (
+            "/v1/vms/{name}/sessions/{id}",
+            "delete",
+            &["204", "400", "404", "409", "501", "502", "503"],
+        ),
+        (
+            "/v1/vms/{name}/sessions/{id}/events",
+            "get",
+            &["200", "400", "404", "501", "502", "503"],
+        ),
+        (
+            "/v1/vms/{name}/sessions/{id}/cancel",
+            "post",
+            &["200", "400", "404", "501", "502", "503"],
+        ),
+        (
+            "/v1/vms/{name}/tunnel/{port}",
+            "get",
+            &["101", "400", "404", "429", "501", "502", "503"],
+        ),
+    ];
+    for (path, method, statuses) in expectations {
+        let responses = doc["paths"][path][method]["responses"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{method} {path} must declare responses"));
+        let mut listed: Vec<&str> = responses.keys().map(String::as_str).collect();
+        listed.sort_unstable();
+        assert_eq!(listed, statuses, "{method} {path}");
+        for status in statuses
+            .iter()
+            .filter(|status| status.starts_with(['4', '5']))
+        {
+            assert!(
+                refers_to(&responses[*status], "ErrorResponse"),
+                "{method} {path} {status} must carry the error envelope"
+            );
+        }
+    }
+    // The timeout of a session or preview request is the general agent
+    // deadline, not a gateway timeout of its own.
+    for (path, method) in [
+        ("/v1/vms/{name}/sessions", "post"),
+        ("/v1/vms/{name}/tunnel/{port}", "get"),
+    ] {
+        assert!(
+            doc["paths"][path][method]["responses"]["504"].is_null(),
+            "{method} {path} must not document a 504"
+        );
+    }
+}
+
 /// Whether a property schema refers to the named component, directly or
 /// through the wrapper utoipa emits for an optional field.
 fn refers_to(property: &serde_json::Value, component: &str) -> bool {

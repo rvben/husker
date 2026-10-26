@@ -1088,6 +1088,7 @@ dependencies = [
  "libc",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-vsock",
  "tracing",

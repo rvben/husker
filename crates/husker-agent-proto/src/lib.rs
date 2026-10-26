@@ -279,9 +279,53 @@ pub struct WriteFileResponse {
     pub bytes_written: u64,
 }
 
+/// Why the guest agent refused a request, when the refusal has a stable
+/// classification. It travels beside the human-readable message so the host
+/// can choose a status and an error kind without parsing prose. An agent
+/// newer than the host may send a code this list does not name; it decodes
+/// as [`AgentErrorCode::Unknown`] and the host treats the failure as
+/// unclassified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentErrorCode {
+    /// The session id is not a hyphenated hexadecimal UUID.
+    InvalidSessionId,
+    /// No session with that id exists on the guest.
+    SessionNotFound,
+    /// The limit on simultaneously running sessions is reached.
+    TooManyRunningSessions,
+    /// The limit on retained sessions is reached; finished sessions have to
+    /// be removed before another can start or the list can be read.
+    SessionRetentionLimit,
+    /// The session is still running, so it cannot be removed yet.
+    SessionRunning,
+    /// A session with that id already exists.
+    SessionIdExists,
+    /// Nothing on the guest accepted the tunnel's loopback connection.
+    TunnelConnectFailed,
+    /// A code this host does not know.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub message: String,
+    /// Stable classification of the refusal. Absent when the failure has no
+    /// classification, and from agents built before codes existed, whose
+    /// errors decode with `None` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<AgentErrorCode>,
+}
+
+impl ErrorResponse {
+    /// An unclassified failure, described only by its message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: None,
+        }
+    }
 }
 
 /// Guest network information reported by the agent.
@@ -719,6 +763,43 @@ mod tests {
         }
         assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM, 4);
+    }
+
+    #[test]
+    fn error_codes_round_trip_and_tolerate_both_directions_of_skew() {
+        let coded = AgentResponse::Error(ErrorResponse {
+            message: "session not found".into(),
+            code: Some(AgentErrorCode::SessionNotFound),
+        });
+        let value = serde_json::to_value(&coded).unwrap();
+        assert_eq!(value["code"], "session_not_found");
+        match serde_json::from_value::<AgentResponse>(value).unwrap() {
+            AgentResponse::Error(back) => {
+                assert_eq!(back.message, "session not found");
+                assert_eq!(back.code, Some(AgentErrorCode::SessionNotFound));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // An unclassified failure omits the field, so an older host that
+        // only knows `message` decodes it unchanged.
+        let plain = serde_json::to_value(AgentResponse::Error(ErrorResponse::new("boom"))).unwrap();
+        assert_eq!(plain.get("code"), None, "{plain}");
+        assert_eq!(plain["message"], "boom");
+
+        // An agent older than codes sends only the message.
+        let legacy = r#"{"type":"Error","message":"session not found"}"#;
+        match serde_json::from_str::<AgentResponse>(legacy).unwrap() {
+            AgentResponse::Error(back) => assert_eq!(back.code, None),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // An agent newer than this host sends a code it does not know.
+        let future = r#"{"type":"Error","message":"x","code":"not_in_this_build"}"#;
+        match serde_json::from_str::<AgentResponse>(future).unwrap() {
+            AgentResponse::Error(back) => assert_eq!(back.code, Some(AgentErrorCode::Unknown)),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]

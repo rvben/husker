@@ -2,9 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ExecRequest, ReadFileRequest, ReconfigureNetworkRequest,
-    ShellDataRequest, ShellResizeRequest, ShellStartRequest, WriteFileRequest, base64_decode,
-    base64_encode, read_message, write_message,
+    AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ReadFileRequest,
+    ReconfigureNetworkRequest, ShellDataRequest, ShellResizeRequest, ShellStartRequest,
+    WriteFileRequest, base64_decode, base64_encode, read_message, write_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, warn};
@@ -21,6 +21,18 @@ pub enum AgentError {
     UnexpectedResponse,
     #[error("agent returned error: {0}")]
     Agent(String),
+    /// A refusal the guest agent classified, so callers can act on the
+    /// class instead of the wording.
+    #[error("agent returned error: {message}")]
+    Rejected {
+        code: AgentErrorCode,
+        message: String,
+    },
+    #[error(
+        "guest agent protocol v{reported} does not support sessions or preview tunnels; refresh \
+         the guest image (v{required} required)"
+    )]
+    SessionsUnsupported { reported: u32, required: u32 },
     #[error(
         "the guest agent cannot read from a byte offset: it answered a read at offset {offset} \
          with the start of the file. The VM's image predates ranged reads in husker-agent \
@@ -43,6 +55,42 @@ pub enum AgentError {
         /// level that produced the error has no access to the VM's logs.
         detail: String,
     },
+}
+
+/// Classify a session or tunnel refusal. The agent's own code wins; without
+/// one, the message is matched against the phrases that protocol 5 agents
+/// from husker 0.4.51 and 0.4.52 send, which predate the code field.
+fn session_refusal(error: ErrorResponse) -> AgentError {
+    match error.code.or_else(|| legacy_session_code(&error.message)) {
+        Some(code) => AgentError::Rejected {
+            code,
+            message: error.message,
+        },
+        None => AgentError::Agent(error.message),
+    }
+}
+
+/// The refusal phrases of session-capable agents built before the code field
+/// existed. Each phrase is the start of the message those agents send.
+fn legacy_session_code(message: &str) -> Option<AgentErrorCode> {
+    const PHRASES: [(&str, AgentErrorCode); 6] = [
+        ("session not found", AgentErrorCode::SessionNotFound),
+        ("invalid session id", AgentErrorCode::InvalidSessionId),
+        (
+            "too many running sessions",
+            AgentErrorCode::TooManyRunningSessions,
+        ),
+        (
+            "session retention limit",
+            AgentErrorCode::SessionRetentionLimit,
+        ),
+        ("cancel the running session", AgentErrorCode::SessionRunning),
+        ("session id already exists", AgentErrorCode::SessionIdExists),
+    ];
+    PHRASES
+        .iter()
+        .find(|(phrase, _)| message.starts_with(phrase))
+        .map(|(_, code)| *code)
 }
 
 /// Warn when a connected guest agent reports a protocol version that differs
@@ -194,18 +242,17 @@ where
         &mut self,
         request: AgentRequest,
     ) -> Result<AgentResponse, AgentError> {
-        let version = self.guest_info().await?.protocol_version;
-        if version < husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_SESSIONS {
-            return Err(AgentError::Agent(format!(
-                "guest agent protocol v{version} does not support sessions or preview tunnels; refresh the guest image (v5 required)"
-            )));
+        let reported = self.guest_info().await?.protocol_version;
+        let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_SESSIONS;
+        if reported < required {
+            return Err(AgentError::SessionsUnsupported { reported, required });
         }
         write_message(&mut self.stream, &request).await?;
         match read_message(&mut self.stream)
             .await?
             .ok_or(AgentError::UnexpectedResponse)?
         {
-            AgentResponse::Error(e) => Err(AgentError::Agent(e.message)),
+            AgentResponse::Error(error) => Err(session_refusal(error)),
             response => Ok(response),
         }
     }

@@ -8,7 +8,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
-use husker_agent_proto::{SessionEventsResponse, SessionInfo, SessionStartRequest};
+use husker_agent_proto::{AgentErrorCode, SessionEventsResponse, SessionInfo, SessionStartRequest};
 use husker_core::{AgentConnection, AgentError, HuskerCore};
 use husker_vmm::VmmBackend;
 use serde::Deserialize;
@@ -31,45 +31,86 @@ async fn connection<B: VmmBackend + 'static>(
         .map_err(map_agent_connect_error)
 }
 
+/// The REST answer for a session or preview request the guest side could not
+/// serve. Classified refusals map by their code; a refusal without one is a
+/// guest-side failure the caller can only inspect, not correct.
 fn session_error(error: AgentError) -> Failure {
-    if matches!(error, AgentError::NotReady { .. }) {
-        return (
-            StatusCode::GATEWAY_TIMEOUT,
-            error_response_with_hint(
-                "session_timeout",
-                error.to_string(),
-                "a start may already have been accepted; list sessions and inspect their status before retrying",
+    const UNCLASSIFIED: (StatusCode, &str, &str) = (
+        StatusCode::BAD_GATEWAY,
+        "session_failed",
+        "inspect guest status; refresh older images with the current guest agent",
+    );
+    let (status, kind, hint) = match &error {
+        // Same status and kind as every other agent deadline in this API; the
+        // hint differs because a start can have landed before the deadline.
+        AgentError::NotReady { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_not_ready",
+            "the guest did not answer within the transport deadline; a session start may already \
+             have been accepted, so list sessions and inspect their status before retrying one",
+        ),
+        AgentError::SessionsUnsupported { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "guest_capability_missing",
+            "rebuild or re-import the VM's image with the current guest agent",
+        ),
+        AgentError::Rejected { code, .. } => match code {
+            AgentErrorCode::InvalidSessionId => (
+                StatusCode::BAD_REQUEST,
+                "invalid_session_id",
+                "session ids are the UUIDs returned when a session starts",
             ),
-        );
-    }
-    let message = error.to_string();
-    let (status, kind) = if message.contains("session not found") {
-        (StatusCode::NOT_FOUND, "session_not_found")
-    } else if message.contains("invalid session id") {
-        (StatusCode::BAD_REQUEST, "invalid_session_id")
-    } else if message.contains("does not support sessions") {
-        (StatusCode::NOT_IMPLEMENTED, "guest_capability_missing")
-    } else if message.contains("too many running") {
-        (StatusCode::TOO_MANY_REQUESTS, "session_capacity_exhausted")
-    } else if message.contains("retention limit") || message.contains("cancel the running") {
-        (StatusCode::CONFLICT, "session_conflict")
-    } else {
-        (StatusCode::BAD_GATEWAY, "session_failed")
+            AgentErrorCode::SessionNotFound => (
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "list the VM's sessions for the current ids",
+            ),
+            AgentErrorCode::TooManyRunningSessions => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "session_capacity_exhausted",
+                "wait for a running session to finish, or cancel one",
+            ),
+            AgentErrorCode::SessionRetentionLimit => (
+                StatusCode::CONFLICT,
+                "session_conflict",
+                "remove finished sessions",
+            ),
+            AgentErrorCode::SessionRunning => (
+                StatusCode::CONFLICT,
+                "session_conflict",
+                "cancel the session, then remove it",
+            ),
+            AgentErrorCode::SessionIdExists => (
+                StatusCode::CONFLICT,
+                "session_conflict",
+                "retry; the daemon generates a fresh id for every start",
+            ),
+            AgentErrorCode::TunnelConnectFailed => (
+                StatusCode::BAD_GATEWAY,
+                "preview_unreachable",
+                "nothing on the guest accepted the connection; start the application on that \
+                 port, or check which port it listens on",
+            ),
+            AgentErrorCode::Unknown => UNCLASSIFIED,
+        },
+        _ => UNCLASSIFIED,
     };
     (
         status,
-        error_response_with_hint(
-            kind,
-            message,
-            "inspect guest status; refresh older images with the current guest agent",
-        ),
+        error_response_with_hint(kind, error.to_string(), hint),
     )
 }
 
 #[utoipa::path(post, path = "/v1/vms/{name}/sessions", tag = "sessions",
     params(("name" = String, Path)), request_body = ExecRequest,
     responses((status = 201, body = SessionInfo, description = "Detached command started"),
-        (status = 403, body = ErrorResponse, description = "Execution policy denied")))]
+        (status = 403, body = ErrorResponse, description = "Execution policy denied"),
+        (status = 404, body = ErrorResponse, description = "VM not found"),
+        (status = 409, body = ErrorResponse, description = "Session retention limit reached; remove finished sessions"),
+        (status = 429, body = ErrorResponse, description = "Too many running sessions"),
+        (status = 501, body = ErrorResponse, description = "Guest agent predates sessions"),
+        (status = 502, body = ErrorResponse, description = "Guest failed to start the session"),
+        (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn start<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -180,7 +221,10 @@ async fn start_owned<B: VmmBackend + 'static>(
                     break;
                 }
                 Some(Ok(_)) => failed_since = None,
-                Some(Err(error)) if error.to_string().contains("session not found") => break,
+                Some(Err(AgentError::Rejected {
+                    code: AgentErrorCode::SessionNotFound,
+                    ..
+                })) => break,
                 None | Some(Err(_)) => {
                     // A timed-out framed read cannot safely be reused.
                     conn = None;
@@ -198,7 +242,12 @@ async fn start_owned<B: VmmBackend + 'static>(
 }
 
 #[utoipa::path(get, path = "/v1/vms/{name}/sessions", tag = "sessions", params(("name" = String, Path)),
-    responses((status = 200, body = [SessionInfo], description = "Guest sessions")))]
+    responses((status = 200, body = [SessionInfo], description = "Guest sessions"),
+        (status = 404, body = ErrorResponse, description = "VM not found"),
+        (status = 409, body = ErrorResponse, description = "Session retention limit exceeded"),
+        (status = 501, body = ErrorResponse, description = "Guest agent predates sessions"),
+        (status = 502, body = ErrorResponse, description = "Guest failed to list sessions"),
+        (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn list<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
@@ -213,7 +262,12 @@ pub(crate) async fn list<B: VmmBackend + 'static>(
 }
 
 #[utoipa::path(get, path = "/v1/vms/{name}/sessions/{id}", tag = "sessions", params(("name" = String, Path), ("id" = String, Path)),
-    responses((status = 200, body = SessionInfo, description = "Session status"), (status = 404, body = ErrorResponse, description = "Session not found")))]
+    responses((status = 200, body = SessionInfo, description = "Session status"),
+        (status = 400, body = ErrorResponse, description = "Invalid session id"),
+        (status = 404, body = ErrorResponse, description = "VM or session not found"),
+        (status = 501, body = ErrorResponse, description = "Guest agent predates sessions"),
+        (status = 502, body = ErrorResponse, description = "Guest failed to read the session"),
+        (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn get<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path((name, id)): Path<(String, String)>,
@@ -234,7 +288,12 @@ pub(crate) struct Cursor {
 }
 
 #[utoipa::path(get, path = "/v1/vms/{name}/sessions/{id}/events", tag = "sessions", params(("name" = String, Path), ("id" = String, Path), ("after" = Option<u64>, Query)),
-    responses((status = 200, body = SessionEventsResponse, description = "Bounded binary-safe event page")))]
+    responses((status = 200, body = SessionEventsResponse, description = "Bounded binary-safe event page"),
+        (status = 400, body = ErrorResponse, description = "Invalid session id"),
+        (status = 404, body = ErrorResponse, description = "VM or session not found"),
+        (status = 501, body = ErrorResponse, description = "Guest agent predates sessions"),
+        (status = 502, body = ErrorResponse, description = "Guest failed to read the session log"),
+        (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn events<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path((name, id)): Path<(String, String)>,
@@ -250,7 +309,12 @@ pub(crate) async fn events<B: VmmBackend + 'static>(
 }
 
 #[utoipa::path(post, path = "/v1/vms/{name}/sessions/{id}/cancel", tag = "sessions", params(("name" = String, Path), ("id" = String, Path)),
-    responses((status = 200, body = SessionInfo, description = "Cancellation requested; poll status for completion")))]
+    responses((status = 200, body = SessionInfo, description = "Cancellation requested; poll status for completion"),
+        (status = 400, body = ErrorResponse, description = "Invalid session id"),
+        (status = 404, body = ErrorResponse, description = "VM or session not found"),
+        (status = 501, body = ErrorResponse, description = "Guest agent predates sessions"),
+        (status = 502, body = ErrorResponse, description = "Guest failed to cancel the session"),
+        (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn cancel<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path((name, id)): Path<(String, String)>,
@@ -265,7 +329,13 @@ pub(crate) async fn cancel<B: VmmBackend + 'static>(
 }
 
 #[utoipa::path(delete, path = "/v1/vms/{name}/sessions/{id}", tag = "sessions", params(("name" = String, Path), ("id" = String, Path)),
-    responses((status = 204, description = "Finished session and its logs removed")))]
+    responses((status = 204, description = "Finished session and its logs removed"),
+        (status = 400, body = ErrorResponse, description = "Invalid session id"),
+        (status = 404, body = ErrorResponse, description = "VM or session not found"),
+        (status = 409, body = ErrorResponse, description = "Session still running; cancel it first"),
+        (status = 501, body = ErrorResponse, description = "Guest agent predates sessions"),
+        (status = 502, body = ErrorResponse, description = "Guest failed to remove the session"),
+        (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn remove<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path((name, id)): Path<(String, String)>,
@@ -279,7 +349,13 @@ pub(crate) async fn remove<B: VmmBackend + 'static>(
 }
 
 #[utoipa::path(get, path = "/v1/vms/{name}/tunnel/{port}", tag = "previews", params(("name" = String, Path), ("port" = u16, Path)),
-    responses((status = 101, description = "Authenticated binary WebSocket tunnel to guest loopback")))]
+    responses((status = 101, description = "Authenticated binary WebSocket tunnel to guest loopback"),
+        (status = 400, body = ErrorResponse, description = "Port is zero, or the request is not a WebSocket upgrade"),
+        (status = 404, body = ErrorResponse, description = "VM not found"),
+        (status = 429, body = ErrorResponse, description = "Too many preview connections"),
+        (status = 501, body = ErrorResponse, description = "Guest agent predates preview tunnels"),
+        (status = 502, body = ErrorResponse, description = "Nothing on the guest accepted the connection"),
+        (status = 503, body = ErrorResponse, description = "Guest agent not ready or did not answer within the deadline")))]
 pub(crate) async fn tunnel<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path((name, port)): Path<(String, u16)>,
@@ -311,19 +387,9 @@ pub(crate) async fn tunnel<B: VmmBackend + 'static>(
             )
         })?;
     let conn = connection(&core, &name, None).await?;
-    let stream = tokio::time::timeout(Duration::from_secs(10), conn.tunnel(port))
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                error_response_with_hint(
-                    "preview_connect_timeout",
-                    "guest preview connection timed out",
-                    "check the guest application",
-                ),
-            )
-        })?
-        .map_err(session_error)?;
+    // The agent client bounds the connect itself and reports a deadline as
+    // `NotReady`, so no second timer races it here.
+    let stream = conn.tunnel(port).await.map_err(session_error)?;
     Ok(ws
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
@@ -403,3 +469,117 @@ async fn relay<B: VmmBackend + 'static>(
     ))
 )]
 pub(crate) struct SessionApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use husker_core::CoreError;
+
+    fn rejected(code: AgentErrorCode) -> AgentError {
+        AgentError::Rejected {
+            code,
+            message: "from the guest".to_string(),
+        }
+    }
+
+    /// Every refusal class has its own status and kind; the hint is the part
+    /// a caller reads when the kind alone does not tell them what to do.
+    #[test]
+    fn session_errors_map_by_class_not_by_wording() {
+        let cases = [
+            (
+                rejected(AgentErrorCode::InvalidSessionId),
+                StatusCode::BAD_REQUEST,
+                "invalid_session_id",
+            ),
+            (
+                rejected(AgentErrorCode::SessionNotFound),
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+            ),
+            (
+                rejected(AgentErrorCode::TooManyRunningSessions),
+                StatusCode::TOO_MANY_REQUESTS,
+                "session_capacity_exhausted",
+            ),
+            (
+                rejected(AgentErrorCode::SessionRetentionLimit),
+                StatusCode::CONFLICT,
+                "session_conflict",
+            ),
+            (
+                rejected(AgentErrorCode::SessionRunning),
+                StatusCode::CONFLICT,
+                "session_conflict",
+            ),
+            (
+                rejected(AgentErrorCode::SessionIdExists),
+                StatusCode::CONFLICT,
+                "session_conflict",
+            ),
+            (
+                rejected(AgentErrorCode::TunnelConnectFailed),
+                StatusCode::BAD_GATEWAY,
+                "preview_unreachable",
+            ),
+            (
+                rejected(AgentErrorCode::Unknown),
+                StatusCode::BAD_GATEWAY,
+                "session_failed",
+            ),
+            (
+                AgentError::SessionsUnsupported {
+                    reported: 4,
+                    required: 5,
+                },
+                StatusCode::NOT_IMPLEMENTED,
+                "guest_capability_missing",
+            ),
+            (
+                AgentError::Agent("starting session command: No such file".to_string()),
+                StatusCode::BAD_GATEWAY,
+                "session_failed",
+            ),
+        ];
+        for (error, status, kind) in cases {
+            let message = error.to_string();
+            let (got_status, body) = session_error(error);
+            assert_eq!(got_status, status, "{kind}: {}", body.0.message);
+            assert_eq!(body.0.kind, kind, "{}", body.0.message);
+            assert_eq!(body.0.message, message);
+            assert!(body.0.hint.is_some(), "{kind} needs a hint");
+        }
+    }
+
+    /// A wording that used to select a class no longer does: only the code
+    /// decides, so an unclassified refusal that happens to mention a session
+    /// id stays a guest-side failure.
+    #[test]
+    fn wording_alone_does_not_classify() {
+        let (status, body) =
+            session_error(AgentError::Agent("session not found in cache".to_string()));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body.0.kind, "session_failed");
+    }
+
+    /// The session deadline answers with the same status and kind as every
+    /// other agent deadline in this API, so one retry rule serves both.
+    #[test]
+    fn session_deadline_matches_the_general_agent_deadline() {
+        let not_ready = || AgentError::NotReady {
+            timeout: Duration::from_secs(10),
+            detail: String::new(),
+        };
+        let (status, body) = session_error(not_ready());
+        let (general_status, general_body) = map_error(CoreError::Agent(not_ready()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, general_status);
+        assert_eq!(body.0.kind, general_body.0.kind);
+        assert_eq!(body.0.message, not_ready().to_string());
+        let hint = body
+            .0
+            .hint
+            .expect("the session deadline explains the start race");
+        assert!(hint.contains("list sessions"), "{hint}");
+    }
+}

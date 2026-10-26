@@ -1,6 +1,7 @@
 use husker_agent_proto::{
-    AgentRequest, AgentResponse, ErrorResponse, ExecResponse, GuestInfoResponse, ReadFileResponse,
-    ShellExitResponse, WriteFileResponse, base64_decode, read_message, write_message,
+    AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecResponse, GuestInfoResponse,
+    ReadFileResponse, ShellExitResponse, WriteFileResponse, base64_decode, read_message,
+    write_message,
 };
 use husker_core::agent_client::{AgentClient, AgentConnection, AgentError, ShellEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -72,9 +73,7 @@ async fn spawn_vsock_ping_proxy(
             } else {
                 write_message(
                     &mut stream,
-                    &AgentResponse::Error(ErrorResponse {
-                        message: "not ready yet".into(),
-                    }),
+                    &AgentResponse::Error(ErrorResponse::new("not ready yet")),
                 )
                 .await
                 .unwrap();
@@ -330,9 +329,7 @@ async fn ping_maps_agent_error_response() {
         assert!(matches!(req, AgentRequest::Ping));
         write_message(
             &mut server,
-            &AgentResponse::Error(ErrorResponse {
-                message: "boom".into(),
-            }),
+            &AgentResponse::Error(ErrorResponse::new("boom")),
         )
         .await
         .unwrap();
@@ -379,9 +376,7 @@ async fn exec_maps_agent_error_response() {
         }
         write_message(
             &mut server,
-            &AgentResponse::Error(ErrorResponse {
-                message: "exec failed in guest".into(),
-            }),
+            &AgentResponse::Error(ErrorResponse::new("exec failed in guest")),
         )
         .await
         .unwrap();
@@ -552,9 +547,7 @@ async fn write_file_maps_agent_error_response() {
         assert!(matches!(req, AgentRequest::WriteFile(_)));
         write_message(
             &mut server,
-            &AgentResponse::Error(ErrorResponse {
-                message: "write denied".into(),
-            }),
+            &AgentResponse::Error(ErrorResponse::new("write denied")),
         )
         .await
         .unwrap();
@@ -585,9 +578,7 @@ async fn shell_start_maps_agent_error_response() {
         }
         write_message(
             &mut server,
-            &AgentResponse::Error(ErrorResponse {
-                message: "shell denied".into(),
-            }),
+            &AgentResponse::Error(ErrorResponse::new("shell denied")),
         )
         .await
         .unwrap();
@@ -658,9 +649,7 @@ async fn shell_recv_maps_agent_error_response() {
     let server_task = tokio::spawn(async move {
         write_message(
             &mut server,
-            &AgentResponse::Error(ErrorResponse {
-                message: "shell failed".into(),
-            }),
+            &AgentResponse::Error(ErrorResponse::new("shell failed")),
         )
         .await
         .unwrap();
@@ -754,9 +743,7 @@ async fn guest_info_maps_agent_error_response() {
         assert!(matches!(req, AgentRequest::GuestInfo));
         write_message(
             &mut server,
-            &AgentResponse::Error(ErrorResponse {
-                message: "no network info".into(),
-            }),
+            &AgentResponse::Error(ErrorResponse::new("no network info")),
         )
         .await
         .unwrap();
@@ -835,6 +822,16 @@ async fn sessions_refuse_old_guest_without_sending_unknown_request() {
     });
     let mut connection = AgentConnection::new(client);
     let error = connection.session_list().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AgentError::SessionsUnsupported {
+                reported: 4,
+                required: 5
+            }
+        ),
+        "{error:?}"
+    );
     assert!(error.to_string().contains("v5 required"));
     drop(connection);
     task.await.unwrap();
@@ -953,9 +950,7 @@ async fn restore_hook_carries_fresh_clock_and_propagates_kernel_errors() {
         assert!((request.unix_time_secs - now).abs() <= 1);
         write_message(
             &mut guest,
-            &AgentResponse::Error(ErrorResponse {
-                message: "VMGenID unavailable".into(),
-            }),
+            &AgentResponse::Error(ErrorResponse::new("VMGenID unavailable")),
         )
         .await
         .unwrap();
@@ -1010,6 +1005,109 @@ async fn stalled_session_response_has_a_bounded_transport_deadline() {
     assert!(matches!(result, Err(AgentError::NotReady { .. })));
     drop(connection);
     responder.await.unwrap();
+}
+
+/// Ask a protocol 5 guest for its sessions and return what the host makes of
+/// the raw `error` frame it answers with.
+async fn session_list_refused_with(error: serde_json::Value) -> AgentError {
+    let (host, mut guest) = tokio::io::duplex(4096);
+    let responder = tokio::spawn(async move {
+        assert!(matches!(
+            read_message::<AgentRequest, _>(&mut guest).await.unwrap(),
+            Some(AgentRequest::GuestInfo)
+        ));
+        write_message(
+            &mut guest,
+            &AgentResponse::GuestInfo(GuestInfoResponse {
+                ipv4: vec![],
+                protocol_version: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message::<AgentRequest, _>(&mut guest).await.unwrap(),
+            Some(AgentRequest::SessionList)
+        ));
+        write_message(&mut guest, &error).await.unwrap();
+    });
+    let mut connection = AgentConnection::new(host);
+    let error = connection.session_list().await.unwrap_err();
+    drop(connection);
+    responder.await.unwrap();
+    error
+}
+
+#[tokio::test]
+async fn session_refusals_are_classified_by_code_then_by_legacy_phrase() {
+    let coded = session_list_refused_with(serde_json::json!({
+        "type": "Error",
+        "message": "session not found",
+        "code": "session_not_found",
+    }))
+    .await;
+    assert!(
+        matches!(
+            &coded,
+            AgentError::Rejected {
+                code: AgentErrorCode::SessionNotFound,
+                message
+            } if message == "session not found"
+        ),
+        "{coded:?}"
+    );
+
+    // A protocol 5 agent from husker 0.4.51 or 0.4.52 sends no code; its
+    // message is the only classification available.
+    let legacy = session_list_refused_with(serde_json::json!({
+        "type": "Error",
+        "message": "too many running sessions (limit 16)",
+    }))
+    .await;
+    assert!(
+        matches!(
+            legacy,
+            AgentError::Rejected {
+                code: AgentErrorCode::TooManyRunningSessions,
+                ..
+            }
+        ),
+        "{legacy:?}"
+    );
+
+    // A code this host does not know still marks the refusal as classified,
+    // and keeps the agent's message.
+    let newer = session_list_refused_with(serde_json::json!({
+        "type": "Error",
+        "message": "sessions are frozen",
+        "code": "from_a_newer_agent",
+    }))
+    .await;
+    assert!(
+        matches!(
+            &newer,
+            AgentError::Rejected {
+                code: AgentErrorCode::Unknown,
+                message
+            } if message == "sessions are frozen"
+        ),
+        "{newer:?}"
+    );
+
+    // Without a code or a known phrase the refusal stays unclassified.
+    let unclassified = session_list_refused_with(serde_json::json!({
+        "type": "Error",
+        "message": "starting session command: No such file or directory (os error 2)",
+    }))
+    .await;
+    assert!(
+        matches!(
+            &unclassified,
+            AgentError::Agent(message)
+                if message == "starting session command: No such file or directory (os error 2)"
+        ),
+        "{unclassified:?}"
+    );
 }
 
 /// An agent older than protocol v2 has no append path and truncates on every

@@ -51,6 +51,27 @@
   frame that is not the text `start` message is reported as
   `invalid_start_message` (400). Frames from daemons older than this contract
   carry only `message`.
+- The session routes (`/v1/vms/{name}/sessions...`) and the preview tunnel
+  (`/v1/vms/{name}/tunnel/{port}`) answer a refusal from the guest agent by
+  its class, which the agent reports as a code beside the message (a guest
+  agent from 0.4.51 or 0.4.52 reports only the message; the daemon
+  classifies those by their unchanged wording):
+  - `invalid_session_id` (400): the id is not one of the UUIDs a start returned
+  - `session_not_found` (404)
+  - `session_conflict` (409): the retention limit is reached, the session is
+    still running, or a generated id collided; the `hint` says which
+  - `session_capacity_exhausted` (429): too many running sessions
+  - `guest_capability_missing` (501): the guest agent predates sessions
+  - `preview_unreachable` (502): nothing on the guest accepted the tunnel
+    connection
+  - `session_failed` (502): a guest-side failure without a class, with the
+    agent's message
+  - `agent_not_ready` (503): the guest did not answer within the transport
+    deadline, the same status and kind as every other agent deadline in the
+    API. A session start may already have been accepted when this is
+    returned, so list the sessions before retrying one. Daemons before 0.4.53
+    answered this case with 504 `session_timeout`, and a slow tunnel connect
+    with 504 `preview_connect_timeout`; both are now 503 `agent_not_ready`.
 
 ## Deprecation workflow
 
