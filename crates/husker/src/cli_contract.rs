@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::cli::COMMAND_CONTRACTS;
+use crate::schema::exit_code;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JsonType {
@@ -347,13 +348,14 @@ pub(crate) enum CliErrorKind {
     PermissionDenied,
     DaemonUnreachable,
     ConfirmationRequired,
+    ConfirmationDeclined,
     OutMatchedNothing,
     JobCleanupFailed,
     VmNotRunning,
 }
 
 impl CliErrorKind {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Error,
         Self::NotFound,
         Self::InvalidUsage,
@@ -361,6 +363,7 @@ impl CliErrorKind {
         Self::PermissionDenied,
         Self::DaemonUnreachable,
         Self::ConfirmationRequired,
+        Self::ConfirmationDeclined,
         Self::OutMatchedNothing,
         Self::JobCleanupFailed,
         Self::VmNotRunning,
@@ -375,6 +378,7 @@ impl CliErrorKind {
             Self::PermissionDenied => "permission_denied",
             Self::DaemonUnreachable => "daemon_unreachable",
             Self::ConfirmationRequired => "confirmation_required",
+            Self::ConfirmationDeclined => "confirmation_declined",
             Self::OutMatchedNothing => "out_matched_nothing",
             Self::JobCleanupFailed => "job_cleanup_failed",
             Self::VmNotRunning => "vm_not_running",
@@ -383,13 +387,18 @@ impl CliErrorKind {
 
     pub(crate) const fn exit_code(self) -> i32 {
         match self {
-            Self::NotFound | Self::InvalidUsage => 2,
-            Self::Conflict => 3,
-            Self::PermissionDenied => 4,
-            Self::DaemonUnreachable => 5,
-            Self::ConfirmationRequired => 6,
+            Self::NotFound | Self::InvalidUsage => exit_code::NOT_FOUND,
+            Self::Conflict => exit_code::CONFLICT,
+            Self::PermissionDenied => exit_code::DENIED,
+            Self::DaemonUnreachable => exit_code::DAEMON_UNREACHABLE,
+            // Both confirmation outcomes leave the system unchanged, so a
+            // caller testing the exit code alone treats them alike; the kind
+            // tells a missing TTY apart from an operator who answered no.
+            Self::ConfirmationRequired | Self::ConfirmationDeclined => {
+                exit_code::CONFIRMATION_REQUIRED
+            }
             Self::Error | Self::OutMatchedNothing | Self::JobCleanupFailed | Self::VmNotRunning => {
-                1
+                exit_code::GENERAL
             }
         }
     }
@@ -406,7 +415,12 @@ impl CliErrorKind {
             Self::Conflict => "Resource exists or is in an incompatible state",
             Self::PermissionDenied => "Authentication, authorization, or policy failure",
             Self::DaemonUnreachable => "Cannot connect to the husker daemon",
-            Self::ConfirmationRequired => "Destructive command needs --yes confirmation",
+            Self::ConfirmationRequired => {
+                "A destructive command reached its confirmation gate without a TTY; re-run with --yes"
+            }
+            Self::ConfirmationDeclined => {
+                "The confirmation prompt was answered no; nothing was changed"
+            }
             Self::OutMatchedNothing => "A requested job output pattern matched nothing",
             Self::JobCleanupFailed => "A completed job VM could not be destroyed",
             Self::VmNotRunning => "The requested VM is not running",
@@ -477,6 +491,22 @@ mod tests {
             normalize_error_kind(Some("vm_not_running"), 1),
             CliErrorKind::VmNotRunning
         );
+    }
+
+    #[test]
+    fn confirmation_outcomes_share_an_exit_code_but_keep_distinct_kinds() {
+        let required = CliErrorKind::ConfirmationRequired;
+        let declined = CliErrorKind::ConfirmationDeclined;
+        assert_eq!(required.exit_code(), declined.exit_code());
+        assert_ne!(required.name(), declined.name());
+        assert_eq!(
+            CliErrorKind::from_name("confirmation_declined"),
+            Some(declined)
+        );
+        assert!(!declined.retryable());
+        // A bare exit code only says the gate was not passed; the kind alone
+        // says that an operator answered no.
+        assert_eq!(CliErrorKind::from_exit_code(declined.exit_code()), required);
     }
 
     #[test]

@@ -503,33 +503,57 @@ fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
 }
 
 /// Gate a destructive command on confirmation: a no-op when `yes` is set;
-/// otherwise prompt when stdin is a TTY, or refuse (exit
-/// `CONFIRMATION_REQUIRED`) when it is not. Shared by `destroy` and
-/// `image delete` so destructive commands behave consistently.
+/// otherwise prompt when stdin is a TTY, or refuse (`confirmation_required`)
+/// when it is not. A prompt answered anything but yes refuses too
+/// (`confirmation_declined`): the command did not run, so it must not exit
+/// as if it had. Shared by every destructive command so they behave alike.
 fn require_confirmation(prompt: &str, yes: bool, format: OutputFormat) {
     use std::io::IsTerminal;
     if yes {
         return;
     }
-    if std::io::stdin().is_terminal() {
-        eprint!("{prompt} [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).ok();
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            eprintln!("Aborted.");
-            std::process::exit(0);
-        }
-    } else {
-        exit_with_error(
-            format,
-            ApiFailure {
-                message: format!("{prompt} requires confirmation"),
-                kind: Some("confirmation_required".into()),
-                exit_code: exit_code::CONFIRMATION_REQUIRED,
-                hint: Some("Re-run with --yes to confirm.".into()),
-            },
-        );
+    if !std::io::stdin().is_terminal() {
+        exit_with_error(format, confirmation_required(prompt));
     }
+    eprint!("{prompt} [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).ok();
+    // On a terminal the echoed Enter ends the prompt line. A captured stderr
+    // sees no echo, so end it here or the error envelope that must be the
+    // last line would share it with the prompt.
+    if !std::io::stderr().is_terminal() {
+        eprintln!();
+    }
+    if !confirms(&answer) {
+        exit_with_error(format, confirmation_declined(prompt));
+    }
+}
+
+/// Whether a line typed at a `[y/N]` prompt is a yes. Anything else, an empty
+/// line and end of input included, keeps the default of no.
+fn confirms(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The refusal for a confirmation gate reached without a terminal to ask on.
+fn confirmation_required(prompt: &str) -> ApiFailure {
+    ApiFailure::with_kind(
+        CliErrorKind::ConfirmationRequired,
+        format!("{prompt} requires confirmation"),
+        Some("Re-run with --yes to confirm.".into()),
+    )
+}
+
+/// The refusal for a prompt the operator answered no (or left empty).
+fn confirmation_declined(prompt: &str) -> ApiFailure {
+    ApiFailure::with_kind(
+        CliErrorKind::ConfirmationDeclined,
+        format!(
+            "{} was not confirmed; nothing was changed",
+            prompt.trim_end_matches('?')
+        ),
+        Some("Answer y at the prompt, or re-run with --yes.".into()),
+    )
 }
 
 /// Bytes available to a non-privileged writer on the fs backing `path`.
@@ -1027,12 +1051,11 @@ async fn run(cli: Cli) -> Result<()> {
                 select_fields("list", spec).unwrap_or_else(|unknown| {
                     exit_with_error(
                         output,
-                        ApiFailure {
-                            message: unknown.message(),
-                            kind: Some(CliErrorKind::InvalidUsage.name().into()),
-                            exit_code: CliErrorKind::InvalidUsage.exit_code(),
-                            hint: Some(unknown.hint()),
-                        },
+                        ApiFailure::with_kind(
+                            CliErrorKind::InvalidUsage,
+                            unknown.message(),
+                            Some(unknown.hint()),
+                        ),
                     )
                 })
             });
@@ -5095,6 +5118,34 @@ mod tests {
     use clap::Parser;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn a_prompt_is_confirmed_only_by_an_explicit_yes() {
+        for yes in ["y", "Y", "yes", "YES\n", "  Yes  "] {
+            assert!(confirms(yes), "{yes:?} should confirm");
+        }
+        for no in ["", "\n", "n", "N", "no", "ye", "yes please"] {
+            assert!(!confirms(no), "{no:?} must not confirm");
+        }
+    }
+
+    #[test]
+    fn a_declined_prompt_is_a_refusal_distinct_from_a_missing_terminal() {
+        let declined = confirmation_declined("Destroy VM 'web'?");
+        assert_eq!(declined.kind.as_deref(), Some("confirmation_declined"));
+        assert_eq!(declined.exit_code, exit_code::CONFIRMATION_REQUIRED);
+        assert_eq!(
+            declined.message,
+            "Destroy VM 'web' was not confirmed; nothing was changed"
+        );
+        assert!(declined.hint.as_deref().unwrap().contains("--yes"));
+
+        let required = confirmation_required("Destroy VM 'web'?");
+        assert_eq!(required.kind.as_deref(), Some("confirmation_required"));
+        assert_eq!(required.exit_code, exit_code::CONFIRMATION_REQUIRED);
+        assert_eq!(required.message, "Destroy VM 'web'? requires confirmation");
+        assert!(required.hint.as_deref().unwrap().contains("--yes"));
+    }
 
     #[test]
     fn vm_page_trusts_a_paging_daemon_and_cuts_a_whole_fleet_response() {

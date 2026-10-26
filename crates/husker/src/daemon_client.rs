@@ -21,6 +21,7 @@ use husker_api::{
     VmResponse, WriteFileRequest, WriteFileResponse, WsExecInput, WsExecOutput,
 };
 
+use crate::cli_contract::CliErrorKind;
 use crate::schema::exit_code;
 
 /// Conservative decoded payload size for one guest-file write. The daemon's
@@ -67,6 +68,21 @@ pub(crate) struct ApiFailure {
 }
 
 impl ApiFailure {
+    /// A failure the CLI raises itself, filed under one of its own error
+    /// kinds so the kind and exit code cannot disagree.
+    pub(crate) fn with_kind(
+        kind: CliErrorKind,
+        message: impl Into<String>,
+        hint: Option<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            kind: Some(kind.name().into()),
+            exit_code: kind.exit_code(),
+            hint,
+        }
+    }
+
     /// Preserve structured daemon failures and connection classification when
     /// an operation has travelled through `anyhow` orchestration.
     pub(crate) fn from_error(error: &anyhow::Error) -> Self {
@@ -74,12 +90,7 @@ impl ApiFailure {
             return failure.clone();
         }
         if error.chain().any(|cause| cause.is::<DaemonUnreachable>()) {
-            return Self {
-                message: format!("{error:#}"),
-                kind: Some("daemon_unreachable".into()),
-                exit_code: exit_code::DAEMON_UNREACHABLE,
-                hint: None,
-            };
+            return Self::with_kind(CliErrorKind::DaemonUnreachable, format!("{error:#}"), None);
         }
         Self {
             message: format!("{error:#}"),

@@ -19,6 +19,11 @@
   - command payload keys are additive-only within a major release
   - documented field types are stable within a major release
   - error JSON always uses `{ "error": { "kind", "message", "hint"? } }`
+  - error kinds are the finite set `husker schema` lists under `errors`; a
+    kind a newer daemon sends is normalized to that set by exit code
+- A destructive command that does not pass its confirmation gate changes
+  nothing and exits 6: `confirmation_required` when stdin is not a TTY and
+  `--yes` is absent, `confirmation_declined` when the prompt was answered no.
 
 ## Error contract
 

@@ -18,7 +18,8 @@ pub(crate) mod exit_code {
     pub const CONFLICT: i32 = 3;
     pub const DENIED: i32 = 4;
     pub const DAEMON_UNREACHABLE: i32 = 5;
-    /// Destructive command attempted without confirmation (no TTY, no --yes).
+    /// A destructive command did not pass its confirmation gate: no TTY and
+    /// no --yes, or the prompt was answered no. Nothing was changed.
     pub const CONFIRMATION_REQUIRED: i32 = 6;
 }
 

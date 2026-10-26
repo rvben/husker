@@ -303,6 +303,7 @@ fn schema_advertises_every_stable_cli_error_kind() {
         "permission_denied",
         "daemon_unreachable",
         "confirmation_required",
+        "confirmation_declined",
         "out_matched_nothing",
         "job_cleanup_failed",
         "vm_not_running",
