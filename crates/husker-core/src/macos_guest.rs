@@ -495,6 +495,27 @@ mod tests {
                 },
                 "kernel",
             ),
+            (
+                CreateVmRequest {
+                    rootfs_path: Some("/r".into()),
+                    ..base.clone()
+                },
+                "rootfs",
+            ),
+            (
+                CreateVmRequest {
+                    initrd_path: Some("/i".into()),
+                    ..base.clone()
+                },
+                "initrd",
+            ),
+            (
+                CreateVmRequest {
+                    ssh_authorized_keys: vec!["ssh-ed25519 AAAA".into()],
+                    ..base.clone()
+                },
+                "SSH keys",
+            ),
         ];
         for (req, what) in cases {
             let err = validate_macos_request(&req).unwrap_err().to_string();

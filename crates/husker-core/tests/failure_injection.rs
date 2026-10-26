@@ -1451,6 +1451,66 @@ async fn partial_tap_creation_is_owned_and_rolled_back() {
     assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.2"));
 }
 
+/// A macOS image is a valid request shape everywhere, so the Linux core must
+/// refuse it by naming the backend it needs, and must do so before it leases
+/// a CID, an IP or a TAP that the next creation would then miss.
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn macos_image_is_refused_on_linux_before_any_host_resource_is_allocated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
+    let state_path = tmp.path().join("state.db");
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+
+    let error = core
+        .create_vm(husker_core::CreateVmRequest {
+            name: "mac".into(),
+            macos_image: Some("sequoia".into()),
+            vcpu_count: Some(1),
+            mem_size_mib: Some(128),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CoreError::InvalidArgument(message)
+                if message.contains("macOS guests require the Apple Virtualization.framework backend")
+        ),
+        "the refusal must name the backend a macOS guest needs, got {error:?}"
+    );
+    assert!(
+        !network.has_tap("husker3").await,
+        "a refused request must not create a TAP"
+    );
+    assert!(core.list_vms().unwrap().is_empty());
+    let leases = husker_state::StateStore::open(&state_path)
+        .unwrap()
+        .list_host_resource_leases()
+        .unwrap();
+    assert!(
+        leases.is_empty(),
+        "a refused request must leave no lease behind: {leases:?}"
+    );
+
+    let created = core
+        .create_vm(create_request("after-refusal", &kernel, &rootfs))
+        .await
+        .unwrap();
+    assert_eq!(created.vsock_cid, 3, "the refusal must not consume a CID");
+    assert_eq!(
+        created.guest_ip.as_deref(),
+        Some("172.20.0.2"),
+        "the refusal must not consume an IP"
+    );
+}
+
 #[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
