@@ -96,6 +96,11 @@ pub enum StateError {
         column: &'static str,
         message: String,
     },
+    #[error(
+        "database schema version {found} is newer than this husker supports ({supported}); \
+         upgrade husker, or restore the database backup taken before the newer version ran"
+    )]
+    SchemaNewerThanBinary { found: u32, supported: u32 },
 }
 
 /// The durable lifecycle states a VM record may occupy.
@@ -772,6 +777,30 @@ const MIGRATIONS: &[(u32, &str)] = &[
     ),
 ];
 
+/// The newest schema version this build knows: the last migration's number.
+/// A database stamped higher was written by a newer husker.
+const SUPPORTED_SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
+
+/// The schema version recorded in the database (`PRAGMA user_version`).
+fn schema_version(conn: &Connection) -> rusqlite::Result<u32> {
+    conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+        .map(|version| version as u32)
+}
+
+/// Refuse a database whose schema version is above `supported`.
+///
+/// A newer husker may have added columns, triggers, or tables this build
+/// does not know, and both the idempotent baseline block and the numbered
+/// migrations would edit such a database blindly. Checked before either runs,
+/// so a rolled-back binary leaves the file exactly as the newer one wrote it.
+fn refuse_newer_schema(conn: &Connection, supported: u32) -> Result<(), StateError> {
+    let found = schema_version(conn)?;
+    if found > supported {
+        return Err(StateError::SchemaNewerThanBinary { found, supported });
+    }
+    Ok(())
+}
+
 /// Bring a database's schema version up to date: stamp the baseline onto a
 /// database that predates versioning, then apply every migration newer than the
 /// recorded `user_version`, in order, each in its own transaction so a
@@ -789,7 +818,7 @@ fn apply_migrations(
         "migrations must be strictly ascending and greater than the baseline"
     );
 
-    let mut current = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as u32;
+    let mut current = schema_version(conn)?;
     // A fresh or pre-versioning database (user_version 0) was just brought to
     // the baseline schema by migrate()'s idempotent block; record that so the
     // baseline is never re-bootstrapped as if it were a migration.
@@ -1025,6 +1054,7 @@ impl StateStore {
 
     fn migrate(&self) -> Result<(), StateError> {
         let conn = self.lock()?;
+        refuse_newer_schema(&conn, SUPPORTED_SCHEMA_VERSION)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS vms (
                 id TEXT PRIMARY KEY,
@@ -5692,6 +5722,93 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version as u32, MIGRATIONS.last().unwrap().0);
+        assert_eq!(version as u32, SUPPORTED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn refuse_newer_schema_accepts_up_to_the_supported_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in [0, 1, 5, 6] {
+            conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+                .unwrap();
+            refuse_newer_schema(&conn, 6).unwrap();
+        }
+    }
+
+    #[test]
+    fn refuse_newer_schema_rejects_a_database_stamped_by_a_newer_husker() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+        let error = refuse_newer_schema(&conn, 6).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                StateError::SchemaNewerThanBinary {
+                    found: 7,
+                    supported: 6
+                }
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("version 7"), "{message}");
+        assert!(message.contains("supports (6)"), "{message}");
+        assert!(message.contains("upgrade husker"), "{message}");
+    }
+
+    /// A database written by a newer husker is refused at open, before the
+    /// baseline block or any migration touches it: a rolled-back binary leaves
+    /// the file exactly as the newer one wrote it, rows and version included.
+    #[test]
+    fn open_refuses_a_database_written_by_a_newer_husker_and_leaves_it_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = StateStore::open(&path).unwrap();
+        let record = make_record("from-the-future");
+        store.insert_vm(&record).unwrap();
+        drop(store);
+
+        let newer = SUPPORTED_SCHEMA_VERSION + 1;
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!("PRAGMA user_version = {newer};"))
+            .unwrap();
+
+        let error = StateStore::open(&path).err().expect("open must refuse");
+        assert!(
+            matches!(
+                error,
+                StateError::SchemaNewerThanBinary { found, supported }
+                    if found == newer && supported == SUPPORTED_SCHEMA_VERSION
+            ),
+            "{error:?}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), newer);
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM vms WHERE id = ?1",
+                params![record.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "from-the-future");
+    }
+
+    #[test]
+    fn open_accepts_a_database_at_the_supported_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let record = make_record("same-version");
+        StateStore::open(&path).unwrap().insert_vm(&record).unwrap();
+
+        let reopened = StateStore::open(&path).unwrap();
+        assert_eq!(reopened.get_vm(record.id).unwrap().name, "same-version");
+        assert_eq!(
+            schema_version(&reopened.lock().unwrap()).unwrap(),
+            SUPPORTED_SCHEMA_VERSION
+        );
     }
 
     #[test]
