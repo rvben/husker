@@ -163,7 +163,11 @@ fn print_action(action: &str, image: &MacosImage, output: OutputFormat) -> Resul
     Ok(())
 }
 
-fn list(data_dir: &Path, output: OutputFormat) -> Result<()> {
+/// The complete bundles under the data dir's macOS image directory, by name.
+/// Install staging dirs and downloads (dot-prefixed), stray files and
+/// incomplete bundles are left out; an incomplete bundle is reported on
+/// stderr so a half-finished install is not mistaken for a missing one.
+fn installed_images(data_dir: &Path) -> Result<Vec<MacosImage>> {
     let dir = macos_images_dir(data_dir);
     let mut images = Vec::new();
     let entries = match std::fs::read_dir(&dir) {
@@ -173,7 +177,6 @@ fn list(data_dir: &Path, output: OutputFormat) -> Result<()> {
     };
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Dot-prefixed entries are install staging dirs and downloads.
         if !is_valid_macos_image_name(&name) || !entry.path().is_dir() {
             continue;
         }
@@ -184,6 +187,11 @@ fn list(data_dir: &Path, output: OutputFormat) -> Result<()> {
         }
     }
     images.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(images)
+}
+
+fn list(data_dir: &Path, output: OutputFormat) -> Result<()> {
+    let images = installed_images(data_dir)?;
     if output == OutputFormat::Json {
         let value = structured_output(
             "macos list",
@@ -1059,10 +1067,131 @@ fn data_volumes(apfs_list: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use husker_vmm::macos_bundle::MACOS_BUNDLE_FORMAT;
 
     /// Signal dispositions are process-wide, so the tests that change them
     /// run one at a time under a threaded test runner.
     static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn manifest(build: &str, agent_provisioned: bool) -> MacOsBundleManifest {
+        MacOsBundleManifest {
+            format: MACOS_BUNDLE_FORMAT,
+            build: build.into(),
+            os_version: "26.0.1".into(),
+            disk_size_bytes: 64 << 30,
+            min_cpus: 2,
+            min_memory_mib: 4096,
+            agent_provisioned,
+        }
+    }
+
+    /// Write a bundle named `name` under the data dir. `complete` adds the
+    /// disk, auxiliary storage and hardware model a boot needs.
+    fn write_bundle(
+        data_dir: &Path,
+        name: &str,
+        manifest: &MacOsBundleManifest,
+        complete: bool,
+    ) -> MacOsBundle {
+        let dir = macos_images_dir(data_dir).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = MacOsBundle::new(dir);
+        bundle.write_manifest(manifest).unwrap();
+        if complete {
+            for p in [
+                bundle.disk_path(),
+                bundle.aux_path(),
+                bundle.hardware_model_path(),
+            ] {
+                std::fs::write(p, b"x").unwrap();
+            }
+        }
+        bundle
+    }
+
+    #[test]
+    fn list_reports_complete_bundles_by_name_and_skips_everything_else() {
+        let data = tempfile::tempdir().unwrap();
+        assert!(
+            installed_images(data.path()).unwrap().is_empty(),
+            "no macos dir yet means no images, not an error"
+        );
+
+        let images = macos_images_dir(data.path());
+        let provisioned = write_bundle(data.path(), "tahoe", &manifest("25A354", true), true);
+        write_bundle(data.path(), "sequoia", &manifest("24G84", false), true);
+        write_bundle(
+            data.path(),
+            "half-installed",
+            &manifest("25A354", false),
+            false,
+        );
+        write_bundle(
+            data.path(),
+            ".tahoe.installing",
+            &manifest("25A354", true),
+            true,
+        );
+        std::fs::write(images.join("restore.ipsw"), b"not a bundle").unwrap();
+
+        let listed = installed_images(data.path()).unwrap();
+        let names: Vec<&str> = listed.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["sequoia", "tahoe"]);
+
+        let tahoe = &listed[1];
+        assert_eq!(tahoe.path, provisioned.dir().display().to_string());
+        assert_eq!(tahoe.build, "25A354");
+        assert_eq!(tahoe.os_version, "26.0.1");
+        assert_eq!(tahoe.disk_size_bytes, 64 << 30);
+        assert_eq!((tahoe.min_cpus, tahoe.min_memory_mib), (2, 4096));
+        assert!(tahoe.agent_provisioned);
+        assert!(!listed[0].agent_provisioned);
+    }
+
+    #[test]
+    fn provision_refuses_a_missing_image_and_a_non_root_caller() {
+        let data = tempfile::tempdir().unwrap();
+        let err = provision(data.path(), "missing").unwrap_err();
+        let failure = err
+            .downcast_ref::<ApiFailure>()
+            .expect("structured failure");
+        assert_eq!(failure.kind.as_deref(), Some("not_found"), "{err:#}");
+        assert_eq!(failure.exit_code, exit_code::NOT_FOUND);
+        assert!(
+            failure
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("sudo may change HOME")),
+            "{err:#}"
+        );
+
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping the non-root half: running as root");
+            return;
+        }
+        let bundle = write_bundle(data.path(), "tahoe", &manifest("25A354", false), true);
+        let err = provision(data.path(), "tahoe").unwrap_err();
+        let failure = err
+            .downcast_ref::<ApiFailure>()
+            .expect("structured failure");
+        assert_eq!(
+            failure.kind.as_deref(),
+            Some("permission_denied"),
+            "{err:#}"
+        );
+        assert_eq!(failure.exit_code, exit_code::DENIED);
+        assert_eq!(
+            failure.hint.as_deref(),
+            Some(format!("sudo husker macos provision {}", bundle.dir().display()).as_str()),
+            "the hint names the bundle path, which survives sudo changing HOME"
+        );
+        assert_eq!(
+            bundle.read_manifest().unwrap(),
+            manifest("25A354", false),
+            "a refused provision leaves the manifest alone"
+        );
+    }
 
     fn sighup_handler() -> usize {
         // SAFETY: a null new action only queries the current disposition.
