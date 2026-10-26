@@ -29,6 +29,12 @@
   completes, and a command the daemon ended at its run timeout (the API's
   `exec_timeout`). It is not marked retryable, since a timed-out command may
   have completed in the guest.
+- `exec`, `job` and `shell` exit with the guest command's exit code, and
+  `exec` and `job` report `status: "error"` in their JSON result when it is
+  nonzero. A guest exit code is the command's result, not a tool error: no
+  envelope is written, and the code may coincide with any of the tool's exit
+  codes. `husker schema` declares the pass-through under those commands'
+  `extensions`.
 
 ## Error contract
 

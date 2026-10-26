@@ -254,3 +254,63 @@ async fn a_command_the_daemon_timed_out_is_reported_as_a_timeout() {
     );
     assert!(output.stdout.is_empty());
 }
+
+/// A daemon whose exec route reports a command that ended with `exit_code`.
+fn exec_ended_with(
+    exit_code: i32,
+) -> impl Fn(&str, &str) -> (StatusCode, String) + Send + Sync + 'static {
+    move |method, target| {
+        if method == "POST" && target == "/v1/vms/vm/exec" {
+            (
+                StatusCode::OK,
+                format!(r#"{{"exit_code":{exit_code},"stdout":"","stderr":"boom\n"}}"#),
+            )
+        } else {
+            no_route(method, target)
+        }
+    }
+}
+
+/// A guest exit code is the command's result, not a tool failure, so it must
+/// never be wrapped in an error envelope.
+fn assert_no_envelope(output: &Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .last()
+            .is_none_or(|last| serde_json::from_str::<Value>(last).is_err()),
+        "a guest exit code must not be reported as a tool error:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_guest_command_that_fails_is_reported_as_its_own_result() {
+    let fixture = Fixture::start(exec_ended_with(3)).await;
+    let output = fixture
+        .husker(&["--output", "json", "exec", "vm", "--", "false"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("stdout is not one JSON document:\n{stderr}"));
+    assert_eq!(document["status"], "error", "{document}");
+    assert_eq!(document["action"], "exec");
+    assert_eq!(document["result"]["exit_code"], 3);
+    assert_eq!(document["result"]["stderr"], "boom\n");
+    assert_no_envelope(&output);
+}
+
+#[tokio::test]
+async fn a_guest_command_that_succeeds_is_reported_ok() {
+    let fixture = Fixture::start(exec_ended_with(0)).await;
+    let output = fixture
+        .husker(&["--output", "json", "exec", "vm", "--", "true"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["status"], "ok", "{document}");
+    assert_eq!(document["result"]["exit_code"], 0);
+    assert_no_envelope(&output);
+}

@@ -6,12 +6,9 @@ use anyhow::Result;
 use crate::cli::{COMMAND_CONTRACTS, Cli};
 use crate::cli_contract::{CliErrorKind, command_contract};
 
-/// Extract a clean error message from an API error response.
-///
-/// Handles JSON error bodies, plain text, and empty responses gracefully
-/// so the CLI never dumps raw stack traces at the user.
-/// Exit codes husker returns for its own failures. `exec` and `shell` instead
-/// pass through the guest command's exit code. Documented in `husker schema`.
+/// Exit codes husker returns for its own failures. `exec`, `job` and `shell`
+/// instead pass through the guest command's exit code, which `husker schema`
+/// declares under those commands' `extensions`.
 pub(crate) mod exit_code {
     pub const GENERAL: i32 = 1;
     pub const NOT_FOUND: i32 = 2;
@@ -354,7 +351,25 @@ fn enrich_v0_3(schema: &mut serde_json::Value) {
         {
             object.insert("confirmation_bypass_arg".into(), serde_json::json!("--yes"));
         }
+        if matches!(name.as_str(), "exec" | "job" | "shell") {
+            object.insert("extensions".into(), guest_exit_code_extension());
+        }
     }
+}
+
+/// The schema extension of a command that exits with the guest command's exit
+/// code. It is not a clispec outcome: outcome codes are fixed and must not
+/// overlap the error exit codes, while a guest command can exit with any code.
+fn guest_exit_code_extension() -> serde_json::Value {
+    serde_json::json!({
+        "exit_code": {
+            "source": "guest_command",
+            "description": "Exits with the guest command's exit code. A nonzero code is \
+                            the command's result, not one of the tool's error kinds, and \
+                            writes no error envelope; the absence of an envelope on stderr \
+                            tells it apart from a tool error with the same code."
+        }
+    })
 }
 
 /// Global args accepted by every command, derived from the root command.

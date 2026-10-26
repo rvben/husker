@@ -14,6 +14,13 @@ registry. CI verifies that every command leaf has exactly one contract.
 ## Conventions
 
 - Most command results are objects with `status: "ok"` and an `action`.
+- `exec` and `job` run a guest command and pass its exit code through: their
+  `status` is the guest command's result (`ok` for exit code 0, `error`
+  otherwise) and the process exits with that code. No error envelope is
+  written, since the tool itself did not fail; the absence of an envelope on
+  stderr tells a guest exit code apart from a tool error with the same code.
+  `husker schema` declares the pass-through under those commands'
+  `extensions`.
 - Resource payloads remain nested (`vm`, `image`, `service`, and so on) so new
   resource fields can be added without changing the command envelope.
 - In clispec v0.2, `output_fields` for a list command describe one item in its
@@ -77,6 +84,9 @@ a genuinely empty fleet:
   }
 }
 ```
+
+A command that exits nonzero has the same shape with `status: "error"` and
+its code in `result.exit_code`, and `husker` exits with that code.
 
 ## Errors
 

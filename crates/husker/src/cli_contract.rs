@@ -475,6 +475,13 @@ pub(crate) fn normalize_error_kind(kind: Option<&str>, exit_code: i32) -> CliErr
         .unwrap_or_else(|| CliErrorKind::from_exit_code(exit_code))
 }
 
+/// The `status` of a command that ran a guest command and passes its exit
+/// code through. It reports the guest command's own result: a nonzero code is
+/// `error` without an error envelope, since the tool itself did not fail.
+pub(crate) fn guest_command_status(exit_code: i32) -> &'static str {
+    if exit_code == 0 { "ok" } else { "error" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

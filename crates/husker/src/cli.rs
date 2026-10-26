@@ -359,7 +359,7 @@ pub(crate) enum Commands {
         amount_mib: u32,
     },
 
-    /// Execute a command in a VM
+    /// Execute a command in a VM and exit with its exit code
     Exec {
         /// VM name
         name: String,
@@ -631,7 +631,7 @@ pub(crate) enum Commands {
         action: SecretAction,
     },
 
-    /// Open an interactive shell in a VM
+    /// Open an interactive shell in a VM and exit with the shell's exit code
     Shell {
         /// VM name
         name: String,

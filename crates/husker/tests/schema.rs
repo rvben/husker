@@ -425,3 +425,39 @@ fn schema_effects_are_declared_per_command() {
         );
     }
 }
+
+/// The commands that exit with a guest command's exit code declare it in a
+/// schema extension, since a passed-through code is neither one of the tool's
+/// error kinds nor a fixed outcome code, and their descriptions say so. No
+/// other command carries the extension.
+#[test]
+fn guest_exit_code_passthrough_is_declared_per_command() {
+    let document = schema_document();
+    let passthrough = ["exec", "job", "shell"];
+    for path in passthrough {
+        let command = command_at_path(&document, path);
+        let exit_code = &command["extensions"]["exit_code"];
+        assert_eq!(exit_code["source"], "guest_command", "`{path}`");
+        assert!(
+            exit_code["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("envelope")),
+            "`{path}` must say how a guest exit code is told from a tool error"
+        );
+        assert!(
+            command["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("exit code")),
+            "`{path}` description: {}",
+            command["description"]
+        );
+    }
+    for command in document["commands"].as_array().unwrap() {
+        let name = command["name"].as_str().unwrap();
+        assert_eq!(
+            command.get("extensions").is_some(),
+            passthrough.contains(&name),
+            "`{name}` extensions"
+        );
+    }
+}

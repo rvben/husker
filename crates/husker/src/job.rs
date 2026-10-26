@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use husker_api::{ExecRequest, ExecResponse};
 
 use crate::cli::OutputFormat;
-use crate::cli_contract::{CliErrorKind, structured_output};
+use crate::cli_contract::{CliErrorKind, guest_command_status, structured_output};
 use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent};
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::exit_code;
@@ -543,10 +543,10 @@ fn outcome_json(
     lifecycle_failed: bool,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
-        "status": if lifecycle_failed || outcome.exec.exit_code != 0 || retrieval_failure.is_some() {
+        "status": if lifecycle_failed || retrieval_failure.is_some() {
             "error"
         } else {
-            "ok"
+            guest_command_status(outcome.exec.exit_code)
         },
         "action": "job",
         "vm": name,

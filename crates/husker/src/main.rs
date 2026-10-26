@@ -27,7 +27,9 @@ mod vm_creation;
 use crate::cli::*;
 #[cfg(test)]
 use crate::cli_contract::command_contract;
-use crate::cli_contract::{CliErrorKind, normalize_error_kind, select_fields, structured_output};
+use crate::cli_contract::{
+    CliErrorKind, guest_command_status, normalize_error_kind, select_fields, structured_output,
+};
 use crate::config::*;
 use crate::daemon::*;
 use crate::daemon_client::{
@@ -1459,7 +1461,7 @@ async fn run(cli: Cli) -> Result<()> {
                 print_output(
                     output,
                     &serde_json::json!({
-                        "status": "ok",
+                        "status": guest_command_status(result.exit_code),
                         "action": "exec",
                         "vm": name,
                         "result": result,
