@@ -171,6 +171,15 @@ async fn a_preview_tunnel_has_no_json_form() {
 }
 
 #[tokio::test]
+async fn a_shell_without_a_terminal_is_refused_before_any_request() {
+    // The fixture runs the binary with stdin closed, which is what a pipe or
+    // a CI job gives a shell: no terminal to bridge. A shell has only a text
+    // form, so the refusal must be the terminal one, not the JSON one.
+    let hint = refused_up_front(&["--output", "text", "shell", "vm"]).await;
+    assert!(hint.contains("`husker exec`"), "{hint}");
+}
+
+#[tokio::test]
 async fn a_log_snapshot_keeps_its_json_form() {
     let fixture = Fixture::start(|method, target| {
         if method == "GET" && target.starts_with("/v1/vms/vm/logs?") {

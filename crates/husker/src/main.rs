@@ -1809,7 +1809,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Shell { name, command } => {
-            run_shell(&target, config_path, name, command, output).await
+            run_shell(&target, &name, command.as_deref(), output).await
         }
         Commands::Version => {
             let mut daemon_info: Option<serde_json::Value> = None;
@@ -3753,102 +3753,64 @@ fn render_text_exec_event(event: DaemonExecEvent) -> Result<()> {
     Ok(())
 }
 
+/// The refusal `husker shell` makes before opening a session, with its
+/// remedy, or `None` when the daemon takes the session.
+///
+/// Mirrors the daemon's rule: a `running` VM takes the session, and a
+/// `suspended` VM is resumed on connect unless it opted out of `auto_resume`
+/// (the daemon reports that field only for VMs with an idle policy; every
+/// other VM resumes on connect). Any other state is refused here, so the
+/// WebSocket is never opened for a VM the daemon would turn away and the
+/// remedy is named.
+fn shell_refusal(name: &str, state: &str, auto_resume: Option<bool>) -> Option<ApiFailure> {
+    let hint = match state {
+        "running" => return None,
+        "suspended" if auto_resume != Some(false) => return None,
+        "stopped" => Some("start the VM first with `husker run`".to_string()),
+        "paused" | "suspended" => Some(format!("resume the VM first with `husker resume {name}`")),
+        _ => None,
+    };
+    Some(ApiFailure::with_kind(
+        CliErrorKind::VmNotRunning,
+        format!("VM '{name}' is {state}, expected running"),
+        hint,
+    ))
+}
+
 /// Run an interactive shell session inside a VM.
 ///
-/// On Linux, connects directly to the Firecracker vsock UDS proxy for lower
-/// latency. Falls back to the WebSocket path if the vsock socket is missing.
-/// On macOS, always uses the WebSocket path through the daemon.
-#[cfg(feature = "linux-net")]
+/// Every shell goes through the daemon's WebSocket route, on every host, so
+/// the session guard, audit log, metrics and agent readiness wait apply to it
+/// like to any other guest access.
 async fn run_shell(
-    target: &DaemonTarget,
-    config_path: Option<PathBuf>,
-    name: String,
-    command: Option<String>,
-    output: OutputFormat,
-) -> Result<()> {
-    let client = target.daemon();
-    let vm = client.vm(&name).await?;
-    let vm_id = &vm.id;
-
-    let config = load_config(config_path.as_deref());
-    let runtime_dir = config.effective_state_dir().join("run");
-    let vsock_path = runtime_dir.join(format!("{vm_id}.vsock"));
-
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("Error: `husker shell` requires an interactive terminal");
-        std::process::exit(1);
-    }
-
-    // Try direct vsock first (lower latency), fall back to WebSocket.
-    if vsock_path.exists() {
-        let mut conn =
-            husker_core::AgentClient::connect(&vsock_path, husker_agent_proto::AGENT_VSOCK_PORT)
-                .await
-                .context("connecting to agent")?;
-
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-
-        conn.shell_start(command.as_deref(), cols, rows)
-            .await
-            .context("starting shell")?;
-
-        crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
-
-        let result = run_shell_bridge(&mut conn).await;
-
-        crossterm::terminal::disable_raw_mode().ok();
-        println!();
-
-        match result {
-            Ok(exit_code) => std::process::exit(exit_code),
-            Err(e) => {
-                eprintln!("Shell error: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // Direct vsock unavailable — use WebSocket through daemon.
-    run_shell_ws(target, &name, command.as_deref(), output).await
-}
-
-#[cfg(not(feature = "linux-net"))]
-async fn run_shell(
-    target: &DaemonTarget,
-    _config_path: Option<PathBuf>,
-    name: String,
-    command: Option<String>,
-    output: OutputFormat,
-) -> Result<()> {
-    run_shell_ws(target, &name, command.as_deref(), output).await
-}
-
-/// WebSocket-based interactive shell, works on both Linux and macOS.
-async fn run_shell_ws(
     target: &DaemonTarget,
     name: &str,
     command: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    // Pre-check: verify VM is running before opening the WebSocket.
-    let client = target.daemon();
-    let vm = client.vm(name).await?;
-    let state = vm.state.as_str();
-    if state != "running" {
-        let hint = match state {
-            "stopped" => Some("start the VM first with `husker run`".to_string()),
-            "paused" => Some(format!("resume the VM first with `husker resume {name}`")),
-            _ => None,
-        };
+    // A shell bridges the terminal's raw stdin, so a pipe cannot drive it.
+    // Refuse before any request: the daemon must never start a session that
+    // could not have been used.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         exit_with_error(
             output,
-            ApiFailure {
-                message: format!("VM '{name}' is {state}, expected running"),
-                kind: Some("vm_not_running".into()),
-                exit_code: exit_code::CONFLICT,
-                hint,
-            },
+            ApiFailure::with_kind(
+                CliErrorKind::InvalidUsage,
+                "`husker shell` needs an interactive terminal: stdin is not a TTY",
+                Some(
+                    "run it from a terminal, or use `husker exec` for a non-interactive command"
+                        .into(),
+                ),
+            ),
         );
+    }
+
+    // A VM the daemon would refuse is reported with its remedy before the
+    // WebSocket is opened.
+    let client = target.daemon();
+    let vm = client.vm(name).await?;
+    if let Some(failure) = shell_refusal(name, &vm.state, vm.auto_resume) {
+        exit_with_error(output, failure);
     }
 
     let ws_url = target
@@ -4032,52 +3994,6 @@ fn parse_cp_path(s: &str) -> CpPath {
         }
     }
     CpPath::Local(PathBuf::from(s))
-}
-
-#[cfg(feature = "linux-net")]
-async fn run_shell_bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    conn: &mut husker_core::AgentConnection<S>,
-) -> Result<i32> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut stdin = tokio::io::stdin();
-    let mut stdin_buf = vec![0u8; 1024];
-    let mut sigwinch = signal(SignalKind::window_change()).context("registering SIGWINCH")?;
-    let mut sighup = signal(SignalKind::hangup()).context("registering SIGHUP")?;
-
-    loop {
-        tokio::select! {
-            result = stdin.read(&mut stdin_buf) => {
-                match result {
-                    Ok(0) => return Ok(0),
-                    Ok(n) => {
-                        conn.shell_send(&stdin_buf[..n]).await?;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            _ = sigwinch.recv() => {
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    conn.shell_resize(cols, rows).await?;
-                }
-            }
-            _ = sighup.recv() => {
-                return Ok(0);
-            }
-            event = conn.shell_recv() => {
-                match event? {
-                    husker_core::ShellEvent::Data(data) => {
-                        use std::io::Write;
-                        std::io::stdout().write_all(&data)?;
-                        std::io::stdout().flush()?;
-                    }
-                    husker_core::ShellEvent::Exit(code) => {
-                        return Ok(code);
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -5200,6 +5116,34 @@ mod tests {
         for no in ["", "\n", "n", "N", "no", "ye", "yes please"] {
             assert!(!confirms(no), "{no:?} must not confirm");
         }
+    }
+
+    #[test]
+    fn a_shell_is_refused_only_for_vms_the_daemon_would_turn_away() {
+        assert!(shell_refusal("vm", "running", None).is_none());
+        // The daemon resumes a suspended VM on connect unless it opted out.
+        assert!(shell_refusal("vm", "suspended", None).is_none());
+        assert!(shell_refusal("vm", "suspended", Some(true)).is_none());
+
+        let stopped = shell_refusal("vm", "stopped", None).unwrap();
+        assert_eq!(stopped.kind.as_deref(), Some("vm_not_running"));
+        assert_eq!(stopped.exit_code, exit_code::CONFLICT);
+        assert_eq!(stopped.message, "VM 'vm' is stopped, expected running");
+        assert_eq!(
+            stopped.hint.as_deref(),
+            Some("start the VM first with `husker run`")
+        );
+
+        let resume_hint = Some("resume the VM first with `husker resume vm`");
+        let paused = shell_refusal("vm", "paused", None).unwrap();
+        assert_eq!(paused.hint.as_deref(), resume_hint);
+        let opted_out = shell_refusal("vm", "suspended", Some(false)).unwrap();
+        assert_eq!(opted_out.message, "VM 'vm' is suspended, expected running");
+        assert_eq!(opted_out.hint.as_deref(), resume_hint);
+
+        let creating = shell_refusal("vm", "creating", None).unwrap();
+        assert_eq!(creating.kind.as_deref(), Some("vm_not_running"));
+        assert!(creating.hint.is_none());
     }
 
     #[test]
