@@ -201,21 +201,24 @@ pub(crate) fn exec_env_allowed(env: &HashMap<String, String>, policy: &ApiPolicy
 pub(crate) async fn health<B: VmmBackend + 'static>(
     State(core): State<SharedCore<B>>,
 ) -> Json<HealthResponse> {
-    let (total, running, state_db_ok) = match core.list_vms() {
-        Ok(vms) => {
-            let total = vms.len() as u64;
-            let running = vms
-                .iter()
-                .filter(|v| v.state == VmLifecycleState::Running)
-                .count() as u64;
-            (total, running, true)
+    // The store counts the fleet itself, so the probe costs the same on a
+    // thousand VMs as on none. When it cannot answer, the counts are withheld
+    // rather than zeroed: a monitor must tell an unreadable store from an
+    // idle daemon.
+    let vms = match core.vm_counts() {
+        Ok(counts) => Some(VmCounts {
+            total: counts.total,
+            running: counts.running,
+        }),
+        Err(error) => {
+            warn!(error = %error, "health probe could not count VMs in the state store");
+            None
         }
-        Err(_) => (0, 0, false),
     };
     let mut checks = HashMap::new();
     checks.insert(
         "state_db".into(),
-        if state_db_ok {
+        if vms.is_some() {
             "ok".into()
         } else {
             "degraded".into()
@@ -266,7 +269,7 @@ pub(crate) async fn health<B: VmmBackend + 'static>(
     Json(HealthResponse {
         status: status.into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        vms: VmCounts { total, running },
+        vms,
         checks,
         uptime_seconds: metrics().start.elapsed().as_secs(),
         backend: backend.to_string(),

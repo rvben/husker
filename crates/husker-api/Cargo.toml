@@ -38,3 +38,5 @@ http-body-util = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tempfile = "3"
+# Breaks a state store underneath a live core in the health tests.
+rusqlite = { workspace = true }

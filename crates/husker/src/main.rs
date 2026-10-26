@@ -1804,43 +1804,51 @@ async fn run(cli: Cli) -> Result<()> {
             run_shell(&target, &name, command.as_deref(), output).await
         }
         Commands::Version => {
-            let mut daemon_info: Option<serde_json::Value> = None;
+            // The daemon's version and, when its state store could be read,
+            // the (total, running) VM counts. A daemon reports `vms` as null
+            // when the store is unreadable; that stays distinct from an
+            // empty fleet all the way to the output.
+            let mut daemon: Option<(String, Option<(u64, u64)>)> = None;
 
             let client = target.client_with_timeout(std::time::Duration::from_secs(2))?;
             if let Ok(resp) = client.try_send(client.get("/v1/health")).await
                 && resp.status().is_success()
                 && let Ok(health) = resp.json::<serde_json::Value>().await
             {
-                let version = health["version"].as_str().unwrap_or("unknown");
-                let total = health["vms"]["total"].as_u64().unwrap_or(0);
-                let running = health["vms"]["running"].as_u64().unwrap_or(0);
-                daemon_info = Some(serde_json::json!({
-                    "version": version,
-                    "vms_total": total,
-                    "vms_running": running,
-                }));
+                let version = health["version"].as_str().unwrap_or("unknown").to_string();
+                let counts = health["vms"]["total"]
+                    .as_u64()
+                    .zip(health["vms"]["running"].as_u64());
+                daemon = Some((version, counts));
             }
 
             if output == OutputFormat::Json {
+                let daemon = daemon.map(|(version, counts)| {
+                    serde_json::json!({
+                        "version": version,
+                        "vms_total": counts.map(|(total, _)| total),
+                        "vms_running": counts.map(|(_, running)| running),
+                    })
+                });
                 print_output(
                     output,
                     &serde_json::json!({
                         "status": "ok",
                         "action": "version",
                         "client_version": env!("CARGO_PKG_VERSION"),
-                        "daemon": daemon_info,
+                        "daemon": daemon,
                     }),
                     "",
                 );
             } else {
                 println!("husker {}", env!("CARGO_PKG_VERSION"));
-                if let Some(daemon) = daemon_info {
-                    println!(
-                        "daemon {} ({} VMs, {} running)",
-                        daemon["version"].as_str().unwrap_or("unknown"),
-                        daemon["vms_total"].as_u64().unwrap_or(0),
-                        daemon["vms_running"].as_u64().unwrap_or(0)
-                    );
+                if let Some((version, counts)) = daemon {
+                    match counts {
+                        Some((total, running)) => {
+                            println!("daemon {version} ({total} VMs, {running} running)")
+                        }
+                        None => println!("daemon {version} (VM counts unavailable)"),
+                    }
                 }
             }
             Ok(())

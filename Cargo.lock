@@ -1124,6 +1124,7 @@ dependencies = [
  "husker-state",
  "husker-storage",
  "husker-vmm",
+ "rusqlite",
  "serde",
  "serde_json",
  "subtle",

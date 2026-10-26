@@ -1499,6 +1499,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(self.state.list_vms()?)
     }
 
+    /// Count the VMs and the running ones without loading their records.
+    pub fn vm_counts(&self) -> Result<husker_state::VmCounts, CoreError> {
+        Ok(self.state.count_vms()?)
+    }
+
     /// Return the durable hard-lifetime policy for a VM generation.
     pub fn get_vm_expiration(&self, vm_id: Uuid) -> Result<Option<VmExpirationRecord>, CoreError> {
         Ok(self.state.get_vm_expiration(vm_id)?)

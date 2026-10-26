@@ -588,7 +588,9 @@ impl WsShellOutput {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
-    pub vms: VmCounts,
+    /// Fleet counts, or `null` when the state store could not be read; then
+    /// `checks.state_db` is `"degraded"` and so is `status`.
+    pub vms: Option<VmCounts>,
     pub checks: HashMap<String, String>,
     pub uptime_seconds: u64,
     /// Capability-defining backend kind: `"firecracker"`, `"qemu"`, or

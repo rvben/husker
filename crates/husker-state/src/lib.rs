@@ -296,6 +296,15 @@ pub struct PortForwardRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Fleet size as counted in the store, without loading any record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmCounts {
+    /// Every VM record, whatever its state.
+    pub total: u64,
+    /// Records in the `running` state.
+    pub running: u64,
+}
+
 /// Durable ownership of Linux host resources allocated before a VM record can
 /// take ownership. A lease survives daemon restart until creation commits or
 /// cleanup releases it.
@@ -1371,6 +1380,22 @@ impl StateStore {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(records)
+    }
+
+    /// Count the VMs and the running ones in one query, so a health probe
+    /// stays cheap however large the fleet grows.
+    pub fn count_vms(&self) -> Result<VmCounts, StateError> {
+        let conn = self.lock()?;
+        let count = |row: &rusqlite::Row<'_>, index: usize| {
+            let raw: i64 = row.get(index)?;
+            u64::try_from(raw).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, raw))
+        };
+        let (total, running) = conn.query_row(
+            "SELECT COUNT(*), COUNT(CASE WHEN state = ?1 THEN 1 END) FROM vms",
+            params![VmLifecycleState::Running.as_str()],
+            |row| Ok((count(row, 0)?, count(row, 1)?)),
+        )?;
+        Ok(VmCounts { total, running })
     }
 
     /// List all VMs owned by a given service, ordered by ordinal.
@@ -3511,6 +3536,48 @@ mod tests {
 
         let list = store.list_vms().unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn count_vms_agrees_with_the_listing() {
+        let store = StateStore::open_memory().unwrap();
+        assert_eq!(
+            store.count_vms().unwrap(),
+            VmCounts {
+                total: 0,
+                running: 0
+            }
+        );
+
+        let stopped = make_record("vm-stopped");
+        let suspended = make_record("vm-suspended");
+        for record in [&make_record("vm-running"), &stopped, &suspended] {
+            store.insert_vm(record).unwrap();
+        }
+        store
+            .update_vm_state(stopped.id, VmLifecycleState::Stopped)
+            .unwrap();
+        store
+            .update_vm_state(suspended.id, VmLifecycleState::Suspended)
+            .unwrap();
+
+        let counts = store.count_vms().unwrap();
+        assert_eq!(
+            counts,
+            VmCounts {
+                total: 3,
+                running: 1
+            }
+        );
+        let listed = store.list_vms().unwrap();
+        assert_eq!(counts.total as usize, listed.len());
+        assert_eq!(
+            counts.running as usize,
+            listed
+                .iter()
+                .filter(|vm| vm.state == VmLifecycleState::Running)
+                .count()
+        );
     }
 
     #[test]

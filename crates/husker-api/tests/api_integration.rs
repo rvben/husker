@@ -179,6 +179,41 @@ async fn health_counts_vms_correctly() {
     assert_eq!(json["vms"]["running"], 2);
 }
 
+/// A probe that cannot count the fleet must say so, not report an empty one:
+/// an orchestrator reading `vms.total == 0` would take an unreadable store
+/// for an idle daemon.
+#[tokio::test]
+async fn health_withholds_vm_counts_when_the_state_store_cannot_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("husker.db");
+    let state = husker_state::StateStore::open(&db).unwrap();
+    // Take the table away underneath the core's own connection: the only way
+    // to make a count fail on a store that opened fine.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("ALTER TABLE vms RENAME TO vms_unavailable")
+        .unwrap();
+    let storage = husker_storage::StorageConfig {
+        data_dir: dir.path().to_path_buf(),
+        state_dir: dir.path().to_path_buf(),
+    };
+    let app = router(make_core(state, storage, dir.path().join("run")));
+
+    let response = app
+        .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert!(
+        json["vms"].is_null(),
+        "counts must be withheld, never zeroed: {json}"
+    );
+    assert_eq!(json["checks"]["state_db"], "degraded", "{json}");
+    assert_eq!(json["status"], "degraded", "{json}");
+}
+
 #[tokio::test]
 async fn health_includes_subsystem_checks_and_uptime() {
     let app = router(test_core());
