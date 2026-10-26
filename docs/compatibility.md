@@ -28,6 +28,19 @@
   - optional `hint`
   - optional `details`
   - backward-compatible alias `error`
+- Requests the API refuses before a handler runs use the same schema. Their
+  status codes are the HTTP conventions and their kinds are stable:
+  - `invalid_json` (400): the body is not JSON
+  - `invalid_request_body` (422): the body is JSON of the wrong shape, with
+    the field in `message`
+  - `payload_too_large` (413): the body exceeds `max_request_bytes`
+  - `unsupported_media_type` (415): no `Content-Type: application/json`
+  - `invalid_query` (400) and `invalid_path` (400): a query or path
+    parameter does not parse, with the raw value in `message`
+  - `websocket_upgrade_required` (400 or 426): a WebSocket route opened
+    without an upgrade
+  - `route_not_found` (404) and `method_not_allowed` (405, with the `Allow`
+    header)
 
 ## Deprecation workflow
 

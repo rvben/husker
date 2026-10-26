@@ -236,7 +236,9 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
 
     let router = router
         .route("/v1/health", get(health::<B>))
-        .merge(utoipa_swagger_ui::SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi));
+        .merge(utoipa_swagger_ui::SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi))
+        .fallback(crate::extract::route_not_found)
+        .method_not_allowed_fallback(crate::extract::method_not_allowed);
 
     let router = if let Some(token) = auth_token {
         let expected = Arc::new(token.header_value());
@@ -320,7 +322,10 @@ pub fn metrics_router<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
     token: Option<BearerToken>,
 ) -> Router {
-    let router = Router::new().route("/v1/metrics", get(metrics_handler::<B>));
+    let router = Router::new()
+        .route("/v1/metrics", get(metrics_handler::<B>))
+        .fallback(crate::extract::route_not_found)
+        .method_not_allowed_fallback(crate::extract::method_not_allowed);
     let router = if let Some(token) = token {
         let expected = Arc::new(token.header_value());
         router.layer(axum::middleware::from_fn_with_state(

@@ -3,9 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
+use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
@@ -17,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utoipa::OpenApi;
 
 use crate::errors::{error_response_with_hint, map_agent_connect_error, map_error};
+use crate::extract::{Json, Path, Query, WebSocketUpgrade};
 use crate::{AppState, ErrorResponse, ExecRequest, current_policy};
 
 type Failure = (StatusCode, Json<ErrorResponse>);
@@ -285,7 +285,7 @@ pub(crate) async fn remove<B: VmmBackend + 'static>(
 pub(crate) async fn tunnel<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path((name, port)): Path<(String, u16)>,
-    ws: WebSocketUpgrade,
+    WebSocketUpgrade(ws): WebSocketUpgrade,
 ) -> Result<Response, Failure> {
     if port == 0 {
         return Err((

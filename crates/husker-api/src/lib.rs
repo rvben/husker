@@ -20,6 +20,7 @@ type AppState<B> = Arc<HuskerCore<B>>;
 
 mod dto;
 mod errors;
+mod extract;
 mod handlers;
 mod router;
 mod sessions;

@@ -1,7 +1,8 @@
 //! Error envelope and `CoreError` -> HTTP status/code mapping for the husker HTTP API.
 
-use axum::Json;
 use axum::http::StatusCode;
+
+use crate::extract::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 

@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axum::Json;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket};
 use axum::http::{HeaderName, StatusCode};
 use axum::response::IntoResponse;
 use tracing::{debug, info, warn};
@@ -28,6 +27,7 @@ use crate::dto::*;
 use crate::errors::{
     ErrorResponse, error_response, error_response_with_hint, map_agent_connect_error, map_error,
 };
+use crate::extract::{Json, Path, Query, WebSocketUpgrade};
 use crate::{ApiPolicy, current_policy, max_vms, metrics};
 
 /// Default agent-readiness wait for exec when the caller does not specify one.
@@ -1532,7 +1532,7 @@ pub(crate) fn resolve_exec_environment<B: VmmBackend + 'static>(
 pub(crate) async fn exec_ws<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
-    ws: WebSocketUpgrade,
+    WebSocketUpgrade(ws): WebSocketUpgrade,
 ) -> impl IntoResponse {
     info!(audit = "exec_stream_upgrade", vm = %name);
     ws.on_upgrade(move |socket| exec_ws_session(core, name, socket))
@@ -1973,7 +1973,7 @@ pub(crate) async fn write_file_handler<B: VmmBackend + 'static>(
 pub(crate) async fn shell_ws<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
     Path(name): Path<String>,
-    ws: WebSocketUpgrade,
+    WebSocketUpgrade(ws): WebSocketUpgrade,
 ) -> impl IntoResponse {
     info!(audit = "shell_upgrade", vm = %name);
     ws.on_upgrade(move |socket| shell_ws_session(core, name, socket))

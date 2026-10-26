@@ -70,6 +70,30 @@ async fn response_text(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// Assert a request was refused with `status` and the error envelope carrying
+/// `kind`, and return the envelope for message and hint checks. Requests the
+/// API refuses before a handler runs (unparseable bodies, unknown routes) must
+/// answer with the same envelope as every handler error, or a client cannot
+/// tell them apart from a proxy's plain-text page.
+async fn rejected(
+    response: axum::response::Response,
+    status: StatusCode,
+    kind: &str,
+) -> serde_json::Value {
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/json",
+        "a rejection must be JSON"
+    );
+    let json = response_json(response).await;
+    assert_eq!(json["kind"], kind, "{json}");
+    let message = json["message"].as_str().expect("message is a string");
+    assert!(!message.is_empty(), "{json}");
+    assert_eq!(json["error"], json["message"], "the legacy alias: {json}");
+    json
+}
+
 // ── Health Endpoint ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -213,19 +237,29 @@ async fn metrics_router_serves_only_metrics_not_the_api() {
     let body = response_text(response).await;
     assert!(body.contains("husker_vms_total"));
 
-    // No other route is mounted on the metrics listener.
+    // No other route is mounted on the metrics listener, and the refusal uses
+    // the same envelope as the API listener.
     for path in ["/v1/vms", "/v1/health", "/v1/diagnostics", "/v1/secrets"] {
         let response = app
             .clone()
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "{path} must not be reachable on the metrics-only listener"
-        );
+        let json = rejected(response, StatusCode::NOT_FOUND, "route_not_found").await;
+        assert_eq!(json["message"], format!("no route for GET {path}"));
     }
+
+    let response = app
+        .oneshot(Request::post("/v1/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json = rejected(
+        response,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    )
+    .await;
+    assert_eq!(json["message"], "POST is not allowed on /v1/metrics");
 }
 
 #[tokio::test]
@@ -798,8 +832,54 @@ async fn create_vm_without_content_type_returns_unsupported_media_type() {
         .await
         .unwrap();
 
-    // axum returns 415 when Content-Type header is missing for Json extractor
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let json = rejected(
+        response,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported_media_type",
+    )
+    .await;
+    assert_eq!(
+        json["hint"],
+        "send the body with Content-Type: application/json"
+    );
+}
+
+#[tokio::test]
+async fn create_vm_over_the_body_limit_returns_413_with_the_limit_in_the_message() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            husker_api::set_policy(husker_api::ApiPolicy::default());
+        }
+    }
+    let _reset = Reset;
+    husker_api::set_policy(husker_api::ApiPolicy {
+        max_request_bytes: 64,
+        ..Default::default()
+    });
+    // The router reads the limit when it is built.
+    let app = router(test_core());
+    let body = serde_json::json!({
+        "name": "test-vm",
+        "kernel_path": format!("/{}", "k".repeat(64)),
+        "rootfs_path": "/nonexistent/rootfs.ext4"
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/vms")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let json = rejected(response, StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large").await;
+    assert_eq!(json["message"], "request body exceeds the 64 byte limit");
+    assert!(
+        json["hint"].as_str().unwrap().contains("max_request_bytes"),
+        "{json}"
+    );
 }
 
 // ── POST /vms with Invalid JSON ──────────────────────────────────────
@@ -817,8 +897,14 @@ async fn create_vm_with_invalid_json_returns_400() {
         .await
         .unwrap();
 
-    // axum returns 400 for syntactically invalid JSON
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = rejected(response, StatusCode::BAD_REQUEST, "invalid_json").await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Failed to parse the request body as JSON"),
+        "{json}"
+    );
 }
 
 // ── POST /vms with Missing Required Fields ───────────────────────────
@@ -840,7 +926,19 @@ async fn create_vm_missing_name_returns_422() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = rejected(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_request_body",
+    )
+    .await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `name`"),
+        "{json}"
+    );
 }
 
 // ── POST /vms with Bad Kernel Path ───────────────────────────────────
@@ -1072,7 +1170,15 @@ async fn unknown_route_returns_404() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = rejected(response, StatusCode::NOT_FOUND, "route_not_found").await;
+    assert_eq!(json["message"], "no route for GET /v1/nonexistent");
+    assert!(
+        json["hint"]
+            .as_str()
+            .unwrap()
+            .contains("/api-docs/openapi.json"),
+        "{json}"
+    );
 }
 
 #[tokio::test]
@@ -1084,7 +1190,85 @@ async fn wrong_method_returns_405() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    // The hint points at the Allow header, so the header must be there.
+    let allow = response.headers()["allow"].to_str().unwrap().to_string();
+    let json = rejected(
+        response,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    )
+    .await;
+    assert_eq!(json["message"], "PUT is not allowed on /v1/vms");
+    assert_eq!(
+        json["hint"],
+        "the Allow header lists the methods this route accepts"
+    );
+    for method in ["GET", "POST"] {
+        assert!(allow.contains(method), "Allow: {allow}");
+    }
+}
+
+#[tokio::test]
+async fn unparseable_path_parameter_returns_400_with_the_envelope() {
+    let app = router(test_core());
+    let response = app
+        .oneshot(
+            Request::delete("/v1/vms/ghost/ports/notaport")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let json = rejected(response, StatusCode::BAD_REQUEST, "invalid_path").await;
+    assert!(json["message"].as_str().unwrap().contains("u16"), "{json}");
+}
+
+#[tokio::test]
+async fn websocket_route_opened_without_an_upgrade_returns_the_envelope() {
+    let app = router(test_core());
+
+    // A plain GET carries no Connection: upgrade header.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/vms/ghost/shell")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = rejected(
+        response,
+        StatusCode::BAD_REQUEST,
+        "websocket_upgrade_required",
+    )
+    .await;
+    assert!(
+        json["hint"].as_str().unwrap().contains("WebSocket client"),
+        "{json}"
+    );
+
+    // The handshake headers without a connection that can actually upgrade
+    // (what a proxy that strips the upgrade produces) keep the same kind.
+    let response = app
+        .oneshot(
+            Request::get("/v1/vms/ghost/exec/stream")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    rejected(
+        response,
+        StatusCode::UPGRADE_REQUIRED,
+        "websocket_upgrade_required",
+    )
+    .await;
 }
 
 // ── VmResponse Deserialization ───────────────────────────────────────
@@ -1315,7 +1499,13 @@ async fn list_vms_pages_in_creation_order_and_reports_the_fleet_size() {
         .oneshot(Request::get("/v1/vms?limit=x").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let json = rejected(malformed, StatusCode::BAD_REQUEST, "invalid_query").await;
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("invalid query string `limit=x`: "),
+        "{message}"
+    );
+    assert!(message.contains("invalid digit"), "{message}");
 }
 
 // ── Exec with Missing Required Fields ────────────────────────────────
@@ -1336,8 +1526,19 @@ async fn exec_without_command_field_returns_422() {
         .await
         .unwrap();
 
-    // Missing required field "command" should return 422 (JSON parse error)
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = rejected(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_request_body",
+    )
+    .await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `command`"),
+        "{json}"
+    );
 }
 
 // ── Exec with Empty Body ─────────────────────────────────────────────
@@ -1355,8 +1556,7 @@ async fn exec_with_empty_body_returns_400() {
         .await
         .unwrap();
 
-    // axum returns 400 for empty body (syntactically invalid JSON)
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    rejected(response, StatusCode::BAD_REQUEST, "invalid_json").await;
 }
 
 // ── Read File with Missing Path Field ────────────────────────────────
@@ -1375,7 +1575,19 @@ async fn read_file_missing_path_returns_422() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = rejected(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_request_body",
+    )
+    .await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `path`"),
+        "{json}"
+    );
 }
 
 // ── Write File with Missing Fields ───────────────────────────────────
@@ -1396,7 +1608,19 @@ async fn write_file_missing_data_returns_422() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = rejected(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_request_body",
+    )
+    .await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `data`"),
+        "{json}"
+    );
 }
 
 // ── Port Forward Endpoints ───────────────────────────────────────────
@@ -1477,7 +1701,19 @@ async fn add_port_forward_missing_fields_returns_422() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = rejected(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_request_body",
+    )
+    .await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `guest_port`"),
+        "{json}"
+    );
 }
 
 #[tokio::test]
@@ -1493,7 +1729,7 @@ async fn add_port_forward_invalid_json_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    rejected(response, StatusCode::BAD_REQUEST, "invalid_json").await;
 }
 
 #[tokio::test]
