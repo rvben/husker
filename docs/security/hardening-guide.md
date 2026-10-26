@@ -31,7 +31,13 @@
   - `allowed_read_paths = ["/tmp", "/var/log"]`
   - `allowed_write_paths = ["/tmp"]`
 - Constrain command execution:
-  - `exec_allowlist` and `exec_denylist`
+  - `exec_allowlist` and `exec_denylist`. The allowlist matches the request's
+    command exactly as written (`echo` admits `echo`, not `/bin/echo`; list a
+    shell by path to admit it). The denylist matches by program, so `rm` also
+    blocks `/bin/rm` and `./rm`, and `/bin/rm` also blocks a bare `rm`. Neither
+    list sees through an interpreter (`sh -c ...` is the command `sh`), so the
+    allowlist is the control and the denylist a guard against mistakes. The
+    interactive shell answers to the same lists.
   - `exec_env_allowlist`
   - `exec_timeout_secs`
 

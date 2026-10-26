@@ -138,8 +138,40 @@ pub(crate) fn is_allowed_host_path(path: &str, allowlist: &[String]) -> bool {
     })
 }
 
+/// The program name a command string refers to: the last path component, or
+/// the whole string when it carries no `/`.
+fn program_name(command: &str) -> &str {
+    command.rsplit('/').next().unwrap_or(command)
+}
+
+/// Whether a denylist entry and a request's command name the same program.
+///
+/// Two paths must be equal. When either side is a bare name the program names
+/// are compared, so `rm` covers `/bin/rm`, `/usr/bin/rm` and `./rm` as well as
+/// a PATH-resolved `rm`, and `/bin/rm` covers a bare `rm`. A deny is read
+/// broadly because every spelling of a banned program has to be caught.
+fn same_program(entry: &str, command: &str) -> bool {
+    if entry.contains('/') && command.contains('/') {
+        entry == command
+    } else {
+        program_name(entry) == program_name(command)
+    }
+}
+
+/// Whether the execution policy admits `command` as a request's program.
+///
+/// The denylist is matched by program ([`same_program`]); the allowlist is
+/// matched on the command exactly as written, so an allow for `echo` does not
+/// admit `/tmp/evil/echo`, and an operator who wants a shell by path lists the
+/// path. Neither list sees through an interpreter: a request whose command is
+/// `sh` runs whatever its arguments say, so the allowlist is the control and
+/// the denylist a guard against mistakes.
 pub(crate) fn exec_command_allowed(command: &str, policy: &ApiPolicy) -> bool {
-    if policy.exec_denylist.iter().any(|c| c == command) {
+    if policy
+        .exec_denylist
+        .iter()
+        .any(|entry| same_program(entry, command))
+    {
         return false;
     }
     if policy.exec_allowlist.is_empty() {

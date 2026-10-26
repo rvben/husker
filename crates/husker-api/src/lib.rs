@@ -2210,6 +2210,56 @@ mod tests {
         assert!(exec_env_allowed(&env, &policy));
     }
 
+    /// A banned program stays banned however the request spells it: a bare
+    /// entry covers every path to that name, and a path entry covers the bare
+    /// name. Two different paths are different programs.
+    #[test]
+    fn exec_denylist_matches_every_spelling_of_the_program() {
+        let policy = ApiPolicy {
+            exec_denylist: vec!["rm".into()],
+            ..ApiPolicy::default()
+        };
+        for spelling in ["rm", "/bin/rm", "/usr/bin/rm", "./rm"] {
+            assert!(
+                !exec_command_allowed(spelling, &policy),
+                "{spelling} is rm and must be denied"
+            );
+        }
+        for other in ["rmdir", "/bin/rmx", "/bin/rm/"] {
+            assert!(
+                exec_command_allowed(other, &policy),
+                "{other} is not rm and must pass"
+            );
+        }
+
+        let policy = ApiPolicy {
+            exec_denylist: vec!["/bin/rm".into()],
+            ..ApiPolicy::default()
+        };
+        assert!(!exec_command_allowed("/bin/rm", &policy));
+        assert!(!exec_command_allowed("rm", &policy));
+        assert!(exec_command_allowed("/usr/bin/rm", &policy));
+    }
+
+    /// An allow admits the command exactly as listed, so a bare name does not
+    /// admit a same-named binary from an arbitrary directory, and a path does
+    /// not admit whatever the guest's PATH resolves the bare name to.
+    #[test]
+    fn exec_allowlist_matches_the_command_as_written() {
+        let policy = ApiPolicy {
+            exec_allowlist: vec!["echo".into(), "/bin/sh".into()],
+            ..ApiPolicy::default()
+        };
+        assert!(exec_command_allowed("echo", &policy));
+        assert!(exec_command_allowed("/bin/sh", &policy));
+        for other in ["/bin/echo", "/tmp/evil/echo", "sh", "/usr/bin/sh"] {
+            assert!(
+                !exec_command_allowed(other, &policy),
+                "{other} is not listed as written and must be denied"
+            );
+        }
+    }
+
     #[test]
     fn rate_limited_route_classification() {
         assert_eq!(

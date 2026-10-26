@@ -115,6 +115,11 @@
 # exec_timeout_secs = 30
 # Upper bound for per-request exec timeouts (husker exec/job --timeout).
 # exec_timeout_max_secs = 3600
+# The allowlist matches the request's command exactly as written: "echo" admits
+# "echo" but not "/bin/echo"; list a shell by its path to admit it. The denylist
+# matches by program: "rm" also blocks "/bin/rm" and "./rm", and "/bin/rm" also
+# blocks a bare "rm". Neither list sees through an interpreter ("sh -c ..."), so
+# the allowlist is the control and the denylist a guard against mistakes.
 # exec_allowlist = ["echo", "ls", "cat"]
 # exec_denylist = ["rm", "mkfs", "dd"]
 # exec_env_allowlist = ["PATH", "HOME", "TERM"]
