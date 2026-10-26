@@ -754,6 +754,16 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
 
+        // Apple VZ attaches no host directories, so a mount request fails here
+        // rather than producing a VM without the share the caller asked for.
+        if !req.mounts.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "host bind-mounts (--mount) are only supported on Linux; copy files in with \
+                 `husker cp`, or run a job with --sync-cwd"
+                    .into(),
+            ));
+        }
+
         let backend_selection = self
             .vmm
             .select_backend(husker_vmm::BackendRequirements {

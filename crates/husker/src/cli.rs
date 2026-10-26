@@ -270,7 +270,7 @@ pub(crate) enum Commands {
         volume: Option<String>,
 
         /// Bind-mount a host directory into the guest over virtiofs as host:guest[:ro]
-        /// (repeatable; QEMU only - pass --vmm qemu)
+        /// (repeatable; Linux only, served by the QEMU backend)
         #[arg(long)]
         mount: Vec<String>,
 
@@ -498,7 +498,7 @@ pub(crate) enum Commands {
         volume: Option<String>,
 
         /// Bind-mount a host directory into the guest over virtiofs as host:guest[:ro]
-        /// (repeatable; QEMU only - pass --vmm qemu)
+        /// (repeatable; Linux only, served by the QEMU backend)
         #[arg(long)]
         mount: Vec<String>,
 

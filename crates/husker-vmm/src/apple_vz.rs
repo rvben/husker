@@ -527,6 +527,11 @@ impl VmmBackend for AppleVzBackend {
         config: VmConfig,
     ) -> Result<CreatedVm, VmmError> {
         selection.validate_for_backend(&config, BackendKind::AppleVz)?;
+        if !config.host_shares.is_empty() {
+            return Err(VmmError::Unsupported(
+                "host bind-mounts (--mount) are not supported on Apple VZ".into(),
+            ));
+        }
         {
             let instances = self.instances.lock().await;
             if instances.values().any(|i| i.info.name == config.name) {
@@ -1049,6 +1054,33 @@ mod tests {
         assert!(
             matches!(&result, Err(VmmError::InvalidConfig(msg)) if msg.contains("OVMF boot")),
             "expected InvalidConfig with OVMF hint, got {result:?}"
+        );
+    }
+
+    /// A host share is refused before the serial log or any VZ object exists:
+    /// the backend has no virtiofs device, and a VM without the share the
+    /// caller asked for must not come up.
+    #[tokio::test]
+    async fn host_shares_are_rejected_before_any_vz_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
+        let mut config = minimal_config_with_boot(crate::BootMode::DirectKernel);
+        config.host_shares = vec![crate::HostShare {
+            host: "/srv/work".into(),
+            guest: "/work".into(),
+            read_only: false,
+            tag: "fs0".into(),
+        }];
+        let result = backend
+            .create_vm(backend.select_backend_for_config(&config).unwrap(), config)
+            .await;
+        assert!(
+            matches!(&result, Err(VmmError::Unsupported(msg)) if msg.contains("--mount")),
+            "expected Unsupported naming --mount, got {result:?}"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a refused VM must leave no runtime file behind"
         );
     }
 }

@@ -3735,6 +3735,42 @@ mod kernel_args_composition {
         );
     }
 
+    /// The macOS build has no virtiofs backend, so a mount request is refused
+    /// before any resource is allocated. The images are real files and the
+    /// mock backend accepts every config, so without the check this request
+    /// would produce a running VM that lacks the share it asked for.
+    #[tokio::test]
+    async fn create_vm_refuses_host_mounts_without_a_virtiofs_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("vmlinux");
+        std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
+        let rootfs = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+        let (core, _mock) = make_capturing_core(&tmp);
+
+        let error = core
+            .create_vm(CreateVmRequest {
+                name: "mounted".into(),
+                kernel_path: Some(kernel),
+                rootfs_path: Some(rootfs),
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                mounts: vec!["/srv/work:/work".into()],
+                ..Default::default()
+            })
+            .await
+            .expect_err("a mount request must not produce a VM");
+
+        assert!(
+            matches!(&error, CoreError::InvalidArgument(msg) if msg.contains("only supported on Linux")),
+            "expected InvalidArgument naming Linux, got {error:?}"
+        );
+        assert!(
+            core.list_vms().unwrap().is_empty(),
+            "a refused request must leave no VM record behind"
+        );
+    }
+
     #[tokio::test]
     async fn direct_kernel_without_initrd_has_root_arg() {
         let tmp = tempfile::tempdir().unwrap();

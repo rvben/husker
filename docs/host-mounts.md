@@ -12,6 +12,7 @@ inside the guest without copying.
 | Host changes visible in guest? | Yes, immediately | No - snapshot at launch |
 | Guest writes visible on host? | Yes, immediately | Only via `--out` / `--write-back` |
 | QEMU only? | Yes | No |
+| Linux only? | Yes (rejected on macOS) | No |
 | Works with `--pool`? | Yes (QEMU pool) | Yes |
 
 Use `--mount` when the guest needs to read or write host files in real time
@@ -108,6 +109,11 @@ QEMU backend. When `--vmm` is unset, husker selects QEMU automatically as soon
 as a `--mount` is present, so you do not need to pass `--vmm qemu`. Passing
 `--vmm firecracker` together with `--mount` is rejected rather than silently
 producing a VM without the share.
+
+**Linux only.** The macOS build (Apple VZ) has no virtiofs device, so `husker
+run --mount` and `husker job --mount` are rejected at create time there, with
+the same reasoning: a VM must not come up without the share it was asked for.
+On macOS, copy files in with `husker cp`, or run a job with `--sync-cwd`.
 
 **Cloud-image (UEFI) VMs.** When booting with `--cloud-image`, the virtiofs
 device is attached to the VM but the guest does not receive the

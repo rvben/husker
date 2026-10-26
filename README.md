@@ -278,8 +278,9 @@ range. The guest IP appears in `husker info ubuntu` once the agent reports it (t
 within 20-30 seconds of first boot). Connect with `husker shell ubuntu` or via SSH once
 the IP is known.
 
-**Not yet supported on macOS with cloud images:** `--volume`, `--mount`, `--balloon`, and services
-(`husker service`). Bridged networking (`--net bridged`) is Linux-only.
+**Not yet supported on macOS with cloud images:** `--volume`, `--balloon`, and services
+(`husker service`). Host bind-mounts (`--mount`) and bridged networking (`--net bridged`)
+are Linux-only with any image.
 
 ### macOS guests
 
