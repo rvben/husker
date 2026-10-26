@@ -434,7 +434,9 @@ async fn download(url: &str, dest: &Path, output: OutputFormat) -> Result<()> {
             .await
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut resp = reqwest::get(url)
+    let mut resp = husker::http::client(husker::http::HttpTimeouts::default())?
+        .get(url)
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()

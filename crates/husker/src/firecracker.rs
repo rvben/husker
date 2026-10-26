@@ -61,7 +61,9 @@ pub async fn install(data_dir: &Path) -> Result<PathBuf> {
     let dest = bin_dir.join("firecracker");
 
     eprintln!("Downloading {url}");
-    let response = reqwest::get(&url)
+    let response = crate::http::client(crate::http::HttpTimeouts::default())?
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     if !response.status().is_success() {

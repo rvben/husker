@@ -3356,55 +3356,76 @@ async fn image_command(
             }
         }
         ImageAction::Pull { from, force } => {
+            use husker::images::{AssetState, PullStage};
+
             let config = load_config(None);
+            let timeouts = husker::http::HttpTimeouts::default();
             let configured = from.unwrap_or(config.images_base_url.clone());
-            let base_url = husker::images::resolve_download_base(&configured)
+            let base_url = husker::images::resolve_download_base(&configured, timeouts)
                 .await
                 .context("resolving images release URL")?;
             if base_url != configured {
                 eprintln!("Resolved {configured} -> {base_url}");
             }
-            let manifest = husker::images::fetch_manifest(&base_url)
+            let manifest = husker::images::fetch_manifest(&base_url, timeouts)
                 .await
                 .context("fetching SHA256SUMS manifest")?;
 
             let targets = config.image_pull_targets(std::env::consts::ARCH);
+            let specs = husker::images::release_specs(&base_url, &manifest, &targets)?;
 
             // The kernel and initramfs must come from the SAME image release: a
             // stale kernel paired with a freshly downloaded initramfs fails module
-            // loading. So treat the asset set as all-or-nothing rather than skipping
-            // per-file: only skip when every destination already exists, otherwise
-            // (re)download all of them from this manifest so the set stays matched.
-            let all_present = targets.iter().all(|(_, dest)| dest.exists());
-            if all_present && !force {
-                eprintln!("All default images already present (pass --force to re-download).");
+            // loading, so the asset set is pulled as one unit. When every
+            // destination already exists the files are compared with the release
+            // instead of replaced: one that differs may be an operator's
+            // customised image, and only --force overwrites it.
+            let all_present = specs.iter().all(|spec| spec.dest.exists());
+            let (assets, summary) = if all_present && !force {
+                let assets = husker::images::compare_installed(&specs).await?;
+                let differing: Vec<&str> = assets
+                    .iter()
+                    .filter(|asset| asset.state == AssetState::Differs)
+                    .map(|asset| asset.name.as_str())
+                    .collect();
+                let summary = if differing.is_empty() {
+                    "All default images already present and match the release (pass --force \
+                     to re-download)."
+                        .to_string()
+                } else {
+                    format!(
+                        "All default images already present; {} differ from the release: {} \
+                         (pass --force to replace them).",
+                        differing.len(),
+                        differing.join(", ")
+                    )
+                };
+                (assets, summary)
             } else {
-                for (asset, dest) in &targets {
-                    let sha = manifest.get(asset).ok_or_else(|| {
-                        anyhow::anyhow!("{asset} missing from manifest at {base_url}")
-                    })?;
-                    let url = format!("{}/{}", base_url.trim_end_matches('/'), asset);
-                    eprintln!("Downloading {url} -> {}", dest.display());
-                    husker::images::fetch_and_verify(husker::images::DownloadSpec {
-                        url,
-                        expected_sha256: sha.clone(),
-                        dest: dest.clone(),
+                let assets =
+                    husker::images::pull_image_set(&specs, timeouts, |spec, stage| match stage {
+                        PullStage::Downloading => {
+                            eprintln!("Downloading {} -> {}", spec.url, spec.dest.display())
+                        }
+                        PullStage::Verified => eprintln!("Verified {}", spec.dest.display()),
                     })
                     .await?;
-                    eprintln!("Verified {}", dest.display());
-                }
-            }
+                let summary = format!("Installed {} images.", assets.len());
+                (assets, summary)
+            };
 
             print_output(
                 output,
                 &serde_json::json!({
                     "status": "ok",
                     "action": "image-pull",
+                    "source": base_url,
                     "kernel": config.default_kernel,
                     "rootfs": config.default_rootfs,
                     "initrd": config.default_initrd,
+                    "assets": assets,
                 }),
-                "Images pulled.",
+                summary,
             );
         }
     }

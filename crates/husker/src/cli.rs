@@ -1595,9 +1595,11 @@ const IMAGE_EXPORT: &[F] = &[
 const IMAGE_PULL: &[F] = &[
     F::required("status", T::String),
     F::required("action", T::String),
+    F::required("source", T::String),
     F::required("kernel", T::String),
     F::required("rootfs", T::String),
     F::required("initrd", T::NullableString),
+    F::required("assets", T::Array),
 ];
 const MACOS_IMAGE_ACTION: &[F] = &[
     F::required("status", T::String),
@@ -1752,7 +1754,7 @@ pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
     CommandContract::object("image get", Effects::ReadOnly, IMAGE_ACTION),
     CommandContract::object("image export", Effects::Idempotent, IMAGE_EXPORT),
     CommandContract::object("image delete", Effects::Idempotent, IMAGE_DELETE),
-    CommandContract::object("image pull", Effects::NonIdempotent, IMAGE_PULL),
+    CommandContract::object("image pull", Effects::Idempotent, IMAGE_PULL),
     CommandContract::object("macos install", Effects::NonIdempotent, MACOS_IMAGE_ACTION),
     CommandContract::list(
         "macos list",

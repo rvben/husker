@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-const GITHUB_API_USER_AGENT: &str = concat!("husker/", env!("CARGO_PKG_VERSION"));
+use crate::http::{self, HttpTimeouts};
 
 /// Prefix used on image-release tags produced by `build-images.yml`.
 /// A separate prefix keeps the images releases out of the semver "latest"
@@ -18,11 +18,47 @@ const IMAGES_TAG_PREFIX: &str = "images-";
 /// images release, because every `v*` release triggers an image build.
 const MAX_RELEASE_PAGES: u32 = 10;
 
+/// One asset of an image release and the path it is installed at.
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
+    /// Asset name as listed in the release manifest, e.g. `kernel-x86_64`.
+    pub name: String,
     pub url: String,
     pub expected_sha256: String,
     pub dest: PathBuf,
+}
+
+/// How an installed default image relates to the release it was compared
+/// with or pulled from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetState {
+    /// Downloaded, verified and installed by this run.
+    Installed,
+    /// Already present and identical to the release asset.
+    Current,
+    /// Already present but different from the release asset. It is left in
+    /// place: an operator may have customised it on purpose, and only
+    /// `--force` replaces it.
+    Differs,
+}
+
+/// The outcome for one default image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssetReport {
+    pub name: String,
+    pub path: PathBuf,
+    pub state: AssetState,
+}
+
+/// Milestones `pull_image_set` reports for each asset, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullStage {
+    /// The download of this asset is starting.
+    Downloading,
+    /// The asset is downloaded and its digest matches the manifest. It is not
+    /// installed until every asset in the set has reached this point.
+    Verified,
 }
 
 /// Parse an Alpine-style `SHA256SUMS` manifest: one entry per line as
@@ -41,11 +77,121 @@ pub fn parse_manifest(contents: &str) -> HashMap<String, String> {
         .collect()
 }
 
-pub async fn fetch_and_verify(spec: DownloadSpec) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .build()
-        .context("building http client")?;
+/// Build the download set for `targets` (asset name, destination) from a
+/// release manifest. Every asset is looked up before anything is downloaded,
+/// so a manifest that lacks one fails the pull before it touches the data dir.
+pub fn release_specs(
+    base_url: &str,
+    manifest: &HashMap<String, String>,
+    targets: &[(String, PathBuf)],
+) -> Result<Vec<DownloadSpec>> {
+    let base = base_url.trim_end_matches('/');
+    targets
+        .iter()
+        .map(|(name, dest)| {
+            let sha = manifest
+                .get(name)
+                .ok_or_else(|| anyhow!("{name} missing from manifest at {base_url}"))?;
+            Ok(DownloadSpec {
+                name: name.clone(),
+                url: format!("{base}/{name}"),
+                expected_sha256: sha.clone(),
+                dest: dest.clone(),
+            })
+        })
+        .collect()
+}
 
+/// Download and install a set of release assets as one unit.
+///
+/// Every asset is streamed to a staging file beside its destination and
+/// checked against its manifest digest. Only when all of them verify are they
+/// moved into place, so a failure part way through the set, whether a network
+/// error, a missing asset or a corrupt download, installs nothing: the kernel
+/// and initramfs on disk always come from the same release. Each staging file
+/// is flushed to stable storage before it is installed and its directory is
+/// flushed afterwards, so a crash right after a pull cannot leave a truncated
+/// image under a complete-looking name.
+pub async fn pull_image_set(
+    specs: &[DownloadSpec],
+    timeouts: HttpTimeouts,
+    mut progress: impl FnMut(&DownloadSpec, PullStage),
+) -> Result<Vec<AssetReport>> {
+    let client = http::client(timeouts)?;
+
+    let mut staged: Vec<PathBuf> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        progress(spec, PullStage::Downloading);
+        match stage(&client, spec).await {
+            Ok(part) => staged.push(part),
+            Err(e) => {
+                discard(&staged).await;
+                return Err(e);
+            }
+        }
+        progress(spec, PullStage::Verified);
+    }
+
+    for (spec, part) in specs.iter().zip(&staged) {
+        if let Err(e) = install(part, &spec.dest).await {
+            discard(&staged).await;
+            return Err(e);
+        }
+    }
+
+    Ok(specs
+        .iter()
+        .map(|spec| spec.report(AssetState::Installed))
+        .collect())
+}
+
+/// Compare the installed files of `specs` with their manifest digests without
+/// downloading anything. Every file is read in full, so this costs a few
+/// seconds for a rootfs.
+pub async fn compare_installed(specs: &[DownloadSpec]) -> Result<Vec<AssetReport>> {
+    let mut reports = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let state = if sha256_file(&spec.dest).await? == spec.expected_sha256 {
+            AssetState::Current
+        } else {
+            AssetState::Differs
+        };
+        reports.push(spec.report(state));
+    }
+    Ok(reports)
+}
+
+impl DownloadSpec {
+    fn report(&self, state: AssetState) -> AssetReport {
+        AssetReport {
+            name: self.name.clone(),
+            path: self.dest.clone(),
+            state,
+        }
+    }
+}
+
+/// Download one asset into its staging file and verify the digest. The
+/// staging file is removed on any failure.
+async fn stage(client: &reqwest::Client, spec: &DownloadSpec) -> Result<PathBuf> {
+    let dir = parent_dir(&spec.dest);
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating parent dir {}", dir.display()))?;
+
+    let part = staging_path(&spec.dest);
+    let result = download_verified(client, spec, &part).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    result.map(|()| part)
+}
+
+async fn download_verified(
+    client: &reqwest::Client,
+    spec: &DownloadSpec,
+    part: &Path,
+) -> Result<()> {
     let mut resp = client
         .get(&spec.url)
         .send()
@@ -54,48 +200,109 @@ pub async fn fetch_and_verify(spec: DownloadSpec) -> Result<()> {
         .error_for_status()
         .with_context(|| format!("GET {}", spec.url))?;
 
-    if let Some(parent) = spec.dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating parent dir {}", parent.display()))?;
-    }
-
-    let tmp = spec.dest.with_file_name(format!(
-        "{}.part",
-        spec.dest.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    let mut file = tokio::fs::File::create(&tmp)
+    let mut file = tokio::fs::File::create(part)
         .await
-        .with_context(|| format!("opening {}", tmp.display()))?;
-
+        .with_context(|| format!("opening {}", part.display()))?;
     let mut hasher = Sha256::new();
-    while let Some(chunk) = resp.chunk().await.context("reading response chunk")? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("reading {}", spec.url))?
+    {
         hasher.update(&chunk);
-        file.write_all(&chunk).await.context("writing chunk")?;
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("writing {}", part.display()))?;
     }
-    file.flush().await.context("flushing download")?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("flushing {}", part.display()))?;
     drop(file);
 
     let got = hex::encode(hasher.finalize());
     if got != spec.expected_sha256 {
-        let _ = tokio::fs::remove_file(&tmp).await;
         return Err(anyhow!(
             "sha256 mismatch for {}: expected {}, got {}",
-            spec.dest.display(),
+            spec.name,
             spec.expected_sha256,
             got,
         ));
     }
-
-    tokio::fs::rename(&tmp, &spec.dest)
-        .await
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), spec.dest.display()))?;
     Ok(())
 }
 
-pub async fn fetch_manifest(base_url: &str) -> Result<HashMap<String, String>> {
+/// Move a verified staging file onto its destination and flush the directory
+/// so the rename itself survives a crash.
+async fn install(part: &Path, dest: &Path) -> Result<()> {
+    tokio::fs::rename(part, dest)
+        .await
+        .with_context(|| format!("renaming {} -> {}", part.display(), dest.display()))?;
+    let dir = parent_dir(dest);
+    tokio::fs::File::open(dir)
+        .await
+        .with_context(|| format!("opening {}", dir.display()))?
+        .sync_all()
+        .await
+        .with_context(|| format!("flushing {}", dir.display()))
+}
+
+/// Remove the staging files of a pull that did not complete. Errors are
+/// ignored: the pull is already failing for a better reason, and an asset
+/// installed before the failure no longer exists at its staging path.
+async fn discard(staged: &[PathBuf]) {
+    for part in staged {
+        let _ = tokio::fs::remove_file(part).await;
+    }
+}
+
+fn staging_path(dest: &Path) -> PathBuf {
+    dest.with_file_name(format!(
+        "{}.part",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+/// The directory a destination lives in. A bare file name has the current
+/// directory as its parent, which `Path::parent` reports as an empty path.
+fn parent_dir(dest: &Path) -> &Path {
+    match dest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+async fn sha256_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    })
+    .await
+    .context("hashing an installed image")?
+}
+
+pub async fn fetch_manifest(
+    base_url: &str,
+    timeouts: HttpTimeouts,
+) -> Result<HashMap<String, String>> {
     let url = format!("{}/SHA256SUMS", base_url.trim_end_matches('/'));
-    let body = reqwest::get(&url)
+    let body = http::client(timeouts)?
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
@@ -116,7 +323,7 @@ struct GithubRelease {
 /// specific release, return it unchanged. Otherwise treat it as a GitHub
 /// repo URL and ask the API for the newest release whose tag starts with
 /// `images-`.
-pub async fn resolve_download_base(config_url: &str) -> Result<String> {
+pub async fn resolve_download_base(config_url: &str, timeouts: HttpTimeouts) -> Result<String> {
     let trimmed = config_url.trim_end_matches('/');
     if trimmed.contains("/releases/download/") {
         return Ok(trimmed.to_string());
@@ -136,10 +343,7 @@ pub async fn resolve_download_base(config_url: &str) -> Result<String> {
             )
         })?;
 
-    let client = reqwest::Client::builder()
-        .user_agent(GITHUB_API_USER_AGENT)
-        .build()
-        .context("building http client")?;
+    let client = http::client(timeouts)?;
 
     // Walk the release pages newest-first until one carries an images-* tag.
     // Reading only the first page would silently resolve a STALE release once

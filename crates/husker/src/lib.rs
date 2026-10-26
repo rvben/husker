@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 pub mod firecracker;
+pub mod http;
 pub mod images;
 pub mod storage_setup;
 
