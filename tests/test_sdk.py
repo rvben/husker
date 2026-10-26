@@ -7,7 +7,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from husker import Client, CapabilityUnsupported, Conflict, NotFound, Unauthorized
+from husker import (CapabilityUnsupported, Client, CommandFailed, Conflict, FileChanged,
+                    NotFound, Unauthorized)
 
 ID = "01234567-89ab-cdef-0123-456789abcdef"
 INFO = dict(id=ID, command="sh", state="completed", created_at=1,
@@ -158,8 +159,13 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(b"".join(chunks), self.server.file_data)
         self.assertTrue(all(len(c) <= 103 for c in chunks))
         self.server.change_file = True
-        with self.assertRaises(Conflict):
+        with self.assertRaises(FileChanged) as raised:
             list(vm.iter_file("/workspace/large", chunk_size=103))
+        # The SDK detected the change itself: a Conflict for existing handlers,
+        # without a daemon error kind.
+        self.assertIsInstance(raised.exception, Conflict)
+        self.assertIsNone(raised.exception.kind)
+        self.assertIsNone(raised.exception.status)
         source = io.BytesIO(self.server.file_data)
         self.assertEqual(vm.upload("/workspace/upload", source, mode=0o600, chunk_size=103), 1280)
         writes = [r[3] for r in self.server.requests if r[1].endswith("/files/write")]
@@ -169,6 +175,21 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(all(w["append"] and w["mode"] is None for w in writes[1:]))
         self.assertEqual(vm.upload("/workspace/empty", io.BytesIO()), 0)
         self.assertFalse(self.server.requests[-1][3]["append"])
+
+    def test_exec_check_raises_command_failed_with_the_result(self):
+        vm = self.client.connect("dev")
+        self.server.health = [3]
+        with self.assertRaises(CommandFailed) as raised:
+            vm.exec(["false"], check=True)
+        error = raised.exception
+        self.assertEqual(error.result.exit_code, 3)
+        self.assertEqual(error.result.stdout, "hello")
+        self.assertIn("exited with 3", str(error))
+        # No daemon error was involved, so there is no daemon kind or status.
+        self.assertIsNone(error.kind)
+        self.assertIsNone(error.status)
+        self.server.health = [3]
+        self.assertEqual(vm.exec(["false"]).exit_code, 3)
 
     def test_typed_errors_include_server_hint(self):
         for status, cls in [(404, NotFound), (409, Conflict), (501, CapabilityUnsupported)]:

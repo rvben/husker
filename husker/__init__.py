@@ -12,7 +12,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 __all__ = ["Client", "Sandbox", "Session", "SessionInfo", "Event", "EventPage",
            "ExecResult", "HuskerError", "TransportError", "NotFound", "Conflict",
-           "PolicyDenied", "Unauthorized", "CapabilityUnsupported", "CapacityExceeded"]
+           "PolicyDenied", "Unauthorized", "CapabilityUnsupported", "CapacityExceeded",
+           "CommandFailed", "FileChanged"]
 
 
 class HuskerError(Exception):
@@ -46,6 +47,20 @@ class CapabilityUnsupported(HuskerError):
 
 
 class CapacityExceeded(HuskerError):
+    pass
+
+
+class CommandFailed(HuskerError):
+    """A guest command run with ``check=True`` exited nonzero. The SDK raises
+    this itself, so ``kind`` is None; ``result`` holds the command's output."""
+    def __init__(self, result):
+        super().__init__("guest command exited with %s: %s" % (result.exit_code, result.stderr))
+        self.result = result
+
+
+class FileChanged(Conflict):
+    """A guest file changed size or modification time between the ranges of
+    a streamed download. The SDK raises this itself, so ``kind`` is None."""
     pass
 
 
@@ -217,7 +232,7 @@ class Sandbox:
         result = ExecResult(**self.client._request("POST", self._path + "/exec", request,
             timeout=http_timeout))
         if check and result.exit_code != 0:
-            raise HuskerError("guest command exited with %s: %s" % (result.exit_code, result.stderr), kind="exec_failed")
+            raise CommandFailed(result)
         return result
 
     def start(self, argv: Sequence[str], *, workdir=None, env=None, secrets=None, timeout_secs=3600):
@@ -254,7 +269,7 @@ class Sandbox:
             if current[0] is None or current[1] is None:
                 raise CapabilityUnsupported("streaming files requires a guest with ranged-read metadata")
             if identity is not None and current != identity:
-                raise Conflict("guest file changed during transfer", kind="file_changed")
+                raise FileChanged("guest file changed during transfer")
             identity = current
             data = base64.b64decode(value["data"], validate=True)
             if len(data) > chunk_size or offset + len(data) > current[0] or (not data and offset < current[0]):

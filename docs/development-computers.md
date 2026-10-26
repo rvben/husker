@@ -159,8 +159,12 @@ streaming uploads/downloads, session start/list,
 suspend/resume, fork, and explicit destruction. `Session` supports status,
 cursor pages/iteration, wait, cancellation, and removal. HTTP errors expose
 `status`, `kind`, and `hint`, with typed subclasses for authentication, policy,
-missing resources, conflicts, capacity, and unsupported capabilities. The client
-verifies TLS and refuses redirects to avoid forwarding daemon credentials.
+missing resources, conflicts, capacity, and unsupported capabilities. Two
+failures the SDK detects itself carry no daemon `kind`: `exec(..., check=True)`
+raises `CommandFailed` with the command's `ExecResult` as `result`, and
+`iter_file` raises `FileChanged`, a `Conflict`, when the guest file changes
+between ranges. The client verifies TLS and refuses redirects to avoid
+forwarding daemon credentials.
 
 `vm.wait_ready(["curl", "--fail", "http://127.0.0.1:3000/health"])` waits for
 application readiness; its default `true` probe only establishes guest execution
