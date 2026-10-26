@@ -17,6 +17,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+log = "0.4"
 tempfile = "3"
 uuid = { workspace = true }
 chrono = { workspace = true }

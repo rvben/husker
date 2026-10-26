@@ -2535,7 +2535,9 @@ mod tests {
         ));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-        let (status, _) = map_error(CoreError::State(husker_state::StateError::LockPoisoned));
+        let (status, _) = map_error(CoreError::State(husker_state::StateError::Io(
+            std::io::Error::other("disk"),
+        )));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
         let (status, _) = map_error(CoreError::Vmm(husker_vmm::VmmError::VmNotFound(

@@ -2,6 +2,7 @@
 //! forwards, host groups, and services.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -86,8 +87,8 @@ pub enum StateError {
     HostResourceLeaseMismatch(Uuid),
     #[error("VM expiration does not match VM record: {0}")]
     VmExpirationMismatch(Uuid),
-    #[error("lock poisoned")]
-    LockPoisoned,
+    #[error("connection pool: {0}")]
+    Pool(#[from] r2d2::Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("corrupt data in column {column}: {message}")]
@@ -914,33 +915,76 @@ fn insert_vm_expiration_on(
     Ok(())
 }
 
+/// How long a connection waits for a busy database before giving up. Covers
+/// both the write lock a statement waits for and the WAL switch at open.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Pause between attempts to switch a busy database to WAL at open.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Configures a file-backed connection; every pooled connection runs this.
+///
+/// WAL enables concurrent readers alongside a single writer, and the busy
+/// timeout lets a writer wait for the write lock instead of failing under
+/// contention. foreign_keys is enforced per-connection.
+///
+/// synchronous=NORMAL fsyncs the WAL at checkpoints instead of on every
+/// commit. Every state call runs on a tokio worker, so a per-commit fsync
+/// stalls the executor for the disk's flush latency. In WAL mode the database
+/// stays consistent across any crash under NORMAL; only a power loss or kernel
+/// panic can roll back the newest commits, which the daemon tolerates because
+/// no VM survives the host and every VM row is reconciled at startup.
+fn init_connection(conn: &mut Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(LOCK_WAIT)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+    )
+}
+
+/// Switches the database file to WAL on one connection before the pool opens
+/// its own.
+///
+/// `PRAGMA journal_mode=WAL` is a write on a file that is not yet in WAL mode,
+/// and SQLite refuses a read-to-write lock upgrade at once, without consulting
+/// the busy handler, while another connection holds the write lock. The pool
+/// opens its connections concurrently on worker threads, so on a fresh file
+/// they would race each other for that switch and every loser would fail
+/// with "database is locked" (logged by r2d2, then retried). Once the file is
+/// in WAL mode the pragma is a read, so pooled connections never contend for
+/// the write lock, neither with each other nor with a live writer.
+///
+/// A writer outside this process (a previous daemon still draining) can hold
+/// the lock during the switch, so a busy error is retried for up to
+/// `LOCK_WAIT` rather than failing the open.
+fn prepare_database(path: &Path) -> Result<(), StateError> {
+    let mut conn = Connection::open(path)?;
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match init_connection(&mut conn) {
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            result => return Ok(result?),
+        }
+    }
+}
+
 impl StateStore {
     /// Open or create the state database (file-backed, pooled for concurrency).
+    ///
+    /// Blocks for up to `LOCK_WAIT` when another process holds the database's
+    /// write lock while the file is switched to WAL.
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        // WAL enables concurrent readers alongside a single writer; busy_timeout
-        // lets a writer wait for the write lock instead of failing under
-        // contention. foreign_keys is enforced per-connection.
-        //
-        // synchronous=NORMAL fsyncs the WAL at checkpoints instead of on every
-        // commit. Every state call runs on a tokio worker, so a per-commit fsync
-        // stalls the executor for the disk's flush latency. In WAL mode the
-        // database stays consistent across any crash under NORMAL; only a power
-        // loss or kernel panic can roll back the newest commits, which the daemon
-        // tolerates because no VM survives the host and every VM row is
-        // reconciled at startup.
-        let manager = SqliteConnectionManager::file(path).with_init(|c| {
-            c.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
-                 PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
-            )
-        });
+        prepare_database(path)?;
+        let manager = SqliteConnectionManager::file(path).with_init(init_connection);
         let pool = r2d2::Pool::builder()
             .max_size(8)
             // SQLite connections are local and don't go stale like a network DB,
             // so skip the per-checkout test query.
             .test_on_check_out(false)
-            .build(manager)
-            .map_err(|_| StateError::LockPoisoned)?;
+            .build(manager)?;
         let store = Self { pool };
         store.migrate()?;
         Ok(store)
@@ -959,15 +1003,14 @@ impl StateStore {
         let pool = r2d2::Pool::builder()
             .max_size(1)
             .test_on_check_out(false)
-            .build(manager)
-            .map_err(|_| StateError::LockPoisoned)?;
+            .build(manager)?;
         let store = Self { pool };
         store.migrate()?;
         Ok(store)
     }
 
     fn lock(&self) -> Result<PooledConn, StateError> {
-        self.pool.get().map_err(|_| StateError::LockPoisoned)
+        Ok(self.pool.get()?)
     }
 
     fn migrate(&self) -> Result<(), StateError> {
@@ -3093,6 +3136,8 @@ fn row_to_volume_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VolumeRecor
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, Once};
+
     use super::*;
 
     #[test]
@@ -3576,6 +3621,115 @@ mod tests {
                 "synchronous must be NORMAL (1), not FULL (2)"
             );
         }
+    }
+
+    /// Records every `log` record emitted in this process. r2d2 reports a
+    /// failed connection setup through `log::error!` and retries silently, so
+    /// the records are the only surface on which a pool race shows up.
+    struct RecordingLogger(Mutex<Vec<String>>);
+
+    impl log::Log for RecordingLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", record.target(), record.args()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    static RECORDING_LOGGER: RecordingLogger = RecordingLogger(Mutex::new(Vec::new()));
+
+    fn install_recording_logger() -> &'static RecordingLogger {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            log::set_logger(&RECORDING_LOGGER).expect("no other logger in the test process");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        &RECORDING_LOGGER
+    }
+
+    /// Opening a fresh database while another connection holds the write lock
+    /// must succeed once the lock is released, without any pooled connection
+    /// failing on the way: the switch to WAL runs on one connection that
+    /// retries until the lock is free, so the pool's concurrent setup never
+    /// contends for it. Without that, the pool workers race each other and the
+    /// writer for the switch and r2d2 logs "database is locked" per loser.
+    #[test]
+    fn open_waits_for_a_live_writer_without_pool_errors() {
+        let logger = install_recording_logger();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let opener = {
+            let path = path.clone();
+            std::thread::spawn(move || StateStore::open(&path).map(drop))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        writer.execute_batch("COMMIT").unwrap();
+        drop(writer);
+
+        opener
+            .join()
+            .unwrap()
+            .expect("open waits for the writer to release the lock");
+        let locked: Vec<String> = logger
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.contains("database is locked"))
+            .cloned()
+            .collect();
+        assert!(
+            locked.is_empty(),
+            "pool connections contended for the write lock: {locked:?}"
+        );
+    }
+
+    /// Once the database is open its file is in WAL mode, so configuring a
+    /// further connection is a read: the pool can grow while a writer holds
+    /// the lock without contending for it.
+    #[test]
+    fn connection_setup_on_an_open_database_does_not_need_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = StateStore::open(&path).unwrap();
+
+        let writer = store.lock().unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut fresh = Connection::open(&path).unwrap();
+        init_connection(&mut fresh).expect("connection setup must not need the write lock");
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A path that cannot be opened is reported at once with the SQLite
+    /// reason, not after the pool has waited out its connection timeout.
+    #[test]
+    fn open_reports_an_unusable_path_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("state.db");
+
+        let started = Instant::now();
+        let error = StateStore::open(&path)
+            .map(drop)
+            .expect_err("a missing directory cannot hold the database");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "open took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(error, StateError::Database(_)),
+            "expected the SQLite open error, got {error}"
+        );
     }
 
     #[test]

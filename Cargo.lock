@@ -1213,6 +1213,7 @@ version = "0.4.52"
 dependencies = [
  "chrono",
  "husker-types",
+ "log",
  "r2d2",
  "r2d2_sqlite",
  "rusqlite",
