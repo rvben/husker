@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use husker_api::router_with_auth;
+use husker_api::{BearerToken, router_with_auth};
 use husker_core::{BackendKind, BootKind, HuskerCore, NetworkMode};
 use husker_state::{VmLifecycleState, VmRecord};
 use husker_vmm::{BackendSelection, CreatedVm, VmConfig, VmInfo, VmState, VmmBackend, VmmError};
@@ -15,6 +15,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 use tower::ServiceExt;
+
+/// The token every authenticated request in this file presents as
+/// `Bearer test-token`.
+fn test_token() -> Option<BearerToken> {
+    Some(BearerToken::new("test-token").unwrap())
+}
 
 struct AgentBackend {
     info: VmInfo,
@@ -178,7 +184,7 @@ impl Fixture {
         }
     }
     async fn request(&self, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
-        let response = router_with_auth(self.core.clone(), Some("test-token".into()))
+        let response = router_with_auth(self.core.clone(), test_token())
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -317,7 +323,7 @@ async fn cancelled_http_start_still_hands_off_guest_session_and_idle_monitor() {
         release: tokio::sync::Semaphore::new(0),
     });
     let f = Fixture::new_with_gate(Some(gate.clone())).await;
-    let app = router_with_auth(f.core.clone(), Some("test-token".into()));
+    let app = router_with_auth(f.core.clone(), test_token());
     let request = Request::builder()
         .method("POST")
         .uri("/v1/vms/dev/sessions")
@@ -362,7 +368,7 @@ async fn cancelled_http_start_still_hands_off_guest_session_and_idle_monitor() {
 #[tokio::test]
 async fn session_and_tunnel_routes_require_auth() {
     let f = Fixture::new().await;
-    let app = router_with_auth(f.core.clone(), Some("test-token".into()));
+    let app = router_with_auth(f.core.clone(), test_token());
     for (method, path) in [
         ("POST", "/v1/vms/dev/sessions"),
         ("GET", "/v1/vms/dev/sessions"),
@@ -420,7 +426,7 @@ async fn authenticated_tunnel_preserves_http_without_exposing_daemon_token() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router_with_auth(f.core.clone(), Some("test-token".into()));
+    let app = router_with_auth(f.core.clone(), test_token());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -489,7 +495,7 @@ async fn preview_drains_both_directions_when_guest_writes_before_reading() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router_with_auth(f.core.clone(), Some("test-token".into()));
+    let app = router_with_auth(f.core.clone(), test_token());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -670,7 +676,7 @@ async fn shell_applies_the_exec_command_policy_before_contacting_the_guest() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router_with_auth(f.core.clone(), Some("test-token".into()));
+    let app = router_with_auth(f.core.clone(), test_token());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

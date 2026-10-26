@@ -52,6 +52,55 @@ pub(crate) fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'sta
     None
 }
 
+// ── Bearer tokens ─────────────────────────────────────────────────────
+
+/// A bearer token that the protected routes require.
+///
+/// Constructing one refuses empty and whitespace-only values, so a token that
+/// reaches a router is always a real secret. Without this a blank `api_token`
+/// (an unset variable in a unit file, a failed secret substitution) counted as
+/// authentication: it satisfied the rule that a non-loopback daemon needs a
+/// token while no client could ever present the matching header.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BearerToken(String);
+
+/// The error for a bearer token with no content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyBearerToken;
+
+impl std::fmt::Display for EmptyBearerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("bearer token must not be empty")
+    }
+}
+
+impl std::error::Error for EmptyBearerToken {}
+
+impl BearerToken {
+    /// Accept `token` as a bearer token. Whitespace-only values are refused
+    /// along with the empty string; an accepted token is kept byte for byte.
+    pub fn new(token: impl Into<String>) -> Result<Self, EmptyBearerToken> {
+        let token = token.into();
+        if token.trim().is_empty() {
+            return Err(EmptyBearerToken);
+        }
+        Ok(Self(token))
+    }
+
+    /// The exact `Authorization` header value a caller must present.
+    fn header_value(&self) -> String {
+        format!("Bearer {}", self.0)
+    }
+}
+
+/// The secret never reaches a log line through a `Debug` rendering of a
+/// configuration struct.
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BearerToken(<redacted>)")
+    }
+}
+
 // ── Router ────────────────────────────────────────────────────────────
 
 /// Build the API router.
@@ -61,11 +110,11 @@ pub fn router<B: VmmBackend + 'static>(core: Arc<HuskerCore<B>>) -> Router {
 
 /// Build the API router with optional bearer token authentication.
 ///
-/// When `auth_token` is set, mutating endpoints and interactive shell access
-/// require `Authorization: Bearer <token>`.
+/// When `auth_token` is set, every route except `/v1/health` and the static
+/// API docs requires `Authorization: Bearer <token>`.
 pub fn router_with_auth<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
-    auth_token: Option<String>,
+    auth_token: Option<BearerToken>,
 ) -> Router {
     let policy = current_policy();
     let router = Router::new()
@@ -190,7 +239,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .merge(utoipa_swagger_ui::SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi));
 
     let router = if let Some(token) = auth_token {
-        let expected = Arc::new(format!("Bearer {token}"));
+        let expected = Arc::new(token.header_value());
         router.layer(axum::middleware::from_fn_with_state(
             expected,
             auth_middleware,
@@ -218,7 +267,7 @@ pub async fn serve<B: VmmBackend + 'static>(
 pub async fn serve_with_auth<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
     addr: SocketAddr,
-    auth_token: Option<String>,
+    auth_token: Option<BearerToken>,
 ) -> std::io::Result<()> {
     let app = router_with_auth(core, auth_token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -269,11 +318,11 @@ const GRACEFUL_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// firewall); when `None` it is unauthenticated (the standard exporter pattern).
 pub fn metrics_router<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
-    token: Option<String>,
+    token: Option<BearerToken>,
 ) -> Router {
     let router = Router::new().route("/v1/metrics", get(metrics_handler::<B>));
     let router = if let Some(token) = token {
-        let expected = Arc::new(format!("Bearer {token}"));
+        let expected = Arc::new(token.header_value());
         router.layer(axum::middleware::from_fn_with_state(
             expected,
             auth_middleware,
@@ -290,7 +339,7 @@ pub fn metrics_router<B: VmmBackend + 'static>(
 pub async fn serve_metrics<B: VmmBackend + 'static>(
     core: Arc<HuskerCore<B>>,
     addr: SocketAddr,
-    token: Option<String>,
+    token: Option<BearerToken>,
 ) -> std::io::Result<()> {
     let app = metrics_router(core, token);
     let listener = tokio::net::TcpListener::bind(addr).await?;

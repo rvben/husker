@@ -13,6 +13,10 @@
 
 - Configure a high-entropy bearer token:
   - `api_token = "<long-random-secret>"`
+- A blank token is refused: the daemon exits at start when `api_token` (from
+  the config file, `HUSKER_API_TOKEN`, or `--api-token`) is set but empty or
+  whitespace-only, so a failed secret substitution cannot pass for
+  authentication. The same applies to `metrics_token`.
 - Rotate token on incident response or operator turnover.
 - Treat one daemon and its token as one trust domain. A token holder has full
   control of every VM, volume, and secret on that daemon.

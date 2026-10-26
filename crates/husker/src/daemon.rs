@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use husker_api::BearerToken;
 #[cfg(feature = "linux-net")]
 use husker_net::DaemonNetwork as _;
 
@@ -34,6 +35,51 @@ pub(crate) fn validate_daemon_bind(
         );
     }
     Ok(())
+}
+
+/// The bearer tokens a daemon enforces, parsed from the configuration once,
+/// before the bind check and before anything is started. A setting that is
+/// present but blank is a misconfiguration (an unset variable in a unit file, a
+/// failed secret substitution) and is refused here rather than accepted as a
+/// token nobody can present.
+#[derive(Debug)]
+pub(crate) struct DaemonAuth {
+    pub(crate) api_token: Option<BearerToken>,
+    pub(crate) metrics_token: Option<BearerToken>,
+}
+
+impl DaemonAuth {
+    pub(crate) fn from_config(config: &Config) -> Result<Self> {
+        Ok(Self {
+            api_token: configured_token(
+                config.api_token.as_deref(),
+                "api_token",
+                "HUSKER_API_TOKEN or --api-token",
+            )?,
+            metrics_token: configured_token(
+                config.metrics_token.as_deref(),
+                "metrics_token",
+                "HUSKER_METRICS_TOKEN",
+            )?,
+        })
+    }
+}
+
+fn configured_token(
+    value: Option<&str>,
+    setting: &str,
+    overrides: &str,
+) -> Result<Option<BearerToken>> {
+    value
+        .map(|token| {
+            BearerToken::new(token).map_err(|e| {
+                anyhow::anyhow!(
+                    "{setting} is set but blank ({e}): unset it in the config file and {overrides} \
+                     to run without this token, or set a long random value"
+                )
+            })
+        })
+        .transpose()
 }
 
 /// Restrict a daemon-owned directory to owner-only (0700). Best-effort: logs on
@@ -334,7 +380,11 @@ async fn reconcile_host_resources(
     }
 }
 
-pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<()> {
+pub(crate) async fn start_daemon(
+    config: Config,
+    listen: SocketAddr,
+    auth: DaemonAuth,
+) -> Result<()> {
     tracing::info!("starting husker daemon");
 
     // Resolve firecracker_bin to an absolute path before handing it to the
@@ -537,6 +587,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
         run_linux_network(host_network.as_ref(), &linux_network, async {
             let runtime_config = DaemonRuntimeConfig::from_config(
                 &config,
+                auth,
                 listen,
                 DaemonRuntimeMode::LinuxNet {
                     reclaim_grace_secs: config.reclaim_grace_secs,
@@ -644,7 +695,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
     #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
     {
         let runtime_config =
-            DaemonRuntimeConfig::from_config(&config, listen, DaemonRuntimeMode::Basic);
+            DaemonRuntimeConfig::from_config(&config, auth, listen, DaemonRuntimeMode::Basic);
         let vmm = husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
 
         let core = Arc::new(
@@ -673,7 +724,7 @@ pub(crate) async fn start_daemon(config: Config, listen: SocketAddr) -> Result<(
     #[cfg(all(not(feature = "linux-net"), not(target_os = "macos")))]
     {
         let runtime_config =
-            DaemonRuntimeConfig::from_config(&config, listen, DaemonRuntimeMode::Basic);
+            DaemonRuntimeConfig::from_config(&config, auth, listen, DaemonRuntimeMode::Basic);
         // No networking stack available (no `linux-net` feature, not macOS).
         // The API server can still run; VM operations will fail at create time
         // because no networking is configured. Primarily used by CI drills.
@@ -757,21 +808,26 @@ async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
 #[derive(Debug)]
 struct DaemonRuntimeConfig {
     listen: SocketAddr,
-    api_token: Option<String>,
+    api_token: Option<BearerToken>,
     metrics_listen: Option<SocketAddr>,
-    metrics_token: Option<String>,
+    metrics_token: Option<BearerToken>,
     service_reconcile_enabled: bool,
     service_reconcile_interval: u64,
     mode: DaemonRuntimeMode,
 }
 
 impl DaemonRuntimeConfig {
-    fn from_config(config: &Config, listen: SocketAddr, mode: DaemonRuntimeMode) -> Self {
+    fn from_config(
+        config: &Config,
+        auth: DaemonAuth,
+        listen: SocketAddr,
+        mode: DaemonRuntimeMode,
+    ) -> Self {
         Self {
             listen,
-            api_token: config.api_token.clone(),
+            api_token: auth.api_token,
             metrics_listen: config.metrics_listen,
-            metrics_token: config.metrics_token.clone(),
+            metrics_token: auth.metrics_token,
             service_reconcile_enabled: config.service_reconcile_enabled,
             service_reconcile_interval: config.service_reconcile_interval_secs,
             mode,
@@ -1128,7 +1184,7 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
 fn spawn_metrics_endpoint<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     metrics_listen: Option<SocketAddr>,
-    metrics_token: Option<String>,
+    metrics_token: Option<BearerToken>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     metrics_listen.map(|addr| {
         tokio::spawn(async move {

@@ -413,8 +413,13 @@ async fn read_guest_file_or_empty(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// The token a client sends. A blank `api_token` in the config file or in
+/// HUSKER_API_TOKEN is not a credential (the daemon refuses to start with one),
+/// so a client holding one sends no header rather than `Bearer` and nothing.
 fn resolve_api_token(cli_api_token: Option<String>, config_path: Option<&Path>) -> Option<String> {
-    cli_api_token.or_else(|| load_config(config_path).api_token)
+    cli_api_token
+        .or_else(|| load_config(config_path).api_token)
+        .filter(|token| !token.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -768,8 +773,9 @@ async fn run(cli: Cli) -> Result<()> {
         if let Some(token) = cli_api_token {
             config.api_token = Some(token);
         }
-        validate_daemon_bind(listen, allow_remote, config.api_token.is_some())?;
-        return start_daemon(config, listen).await;
+        let auth = DaemonAuth::from_config(&config)?;
+        validate_daemon_bind(listen, allow_remote, auth.api_token.is_some())?;
+        return start_daemon(config, listen, auth).await;
     }
 
     let resolved_target =
@@ -5899,6 +5905,18 @@ mod tests {
     }
 
     #[test]
+    fn api_token_flag_refuses_an_empty_value() {
+        let kind = Cli::try_parse_from(["husker", "--api-token", "", "list"])
+            .map(|_| ())
+            .expect_err("an empty --api-token is a usage error")
+            .kind();
+        assert_eq!(kind, clap::error::ErrorKind::InvalidValue);
+        let cli = Cli::try_parse_from(["husker", "--api-token", "t", "list"])
+            .expect("a non-empty token parses");
+        assert_eq!(cli.api_token.as_deref(), Some("t"));
+    }
+
+    #[test]
     fn output_flag_accepts_json() {
         let cli = Cli::try_parse_from(["husker", "--output", "json", "list"])
             .expect("cli should parse with json output");
@@ -6688,6 +6706,57 @@ mod tests {
     }
 
     #[test]
+    fn daemon_auth_accepts_configured_tokens_and_absent_ones() {
+        let config = Config::default();
+        let auth = DaemonAuth::from_config(&config).unwrap();
+        assert!(auth.api_token.is_none());
+        assert!(auth.metrics_token.is_none());
+
+        let config = Config {
+            api_token: Some("api-secret".to_string()),
+            metrics_token: Some("metrics-secret".to_string()),
+            ..Config::default()
+        };
+        let auth = DaemonAuth::from_config(&config).unwrap();
+        assert!(auth.api_token.is_some());
+        assert!(auth.metrics_token.is_some());
+    }
+
+    #[test]
+    fn daemon_auth_rejects_an_empty_api_token() {
+        // A blank token would satisfy the "remote bind needs a token" rule while no
+        // client could ever authenticate; it is a misconfiguration, refused up front.
+        let config = Config {
+            api_token: Some(String::new()),
+            ..Config::default()
+        };
+        let err = DaemonAuth::from_config(&config).unwrap_err().to_string();
+        assert!(err.contains("api_token"), "{err}");
+        assert!(err.contains("HUSKER_API_TOKEN"), "{err}");
+        assert!(err.contains("--api-token"), "{err}");
+    }
+
+    #[test]
+    fn daemon_auth_rejects_a_whitespace_only_metrics_token() {
+        let config = Config {
+            metrics_token: Some(" \t".to_string()),
+            ..Config::default()
+        };
+        let err = DaemonAuth::from_config(&config).unwrap_err().to_string();
+        assert!(err.contains("metrics_token"), "{err}");
+        assert!(err.contains("HUSKER_METRICS_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_api_token_from_the_environment_is_rejected_by_the_daemon() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSKER_API_TOKEN", "");
+        let config = load_config(None);
+        assert_eq!(config.api_token.as_deref(), Some(""));
+        assert!(DaemonAuth::from_config(&config).is_err());
+    }
+
+    #[test]
     fn env_override_data_dir() {
         let _guard = env_mutex().lock().unwrap();
         let _env = EnvVarGuard::set("HUSKER_DATA_DIR", "/tmp/husker-env-test");
@@ -6902,6 +6971,18 @@ mod tests {
         let config_dir = temp_test_dir("resolve-api-token-none");
         let config_path = config_dir.join("config.toml");
         std::fs::write(&config_path, "data_dir = \"/tmp/husker\"\n").unwrap();
+
+        let resolved = resolve_api_token(None, Some(&config_path));
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_api_token_treats_a_blank_config_token_as_absent() {
+        // A blank token is not a credential: the client sends no header instead of
+        // `Bearer` followed by nothing, which the daemon would reject anyway.
+        let config_dir = temp_test_dir("resolve-api-token-blank");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "api_token = \"  \"\n").unwrap();
 
         let resolved = resolve_api_token(None, Some(&config_path));
         assert!(resolved.is_none());

@@ -29,8 +29,10 @@ pub(crate) struct Cli {
     #[arg(long, short = 'c', env = "HUSKER_CONTEXT", global = true)]
     pub(crate) context: Option<String>,
 
-    /// Bearer token for authenticated API access.
-    #[arg(long)]
+    /// Bearer token for authenticated API access. A blank value is refused:
+    /// an empty token is a misconfiguration, not a request for no
+    /// authentication.
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub(crate) api_token: Option<String>,
 
     /// Output format for command responses.

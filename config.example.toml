@@ -69,8 +69,10 @@
 
 # ── API Security and Limits ─────────────────────────────────────────
 
-# Optional bearer token required by mutating and shell endpoints.
-# Set this in production or whenever daemon binds beyond localhost.
+# Optional bearer token required by every endpoint except /v1/health and the
+# API docs. Set this in production or whenever daemon binds beyond localhost.
+# A blank value is a startup error, not "no authentication": leave it unset
+# instead.
 # api_token = "replace-with-a-long-random-token"
 
 # Optional separate bind for a /v1/metrics endpoint, so Prometheus can scrape while

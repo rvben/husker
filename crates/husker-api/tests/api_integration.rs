@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use husker_api::{VmResponse, metrics_router, router};
+use husker_api::{BearerToken, VmResponse, metrics_router, router};
 use husker_core::{BackendKind, BootKind, HuskerCore, NetworkMode, UserdataStatus};
 use husker_state::VmLifecycleState;
 
@@ -232,7 +232,10 @@ async fn metrics_router_serves_only_metrics_not_the_api() {
 async fn metrics_router_requires_bearer_when_token_set() {
     // With a token configured, the metrics endpoint rejects unauthenticated and
     // wrong-token scrapes and accepts the correct bearer.
-    let app = metrics_router(test_core(), Some("s3cret-metrics-token".into()));
+    let app = metrics_router(
+        test_core(),
+        Some(BearerToken::new("s3cret-metrics-token").unwrap()),
+    );
 
     // No Authorization header -> 401.
     let response = app

@@ -27,7 +27,10 @@ mod sessions;
 pub use dto::*;
 pub use errors::ErrorResponse;
 pub use husker_agent_proto::{SessionEvent, SessionEventsResponse, SessionInfo, SessionState};
-pub use router::{metrics_router, router, router_with_auth, serve, serve_metrics, serve_with_auth};
+pub use router::{
+    BearerToken, EmptyBearerToken, metrics_router, router, router_with_auth, serve, serve_metrics,
+    serve_with_auth,
+};
 
 use handlers::*;
 
@@ -420,6 +423,31 @@ mod tests {
         {
             Arc::new(HuskerCore::new(vmm, state, storage, runtime_dir))
         }
+    }
+
+    /// The token the authenticated router tests configure; requests present
+    /// `Bearer secret`.
+    fn secret_token() -> Option<BearerToken> {
+        Some(BearerToken::new("secret").unwrap())
+    }
+
+    #[test]
+    fn bearer_token_refuses_blank_values() {
+        assert_eq!(BearerToken::new("").unwrap_err(), EmptyBearerToken);
+        assert_eq!(BearerToken::new(" \t\n").unwrap_err(), EmptyBearerToken);
+        assert_eq!(
+            EmptyBearerToken.to_string(),
+            "bearer token must not be empty"
+        );
+        assert!(BearerToken::new("s").is_ok());
+    }
+
+    #[test]
+    fn bearer_token_debug_does_not_print_the_secret() {
+        let token = BearerToken::new("hunter2").unwrap();
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 
     fn test_core() -> Arc<HuskerCore<husker_vmm::firecracker::FirecrackerBackend>> {
@@ -1848,7 +1876,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_allows_public_health_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
             .await
@@ -1860,7 +1888,7 @@ mod tests {
     async fn auth_enabled_rejects_read_without_token() {
         // SEC-3 regression: list/detail reads leak guest_ip/pid/rootfs_path, so on a
         // token-protected daemon they must require the token (previously public).
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         for path in ["/v1/vms", "/v1/pools", "/v1/diagnostics", "/v1/profiles"] {
             let response = app
                 .clone()
@@ -1888,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_mutating_endpoint_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(
                 Request::post("/v1/vms/nonexistent/stop")
@@ -1908,7 +1936,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_accepts_valid_token_for_mutating_endpoint() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(
                 Request::post("/v1/vms/nonexistent/stop")
@@ -1924,7 +1952,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_requires_token_for_shell_endpoint() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(
                 Request::get("/v1/vms/nonexistent/shell")
@@ -1938,7 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_logs_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(
                 Request::get("/v1/vms/any/logs")
@@ -1952,7 +1980,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_metrics_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
             .await
@@ -1962,7 +1990,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_service_mutation_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let body = serde_json::json!({ "name": "default" });
         let response = app
             .oneshot(
@@ -1978,7 +2006,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_snapshot_mutation_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let body = serde_json::json!({ "name": "snap-1", "vm": "vm-a" });
         let response = app
             .oneshot(
@@ -1994,7 +2022,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_image_mutation_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let body = serde_json::json!({
             "name": "ubuntu-base",
             "source_path": "/tmp/source.ext4"
@@ -2013,7 +2041,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_volume_delete_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(
                 Request::delete("/v1/volumes/data")
@@ -2027,7 +2055,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_volume_create_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let body = serde_json::json!({ "name": "data", "size_mib": 1024 });
         let response = app
             .oneshot(
@@ -2043,7 +2071,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_secret_read_without_token() {
-        let app = router_with_auth(test_core(), Some("secret".into()));
+        let app = router_with_auth(test_core(), secret_token());
         let response = app
             .oneshot(Request::get("/v1/secrets").body(Body::empty()).unwrap())
             .await
