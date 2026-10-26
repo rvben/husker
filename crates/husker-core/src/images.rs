@@ -409,10 +409,8 @@ fn map_oci_materialization_error(error: OciMaterializationError) -> CoreError {
 /// caller used, so the reported value can be fed straight back to `import-oci`.
 ///
 /// The only caller is `import_oci_image`, which needs `linux-net`. The function
-/// itself is pure string handling, so it stays compiled everywhere and its test
-/// runs on macOS too; without that feature it simply has no caller outside the
-/// test.
-#[cfg_attr(not(feature = "linux-net"), allow(dead_code))]
+/// itself is pure string handling, so its test runs on every host.
+#[cfg(any(feature = "linux-net", test))]
 fn oci_source_path(reference: &str) -> String {
     format!("oci://{}", husker_oci::strip_oci_scheme(reference))
 }

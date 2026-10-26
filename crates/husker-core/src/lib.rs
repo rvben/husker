@@ -1223,12 +1223,6 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.resource_limits
     }
 
-    /// Whether this binary carries an embedded guest agent (needed by cloud-image
-    /// VMs at create time).
-    pub fn embedded_agent_present(&self) -> bool {
-        !self.embedded_agent.is_empty()
-    }
-
     /// Configured host uplink interface for guest NAT egress, if set. `None` on
     /// the macOS backend (which NATs internally) or when unconfigured.
     pub fn host_interface(&self) -> Option<&str> {
@@ -1313,12 +1307,6 @@ impl<B: VmmBackend> HuskerCore<B> {
         self
     }
 
-    /// Return the daemon-configured default memory (MiB) and vCPU count.
-    /// Both are `None` when not configured (the built-in 128 / 1 fallback applies).
-    pub fn default_resources(&self) -> (Option<u32>, Option<u32>) {
-        (self.default_memory, self.default_cpus)
-    }
-
     /// Return the named VM presets stored in this daemon instance.
     pub fn profiles(&self) -> &std::collections::HashMap<String, DaemonProfile> {
         &self.profiles
@@ -1379,11 +1367,6 @@ impl<B: VmmBackend> HuskerCore<B> {
         map.entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
-    }
-
-    /// The storage configuration this core was built with.
-    pub fn storage_config(&self) -> &husker_storage::StorageConfig {
-        &self.storage
     }
 }
 

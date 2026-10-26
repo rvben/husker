@@ -569,14 +569,7 @@ pub(crate) async fn start_daemon(
         // Once bridge setup begins, every return path flows through host-network
         // teardown. This includes nftables initialization and runtime failures.
         run_linux_network(host_network.as_ref(), &linux_network, async {
-            let runtime_config = DaemonRuntimeConfig::from_config(
-                &config,
-                auth,
-                listen,
-                DaemonRuntimeMode::LinuxNet {
-                    reclaim_grace_secs: config.reclaim_grace_secs,
-                },
-            );
+            let runtime_config = DaemonRuntimeConfig::from_config(&config, auth, listen);
 
             #[cfg(target_os = "linux")]
             let core = {
@@ -678,8 +671,7 @@ pub(crate) async fn start_daemon(
 
     #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
     {
-        let runtime_config =
-            DaemonRuntimeConfig::from_config(&config, auth, listen, DaemonRuntimeMode::Basic);
+        let runtime_config = DaemonRuntimeConfig::from_config(&config, auth, listen);
         let vmm = husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
 
         let core = Arc::new(
@@ -707,8 +699,7 @@ pub(crate) async fn start_daemon(
 
     #[cfg(all(not(feature = "linux-net"), not(target_os = "macos")))]
     {
-        let runtime_config =
-            DaemonRuntimeConfig::from_config(&config, auth, listen, DaemonRuntimeMode::Basic);
+        let runtime_config = DaemonRuntimeConfig::from_config(&config, auth, listen);
         // No networking stack available (no `linux-net` feature, not macOS).
         // The API server can still run; VM operations will fail at create time
         // because no networking is configured. Primarily used by CI drills.
@@ -798,16 +789,16 @@ struct DaemonRuntimeConfig {
     metrics_token: Option<BearerToken>,
     service_reconcile_enabled: bool,
     service_reconcile_interval: u64,
-    mode: DaemonRuntimeMode,
+    /// Seconds a stopped VM keeps its host network resources before the
+    /// reclaim loop releases them. Only a `linux-net` daemon owns host
+    /// networking, so only that build carries the setting; the Linux-only
+    /// recovery and workers in `run_daemon_runtime` are gated the same way.
+    #[cfg(feature = "linux-net")]
+    reclaim_grace_secs: u64,
 }
 
 impl DaemonRuntimeConfig {
-    fn from_config(
-        config: &Config,
-        auth: DaemonAuth,
-        listen: SocketAddr,
-        mode: DaemonRuntimeMode,
-    ) -> Self {
+    fn from_config(config: &Config, auth: DaemonAuth, listen: SocketAddr) -> Self {
         Self {
             listen,
             api_token: auth.api_token,
@@ -830,20 +821,10 @@ impl DaemonRuntimeConfig {
             metrics_token: auth.metrics_token,
             service_reconcile_enabled: config.service_reconcile_enabled,
             service_reconcile_interval: config.service_reconcile_interval_secs,
-            mode,
+            #[cfg(feature = "linux-net")]
+            reclaim_grace_secs: config.reclaim_grace_secs,
         }
     }
-}
-
-/// The only valid platform extensions to the shared daemon runtime. Keeping
-/// this as a closed enum makes Linux-only recovery and workers explicit without
-/// admitting impossible combinations of feature booleans.
-#[derive(Debug)]
-enum DaemonRuntimeMode {
-    #[cfg_attr(feature = "linux-net", allow(dead_code))]
-    Basic,
-    #[cfg(feature = "linux-net")]
-    LinuxNet { reclaim_grace_secs: u64 },
 }
 
 /// Own every task started by the daemon runtime. Mutating workers receive a
@@ -1065,63 +1046,59 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     config: DaemonRuntimeConfig,
 ) -> Result<()> {
-    #[cfg(feature = "linux-net")]
-    let reclaim_network_on_shutdown = matches!(&config.mode, DaemonRuntimeMode::LinuxNet { .. });
-
     run_initial_service_reconcile(&core).await;
 
-    match &config.mode {
-        DaemonRuntimeMode::Basic => {}
-        #[cfg(feature = "linux-net")]
-        DaemonRuntimeMode::LinuxNet { .. } => {
-            let recovery = core
-                .recover_host_resource_leases()
-                .await
-                .context("recovering interrupted VM host resources")?;
-            if recovery.recovered > 0 {
-                tracing::info!(
-                    recovered = recovery.recovered,
-                    "recovered interrupted VM creations"
-                );
-            }
-            if recovery.failed > 0 {
-                tracing::warn!(
-                    failed = recovery.failed,
-                    "interrupted VM creations still hold host resources; their leases are retried at the next start"
-                );
-            }
-            let networks = core
-                .restore_suspended_vm_networks()
-                .await
-                .context("restoring suspended VM networks")?;
-            if networks.restored > 0 {
-                tracing::info!(
-                    restored = networks.restored,
-                    recreated = networks.recreated,
-                    "restored suspended VM networks (egress policy and bridge attachment)"
-                );
-            }
-            if networks.failed > 0 {
-                tracing::warn!(
-                    failed = networks.failed,
-                    "suspended VMs whose network could not be restored will fail to resume until the host is repaired"
-                );
-            }
-            let reconcile = core.reconcile_port_forwards_from_state().await;
-            if reconcile.restored > 0 {
-                tracing::info!(
-                    restored = reconcile.restored,
-                    "restored persisted port-forward nftables rules"
-                );
-            }
-            if reconcile.skipped_suspended > 0 {
-                tracing::info!(
-                    skipped = reconcile.skipped_suspended,
-                    "skipped DNAT restore for suspended VMs; re-installing resume listeners instead"
-                );
-            }
-            core.reinstall_resume_listeners().await;
+    // Only a daemon that owns host networking has leases, suspended VM
+    // networks and port-forward rules to recover.
+    #[cfg(feature = "linux-net")]
+    {
+        let recovery = core
+            .recover_host_resource_leases()
+            .await
+            .context("recovering interrupted VM host resources")?;
+        if recovery.recovered > 0 {
+            tracing::info!(
+                recovered = recovery.recovered,
+                "recovered interrupted VM creations"
+            );
         }
+        if recovery.failed > 0 {
+            tracing::warn!(
+                failed = recovery.failed,
+                "interrupted VM creations still hold host resources; their leases are retried at the next start"
+            );
+        }
+        let networks = core
+            .restore_suspended_vm_networks()
+            .await
+            .context("restoring suspended VM networks")?;
+        if networks.restored > 0 {
+            tracing::info!(
+                restored = networks.restored,
+                recreated = networks.recreated,
+                "restored suspended VM networks (egress policy and bridge attachment)"
+            );
+        }
+        if networks.failed > 0 {
+            tracing::warn!(
+                failed = networks.failed,
+                "suspended VMs whose network could not be restored will fail to resume until the host is repaired"
+            );
+        }
+        let reconcile = core.reconcile_port_forwards_from_state().await;
+        if reconcile.restored > 0 {
+            tracing::info!(
+                restored = reconcile.restored,
+                "restored persisted port-forward nftables rules"
+            );
+        }
+        if reconcile.skipped_suspended > 0 {
+            tracing::info!(
+                skipped = reconcile.skipped_suspended,
+                "skipped DNAT restore for suspended VMs; re-installing resume listeners instead"
+            );
+        }
+        core.reinstall_resume_listeners().await;
     }
 
     let mut workers = RuntimeWorkers::new();
@@ -1146,10 +1123,10 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
     ));
 
     #[cfg(feature = "linux-net")]
-    if let DaemonRuntimeMode::LinuxNet { reclaim_grace_secs } = config.mode {
+    {
         workers.supervise(spawn_reclaim_loop(
             Arc::clone(&core),
-            reclaim_grace_secs,
+            config.reclaim_grace_secs,
             workers.shutdown_signal(),
         ));
         workers.supervise(Some(spawn_idle_policy_loop(
@@ -1173,7 +1150,7 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
         core.quiesce_shutdown_ingress();
         drain_vms_on_shutdown(&core).await;
         #[cfg(feature = "linux-net")]
-        if reclaim_network_on_shutdown {
+        {
             let reclaimed = core.reclaim_shutdown_vms().await;
             if reclaimed > 0 {
                 tracing::info!(reclaimed, "released drained VM host resources");

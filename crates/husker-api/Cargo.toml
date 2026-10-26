@@ -23,7 +23,6 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
-tokio-stream = "0.1"
 async-stream = "0.3"
 subtle = "2"
 

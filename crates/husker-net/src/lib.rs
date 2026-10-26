@@ -1613,35 +1613,12 @@ fn find_rules_by_comment_prefix(nft_json: &str, prefix: &str) -> Vec<(String, u6
     results
 }
 
-/// Walk `nft -j list table` JSON for the rule with the given comment and return
-/// its inline (packets, bytes) counter, if present.
+/// Collect every husker-managed port-forward rule's (packets, bytes) counter,
+/// keyed by its own `husker-pf:<tap>:<port>` comment.
 ///
 /// The counter is an anonymous per-rule counter statement embedded in the DNAT
 /// rule (see `add_port_forward`), so it serializes as `{"counter":{"packets":N,
 /// "bytes":M}}` (an object) rather than a named-counter reference (a string).
-fn parse_counter_from_table_json(json: &str, comment_tag: &str) -> Option<(u64, u64)> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    for item in v.get("nftables")?.as_array()? {
-        let rule = match item.get("rule") {
-            Some(r) => r,
-            None => continue,
-        };
-        if rule.get("comment").and_then(|c| c.as_str()) != Some(comment_tag) {
-            continue;
-        }
-        for expr in rule.get("expr")?.as_array()? {
-            if let Some(counter) = expr.get("counter") {
-                let p = counter.get("packets")?.as_u64()?;
-                let b = counter.get("bytes")?.as_u64()?;
-                return Some((p, b));
-            }
-        }
-    }
-    None
-}
-
-/// Collect every husker-managed port-forward rule's (packets, bytes) counter,
-/// keyed by its own `husker-pf:<tap>:<port>` comment.
 fn parse_all_counters_from_table_json(json: &str) -> HashMap<String, (u64, u64)> {
     let mut out = HashMap::new();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
@@ -1675,24 +1652,6 @@ fn parse_all_counters_from_table_json(json: &str) -> HashMap<String, (u64, u64)>
         }
     }
     out
-}
-
-/// Read the DNAT rule's traffic counter for a single port forward.
-///
-/// Runs a single `nft -j list table` call and picks out the rule tagged
-/// `husker-pf:<tap_name>:<host_port>`.
-pub async fn read_port_forward_counter(
-    host_port: u16,
-    tap_name: &str,
-    bridge_name: &str,
-) -> Result<(u64, u64), NetError> {
-    let table = nft_table_for_bridge(bridge_name);
-    let output = run_cmd("nft", &["-j", "list", "table", "ip", &table]).await?;
-    let tag = format!("husker-pf:{tap_name}:{host_port}");
-    parse_counter_from_table_json(&output, &tag).ok_or_else(|| NetError::CommandFailed {
-        cmd: "nft -j list table".into(),
-        message: format!("no counter found for rule tagged {tag}"),
-    })
 }
 
 /// Read every husker-managed port-forward counter in one `nft list table` call.
@@ -2803,39 +2762,6 @@ default via 192.168.1.1 dev eth0 proto dhcp metric 100
     // ── Port Forward Counter Parsing ────────────────────────────────────
 
     #[test]
-    fn parses_counter_for_matching_comment() {
-        let json = r#"{"nftables":[{"rule":{"chain":"prerouting","handle":7,
-          "comment":"husker-pf:tap0:8080",
-          "expr":[{"match":{}},{"counter":{"packets":12,"bytes":3456}},{"dnat":{}}]}}]}"#;
-        assert_eq!(
-            parse_counter_from_table_json(json, "husker-pf:tap0:8080"),
-            Some((12, 3456))
-        );
-        assert_eq!(
-            parse_counter_from_table_json(json, "husker-pf:tap0:9999"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_counter_missing_expr_returns_none() {
-        let json = r#"{"nftables":[{"rule":{"chain":"prerouting","handle":7,
-          "comment":"husker-pf:tap0:8080"}}]}"#;
-        assert_eq!(
-            parse_counter_from_table_json(json, "husker-pf:tap0:8080"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_counter_invalid_json_returns_none() {
-        assert_eq!(
-            parse_counter_from_table_json("not json", "husker-pf:tap0:8080"),
-            None
-        );
-    }
-
-    #[test]
     fn parse_all_counters_collects_by_comment() {
         let json = r#"{"nftables":[
             {"rule":{"chain":"prerouting","handle":7,
@@ -2863,5 +2789,17 @@ default via 192.168.1.1 dev eth0 proto dhcp metric 100
     #[test]
     fn parse_all_counters_invalid_json() {
         assert!(parse_all_counters_from_table_json("not json").is_empty());
+    }
+
+    #[test]
+    fn parse_all_counters_skips_a_forward_without_a_counter() {
+        let json = r#"{"nftables":[
+            {"rule":{"chain":"prerouting","handle":7,
+              "comment":"husker-pf:tap0:8080"}},
+            {"rule":{"chain":"prerouting","handle":8,
+              "comment":"husker-pf:tap1:9090",
+              "expr":[{"match":{}},{"dnat":{}}]}}
+        ]}"#;
+        assert!(parse_all_counters_from_table_json(json).is_empty());
     }
 }
