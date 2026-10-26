@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 pub(crate) struct Cli {
     /// Path to config file
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub(crate) config: Option<PathBuf>,
 
     /// Daemon API address (for client commands).
@@ -21,7 +21,7 @@ pub(crate) struct Cli {
     /// Driving a Linux daemon this way unlocks Firecracker-only operations
     /// (fork, suspend, OCI import) from a macOS host. Overrides any selected
     /// context. Defaults to the current context, else http://127.0.0.1:7777.
-    #[arg(long, env = "HUSKER_API_URL")]
+    #[arg(long, env = "HUSKER_API_URL", global = true)]
     pub(crate) api_url: Option<String>,
 
     /// Use a saved context (see `husker context`) as the daemon target.
@@ -32,7 +32,7 @@ pub(crate) struct Cli {
     /// Bearer token for authenticated API access. A blank value is refused:
     /// an empty token is a misconfiguration, not a request for no
     /// authentication.
-    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new(), global = true)]
     pub(crate) api_token: Option<String>,
 
     /// Output format for command responses.

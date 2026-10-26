@@ -375,11 +375,16 @@ fn enrich_v0_3(schema: &mut serde_json::Value) {
 
 /// Global args accepted by every command, derived from the root command.
 /// Returns a clispec-compliant array of arg objects.
+///
+/// Only args clap propagates to every subcommand are listed, so an agent can
+/// place each one after the subcommand as the contract promises. A root arg
+/// without `global = true` would parse before the subcommand only, which is a
+/// different contract and is kept out of this array.
 fn schema_global_args(root: &clap::Command) -> Vec<serde_json::Value> {
     root.get_arguments()
         .filter(|a| {
             let id = a.get_id().as_str();
-            id != "help" && id != "version"
+            id != "help" && id != "version" && a.is_global_set()
         })
         .map(clap_arg_to_schema)
         .collect()

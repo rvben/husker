@@ -6659,6 +6659,38 @@ mod tests {
         assert!(args.iter().any(|a| a["name"] == "name"));
     }
 
+    /// The schema's `global_args` is derived from clap's global flag, so this
+    /// pins the other direction: every root argument is global, and none drops
+    /// out of the advertised list by being parseable before the subcommand only.
+    #[test]
+    fn every_root_argument_is_global_and_listed_in_global_args() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let root_flags: Vec<String> = root
+            .get_arguments()
+            .filter(|arg| !matches!(arg.get_id().as_str(), "help" | "version"))
+            .map(|arg| {
+                assert!(
+                    arg.is_global_set(),
+                    "root argument `{}` must be global so it parses after the subcommand",
+                    arg.get_id()
+                );
+                format!(
+                    "--{}",
+                    arg.get_long().expect("root arguments are long flags")
+                )
+            })
+            .collect();
+        let schema = build_cli_schema();
+        let listed: Vec<&str> = schema["global_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, root_flags);
+    }
+
     #[test]
     fn schema_includes_mutating_suspend() {
         let schema = build_cli_schema();

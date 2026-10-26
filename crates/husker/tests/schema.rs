@@ -310,3 +310,63 @@ fn schema_advertises_every_stable_cli_error_kind() {
         assert!(kinds.contains(kind), "missing error kind '{kind}'");
     }
 }
+
+/// Every arg the schema lists as global must parse after the subcommand, which
+/// is where an agent following the contract places it. A root arg that only
+/// parses before the subcommand is a different contract and must not be listed.
+#[test]
+fn every_global_arg_parses_after_the_subcommand() {
+    let document = schema_document();
+    let global_args = document["global_args"].as_array().unwrap();
+    assert!(!global_args.is_empty());
+    for arg in global_args {
+        let name = arg["name"].as_str().unwrap();
+        let value = match arg["type"].as_str().unwrap() {
+            "boolean" => None,
+            "path" => Some("/nonexistent/husker.toml"),
+            _ => Some(
+                arg["enum"]
+                    .as_array()
+                    .and_then(|values| values.first())
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("value"),
+            ),
+        };
+        let mut command = Command::cargo_bin("husker").unwrap();
+        command.arg("schema").arg(name).args(value);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "`husker schema {name} {}` should parse: {}",
+            value.unwrap_or_default(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// `husker list --api-url ...` used to exit 2 because the flag only parsed
+/// before the subcommand while the schema advertised it as global.
+#[test]
+fn list_accepts_the_daemon_target_after_the_subcommand() {
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .env_remove("HUSKER_CONTEXT")
+        .env_remove("HUSKER_API_URL")
+        .args([
+            "list",
+            "--api-url",
+            "http://127.0.0.1:0",
+            "--output",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "exit {:?}: {stderr}",
+        output.status.code()
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["daemon_reachable"], false);
+}
