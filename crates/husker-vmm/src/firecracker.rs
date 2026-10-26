@@ -124,37 +124,67 @@ pub struct FirecrackerBackend {
 /// not collide on the host UDS. The later of the two requirements wins.
 const FORK_MIN_FIRECRACKER: (u32, u32, u32) = (1, 16, 0);
 const GUEST_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Interval between exit checks while a guest shuts down. Each check locks the
+/// instance map only for the check itself, so every other VM's operations keep
+/// flowing during the grace period.
+const GUEST_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// How a `stop_vm` wait for the Firecracker process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestExit {
+    /// Firecracker exited on its own after the shutdown request.
+    Clean,
+    /// The grace period elapsed, or the process state could not be read, and
+    /// the process was killed.
+    Forced,
+    /// The instance left the map during the wait; a concurrent destroy owns
+    /// the process now.
+    Gone,
+}
 
 /// Wait for a guest-triggered Firecracker exit and force termination when the
 /// guest does not shut down within the bound. A successful `stop_vm` must mean
 /// the process no longer owns its TAP/rootfs/vsock resources; merely accepting
 /// `SendCtrlAltDel` is not sufficient for callers that immediately clean them.
+///
+/// The instance map is locked per exit check, never across the whole grace,
+/// because the map guards every VM: a stop that held it for the full grace
+/// would stall creates, execs and stops of unrelated VMs.
 async fn wait_for_exit_or_kill(
-    process: &mut tokio::process::Child,
+    instances: &Mutex<HashMap<Uuid, FcInstance>>,
+    id: Uuid,
     grace: std::time::Duration,
-) -> Result<bool, VmmError> {
-    if let Ok(Some(_)) = process.try_wait() {
-        return Ok(false);
-    }
-    match tokio::time::timeout(grace, process.wait()).await {
-        Ok(Ok(_)) => Ok(false),
-        Ok(Err(wait_error)) => {
-            process.kill().await.map_err(|kill_error| {
-                VmmError::ProcessError(format!(
-                    "wait for firecracker exit: {wait_error}; force kill also failed: {kill_error}"
-                ))
-            })?;
-            Ok(true)
+) -> Result<GuestExit, VmmError> {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        {
+            let mut instances = instances.lock().await;
+            let Some(instance) = instances.get_mut(&id) else {
+                return Ok(GuestExit::Gone);
+            };
+            match instance.process.try_wait() {
+                Ok(Some(_)) => return Ok(GuestExit::Clean),
+                Ok(None) => {}
+                Err(wait_error) => {
+                    instance.process.kill().await.map_err(|kill_error| {
+                        VmmError::ProcessError(format!(
+                            "wait for firecracker exit: {wait_error}; force kill also failed: {kill_error}"
+                        ))
+                    })?;
+                    return Ok(GuestExit::Forced);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                instance.process.kill().await.map_err(|error| {
+                    VmmError::ProcessError(format!(
+                        "firecracker did not exit within {}s and force kill failed: {error}",
+                        grace.as_secs_f64()
+                    ))
+                })?;
+                return Ok(GuestExit::Forced);
+            }
         }
-        Err(_) => {
-            process.kill().await.map_err(|error| {
-                VmmError::ProcessError(format!(
-                    "firecracker did not exit within {}s and force kill failed: {error}",
-                    grace.as_secs_f64()
-                ))
-            })?;
-            Ok(true)
-        }
+        tokio::time::sleep(GUEST_EXIT_POLL).await;
     }
 }
 
@@ -658,21 +688,25 @@ impl VmmBackend for FirecrackerBackend {
         )
         .await;
 
-        // Re-acquire the instance and do not return while Firecracker can still
-        // hold the TAP open. Shutdown cleanup runs immediately after this call.
-        let mut instances = self.instances.lock().await;
-        if let Some(instance) = instances.get_mut(&id) {
-            let grace = match graceful_request {
-                Ok(()) => GUEST_SHUTDOWN_GRACE,
-                Err(error) => {
-                    tracing::warn!(%id, %error, "guest shutdown request failed; force-stopping firecracker");
-                    std::time::Duration::ZERO
-                }
-            };
-            let forced = wait_for_exit_or_kill(&mut instance.process, grace).await?;
-            if forced {
+        // Do not return while Firecracker can still hold the TAP open: shutdown
+        // cleanup runs immediately after this call.
+        let grace = match graceful_request {
+            Ok(()) => GUEST_SHUTDOWN_GRACE,
+            Err(error) => {
+                tracing::warn!(%id, %error, "guest shutdown request failed; force-stopping firecracker");
+                std::time::Duration::ZERO
+            }
+        };
+        match wait_for_exit_or_kill(&self.instances, id, grace).await? {
+            GuestExit::Clean => {}
+            GuestExit::Forced => {
                 tracing::warn!(%id, "guest did not exit cleanly; force-killed firecracker");
             }
+            GuestExit::Gone => return Ok(()),
+        }
+
+        let mut instances = self.instances.lock().await;
+        if let Some(instance) = instances.get_mut(&id) {
             instance.info.state = VmState::Stopped;
             instance.info.pid = None;
             instance.cgroup.remove();
@@ -1522,31 +1556,145 @@ mod tests {
         assert!(info.pid.is_none());
     }
 
+    /// A running instance wrapping `process`, registered in `backend`'s map.
+    async fn register_running_process(
+        backend: &FirecrackerBackend,
+        dir: &Path,
+        process: tokio::process::Child,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let instance = FcInstance {
+            info: VmInfo {
+                id,
+                name: format!("stop-wait-{id}"),
+                state: VmState::Running,
+                pid: process.id(),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 3,
+            },
+            socket_path: dir.join(format!("{id}.sock")),
+            vsock_path: dir.join(format!("{id}.vsock")),
+            boot_log_path: dir.join(format!("{id}.boot.log")),
+            serial_log_path: dir.join(format!("{id}.serial.log")),
+            process,
+            balloon: false,
+            cgroup: noop_cgroup(),
+        };
+        backend.instances.lock().await.insert(id, instance);
+        id
+    }
+
+    async fn process_has_exited(backend: &FirecrackerBackend, id: Uuid) -> bool {
+        let mut instances = backend.instances.lock().await;
+        instances
+            .get_mut(&id)
+            .expect("instance stays registered")
+            .process
+            .try_wait()
+            .unwrap()
+            .is_some()
+    }
+
     #[tokio::test]
     async fn stop_wait_contract_observes_a_clean_process_exit() {
-        let mut process = tokio::process::Command::new("true").spawn().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend("firecracker", dir.path());
+        let process = tokio::process::Command::new("true").spawn().unwrap();
+        let id = register_running_process(&backend, dir.path(), process).await;
 
-        let forced = wait_for_exit_or_kill(&mut process, std::time::Duration::from_secs(1))
+        let exit = wait_for_exit_or_kill(&backend.instances, id, std::time::Duration::from_secs(1))
             .await
             .unwrap();
 
-        assert!(!forced);
-        assert!(process.try_wait().unwrap().is_some());
+        assert_eq!(exit, GuestExit::Clean);
+        assert!(process_has_exited(&backend, id).await);
     }
 
     #[tokio::test]
     async fn stop_wait_contract_kills_a_process_after_the_grace_period() {
-        let mut process = tokio::process::Command::new("sleep")
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend("firecracker", dir.path());
+        let process = tokio::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .unwrap();
+        let id = register_running_process(&backend, dir.path(), process).await;
 
-        let forced = wait_for_exit_or_kill(&mut process, std::time::Duration::from_millis(10))
-            .await
+        let exit =
+            wait_for_exit_or_kill(&backend.instances, id, std::time::Duration::from_millis(10))
+                .await
+                .unwrap();
+
+        assert_eq!(exit, GuestExit::Forced);
+        assert!(process_has_exited(&backend, id).await);
+    }
+
+    #[tokio::test]
+    async fn stop_wait_contract_reports_an_instance_removed_during_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend("firecracker", dir.path());
+        let process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
             .unwrap();
+        let id = register_running_process(&backend, dir.path(), process).await;
 
-        assert!(forced);
-        assert!(process.try_wait().unwrap().is_some());
+        let instances = Arc::clone(&backend.instances);
+        let wait = tokio::spawn(async move {
+            wait_for_exit_or_kill(&instances, id, std::time::Duration::from_secs(5)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut removed = backend.instances.lock().await.remove(&id).unwrap();
+        removed.process.kill().await.unwrap();
+
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .expect("the wait notices the removal within one poll")
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit, GuestExit::Gone);
+    }
+
+    /// The regression guard for the stop that stalled every other VM: the
+    /// instance map must be free while a guest uses its shutdown grace.
+    #[tokio::test]
+    async fn stop_wait_releases_the_instance_map_during_the_grace_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend("firecracker", dir.path());
+        let process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let id = register_running_process(&backend, dir.path(), process).await;
+
+        let grace = std::time::Duration::from_millis(800);
+        let started = std::time::Instant::now();
+        let instances = Arc::clone(&backend.instances);
+        let wait = tokio::spawn(async move { wait_for_exit_or_kill(&instances, id, grace).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !wait.is_finished(),
+            "the wait must still be inside the grace period when the map is probed"
+        );
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            backend.instances.lock(),
+        )
+        .await;
+        assert!(
+            probe.is_ok(),
+            "another VM's operation could not take the instance map while a guest shuts down"
+        );
+        drop(probe);
+
+        assert_eq!(wait.await.unwrap().unwrap(), GuestExit::Forced);
+        assert!(
+            started.elapsed() >= grace,
+            "the kill must not precede the grace period"
+        );
+        assert!(process_has_exited(&backend, id).await);
     }
 
     /// `set_balloon` on an unknown id returns VmNotFound.
