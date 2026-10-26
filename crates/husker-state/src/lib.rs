@@ -153,6 +153,16 @@ impl std::fmt::Display for VmLifecycleState {
     }
 }
 
+/// Render lifecycle states as the quoted list of an SQL `IN (...)` clause, so
+/// runtime queries spell state names through the enum rather than by hand.
+fn sql_state_list(states: impl IntoIterator<Item = VmLifecycleState>) -> String {
+    states
+        .into_iter()
+        .map(|state| format!("'{state}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown VM lifecycle state '{0}'")]
 pub struct InvalidVmLifecycleState(String);
@@ -1476,9 +1486,14 @@ impl StateStore {
     /// Count children forked from `source_id` that are in a non-terminal state.
     pub fn count_live_forks_of(&self, source_id: Uuid) -> Result<usize, StateError> {
         let conn = self.lock()?;
+        let non_terminal = VmLifecycleState::ALL
+            .into_iter()
+            .filter(|s| !s.is_terminal());
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM vms WHERE forked_from = ?1 \
-             AND state IN ('creating','running','paused','suspending','suspended')",
+            &format!(
+                "SELECT COUNT(*) FROM vms WHERE forked_from = ?1 AND state IN ({})",
+                sql_state_list(non_terminal),
+            ),
             params![source_id.to_string()],
             |r| r.get(0),
         )?;
@@ -2634,29 +2649,47 @@ impl StateStore {
     /// Also records scripts that cannot survive the daemon as `interrupted`.
     /// A standalone VM cannot be resumed after this reconciliation, so leaving
     /// its script `pending` would promise a retry that can never happen.
+    ///
+    /// The three updates are one transaction: a daemon that fails between
+    /// them would otherwise start serving from a half-reconciled database,
+    /// with stopped rows still carrying a PID or a script still `running`.
     pub fn mark_stale_vms_stopped(&self) -> Result<usize, StateError> {
+        use VmLifecycleState as S;
         let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
         let now = Utc::now().to_rfc3339();
-        let count = conn.execute(
-            "UPDATE vms
-             SET state = 'stopped', pid = NULL, suspended_at = NULL, updated_at = ?1
-             WHERE state IN ('running', 'creating', 'paused')",
+        let count = tx.execute(
+            &format!(
+                "UPDATE vms
+                 SET state = '{stopped}', pid = NULL, suspended_at = NULL, updated_at = ?1
+                 WHERE state IN ({stale})",
+                stopped = S::Stopped,
+                stale = sql_state_list([S::Running, S::Creating, S::Paused]),
+            ),
             params![now],
         )?;
         // Terminal and suspended rows are not counted as stale transitions, but
         // none has a live VMM process after daemon restart. Clear legacy or
         // partially-persisted identities while preserving suspended_at for the
-        // resumable suspended lifecycle.
-        conn.execute(
-            "UPDATE vms SET pid = NULL WHERE state IN ('stopped', 'failed', 'suspended')",
+        // resumable suspended lifecycle. A row mid-suspend keeps its PID for
+        // the suspend reconcile, which reaps the orphaned VMM by it.
+        tx.execute(
+            &format!(
+                "UPDATE vms SET pid = NULL WHERE state IN ({})",
+                sql_state_list([S::Stopped, S::Failed, S::Suspended]),
+            ),
             [],
         )?;
-        conn.execute(
-            "UPDATE vms SET userdata_status = 'interrupted', updated_at = ?1
-             WHERE userdata_status = 'running'
-                OR (userdata_status = 'pending' AND state IN ('stopped', 'failed'))",
+        tx.execute(
+            &format!(
+                "UPDATE vms SET userdata_status = 'interrupted', updated_at = ?1
+                 WHERE userdata_status = 'running'
+                    OR (userdata_status = 'pending' AND state IN ({}))",
+                sql_state_list([S::Stopped, S::Failed]),
+            ),
             params![now],
         )?;
+        tx.commit()?;
         Ok(count)
     }
 
@@ -4437,6 +4470,67 @@ mod tests {
 
         let fetched = store.get_vm(rec.id).unwrap();
         assert_eq!(fetched.userdata_status, Some(UserdataStatus::Completed));
+    }
+
+    /// The reconcile is one transaction: when its last statement fails, the
+    /// rows the earlier statements touched are rolled back, so the daemon
+    /// never serves from a database where a VM is stopped on paper but its
+    /// script still reads `running`.
+    #[test]
+    fn mark_stale_rolls_back_every_update_when_one_fails() {
+        let store = StateStore::open_memory().unwrap();
+
+        let mut rec = make_record("ud-atomic");
+        rec.pid = Some(4242);
+        rec.userdata = Some("#!/bin/sh".into());
+        rec.userdata_status = Some(UserdataStatus::Running);
+        store.insert_vm(&rec).unwrap();
+
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_userdata_update
+                 BEFORE UPDATE OF userdata_status ON vms
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+
+        let error = store.mark_stale_vms_stopped().unwrap_err();
+        assert!(error.to_string().contains("injected failure"), "{error}");
+
+        let fetched = store.get_vm(rec.id).unwrap();
+        assert_eq!(fetched.state, VmLifecycleState::Running);
+        assert_eq!(fetched.pid, Some(4242));
+        assert_eq!(fetched.userdata_status, Some(UserdataStatus::Running));
+    }
+
+    #[test]
+    fn sql_state_list_quotes_every_state_for_an_in_clause() {
+        use VmLifecycleState as S;
+        assert_eq!(sql_state_list([S::Running]), "'running'");
+        assert_eq!(
+            sql_state_list([S::Running, S::Creating, S::Paused]),
+            "'running', 'creating', 'paused'"
+        );
+        assert_eq!(sql_state_list([]), "");
+    }
+
+    /// The schema's state guard accepts every state the enum defines. A
+    /// variant added without a migration that widens the trigger would be
+    /// rejected by the database at the first insert.
+    #[test]
+    fn database_accepts_every_vm_lifecycle_state() {
+        let store = StateStore::open_memory().unwrap();
+        for state in VmLifecycleState::ALL {
+            let mut record = make_record(&format!("state-{state}"));
+            record.state = state;
+            store.insert_vm(&record).unwrap();
+            assert_eq!(store.get_vm(record.id).unwrap().state, state);
+            for next in VmLifecycleState::ALL {
+                store.update_vm_state(record.id, next).unwrap();
+            }
+        }
     }
 
     // ── Host Groups ───────────────────────────────────────────────────
