@@ -1958,12 +1958,27 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
         },
         _ => return,
     };
+    // An interactive shell runs whatever it is given, so it answers to the
+    // same execution policy as exec: an operator who allowlists or denylists
+    // commands must be able to keep the shell out with the same lists.
+    let shell_command = command.as_deref().unwrap_or("/bin/sh");
+    if !exec_command_allowed(shell_command, &current_policy()) {
+        info!(audit = "shell_denied", vm = %name, command = shell_command);
+        let _ = send_ws_output(
+            &mut ws,
+            &WsShellOutput::Error {
+                message: format!("command '{shell_command}' is blocked by execution policy"),
+            },
+        )
+        .await;
+        return;
+    }
     info!(
         audit = "shell_start",
         vm = %name,
         cols,
         rows,
-        command = command.as_deref().unwrap_or("/bin/sh")
+        command = shell_command
     );
     metrics()
         .shell_sessions_total

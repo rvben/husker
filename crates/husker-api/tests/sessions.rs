@@ -618,3 +618,86 @@ async fn monitor_releases_idle_guard_while_suspended_and_reacquires_on_resume() 
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn shell_applies_the_exec_command_policy_before_contacting_the_guest() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            husker_api::set_policy(husker_api::ApiPolicy::default());
+        }
+    }
+    let gate = Arc::new(ConnectGate {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(1),
+    });
+    let f = Fixture::new_with_gate(Some(gate.clone())).await;
+    let _reset = Reset;
+    husker_api::set_policy(husker_api::ApiPolicy {
+        exec_denylist: vec!["husker-test-denied-executable".into()],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router_with_auth(f.core.clone(), Some("test-token".into()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let open_shell = |command: &'static str| async move {
+        let mut request = format!("ws://{addr}/v1/vms/dev/shell")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", "Bearer test-token".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        ws.send(Message::Text(
+            json!({ "type": "start", "command": command })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let first: Value = match ws.next().await {
+            Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected a text frame, got {other:?}"),
+        };
+        (ws, first)
+    };
+
+    let (mut denied, first) = open_shell("husker-test-denied-executable").await;
+    assert_eq!(first["type"], "error", "{first}");
+    assert!(
+        first["message"]
+            .as_str()
+            .unwrap()
+            .contains("blocked by execution policy"),
+        "{first}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), gate.entered.notified())
+            .await
+            .is_err(),
+        "a denied shell must not connect to the guest agent"
+    );
+    assert!(
+        !matches!(denied.next().await, Some(Ok(Message::Text(_)))),
+        "a denied shell gets no further frames"
+    );
+
+    let (mut allowed, first) = open_shell("cat").await;
+    if first["type"] != "started" {
+        let message = first["message"].as_str().unwrap_or_default();
+        assert!(
+            first["type"] == "error" && !message.contains("execution policy"),
+            "an allowed command passes the policy gate: {first}"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("an allowed shell connects to the guest agent");
+    let _ = allowed.close(None).await;
+    server.abort();
+}
