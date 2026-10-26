@@ -773,12 +773,40 @@ async fn main() {
         }
     };
     let output = resolve_command_format(cli.output, &cli.command);
+    exit_quietly_when_stdout_closes(&cli.command);
     if let Err(e) = run(cli).await {
         // A daemon failure that travelled through `?` keeps its kind and exit
         // code, a connection failure carries the DaemonUnreachable marker, and
         // everything else is a generic client error. Rendered in the requested
         // format so `--output json` callers always get parseable errors.
         exit_with_error(output, ApiFailure::from_error(&e));
+    }
+}
+
+/// Rust starts every program with SIGPIPE ignored, so a write to a pipe whose
+/// reader has gone away fails with EPIPE instead of ending the process, and
+/// `println!` turns that failure into a panic. For a client command the
+/// failure carries no information: the reader (a `head`, a pager that was
+/// closed) chose to stop listening, and the conventional answer is to stop as
+/// quietly as `cat` does. Restoring the default disposition does that for
+/// every write at once.
+///
+/// Three commands keep the ignored disposition. The daemon and the guest agent
+/// serve sockets and child pipes for as long as they live, so a vanished
+/// reader must stay an error on that one stream. A job owns a VM it has
+/// promised to destroy, so a broken pipe must reach its cleanup as an error
+/// rather than end the process before it.
+fn exit_quietly_when_stdout_closes(command: &Commands) {
+    if matches!(
+        command,
+        Commands::Daemon { .. } | Commands::GuestAgent | Commands::Job { .. }
+    ) {
+        return;
+    }
+    // SAFETY: SIG_DFL installs no handler, so no code of ours can run in a
+    // signal context; the call only changes the process's SIGPIPE disposition.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 

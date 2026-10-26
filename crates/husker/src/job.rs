@@ -437,12 +437,18 @@ fn render_job_exec_event(event: DaemonExecEvent) -> Result<()> {
     match event {
         DaemonExecEvent::Started { .. } => {}
         DaemonExecEvent::Stdout(bytes) => {
-            std::io::stdout().write_all(&bytes)?;
-            std::io::stdout().flush()?;
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(&bytes)
+                .and_then(|()| stdout.flush())
+                .context("the command's output could not be written to stdout")?;
         }
         DaemonExecEvent::Stderr(bytes) => {
-            std::io::stderr().write_all(&bytes)?;
-            std::io::stderr().flush()?;
+            let mut stderr = std::io::stderr().lock();
+            stderr
+                .write_all(&bytes)
+                .and_then(|()| stderr.flush())
+                .context("the command's output could not be written to stderr")?;
         }
     }
     Ok(())
@@ -477,7 +483,7 @@ async fn finish_job(req: &JobRequest<'_>, outcome: JobOutcome) -> JobTermination
         }
     }
 
-    render_outcome(
+    let delivered = render_outcome(
         req,
         &outcome,
         retrieval_failure.as_ref(),
@@ -505,34 +511,49 @@ async fn finish_job(req: &JobRequest<'_>, outcome: JobOutcome) -> JobTermination
         );
     }
 
-    termination
+    match delivered {
+        Ok(()) => termination,
+        Err(error) => JobTermination::Failure(ApiFailure::from_error(
+            &anyhow::Error::new(error).context("the job result could not be written to stdout"),
+        )),
+    }
 }
 
+/// Write the job's result to stdout. A job keeps SIGPIPE ignored so that a
+/// reader who went away mid-stream still lets it destroy its VM, which means
+/// a closed stdout surfaces here as an error instead of ending the process;
+/// the VM is already cleaned up by now, so the error only says the result
+/// never reached anyone.
 fn render_outcome(
     req: &JobRequest<'_>,
     outcome: &JobOutcome,
     retrieval_failure: Option<&ApiFailure>,
     lifecycle_failed: bool,
-) {
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut stdout = std::io::stdout().lock();
     if req.output == OutputFormat::Json {
         let payload = structured_output(
             "job",
             &outcome_json(req.name, outcome, retrieval_failure, lifecycle_failed),
         )
         .expect("job output must match its CLI contract");
-        println!(
+        writeln!(
+            stdout,
             "{}",
             serde_json::to_string_pretty(&payload).expect("job output must serialize")
-        );
+        )?;
     } else {
         if let Some(retrieval) = &outcome.retrieval {
             retrieval.report_text();
         }
         if !outcome.streamed {
-            print!("{}", outcome.exec.stdout);
+            stdout.write_all(outcome.exec.stdout.as_bytes())?;
             eprint!("{}", outcome.exec.stderr);
         }
     }
+    stdout.flush()
 }
 
 fn outcome_json(
