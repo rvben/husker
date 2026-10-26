@@ -920,9 +920,18 @@ impl StateStore {
         // WAL enables concurrent readers alongside a single writer; busy_timeout
         // lets a writer wait for the write lock instead of failing under
         // contention. foreign_keys is enforced per-connection.
+        //
+        // synchronous=NORMAL fsyncs the WAL at checkpoints instead of on every
+        // commit. Every state call runs on a tokio worker, so a per-commit fsync
+        // stalls the executor for the disk's flush latency. In WAL mode the
+        // database stays consistent across any crash under NORMAL; only a power
+        // loss or kernel panic can roll back the newest commits, which the daemon
+        // tolerates because no VM survives the host and every VM row is
+        // reconciled at startup.
         let manager = SqliteConnectionManager::file(path).with_init(|c| {
             c.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
+                 PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
             )
         });
         let pool = r2d2::Pool::builder()
@@ -3542,6 +3551,31 @@ mod tests {
         assert_eq!(store.allocate_cid().unwrap(), 3);
         assert_eq!(store.allocate_cid().unwrap(), 4);
         assert_eq!(store.allocate_cid().unwrap(), 5);
+    }
+
+    /// A file-backed store runs in WAL mode with synchronous=NORMAL on every
+    /// pooled connection: the pragmas are per-connection, so a second
+    /// connection drawn while the first is held must carry them too.
+    #[test]
+    fn file_store_connections_use_wal_with_normal_synchronous() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.db")).unwrap();
+
+        let first = store.lock().unwrap();
+        let second = store.lock().unwrap();
+        for conn in [&first, &second] {
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode, "wal");
+            let synchronous: i64 = conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                synchronous, 1,
+                "synchronous must be NORMAL (1), not FULL (2)"
+            );
+        }
     }
 
     #[test]
