@@ -255,7 +255,8 @@ fn collect_schema_command_inner(
         out.push(serde_json::json!({
             "name": full_path,
             "description": cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
-            "mutating": contract.mutating,
+            "mutating": contract.mutating(),
+            "effects": contract.effects.name(),
             "args": args,
             "output_fields": output_fields,
         }));
@@ -279,24 +280,6 @@ fn enrich_v0_3(schema: &mut serde_json::Value) {
             continue;
         };
         let name = object["name"].as_str().unwrap_or_default().to_string();
-        let mutating = object["mutating"].as_bool().unwrap_or(false);
-        let non_idempotent = name == "run"
-            || name == "fork"
-            || name.ends_with(" create")
-            || name.ends_with(" import")
-            || name.ends_with(" import-oci")
-            || name.ends_with(" pull")
-            || name.ends_with(" checkout");
-        object.insert(
-            "effects".into(),
-            serde_json::json!(if !mutating {
-                "read_only"
-            } else if non_idempotent {
-                "non_idempotent"
-            } else {
-                "idempotent"
-            }),
-        );
 
         if matches!(
             name.as_str(),

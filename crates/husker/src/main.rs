@@ -8187,7 +8187,7 @@ default_auto_resume = false
 
     #[test]
     fn command_contract_profile_list_is_non_mutating() {
-        let mutating = command_contract("profile list").unwrap().mutating;
+        let mutating = command_contract("profile list").unwrap().mutating();
         assert!(
             !mutating,
             "profile list is a read-only introspection command and must not be marked mutating"
@@ -8265,7 +8265,7 @@ default_auto_resume = false
 
     #[test]
     fn setup_storage_in_schema_is_mutating() {
-        let mutating = command_contract("setup storage").unwrap().mutating;
+        let mutating = command_contract("setup storage").unwrap().mutating();
         assert!(
             mutating,
             "setup storage can write scripts with --out and cannot be auto-approved as read-only"

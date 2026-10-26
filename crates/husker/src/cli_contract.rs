@@ -100,36 +100,67 @@ pub(crate) enum OutputContract {
     Unsupported,
 }
 
+/// What re-running a command does, declared per command so a consumer that
+/// grants trust (auto-approval, automatic retry) reads an explicit claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Effects {
+    /// Does not modify state a consumer cares about.
+    ReadOnly,
+    /// May modify state, but repeating it converges to the same state, so a
+    /// failed attempt can be retried.
+    Idempotent,
+    /// Repeating it may cause an additional effect (a second VM, a second
+    /// command run, a new secret value), so it must not be retried blindly.
+    NonIdempotent,
+}
+
+impl Effects {
+    /// The clispec `effects` identifier.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Effects::ReadOnly => "read_only",
+            Effects::Idempotent => "idempotent",
+            Effects::NonIdempotent => "non_idempotent",
+        }
+    }
+
+    /// The deprecated clispec v0.2 `mutating` marker, which the v0.3 contract
+    /// still emits beside `effects`; the spec requires the two to agree.
+    pub(crate) const fn mutating(self) -> bool {
+        !matches!(self, Effects::ReadOnly)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CommandContract {
     pub(crate) path: &'static str,
-    pub(crate) mutating: bool,
+    pub(crate) effects: Effects,
     pub(crate) output: OutputContract,
 }
 
 impl CommandContract {
     pub(crate) const fn object(
         path: &'static str,
-        mutating: bool,
+        effects: Effects,
         fields: &'static [FieldContract],
     ) -> Self {
         Self {
             path,
-            mutating,
+            effects,
             output: OutputContract::Object(fields),
         }
     }
 
     pub(crate) const fn list(
         path: &'static str,
-        mutating: bool,
+        effects: Effects,
         envelope: &'static [FieldContract],
         items_field: &'static str,
         item: &'static [FieldContract],
     ) -> Self {
         Self {
             path,
-            mutating,
+            effects,
             output: OutputContract::List {
                 envelope,
                 items_field,
@@ -138,20 +169,24 @@ impl CommandContract {
         }
     }
 
-    pub(crate) const fn self_describing(path: &'static str, mutating: bool) -> Self {
+    pub(crate) const fn self_describing(path: &'static str, effects: Effects) -> Self {
         Self {
             path,
-            mutating,
+            effects,
             output: OutputContract::SelfDescribing,
         }
     }
 
-    pub(crate) const fn unsupported(path: &'static str, mutating: bool) -> Self {
+    pub(crate) const fn unsupported(path: &'static str, effects: Effects) -> Self {
         Self {
             path,
-            mutating,
+            effects,
             output: OutputContract::Unsupported,
         }
+    }
+
+    pub(crate) const fn mutating(self) -> bool {
+        self.effects.mutating()
     }
 
     pub(crate) fn clispec_fields(self) -> &'static [FieldContract] {

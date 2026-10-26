@@ -370,3 +370,56 @@ fn list_accepts_the_daemon_target_after_the_subcommand() {
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["daemon_reachable"], false);
 }
+
+/// `effects` is declared per command, not derived from the command name:
+/// commands that start a VM, run a command in a guest, or mint a value are
+/// `non_idempotent`; converging state changes are `idempotent`; reads are
+/// `read_only`. The deprecated `mutating` marker must agree with it.
+#[test]
+fn schema_effects_are_declared_per_command() {
+    let document = schema_document();
+    let expected = [
+        ("exec", "non_idempotent"),
+        ("job", "non_idempotent"),
+        ("session start", "non_idempotent"),
+        ("prompt", "non_idempotent"),
+        ("port-forward add", "non_idempotent"),
+        ("snapshot restore", "non_idempotent"),
+        ("secret rotate", "non_idempotent"),
+        ("dev new", "non_idempotent"),
+        ("shell", "non_idempotent"),
+        ("run", "non_idempotent"),
+        ("image pull", "non_idempotent"),
+        ("stop", "idempotent"),
+        ("destroy", "idempotent"),
+        ("port-forward remove", "idempotent"),
+        ("session cancel", "idempotent"),
+        ("context use", "idempotent"),
+        ("setup storage", "idempotent"),
+        ("list", "read_only"),
+        ("session list", "read_only"),
+        ("session get", "read_only"),
+        ("events", "read_only"),
+        ("logs", "read_only"),
+        ("schema", "read_only"),
+    ];
+    for (path, effects) in expected {
+        let command = command_at_path(&document, path);
+        assert_eq!(command["effects"], effects, "effects of `{path}`");
+    }
+
+    for command in document["commands"].as_array().unwrap() {
+        let name = command["name"].as_str().unwrap();
+        let effects = command["effects"].as_str().unwrap();
+        let mutating = command["mutating"].as_bool().unwrap();
+        assert!(
+            matches!(effects, "read_only" | "idempotent" | "non_idempotent"),
+            "`{name}` declares unknown effects {effects:?}"
+        );
+        assert_eq!(
+            mutating,
+            effects != "read_only",
+            "`{name}`: mutating={mutating} disagrees with effects={effects}"
+        );
+    }
+}
