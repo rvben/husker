@@ -359,7 +359,8 @@ pub enum BootMode {
 }
 
 impl BootMode {
-    /// Stable lowercase tag for persistence/display (`"direct"` / `"uefi"` / `"efi"`).
+    /// Stable lowercase tag for persistence and display; the vocabulary is
+    /// [`BootKind::as_str`].
     pub fn as_str(&self) -> &'static str {
         self.kind().as_str()
     }
