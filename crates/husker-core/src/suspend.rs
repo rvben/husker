@@ -320,6 +320,10 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// `rootfs.ext4.fork-src-bak` backup. Restore each one before any resume can
     /// open the stale symlink and boot the source against the wrong disk. Run at
     /// daemon startup. Returns the number recovered.
+    ///
+    /// Only VMs on a backend that can fork are examined: the backup is a fork
+    /// artifact, and the recovery replaces the rootfs with it, so a stray file
+    /// of that name beside another backend's disk must not be consumed.
     pub fn recover_stranded_fork_rootfs(&self) -> usize {
         let vms = match self.state.list_vms() {
             Ok(v) => v,
@@ -330,6 +334,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         };
         let mut recovered = 0;
         for vm in vms {
+            if !husker_vmm::Capabilities::for_backend_kind(vm.vmm).fork {
+                continue;
+            }
             let rootfs = self.storage.vm_dir(&vm.name).join("rootfs.ext4");
             match husker_vmm::firecracker::recover_aliased_rootfs(&rootfs) {
                 Ok(true) => {

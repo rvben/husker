@@ -357,11 +357,21 @@ fn core_with_running_vm_backend(
     (core, inner, id, tmp)
 }
 
-/// Build a core plus a handle to its state store and a VM in an arbitrary
-/// persisted `state`, so reconciliation/recovery paths can be set up directly.
+/// Build a core plus a handle to its state store and a Firecracker VM in an
+/// arbitrary persisted `state`, so reconciliation/recovery paths can be set up
+/// directly.
 fn core_store_with_vm(
     name: &str,
     state: &str,
+) -> (Arc<HuskerCore<SharedRecordingVmm>>, Uuid, tempfile::TempDir) {
+    core_store_with_vm_on(name, state, BackendKind::Firecracker)
+}
+
+/// `core_store_with_vm` with the VM persisted as running on `backend`.
+fn core_store_with_vm_on(
+    name: &str,
+    state: &str,
+    backend: BackendKind,
 ) -> (Arc<HuskerCore<SharedRecordingVmm>>, Uuid, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let inner = RecordingVmm::new();
@@ -393,7 +403,7 @@ fn core_store_with_vm(
         userdata_env: None,
         service_id: None,
         service_ordinal: None,
-        vmm: BackendKind::Firecracker,
+        vmm: backend,
         boot_mode: husker_core::BootKind::DirectKernel,
         balloon: false,
         volume: None,
@@ -505,22 +515,33 @@ async fn reconcile_drops_suspending_without_slot() {
     );
 }
 
+/// Lay out the disk shape a fork leaves when it crashes mid-load under
+/// `data_dir`: the VM's `rootfs.ext4` is a symlink to the fork clone and the
+/// real disk sits in `rootfs.ext4.fork-src-bak`. Returns the rootfs and backup
+/// paths.
+fn strand_fork_source(
+    data_dir: &std::path::Path,
+    name: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let vm_dir = data_dir.join("vms").join(name);
+    std::fs::create_dir_all(&vm_dir).unwrap();
+    let rootfs = vm_dir.join("rootfs.ext4");
+    let clone = data_dir.join(format!("{name}-clone.ext4"));
+    let backup = vm_dir.join("rootfs.ext4.fork-src-bak");
+    std::fs::write(&clone, b"fork-disk").unwrap();
+    std::fs::write(&backup, b"real-source-disk").unwrap();
+    std::os::unix::fs::symlink(&clone, &rootfs).unwrap();
+    (rootfs, backup)
+}
+
 #[tokio::test]
 async fn recover_stranded_fork_rootfs_restores_source_disk() {
     // A fork that crashed mid-load leaves the source VM's rootfs as a stale
     // symlink to the fork clone, with the real disk in `.fork-src-bak`. Startup
     // recovery must restore the real disk at the exact path fork uses, so a
     // later resume does not load the wrong disk.
-    let (core, id, tmp) = core_store_with_vm("vmsrc", "suspended");
-    let vm_dir = tmp.path().join("vms").join("vmsrc");
-    std::fs::create_dir_all(&vm_dir).unwrap();
-    let rootfs = vm_dir.join("rootfs.ext4");
-    let clone = tmp.path().join("clone.ext4");
-    let backup = vm_dir.join("rootfs.ext4.fork-src-bak");
-    std::fs::write(&clone, b"fork-disk").unwrap();
-    std::fs::write(&backup, b"real-source-disk").unwrap();
-    std::os::unix::fs::symlink(&clone, &rootfs).unwrap();
-    let _ = id;
+    let (core, _id, tmp) = core_store_with_vm("vmsrc", "suspended");
+    let (rootfs, backup) = strand_fork_source(tmp.path(), "vmsrc");
 
     let n = core.recover_stranded_fork_rootfs();
     assert_eq!(n, 1, "one stranded source rootfs should be recovered");
@@ -529,6 +550,31 @@ async fn recover_stranded_fork_rootfs_restores_source_disk() {
         std::fs::read(&rootfs).unwrap(),
         b"real-source-disk",
         "source rootfs must hold the real disk, not the fork clone"
+    );
+}
+
+#[tokio::test]
+async fn recover_stranded_fork_rootfs_leaves_other_backends_alone() {
+    // The stranded layout is a Firecracker fork artifact, and fork is refused
+    // on a backend without the capability, so a backup of that name beside
+    // another backend's disk was never written by husker. Recovery must not
+    // replace that VM's rootfs with it.
+    let (core, _id, tmp) = core_store_with_vm_on("vmvz", "stopped", BackendKind::AppleVz);
+    let (rootfs, backup) = strand_fork_source(tmp.path(), "vmvz");
+
+    let n = core.recover_stranded_fork_rootfs();
+    assert_eq!(n, 0, "a backend without fork has nothing to recover");
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        b"real-source-disk",
+        "the backup must be left where it was"
+    );
+    assert!(
+        std::fs::symlink_metadata(&rootfs)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the rootfs must be left as it was"
     );
 }
 
