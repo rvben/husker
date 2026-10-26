@@ -291,9 +291,12 @@ test-contracts:
 test-failure-injection:
 	cargo test -p husker-core --test failure_injection
 
-# Lightweight performance baseline and regression gate
+# Lightweight performance baseline and regression gate. The gate is ignored by
+# default so a workspace test run never measures it beside every other test;
+# this target runs it alone, and fails rather than passing on zero tests if the
+# gate is ever un-ignored or renamed.
 test-perf-baseline:
-	cargo test -p husker-api --test perf_baseline -- --nocapture
+	cargo nextest run -p husker-api --test perf_baseline --run-ignored only --no-tests=fail --no-capture
 
 # Coverage gate (line + branch) for workspace quality floor.
 coverage-ci:

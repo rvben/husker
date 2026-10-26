@@ -10,6 +10,13 @@
 //! conservative p95/p99 ceilings that catch order-of-magnitude regressions
 //! without flaking under hosted-runner variance.
 //!
+//! The gate is a measurement, so it only means something when it runs alone.
+//! It is ignored by default: a workspace test run would execute it beside
+//! every other test on a shared runner, where the ceilings measure contention
+//! for the disk and the scheduler rather than the request path. `make
+//! test-perf-baseline` (the dedicated CI job and `nightly-quality`) runs it on
+//! its own, and fails on zero tests so the gate cannot silently stop running.
+//!
 //! Regressions that do not show up as request latency are guarded by their
 //! mechanism tests instead of this gate: lock hold times in the stop path by
 //! `stop_wait_releases_the_instance_map_during_the_grace_period`, shutdown
@@ -148,6 +155,7 @@ fn assert_ceilings(name: &str, samples: Vec<u128>, p95_max: u128, p99_max: u128)
 }
 
 #[tokio::test]
+#[ignore = "latency gate: run alone via `make test-perf-baseline`, not beside the workspace suite"]
 async fn request_latency_baseline_on_a_seeded_file_store() {
     let dir = tempfile::tempdir().unwrap();
     let app = router(seeded_core(&dir));
