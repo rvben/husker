@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,8 +26,21 @@ const MAX_STATUS_BYTES: u64 = 16 * 1024;
 
 pub struct SessionStore {
     root: PathBuf,
-    active: Mutex<HashMap<String, Option<oneshot::Sender<()>>>>,
+    active: Mutex<HashMap<String, ActiveSession>>,
+    /// Source of the per-start sequence numbers in `active`.
+    next_sequence: AtomicU64,
     creation: tokio::sync::Mutex<()>,
+}
+
+/// A session this agent process started and still supervises. The sequence
+/// number of the start that created the entry tells a finishing worker
+/// whether the entry under its id is still its own: a session removed and
+/// started again under the same id while the previous worker is publishing
+/// its outcome gets a new entry, which that worker must not evict.
+struct ActiveSession {
+    sequence: u64,
+    /// Taken by the first cancellation, so a repeat is a no-op.
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 fn now() -> u64 {
@@ -114,8 +128,21 @@ impl SessionStore {
         Arc::new(Self {
             root,
             active: Mutex::new(HashMap::new()),
+            next_sequence: AtomicU64::new(0),
             creation: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Drop the active entry for `id` if it still belongs to the start that
+    /// was given `sequence`.
+    fn release(&self, id: &str, sequence: u64) {
+        let mut active = self.active.lock().unwrap();
+        if active
+            .get(id)
+            .is_some_and(|session| session.sequence == sequence)
+        {
+            active.remove(id);
+        }
     }
 
     fn directory(&self, id: &str) -> Result<PathBuf, SessionError> {
@@ -303,9 +330,16 @@ impl SessionStore {
                 exit_code: None, output_truncated: false,
             };
             let (cancel, cancelled) = oneshot::channel();
-            self.active.lock().unwrap().insert(info.id.clone(), Some(cancel));
+            let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+            self.active.lock().unwrap().insert(
+                info.id.clone(),
+                ActiveSession {
+                    sequence,
+                    cancel: Some(cancel),
+                },
+            );
             if let Err(error) = self.save(&info).await {
-                self.active.lock().unwrap().remove(&info.id);
+                self.release(&info.id, sequence);
                 return Err(error);
             }
             let store = self.clone();
@@ -319,7 +353,7 @@ impl SessionStore {
                 if let Err(error) = store.save(&outcome).await {
                     tracing::warn!(session = %outcome.id, %error, "session outcome could not be saved");
                 }
-                store.active.lock().unwrap().remove(&outcome.id);
+                store.release(&outcome.id, sequence);
             });
             Ok(info)
         }.await;
@@ -336,7 +370,7 @@ impl SessionStore {
             .lock()
             .unwrap()
             .get_mut(id)
-            .and_then(Option::take)
+            .and_then(|session| session.cancel.take())
         {
             let _ = sender.send(());
         }
@@ -590,6 +624,34 @@ mod tests {
         req.exec.timeout_secs = Some(1);
         store.start(req, TIMEOUT).await.unwrap();
         assert_eq!(finished(&store).await.state, SessionState::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_predecessor_finishing_late_leaves_a_restarted_session_supervised() {
+        // A worker publishes its outcome before it releases its active entry,
+        // and `remove` accepts the session as soon as that outcome is
+        // persisted, so a session started again under the same id can be
+        // live when the previous worker's release runs. That release must
+        // not evict the successor: it stays running and its cancel sender
+        // stays reachable.
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().into());
+        store.start(request("sleep 60"), TIMEOUT).await.unwrap();
+        let predecessor = store.active.lock().unwrap()[ID].sequence;
+        store.cancel(ID).await.unwrap();
+        assert_eq!(finished(&store).await.state, SessionState::Cancelled);
+        store.remove(ID).await.unwrap();
+        store.start(request("sleep 60"), TIMEOUT).await.unwrap();
+
+        store.release(ID, predecessor);
+
+        assert_eq!(store.get(ID).await.unwrap().state, SessionState::Running);
+        store.cancel(ID).await.unwrap();
+        assert_eq!(
+            finished(&store).await.state,
+            SessionState::Cancelled,
+            "the restarted session must still be cancellable"
+        );
     }
 
     #[tokio::test]
