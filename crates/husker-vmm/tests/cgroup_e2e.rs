@@ -107,7 +107,7 @@ async fn cgroup_enforces_memory_max_and_removes_on_drop() {
     // Tear down: kill the child, remove the cgroup, assert the dir is gone.
     child.kill().await.ok();
     child.wait().await.ok();
-    vc.remove();
+    vc.remove().await;
 
     assert!(
         !vm_dir.exists(),

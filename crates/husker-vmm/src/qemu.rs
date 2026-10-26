@@ -514,7 +514,7 @@ impl QemuKvmBackend {
                 tracing::warn!(%id, path = %sock.display(), error = %e, "failed to remove qemu virtiofsd socket during destroy");
             }
         }
-        inst.cgroup.remove();
+        inst.cgroup.remove().await;
         Ok(())
     }
 
@@ -527,7 +527,7 @@ impl QemuKvmBackend {
                     // Process exited: mark as stopped and reap the now-empty cgroup.
                     inst.info.state = VmState::Stopped;
                     inst.info.pid = None;
-                    inst.cgroup.remove();
+                    inst.cgroup.remove().await;
                 }
                 Ok(None) => {}
                 Err(_) => {

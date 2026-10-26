@@ -709,7 +709,7 @@ impl VmmBackend for FirecrackerBackend {
         if let Some(instance) = instances.get_mut(&id) {
             instance.info.state = VmState::Stopped;
             instance.info.pid = None;
-            instance.cgroup.remove();
+            instance.cgroup.remove().await;
         }
         Ok(())
     }
@@ -745,7 +745,7 @@ impl VmmBackend for FirecrackerBackend {
                 tracing::warn!(%id, path = %path.display(), error = %e, "failed to remove firecracker runtime file during destroy");
             }
         }
-        instance.cgroup.remove();
+        instance.cgroup.remove().await;
 
         Ok(())
     }
@@ -761,7 +761,7 @@ impl VmmBackend for FirecrackerBackend {
                     // Process exited: mark as stopped and reap the now-empty cgroup.
                     instance.info.state = VmState::Stopped;
                     instance.info.pid = None;
-                    instance.cgroup.remove();
+                    instance.cgroup.remove().await;
                 }
                 Ok(None) => {} // Still running
                 Err(_) => {
@@ -947,7 +947,7 @@ impl VmmBackend for FirecrackerBackend {
         {
             Ok(p) => p,
             Err(e) => {
-                vm_cgroup.remove();
+                vm_cgroup.remove().await;
                 return Err(VmmError::ProcessError(format!("spawn firecracker: {e}")));
             }
         };
@@ -955,7 +955,7 @@ impl VmmBackend for FirecrackerBackend {
         if let Some(p) = pid
             && let Err(e) = vm_cgroup.place(p)
         {
-            vm_cgroup.remove();
+            vm_cgroup.remove().await;
             let _ = tokio::fs::remove_file(&socket_path).await;
             let _ = tokio::fs::remove_file(&serial_log_path).await;
             let _ = tokio::fs::remove_file(&boot_log_path).await;
@@ -971,7 +971,7 @@ impl VmmBackend for FirecrackerBackend {
         if !socket_path.exists() {
             // The FC process dies via kill_on_drop; remove the runtime files it
             // left so a timed-out restore does not leak the socket and logs.
-            vm_cgroup.remove();
+            vm_cgroup.remove().await;
             let _ = tokio::fs::remove_file(&socket_path).await;
             let _ = tokio::fs::remove_file(&serial_log_path).await;
             let _ = tokio::fs::remove_file(&boot_log_path).await;
@@ -1003,7 +1003,7 @@ impl VmmBackend for FirecrackerBackend {
                         // The FC process was already spawned; clean up its runtime
                         // files (the process itself dies via kill_on_drop) so a
                         // failed alias does not leak the socket and logs.
-                        vm_cgroup.remove();
+                        vm_cgroup.remove().await;
                         let _ = tokio::fs::remove_file(&socket_path).await;
                         let _ = tokio::fs::remove_file(&serial_log_path).await;
                         let _ = tokio::fs::remove_file(&boot_log_path).await;
@@ -1019,7 +1019,7 @@ impl VmmBackend for FirecrackerBackend {
             // drops here too, restoring the source's rootfs.
             let serial_tail = crate::tail_lines(&serial_log_path, 20);
             let boot_tail = crate::tail_lines(&boot_log_path, 20);
-            vm_cgroup.remove();
+            vm_cgroup.remove().await;
             let _ = tokio::fs::remove_file(&socket_path).await;
             let _ = tokio::fs::remove_file(&serial_log_path).await;
             let _ = tokio::fs::remove_file(&boot_log_path).await;

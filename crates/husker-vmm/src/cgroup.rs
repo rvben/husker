@@ -11,6 +11,10 @@ pub const DEFAULT_MEMORY_OVERHEAD_MIB: u32 = 256;
 /// cgroup v2 CPU accounting period (microseconds).
 const CPU_PERIOD_US: u32 = 100_000;
 
+/// How long a SIGKILLed cgroup member is given to exit before the cgroup is
+/// removed; rmdir fails while a task remains.
+const MEMBER_EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Resource-limit configuration resolved from the daemon config.
 #[derive(Clone, Debug)]
 pub struct CgroupConfig {
@@ -144,7 +148,7 @@ impl CgroupSupervisor {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with("vm-") {
-                    Self::kill_and_rmdir(&entry.path());
+                    Self::kill_and_rmdir_blocking(&entry.path());
                 }
             }
         }
@@ -180,8 +184,10 @@ impl CgroupSupervisor {
         Ok(VmCgroup { dir: Some(dir) })
     }
 
-    /// SIGKILL any pids in a cgroup, then rmdir it. Best-effort.
-    fn kill_and_rmdir(dir: &Path) {
+    /// SIGKILL every pid listed in a cgroup. Returns whether any was listed: a
+    /// signalled member needs a moment to exit before the cgroup can be
+    /// removed, and a pid that is already gone is harmless to wait on.
+    fn kill_members(dir: &Path) -> bool {
         let mut killed_any = false;
         if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
             for pid in procs
@@ -193,17 +199,27 @@ impl CgroupSupervisor {
                 killed_any = true;
             }
         }
-        // Best-effort: real cgroup pseudo-files cannot be unlinked; rmdir works
-        // once all tasks have exited. Only wait when we actually signalled a
-        // process (an already-empty cgroup can be removed immediately). If rmdir
-        // still fails, the next daemon-start orphan sweep reaps it.
-        if killed_any {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        killed_any
+    }
+
+    /// Remove a cgroup directory. Best-effort: real cgroup pseudo-files cannot
+    /// be unlinked and rmdir only works once every task has exited; whatever
+    /// is still busy is reaped by the next daemon-start orphan sweep.
+    fn rmdir(dir: &Path) {
         #[cfg(not(test))]
         let _ = std::fs::remove_dir(dir);
         #[cfg(test)]
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Kill a cgroup's members and remove it, waiting on the calling thread for
+    /// signalled members to exit. For the startup orphan sweep, which runs
+    /// before the daemon serves anything.
+    fn kill_and_rmdir_blocking(dir: &Path) {
+        if Self::kill_members(dir) {
+            std::thread::sleep(MEMBER_EXIT_GRACE);
+        }
+        Self::rmdir(dir);
     }
 }
 
@@ -217,17 +233,26 @@ impl VmCgroup {
         write_file(&dir.join("cgroup.procs"), &format!("{pid}\n"))
     }
 
-    pub fn remove(&mut self) {
-        if let Some(dir) = self.dir.take() {
-            CgroupSupervisor::kill_and_rmdir(&dir);
+    /// Kill the cgroup's members and remove it. A signalled member gets
+    /// `MEMBER_EXIT_GRACE` to exit, awaited on the runtime clock so the worker
+    /// running a stop or destroy stays free for other VMs.
+    pub async fn remove(&mut self) {
+        let Some(dir) = self.dir.take() else { return };
+        if CgroupSupervisor::kill_members(&dir) {
+            tokio::time::sleep(MEMBER_EXIT_GRACE).await;
         }
+        CgroupSupervisor::rmdir(&dir);
     }
 }
 
 impl Drop for VmCgroup {
     fn drop(&mut self) {
+        // A dropped guard cannot wait for its members to exit: signal them and
+        // attempt the rmdir once; the startup orphan sweep reaps what is still
+        // busy.
         if let Some(dir) = self.dir.take() {
-            CgroupSupervisor::kill_and_rmdir(&dir);
+            CgroupSupervisor::kill_members(&dir);
+            CgroupSupervisor::rmdir(&dir);
         }
     }
 }
@@ -252,7 +277,7 @@ mod tests {
         (dir, sup)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn create_vm_cgroup_writes_memory_swap_and_oom_group() {
         let (dir, sup) = temp_supervisor(false);
         let id = uuid::Uuid::from_u128(1);
@@ -278,8 +303,36 @@ mod tests {
             !d.join("cpu.max").exists(),
             "cpu.max only when cpu_limit=true"
         );
-        vc.remove();
+        let start = tokio::time::Instant::now();
+        vc.remove().await;
         assert!(!d.exists(), "remove() rmdirs the cgroup");
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::ZERO,
+            "an empty cgroup is removed without waiting"
+        );
+    }
+
+    /// A signalled member is given its exit grace on the runtime clock: under
+    /// a paused clock the grace elapses instantly, which a sleep on the worker
+    /// thread could never satisfy.
+    #[tokio::test(start_paused = true)]
+    async fn remove_awaits_the_exit_grace_for_signalled_members() {
+        let (dir, sup) = temp_supervisor(false);
+        let id = uuid::Uuid::from_u128(4);
+        let mut vc = sup.create_vm_cgroup(id, 1, 128).unwrap();
+        let d = dir.path().join(format!("vm-{id}"));
+        // Above every kernel's pid ceiling, so kill(2) reports ESRCH and no
+        // real process is touched; the member still counts as signalled.
+        fs::write(d.join("cgroup.procs"), format!("{}\n", i32::MAX)).unwrap();
+        let start = tokio::time::Instant::now();
+        vc.remove().await;
+        assert!(!d.exists(), "remove() rmdirs the cgroup after the grace");
+        assert_eq!(
+            start.elapsed(),
+            MEMBER_EXIT_GRACE,
+            "the grace is awaited on the runtime clock"
+        );
     }
 
     #[tokio::test]
@@ -304,12 +357,12 @@ mod tests {
         assert_eq!(fs::read_to_string(procs).unwrap().trim(), "4242");
     }
 
-    #[test]
-    fn disabled_supervisor_produces_noop_cgroups() {
+    #[tokio::test]
+    async fn disabled_supervisor_produces_noop_cgroups() {
         let sup = CgroupSupervisor::disabled();
         let mut vc = sup.create_vm_cgroup(uuid::Uuid::nil(), 1, 128).unwrap();
         vc.place(1).unwrap(); // no-op, no error
-        vc.remove(); // no-op
+        vc.remove().await; // no-op
     }
 
     #[test]
