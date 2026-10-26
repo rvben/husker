@@ -171,8 +171,9 @@ impl VmmKind {
     }
 
     /// Alternative spellings accepted wherever a backend is parsed from
-    /// free text (the API, `HUSKER_VMM`, a profile).
-    const fn aliases(self) -> &'static [&'static str] {
+    /// free text (the API, `HUSKER_VMM`, a profile) and by the CLI's
+    /// `--vmm`, which must not refuse a spelling the daemon takes.
+    pub const fn aliases(self) -> &'static [&'static str] {
         match self {
             Self::Firecracker => &["fc"],
             Self::Qemu => &["kvm"],

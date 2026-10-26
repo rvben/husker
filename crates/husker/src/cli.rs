@@ -19,6 +19,17 @@ fn ready_defaults(default_for: impl Fn(BootKind) -> u64) -> String {
     )
 }
 
+/// The `--vmm` values: every backend under its canonical name, taking the
+/// aliases the daemon, `HUSKER_VMM` and profiles take as well, so a spelling
+/// that works everywhere else is not refused by the parser. The aliases stay
+/// out of the help and the schema; the canonical names are what the CLI
+/// advertises, and the daemon canonicalizes whatever it receives.
+fn vmm_value_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(husker_vmm::VmmKind::ALL.map(|kind| {
+        clap::builder::PossibleValue::new(kind.as_str()).aliases(kind.aliases().iter().copied())
+    }))
+}
+
 fn exec_connect_timeout_help() -> String {
     format!(
         "Seconds to wait for the guest agent to become reachable before failing \
@@ -211,7 +222,7 @@ pub(crate) enum Commands {
         add_host: Vec<String>,
 
         /// Backend to run this VM on
-        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(husker_vmm::VmmKind::ALL.map(husker_vmm::VmmKind::as_str)))]
+        #[arg(long, value_parser = vmm_value_parser())]
         vmm: Option<String>,
 
         /// Boot a cloud image: a catalog image name or a qcow2/img path. Uses QEMU/OVMF on
@@ -451,7 +462,7 @@ pub(crate) enum Commands {
         add_host: Vec<String>,
 
         /// Backend to run this VM on
-        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(husker_vmm::VmmKind::ALL.map(husker_vmm::VmmKind::as_str)))]
+        #[arg(long, value_parser = vmm_value_parser())]
         vmm: Option<String>,
 
         /// Boot a cloud image: a catalog image name or a qcow2/img path. Uses QEMU/OVMF on
@@ -1817,10 +1828,11 @@ pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use husker_core::BootKind;
+    use husker_vmm::VmmKind;
 
-    use super::Cli;
+    use super::{Cli, Commands};
 
     /// The whole numbers a help text mentions, so a default of 30 is not
     /// satisfied by a 300 elsewhere in the sentence.
@@ -1881,6 +1893,74 @@ mod tests {
             assert!(
                 wait.contains(&secs),
                 "wait --timeout help omits the {kind:?} default of {secs}s: {wait:?}"
+            );
+        }
+    }
+
+    /// The `--vmm` value a parsed `run` or `job` carries.
+    fn parsed_vmm(args: &[&str]) -> Option<String> {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        match cli.command {
+            Commands::Run { vmm, .. } | Commands::Job { vmm, .. } => vmm,
+            _ => panic!("{args:?} parsed as a command without --vmm"),
+        }
+    }
+
+    /// `--vmm` takes every spelling the daemon takes, so an alias that works
+    /// in `HUSKER_VMM` or a profile is not refused by the parser before the
+    /// daemon sees it. The value stays as typed; the daemon canonicalizes it.
+    #[test]
+    fn vmm_accepts_the_aliases_the_daemon_accepts() {
+        for kind in VmmKind::ALL {
+            for name in [kind.as_str()]
+                .into_iter()
+                .chain(kind.aliases().iter().copied())
+            {
+                assert_eq!(
+                    parsed_vmm(&["husker", "run", "--vmm", name]).as_deref(),
+                    Some(name)
+                );
+                assert_eq!(
+                    parsed_vmm(&["husker", "job", "--vmm", name, "--", "true"]).as_deref(),
+                    Some(name)
+                );
+            }
+        }
+        let refused = match Cli::try_parse_from(["husker", "run", "--vmm", "xen"]) {
+            Ok(_) => panic!("an unknown backend parsed"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    /// The aliases are accepted, not advertised: the possible values, which
+    /// the help and the schema both list, are the canonical names only.
+    #[test]
+    fn vmm_advertises_only_the_canonical_backend_names() {
+        let root = Cli::command();
+        for name in ["run", "job"] {
+            let command = root.find_subcommand(name).unwrap();
+            let vmm = command
+                .get_arguments()
+                .find(|a| a.get_id() == "vmm")
+                .unwrap_or_else(|| panic!("`{name}` has no `vmm` argument"));
+            let advertised: Vec<String> = vmm
+                .get_possible_values()
+                .iter()
+                .map(|value| value.get_name().to_string())
+                .collect();
+            assert_eq!(advertised, VmmKind::ALL.map(VmmKind::as_str), "{name}");
+
+            let help = command.clone().render_long_help().to_string();
+            let listed = help
+                .lines()
+                .find(|line| line.contains("possible values: firecracker"))
+                .unwrap_or_else(|| panic!("`{name}` help lists no --vmm values:\n{help}"));
+            assert!(
+                listed
+                    .trim_end()
+                    .ends_with("[possible values: firecracker, qemu]"),
+                "{name} help advertises more than the canonical names: {listed}"
             );
         }
     }
