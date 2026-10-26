@@ -55,6 +55,16 @@ pub enum CloudDiskFormat {
     Raw,
 }
 
+impl CloudDiskFormat {
+    /// The format name qemu-img takes for `-f` / `-O`.
+    pub fn qemu_name(self) -> &'static str {
+        match self {
+            CloudDiskFormat::Qcow2 => "qcow2",
+            CloudDiskFormat::Raw => "raw",
+        }
+    }
+}
+
 /// Everything needed to materialize a private cloud-image disk.
 #[derive(Debug, Clone, Copy)]
 pub struct CloudDiskRequest<'a> {
@@ -166,7 +176,7 @@ pub trait StorageDriver: Send + Sync {
 
             let prepared = async {
                 if let Some(size) = request.size_bytes {
-                    resize_disk(request.destination, size).await?;
+                    resize_disk(request.destination, request.format, size).await?;
                 }
                 Ok(())
             }
@@ -381,9 +391,17 @@ pub fn probe_reflink(images_dir: &Path, vms_dir: &Path) -> std::io::Result<Refli
 /// Used for cloud-image VMs: clone the base qcow2 (via `clone_rootfs`) then grow it
 /// so cloud-init's growpart/resizefs can expand the guest filesystem on first boot.
 /// `qemu-img resize` only grows by default; pass a size >= the image's virtual size.
-pub async fn resize_disk(path: &Path, new_size_bytes: u64) -> Result<(), StorageError> {
+///
+/// The format is named explicitly: left to probe, qemu-img would treat a raw
+/// disk whose first bytes look like a qcow2 header as qcow2 and open whatever
+/// backing file that header names.
+pub async fn resize_disk(
+    path: &Path,
+    format: CloudDiskFormat,
+    new_size_bytes: u64,
+) -> Result<(), StorageError> {
     let output = tokio::process::Command::new("qemu-img")
-        .arg("resize")
+        .args(["resize", "-f", format.qemu_name()])
         .arg(path)
         // qemu-img interprets a bare integer (no suffix) as a byte count.
         .arg(new_size_bytes.to_string())
@@ -834,7 +852,7 @@ pub async fn qcow2_virtual_size(path: &Path) -> Result<u64, StorageError> {
         )));
     }
     let out = tokio::process::Command::new("qemu-img")
-        .args(["info", "--output=json"])
+        .args(["info", "-f", "qcow2", "--output=json"])
         .arg(path)
         .output()
         .await
@@ -948,28 +966,171 @@ pub fn validate_rootfs(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Validate that a cloud image exists and is a qcow2 file (the UEFI boot path
-/// attaches it with format=qcow2, so anything else fails inside QEMU later
-/// with a much less useful error).
+/// Validate that a cloud image exists and is a self-contained qcow2 file.
+///
+/// The UEFI boot path attaches it with format=qcow2, so anything else fails
+/// inside QEMU later with a much less useful error. A qcow2 image can also
+/// name other files it reads from, a backing file or an external data file,
+/// and QEMU and qemu-img open those paths as the daemon user. An image from
+/// an untrusted source would then expose any host file the daemon can read
+/// as guest disk content, so only images that carry all of their data
+/// themselves are accepted.
 pub fn validate_cloud_image(path: &Path) -> Result<(), StorageError> {
-    use std::io::Read;
     if !path.exists() {
         return Err(StorageError::InvalidCloudImage(format!(
             "file not found: {}",
             path.display()
         )));
     }
-    let mut file = std::fs::File::open(path).map_err(StorageError::Io)?;
-    let mut magic = [0u8; 4];
-    let n = file.read(&mut magic).map_err(StorageError::Io)?;
-    // qcow2 magic: "QFI\xfb"
-    if n < 4 || magic != [0x51, 0x46, 0x49, 0xfb] {
+    let file = std::fs::File::open(path).map_err(StorageError::Io)?;
+    let references = Qcow2FileReferences::read(file).map_err(|reason| {
+        StorageError::InvalidCloudImage(format!("{reason}: {}", path.display()))
+    })?;
+    if let Some(backing_file) = references.backing_file {
         return Err(StorageError::InvalidCloudImage(format!(
-            "not a qcow2 image (bad magic): {}",
+            "image is layered on a backing file ({backing_file}); only self-contained \
+             images are accepted: {}",
+            path.display()
+        )));
+    }
+    if let Some(data_file) = references.external_data_file {
+        return Err(StorageError::InvalidCloudImage(format!(
+            "image stores its data in an external file ({data_file}); only \
+             self-contained images are accepted: {}",
             path.display()
         )));
     }
     Ok(())
+}
+
+/// The other files a qcow2 image reads from, taken from its header.
+///
+/// Layout per QEMU's docs/interop/qcow2.rst, all fields big-endian: a
+/// version 2 header is 72 bytes and the header extensions follow it directly;
+/// a version 3 header carries feature bits at offset 72 and its own length at
+/// offset 100. The header, its extensions and the backing file name all live
+/// in the first cluster, so that is all this reads.
+struct Qcow2FileReferences {
+    backing_file: Option<String>,
+    /// The external data file: named by its header extension, or merely
+    /// declared by the incompatible-feature bit when the name is absent.
+    external_data_file: Option<String>,
+}
+
+impl Qcow2FileReferences {
+    const MAGIC: [u8; 4] = *b"QFI\xfb";
+    const V2_HEADER_LEN: usize = 72;
+    const V3_HEADER_LEN: usize = 104;
+    const INCOMPATIBLE_DATA_FILE: u64 = 1 << 2;
+    const EXTENSION_END: u32 = 0;
+    const EXTENSION_DATA_FILE_NAME: u32 = 0x4441_5441;
+
+    fn read(mut file: impl std::io::Read) -> Result<Self, String> {
+        let mut head = [0u8; Self::V3_HEADER_LEN];
+        let got = read_up_to(&mut file, &mut head)?;
+        if got < 4 || head[..4] != Self::MAGIC {
+            return Err("not a qcow2 image (bad magic)".into());
+        }
+        let version = be_u32(&head, 4);
+        let header_len = match version {
+            2 => Self::V2_HEADER_LEN,
+            3 => Self::V3_HEADER_LEN,
+            other => return Err(format!("unsupported qcow2 version {other}")),
+        };
+        if got < header_len {
+            return Err("truncated qcow2 header".into());
+        }
+        let cluster_bits = be_u32(&head, 20);
+        if !(9..=21).contains(&cluster_bits) {
+            return Err(format!(
+                "invalid qcow2 cluster size (2^{cluster_bits} bytes)"
+            ));
+        }
+        let cluster_size = 1usize << cluster_bits;
+
+        // Everything else of interest sits in the rest of the first cluster.
+        let mut cluster = head[..got].to_vec();
+        cluster.resize(cluster_size, 0);
+        let filled = got + read_up_to(&mut file, &mut cluster[got..])?;
+        let cluster = &cluster[..filled];
+
+        let extensions_start = if version == 3 {
+            let declared = be_u32(cluster, 100) as usize;
+            if declared < Self::V3_HEADER_LEN || declared > cluster_size {
+                return Err(format!("invalid qcow2 header length {declared}"));
+            }
+            declared
+        } else {
+            Self::V2_HEADER_LEN
+        };
+        let data_file_declared =
+            version == 3 && be_u64(cluster, 72) & Self::INCOMPATIBLE_DATA_FILE != 0;
+
+        let backing_offset = be_u64(cluster, 8) as usize;
+        let backing_len = be_u32(cluster, 16) as usize;
+        let backing_file = if backing_offset != 0 && backing_len != 0 {
+            Some(String::from_utf8_lossy(slice(cluster, backing_offset, backing_len)?).into_owned())
+        } else {
+            None
+        };
+
+        let extensions_end = if backing_offset != 0 {
+            backing_offset.min(cluster.len())
+        } else {
+            cluster.len()
+        };
+        let mut data_file_name = None;
+        let mut at = extensions_start;
+        while at + 8 <= extensions_end {
+            let kind = be_u32(cluster, at);
+            if kind == Self::EXTENSION_END {
+                break;
+            }
+            let len = be_u32(cluster, at + 4) as usize;
+            let data = slice(cluster, at + 8, len)?;
+            if kind == Self::EXTENSION_DATA_FILE_NAME {
+                data_file_name = Some(String::from_utf8_lossy(data).into_owned());
+            }
+            at += 8 + len.div_ceil(8) * 8;
+        }
+
+        Ok(Self {
+            backing_file,
+            external_data_file: match (data_file_name, data_file_declared) {
+                (Some(name), _) => Some(name),
+                (None, true) => Some("unnamed".into()),
+                (None, false) => None,
+            },
+        })
+    }
+}
+
+/// Fill `buf` as far as the reader goes; a short file is not an error here.
+fn read_up_to(mut file: impl std::io::Read, buf: &mut [u8]) -> Result<usize, String> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("cannot read qcow2 header: {e}")),
+        }
+    }
+    Ok(filled)
+}
+
+fn slice(buf: &[u8], at: usize, len: usize) -> Result<&[u8], String> {
+    at.checked_add(len)
+        .and_then(|end| buf.get(at..end))
+        .ok_or_else(|| "qcow2 header points outside its first cluster".to_string())
+}
+
+fn be_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes"))
+}
+
+fn be_u64(buf: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes(buf[at..at + 8].try_into().expect("8 bytes"))
 }
 
 /// Create a sparse file of `size_bytes` at `path`, failing if it already exists.
@@ -1332,7 +1493,9 @@ mod tests {
         tokio::fs::write(&disk, vec![0u8; 1024 * 1024])
             .await
             .unwrap();
-        resize_disk(&disk, 8 * 1024 * 1024).await.unwrap();
+        resize_disk(&disk, CloudDiskFormat::Raw, 8 * 1024 * 1024)
+            .await
+            .unwrap();
         let len = tokio::fs::metadata(&disk).await.unwrap().len();
         assert_eq!(
             len,
@@ -1341,26 +1504,248 @@ mod tests {
         );
     }
 
+    /// A raw disk's first bytes are guest data and may look like anything,
+    /// including a qcow2 header naming a backing file. Resizing it as raw
+    /// must not let qemu-img probe the format and chase that name.
+    #[tokio::test]
+    async fn resize_disk_treats_a_raw_disk_with_a_qcow2_header_as_raw() {
+        if !qemu_img_available() {
+            eprintln!("skipping: qemu-img not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("d.raw");
+        let mut data = vec![0u8; 1024 * 1024];
+        let header = Qcow2HeaderBuilder::v3()
+            .backing_file("/no/such/backing")
+            .build();
+        data[..header.len()].copy_from_slice(&header);
+        tokio::fs::write(&disk, data).await.unwrap();
+        resize_disk(&disk, CloudDiskFormat::Raw, 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let len = tokio::fs::metadata(&disk).await.unwrap().len();
+        assert_eq!(len, 2 * 1024 * 1024);
+    }
+
     #[tokio::test]
     async fn resize_disk_errors_on_missing_file() {
         if !qemu_img_available() {
             eprintln!("skipping resize_disk_errors_on_missing_file: qemu-img not installed");
             return;
         }
-        let err = resize_disk(std::path::Path::new("/no/such/disk.qcow2"), 1 << 30)
-            .await
-            .unwrap_err();
+        let err = resize_disk(
+            std::path::Path::new("/no/such/disk.qcow2"),
+            CloudDiskFormat::Qcow2,
+            1 << 30,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, StorageError::CommandFailed(_)), "got {err:?}");
     }
 
+    /// Builds the first cluster of a qcow2 image by hand, so the validator's
+    /// reading of each header field is pinned independently of qemu-img.
+    struct Qcow2HeaderBuilder {
+        cluster: Vec<u8>,
+        extensions_at: usize,
+    }
+
+    impl Qcow2HeaderBuilder {
+        const CLUSTER_BITS: u32 = 9;
+
+        fn with_version(version: u32, header_len: u32) -> Self {
+            let mut cluster = vec![0u8; 1 << Self::CLUSTER_BITS];
+            cluster[..4].copy_from_slice(b"QFI\xfb");
+            cluster[4..8].copy_from_slice(&version.to_be_bytes());
+            cluster[20..24].copy_from_slice(&Self::CLUSTER_BITS.to_be_bytes());
+            if version == 3 {
+                cluster[100..104].copy_from_slice(&header_len.to_be_bytes());
+            }
+            Self {
+                cluster,
+                extensions_at: header_len as usize,
+            }
+        }
+
+        fn v2() -> Self {
+            Self::with_version(2, 72)
+        }
+
+        fn v3() -> Self {
+            Self::with_version(3, 112)
+        }
+
+        fn backing_file(mut self, name: &str) -> Self {
+            let at = 400usize;
+            self.cluster[8..16].copy_from_slice(&(at as u64).to_be_bytes());
+            self.cluster[16..20].copy_from_slice(&(name.len() as u32).to_be_bytes());
+            self.cluster[at..at + name.len()].copy_from_slice(name.as_bytes());
+            self
+        }
+
+        fn incompatible_features(mut self, bits: u64) -> Self {
+            self.cluster[72..80].copy_from_slice(&bits.to_be_bytes());
+            self
+        }
+
+        fn extension(mut self, kind: u32, data: &[u8]) -> Self {
+            let at = self.extensions_at;
+            self.cluster[at..at + 4].copy_from_slice(&kind.to_be_bytes());
+            self.cluster[at + 4..at + 8].copy_from_slice(&(data.len() as u32).to_be_bytes());
+            self.cluster[at + 8..at + 8 + data.len()].copy_from_slice(data);
+            self.extensions_at = at + 8 + data.len().div_ceil(8) * 8;
+            self
+        }
+
+        fn build(self) -> Vec<u8> {
+            self.cluster
+        }
+
+        fn write_to(self, dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, self.build()).unwrap();
+            path
+        }
+    }
+
+    fn rejection(path: &Path) -> String {
+        match validate_cloud_image(path) {
+            Err(StorageError::InvalidCloudImage(reason)) => reason,
+            other => panic!("expected InvalidCloudImage, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn validate_cloud_image_accepts_qcow2_magic() {
+    fn validate_cloud_image_accepts_self_contained_headers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("img.qcow2");
-        let mut data = vec![0u8; 512];
-        data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
-        std::fs::write(&path, &data).unwrap();
-        assert!(validate_cloud_image(&path).is_ok());
+        let v3 = Qcow2HeaderBuilder::v3()
+            .extension(0x6803_f857, &[0u8; 48])
+            .write_to(dir.path(), "v3.qcow2");
+        validate_cloud_image(&v3).unwrap();
+        let v2 = Qcow2HeaderBuilder::v2().write_to(dir.path(), "v2.qcow2");
+        validate_cloud_image(&v2).unwrap();
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_a_backing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for builder in [Qcow2HeaderBuilder::v2(), Qcow2HeaderBuilder::v3()] {
+            let path = builder
+                .backing_file("/etc/shadow")
+                .write_to(dir.path(), "layered.qcow2");
+            let reason = rejection(&path);
+            assert!(
+                reason.contains("backing file") && reason.contains("/etc/shadow"),
+                "reason names the backing file: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_an_external_data_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Qcow2HeaderBuilder::v3()
+            .incompatible_features(1 << 2)
+            .extension(0x6803_f857, &[0u8; 48])
+            .extension(0x4441_5441, b"/etc/shadow")
+            .write_to(dir.path(), "external.qcow2");
+        let reason = rejection(&path);
+        assert!(
+            reason.contains("external file") && reason.contains("/etc/shadow"),
+            "reason names the data file: {reason}"
+        );
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_the_external_data_file_feature_without_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Qcow2HeaderBuilder::v3()
+            .incompatible_features(1 << 2)
+            .write_to(dir.path(), "external.qcow2");
+        let reason = rejection(&path);
+        assert!(reason.contains("external file"), "{reason}");
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_a_truncated_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.qcow2");
+        std::fs::write(&path, &Qcow2HeaderBuilder::v3().build()[..64]).unwrap();
+        assert!(rejection(&path).contains("truncated"));
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_a_backing_file_name_outside_the_first_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cluster = Qcow2HeaderBuilder::v3().build();
+        cluster[8..16].copy_from_slice(&(1u64 << 20).to_be_bytes());
+        cluster[16..20].copy_from_slice(&8u32.to_be_bytes());
+        let path = dir.path().join("far.qcow2");
+        std::fs::write(&path, cluster).unwrap();
+        assert!(rejection(&path).contains("first cluster"));
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_unknown_versions_and_cluster_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Qcow2HeaderBuilder::with_version(4, 112).write_to(dir.path(), "v4.qcow2");
+        assert!(rejection(&path).contains("version 4"));
+        let mut cluster = Qcow2HeaderBuilder::v3().build();
+        cluster[20..24].copy_from_slice(&40u32.to_be_bytes());
+        let path = dir.path().join("huge-cluster.qcow2");
+        std::fs::write(&path, cluster).unwrap();
+        assert!(rejection(&path).contains("cluster size"));
+    }
+
+    #[test]
+    fn validate_cloud_image_accepts_a_qemu_img_image() {
+        if !qemu_img_available() {
+            eprintln!("skipping: qemu-img not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("plain.qcow2");
+        let status = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", img.to_str().unwrap(), "1M"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        validate_cloud_image(&img).unwrap();
+    }
+
+    #[test]
+    fn validate_cloud_image_rejects_qemu_img_images_that_reference_other_files() {
+        if !qemu_img_available() {
+            eprintln!("skipping: qemu-img not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, vec![b's'; 4096]).unwrap();
+        let secret = secret.to_str().unwrap();
+
+        let layered = dir.path().join("layered.qcow2");
+        let status = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", "-b", secret, "-F", "raw"])
+            .arg(&layered)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let reason = rejection(&layered);
+        assert!(reason.contains(secret), "{reason}");
+
+        let external = dir.path().join("external.qcow2");
+        let status = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", "-o"])
+            .arg(format!("data_file={secret}"))
+            .arg(&external)
+            .arg("1M")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let reason = rejection(&external);
+        assert!(reason.contains(secret), "{reason}");
     }
 
     #[test]

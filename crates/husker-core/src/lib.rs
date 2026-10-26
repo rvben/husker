@@ -2536,6 +2536,19 @@ pub struct IdleMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The first cluster of a qcow2 image with nothing in it: version 3,
+    /// 512-byte clusters, no backing file, no header extensions. It passes
+    /// `validate_cloud_image`, and qemu-img refuses to open it (no refcount
+    /// table), which keeps tests that only need validation hermetic.
+    fn minimal_qcow2_image() -> Vec<u8> {
+        let mut data = vec![0u8; 512];
+        data[..4].copy_from_slice(b"QFI\xfb");
+        data[4..8].copy_from_slice(&3u32.to_be_bytes());
+        data[20..24].copy_from_slice(&9u32.to_be_bytes());
+        data[100..104].copy_from_slice(&104u32.to_be_bytes());
+        data
+    }
+
     #[cfg(feature = "linux-net")]
     use std::collections::HashMap;
 
@@ -4027,10 +4040,7 @@ mod tests {
         let image = tmp.path().join("base.qcow2");
         let code = tmp.path().join("CODE.fd");
         let vars = tmp.path().join("VARS.fd");
-        // image must have valid qcow2 magic so validate_cloud_image passes.
-        let mut qcow2_data = vec![0u8; 512];
-        qcow2_data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
-        std::fs::write(&image, &qcow2_data).unwrap();
+        std::fs::write(&image, minimal_qcow2_image()).unwrap();
         for p in [&code, &vars] {
             std::fs::write(p, b"x").unwrap();
         }
@@ -4088,10 +4098,7 @@ mod tests {
     async fn prepare_cloud_disk_errors_on_missing_ovmf() {
         let tmp = tempfile::tempdir().unwrap();
         let image = tmp.path().join("base.qcow2");
-        // image must have valid qcow2 magic so validate_cloud_image passes.
-        let mut qcow2_data = vec![0u8; 512];
-        qcow2_data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
-        std::fs::write(&image, &qcow2_data).unwrap();
+        std::fs::write(&image, minimal_qcow2_image()).unwrap();
         let driver = husker_storage::default_storage_driver();
         let err = super::prepare_cloud_disk(
             driver.as_ref(),
@@ -5598,13 +5605,11 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     // ── macOS cloud-image path tests ─────────────────────────────────────────
 
-    /// Helper: write a file with valid qcow2 magic (4-byte header + padding).
+    /// Helper: write a cloud image that passes validation.
     #[cfg(not(feature = "linux-net"))]
-    fn write_qcow2_magic(dir: &std::path::Path) -> std::path::PathBuf {
+    fn write_minimal_cloud_image(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("test.qcow2");
-        let mut data = vec![0u8; 512];
-        data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
-        std::fs::write(&path, &data).unwrap();
+        std::fs::write(&path, minimal_qcow2_image()).unwrap();
         path
     }
 
@@ -5813,7 +5818,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     #[tokio::test]
     async fn cloud_image_with_volume_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let image_path = write_qcow2_magic(tmp.path());
+        let image_path = write_minimal_cloud_image(tmp.path());
         let state = husker_state::StateStore::open_memory().unwrap();
         let core = Arc::new(make_vz_core(state, tmp.path()));
 
@@ -5853,7 +5858,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     #[tokio::test]
     async fn cloud_image_with_empty_agent_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let image_path = write_qcow2_magic(tmp.path());
+        let image_path = write_minimal_cloud_image(tmp.path());
         let state = husker_state::StateStore::open_memory().unwrap();
         // Core built WITHOUT with_embedded_agent -> embedded_agent is &[].
         let core = Arc::new(make_vz_core(state, tmp.path()));
@@ -5954,12 +5959,10 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        // Write a file with valid qcow2 magic but a truncated/garbage body so
-        // validate_cloud_image passes but qemu-img convert fails.
+        // A header-only image passes validate_cloud_image, and qemu-img
+        // convert then fails on the missing refcount table.
         let bad_qcow2 = tmp.path().join("bad_body.qcow2");
-        let mut data = vec![0xffu8; 64]; // garbage body
-        data[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]); // valid magic
-        std::fs::write(&bad_qcow2, &data).unwrap();
+        std::fs::write(&bad_qcow2, minimal_qcow2_image()).unwrap();
 
         let state = husker_state::StateStore::open_memory().unwrap();
         let core = Arc::new(make_vz_core(state, tmp.path()).with_embedded_agent(b"fake-agent"));

@@ -704,7 +704,12 @@ async fn cloud_disk_preparation_never_overwrites_an_existing_destination() {
     let dir = tempdir().unwrap();
     let source = dir.path().join("source.qcow2");
     let destination = dir.path().join("disk.qcow2");
-    std::fs::write(&source, [0x51, 0x46, 0x49, 0xfb]).unwrap();
+    let mut header = vec![0u8; 512];
+    header[..4].copy_from_slice(b"QFI\xfb");
+    header[4..8].copy_from_slice(&3u32.to_be_bytes());
+    header[20..24].copy_from_slice(&9u32.to_be_bytes());
+    header[100..104].copy_from_slice(&104u32.to_be_bytes());
+    std::fs::write(&source, header).unwrap();
     std::fs::write(&destination, b"owned by another operation").unwrap();
 
     let error = LocalStorageDriver
