@@ -122,13 +122,16 @@ fn a_derived_initrd_that_was_never_downloaded_is_not_a_failure() {
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "ok");
-    let initrd = report["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|check| check["name"] == "default_initrd")
-        .unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let find = |name: &str| checks.iter().find(|check| check["name"] == name).unwrap();
+    let initrd = find("default_initrd");
     assert_eq!(initrd["status"], "warn");
+    // The derived initrd followed the data directory, so the variable that
+    // moved it is named; the kernel the file names explicitly stayed put and
+    // is attributed to the file.
+    assert_eq!(initrd["env_override"], "HUSKER_DATA_DIR", "{initrd}");
+    let kernel = find("default_kernel");
+    assert!(kernel.get("env_override").is_none(), "{kernel}");
 }
 
 /// An initrd the operator named by hand is a different fact from one husker
@@ -198,6 +201,250 @@ fn config_check_validates_the_effective_environment_override() {
             .unwrap()
             .ends_with("override-vmlinux")
     );
+    assert_eq!(kernel["env_override"], "HUSKER_DEFAULT_KERNEL", "{kernel}");
+
+    // The text rendering names the same variable on the same check.
+    let text = Command::cargo_bin("husker")
+        .unwrap()
+        .env("HUSKER_DEFAULT_KERNEL", &override_kernel)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "text",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("[ok  ] default_kernel: "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        line.ends_with("override-vmlinux (from HUSKER_DEFAULT_KERNEL)"),
+        "{line}"
+    );
+}
+
+/// The two output modes are renderings of one report, so a configuration the
+/// daemon would refuse fails in both. The text mode once exited 0 on an
+/// invalid `images_base_url` while JSON reported `error`.
+#[test]
+fn an_invalid_images_base_url_fails_in_both_output_modes() {
+    let (_dir, config) = valid_config_fixture();
+    let contents = fs::read_to_string(&config)
+        .unwrap()
+        .replace("https://example.invalid/images", "not a url");
+    fs::write(&config, contents).unwrap();
+
+    let json = Command::cargo_bin("husker")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "json",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    let url = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "images_base_url")
+        .unwrap();
+    assert_eq!(url["status"], "fail", "{url}");
+
+    let text = Command::cargo_bin("husker")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "text",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert_eq!(text.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("[FAIL] images_base_url: not a url: ")),
+        "{stdout}"
+    );
+}
+
+/// Every check in the JSON report is a line of the text report, in the same
+/// order and with the same words, so a reader of either sees the same
+/// findings.
+#[test]
+fn the_text_report_lists_the_same_checks_as_the_json_report() {
+    let (_dir, config) = valid_config_fixture();
+    let run = |format: &str| {
+        let output = Command::cargo_bin("husker")
+            .unwrap()
+            // One override in effect, so the attribution is part of the parity.
+            .env("HUSKER_IMAGES_BASE_URL", "https://example.invalid/images")
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--output",
+                format,
+                "config",
+                "check",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let report: serde_json::Value = serde_json::from_str(&run("json")).unwrap();
+    let text = run("text");
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("Config: {}", config.display())
+    );
+    let expected: Vec<String> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| {
+            let tag = match check["status"].as_str().unwrap() {
+                "ok" => "ok  ",
+                "warn" => "warn",
+                "fail" => "FAIL",
+                other => panic!("unknown status {other}"),
+            };
+            let mut line = format!(
+                "[{tag}] {}: {}",
+                check["name"].as_str().unwrap(),
+                check["message"].as_str().unwrap()
+            );
+            if let Some(var) = check["env_override"].as_str() {
+                line.push_str(&format!(" (from {var})"));
+            }
+            line
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(lines.collect::<Vec<_>>(), expected, "{text}");
+}
+
+/// A host tool is found the way the daemon finds it, by name in PATH, not by
+/// running it: the version flags differ between tools (`mkfs.ext4 --version`
+/// exits 1 on every host that has it), which once reported a present tool as
+/// missing in one output mode and present in the other.
+#[cfg(any(all(feature = "linux-net", target_os = "linux"), target_os = "macos"))]
+#[test]
+fn a_host_tool_is_found_in_path_without_being_run() {
+    let (dir, config) = valid_config_fixture();
+    let tools = dir.path().join("tools");
+    fs::create_dir(&tools).unwrap();
+    let names: &[&str] = if cfg!(target_os = "macos") {
+        &["qemu-img"]
+    } else {
+        &["qemu-img", "mkfs.ext4"]
+    };
+    for name in names {
+        // Not executable: running it would fail, finding it succeeds.
+        fs::write(tools.join(name), b"#!/bin/sh\nexit 1\n").unwrap();
+    }
+    let empty = dir.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+
+    let run = |path: &std::path::Path| {
+        let output = Command::cargo_bin("husker")
+            .unwrap()
+            .env("PATH", path)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--output",
+                "json",
+                "config",
+                "check",
+            ])
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stdout)))
+    };
+    let found = run(&tools);
+    let missing = run(&empty);
+    for name in names {
+        let check = |report: &serde_json::Value| {
+            report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == *name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{report}"))
+        };
+        let present = check(&found);
+        assert_eq!(present["status"], "ok", "{present}");
+        assert_eq!(present["message"], tools.join(name).to_str().unwrap());
+        let absent = check(&missing);
+        assert_eq!(absent["status"], "warn", "{absent}");
+        assert!(
+            absent["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("not found; "),
+            "{absent}"
+        );
+    }
+}
+
+/// The daemon keeps the file's backend when `HUSKER_VMM` names an unknown
+/// one, so the check reports the ignored override rather than crediting it.
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+#[test]
+fn an_unknown_vmm_override_is_reported_as_ignored() {
+    let (_dir, config) = valid_config_fixture();
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .env("HUSKER_VMM", "xen")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "json",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let vmm = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "vmm")
+        .unwrap();
+    assert_eq!(vmm["status"], "warn", "{vmm}");
+    let message = vmm["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("firecracker; HUSKER_VMM=xen is ignored: "),
+        "{message}"
+    );
+    assert!(vmm.get("env_override").is_none(), "{vmm}");
 }
 
 /// `husker schema` declares `config check` as a typed object, so a pipe gets

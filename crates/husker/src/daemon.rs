@@ -239,8 +239,10 @@ mod auto_install_tests {
     }
 }
 
-/// Check if a binary name can be found in PATH.
-#[cfg(all(feature = "linux-net", target_os = "linux"))]
+/// Resolve a program the way the daemon starts it: an absolute path stands on
+/// its own, a bare name is looked up in PATH. Compiled where a daemon or a
+/// config check resolves one: Linux with the networking stack, and macOS.
+#[cfg(any(all(feature = "linux-net", target_os = "linux"), target_os = "macos"))]
 pub(crate) fn find_in_path(name: &Path) -> Option<std::path::PathBuf> {
     if name.is_absolute() {
         return name.is_file().then(|| name.to_path_buf());

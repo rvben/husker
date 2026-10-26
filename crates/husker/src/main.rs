@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use husker_api::ExecRequest;
+use husker_core::CheckStatus;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite;
@@ -187,6 +188,16 @@ fn doctor_exit_code(report: &husker_core::DiagnosticsReport) -> i32 {
     }
 }
 
+/// The bracketed tag a text rendering gives a check: a failure stands out in
+/// capitals, and every tag has the same width so the names line up.
+fn status_tag(status: CheckStatus) -> &'static str {
+    match status {
+        CheckStatus::Ok => "ok  ",
+        CheckStatus::Warn => "warn",
+        CheckStatus::Fail => "FAIL",
+    }
+}
+
 /// Render a diagnostics report as `[ok/warn/FAIL] name: message` lines (text)
 /// or the diagnostics JSON object (JSON format).
 fn render_diagnostics(report: &husker_core::DiagnosticsReport, format: OutputFormat) {
@@ -197,12 +208,7 @@ fn render_diagnostics(report: &husker_core::DiagnosticsReport, format: OutputFor
         return;
     }
     for c in &report.checks {
-        let tag = match c.status {
-            husker_core::CheckStatus::Ok => "ok  ",
-            husker_core::CheckStatus::Warn => "warn",
-            husker_core::CheckStatus::Fail => "FAIL",
-        };
-        println!("[{tag}] {}: {}", c.name, c.message);
+        println!("[{}] {}: {}", status_tag(c.status), c.name, c.message);
     }
 }
 
@@ -3989,13 +3995,21 @@ fn parse_cp_path(s: &str) -> CpPath {
     CpPath::Local(PathBuf::from(s))
 }
 
+/// One validated setting of the effective configuration. `env_override` names
+/// the `HUSKER_*` variable whose value was checked in place of the file's, so
+/// a reader knows which source to edit.
 #[derive(Serialize)]
 struct ConfigCheckItem {
     name: String,
-    status: &'static str,
+    status: CheckStatus,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_override: Option<&'static str>,
 }
 
+/// The outcome of `config check`: one list of checks that both the JSON
+/// document and the text rendering are produced from, so the two never
+/// disagree on a status, a message or the order of checks.
 #[derive(Serialize)]
 struct ConfigCheckReport {
     status: &'static str,
@@ -4005,21 +4019,60 @@ struct ConfigCheckReport {
 }
 
 impl ConfigCheckReport {
-    fn push(&mut self, name: impl Into<String>, status: &'static str, message: impl Into<String>) {
+    fn push(
+        &mut self,
+        name: impl Into<String>,
+        status: CheckStatus,
+        message: impl Into<String>,
+        env_override: Option<&'static str>,
+    ) {
         self.checks.push(ConfigCheckItem {
             name: name.into(),
             status,
             message: message.into(),
+            env_override,
         });
     }
 
-    fn finish(&mut self) {
-        self.status = if self.checks.iter().any(|check| check.status == "fail") {
-            "error"
-        } else {
-            "ok"
-        };
+    /// True when a check found something the daemon would fail on; warnings
+    /// do not count.
+    fn has_failure(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Fail)
     }
+
+    fn finish(&mut self) {
+        self.status = if self.has_failure() { "error" } else { "ok" };
+    }
+}
+
+/// The variable named when it is set: `apply_env_overrides` copies every
+/// string and path variable verbatim, so set means in effect.
+fn env_override(var: &'static str) -> Option<&'static str> {
+    std::env::var(var).is_ok().then_some(var)
+}
+
+/// A numeric override is in effect only when it parses; the daemon keeps the
+/// file's value otherwise, so the check must not credit the variable.
+fn numeric_env_override(var: &'static str) -> Option<&'static str> {
+    std::env::var(var)
+        .ok()
+        .filter(|value| value.parse::<u64>().is_ok())
+        .map(|_| var)
+}
+
+/// The variable that moved a default image path: its own override, or
+/// `HUSKER_DATA_DIR` when the path followed the data directory.
+fn image_path_override(
+    config: &Config,
+    var: &'static str,
+    path: &Path,
+    derive: fn(&Path) -> PathBuf,
+) -> Option<&'static str> {
+    env_override(var).or_else(|| {
+        env_override("HUSKER_DATA_DIR").filter(|_| config.is_derived_path(path, derive))
+    })
 }
 
 /// True when the initrd path is one husker derived for itself rather than one
@@ -4030,14 +4083,15 @@ fn is_derived_initrd(config: &Config, initrd: &Path) -> bool {
     config.is_derived_path(initrd, husker::default_initrd_path_for)
 }
 
-fn check_regular_file(report: &mut ConfigCheckReport, name: &str, path: &Path) {
-    let message = path.display().to_string();
+/// A path that must name an existing regular file.
+fn regular_file_check(path: &Path) -> (CheckStatus, String) {
+    let shown = path.display();
     if path.is_file() {
-        report.push(name, "ok", message);
+        (CheckStatus::Ok, shown.to_string())
     } else if path.exists() {
-        report.push(name, "fail", format!("{message}: not a regular file"));
+        (CheckStatus::Fail, format!("{shown}: not a regular file"))
     } else {
-        report.push(name, "fail", format!("{message}: not found"));
+        (CheckStatus::Fail, format!("{shown}: not found"))
     }
 }
 
@@ -4045,23 +4099,70 @@ fn check_regular_file(report: &mut ConfigCheckReport, name: &str, path: &Path) {
 /// is a read-only command: the daemon creates its data directory on first
 /// start, so a directory that does not exist yet is a warning, while a path
 /// that exists and is not a directory is a failure the daemon would hit.
-fn data_dir_status(path: &Path) -> (&'static str, &'static str) {
+fn data_dir_check(path: &Path) -> (CheckStatus, String) {
+    let shown = path.display();
     if path.is_dir() {
-        ("ok", "")
+        (CheckStatus::Ok, shown.to_string())
     } else if path.exists() {
-        ("fail", "not a directory")
+        (CheckStatus::Fail, format!("{shown}: not a directory"))
     } else {
         (
-            "warn",
-            "not created yet; the daemon creates it on first start",
+            CheckStatus::Warn,
+            format!("{shown}: not created yet; the daemon creates it on first start"),
         )
     }
 }
 
-/// Machine-readable config validation. It validates the same effective values
-/// the daemon uses, including environment overrides, and never mixes prose into
-/// stdout before its one JSON document.
-fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
+/// A program the daemon starts: the configured path, or a name resolved
+/// against PATH the way the daemon resolves it.
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+fn program_check(configured: &Path) -> (CheckStatus, String) {
+    match find_in_path(configured) {
+        Some(resolved) if resolved == configured => {
+            (CheckStatus::Ok, resolved.display().to_string())
+        }
+        Some(resolved) => (
+            CheckStatus::Ok,
+            format!("{} -> {}", configured.display(), resolved.display()),
+        ),
+        None => (
+            CheckStatus::Fail,
+            format!("{}: not found", configured.display()),
+        ),
+    }
+}
+
+/// A host tool one feature needs but the daemon starts without: absent is a
+/// warning that names what stops working. Found by the same PATH lookup the
+/// daemon uses, not by running the tool, whose version flags differ.
+#[cfg(any(all(feature = "linux-net", target_os = "linux"), target_os = "macos"))]
+fn tool_check(name: &str, consequence: &str) -> (CheckStatus, String) {
+    match find_in_path(Path::new(name)) {
+        Some(resolved) => (CheckStatus::Ok, resolved.display().to_string()),
+        None => (CheckStatus::Warn, format!("not found; {consequence}")),
+    }
+}
+
+/// A firmware file cloud-image boot needs: absent is a warning, as the daemon
+/// serves every other VM kind without it.
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+fn optional_file_check(path: &Path, consequence: &str) -> (CheckStatus, String) {
+    let shown = path.display();
+    if path.exists() {
+        (CheckStatus::Ok, shown.to_string())
+    } else {
+        (
+            CheckStatus::Warn,
+            format!("{shown}: not found; {consequence}"),
+        )
+    }
+}
+
+/// Load the configuration the way the daemon does and validate every
+/// effective value, environment overrides included. Nothing here prints or
+/// exits: a file that cannot be read or parsed is the report's one failing
+/// check, and the caller renders the report and chooses the exit code.
+fn build_config_check_report(explicit_path: Option<&Path>) -> ConfigCheckReport {
     let path = resolve_config_path(explicit_path);
     let mut report = ConfigCheckReport {
         status: "ok",
@@ -4069,693 +4170,371 @@ fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
         source: "file",
         checks: Vec::new(),
     };
-    let mut config = match std::fs::read_to_string(&path) {
+    let loaded = match std::fs::read_to_string(&path) {
         Ok(contents) => match toml::from_str::<Config>(&contents) {
             Ok(config) => {
-                report.push("config_file", "ok", "parsed successfully");
-                config
+                report.push("config_file", CheckStatus::Ok, "parsed successfully", None);
+                Some(config)
             }
             Err(error) => {
-                report.push("config_file", "fail", format!("parse error: {error}"));
-                report.finish();
-                print_config_check_json(&report)?;
-                std::process::exit(exit_code::GENERAL);
+                report.push(
+                    "config_file",
+                    CheckStatus::Fail,
+                    format!("parse error: {error}"),
+                    None,
+                );
+                None
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit_path.is_none() => {
             report.config_file = None;
             report.source = "defaults";
-            report.push("config_file", "ok", "using defaults; no config file found");
-            Config::default()
+            report.push(
+                "config_file",
+                CheckStatus::Ok,
+                "using defaults; no config file found",
+                None,
+            );
+            Some(Config::default())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.push("config_file", CheckStatus::Fail, "not found", None);
+            None
         }
         Err(error) => {
-            report.push("config_file", "fail", error.to_string());
-            report.finish();
-            print_config_check_json(&report)?;
-            std::process::exit(exit_code::GENERAL);
+            report.push("config_file", CheckStatus::Fail, error.to_string(), None);
+            None
         }
     };
-    apply_env_overrides(&mut config);
+    if let Some(mut config) = loaded {
+        apply_env_overrides(&mut config);
+        check_effective_config(&config, &mut report);
+    }
+    report.finish();
+    report
+}
 
-    let (data_dir_state, data_dir_detail) = data_dir_status(&config.data_dir);
+/// Every check of a loaded configuration, in the order both renderings show
+/// them.
+fn check_effective_config(config: &Config, report: &mut ConfigCheckReport) {
+    let (status, message) = data_dir_check(&config.data_dir);
+    report.push("data_dir", status, message, env_override("HUSKER_DATA_DIR"));
+
+    let (status, message) = regular_file_check(&config.default_kernel);
     report.push(
-        "data_dir",
-        data_dir_state,
-        if data_dir_detail.is_empty() {
-            config.data_dir.display().to_string()
-        } else {
-            format!("{}: {data_dir_detail}", config.data_dir.display())
-        },
+        "default_kernel",
+        status,
+        message,
+        image_path_override(
+            config,
+            "HUSKER_DEFAULT_KERNEL",
+            &config.default_kernel,
+            husker::default_kernel_path_for,
+        ),
     );
-    check_regular_file(&mut report, "default_kernel", &config.default_kernel);
-    check_regular_file(&mut report, "default_rootfs", &config.default_rootfs);
+    let (status, message) = regular_file_check(&config.default_rootfs);
+    report.push(
+        "default_rootfs",
+        status,
+        message,
+        image_path_override(
+            config,
+            "HUSKER_DEFAULT_ROOTFS",
+            &config.default_rootfs,
+            husker::default_rootfs_path_for,
+        ),
+    );
     if let Some(initrd) = &config.default_initrd {
-        if !initrd.exists() && is_derived_initrd(&config, initrd) {
-            report.push(
-                "default_initrd",
-                "warn",
+        let (status, message) = if !initrd.exists() && is_derived_initrd(config, initrd) {
+            (
+                CheckStatus::Warn,
                 format!(
                     "{}: not downloaded yet; VMs boot without an initrd",
                     initrd.display()
                 ),
-            );
+            )
         } else {
-            check_regular_file(&mut report, "default_initrd", initrd);
-        }
+            regular_file_check(initrd)
+        };
+        report.push(
+            "default_initrd",
+            status,
+            message,
+            image_path_override(
+                config,
+                "HUSKER_DEFAULT_INITRD",
+                initrd,
+                husker::default_initrd_path_for,
+            ),
+        );
     }
-    match reqwest::Url::parse(&config.images_base_url) {
-        Ok(_) => report.push("images_base_url", "ok", &config.images_base_url),
-        Err(error) => report.push(
-            "images_base_url",
-            "fail",
+
+    let (status, message) = match reqwest::Url::parse(&config.images_base_url) {
+        Ok(_) => (CheckStatus::Ok, config.images_base_url.clone()),
+        Err(error) => (
+            CheckStatus::Fail,
             format!("{}: {error}", config.images_base_url),
         ),
-    }
-
-    #[cfg(all(feature = "linux-net", target_os = "linux"))]
-    {
-        match find_in_path(&config.firecracker_bin) {
-            Some(path) => report.push("firecracker_bin", "ok", path.display().to_string()),
-            None => report.push(
-                "firecracker_bin",
-                "fail",
-                format!("{}: not found", config.firecracker_bin.display()),
-            ),
-        }
-        match parse_cidr(&config.bridge_subnet) {
-            Ok(_) => report.push("bridge_subnet", "ok", &config.bridge_subnet),
-            Err(error) => report.push(
-                "bridge_subnet",
-                "fail",
-                format!("{}: {error}", config.bridge_subnet),
-            ),
-        }
-        let uplink = husker_net::resolve_host_interface(&config.host_interface);
-        if uplink.warnings.is_empty() {
-            report.push("host_interface", "ok", uplink.effective);
-        } else {
-            report.push("host_interface", "fail", uplink.warnings.join("; "));
-        }
-        #[cfg(target_os = "linux")]
-        if config.vmm == husker_vmm::VmmKind::Qemu {
-            match find_in_path(&config.qemu_bin) {
-                Some(path) => report.push("qemu_bin", "ok", path.display().to_string()),
-                None => report.push(
-                    "qemu_bin",
-                    "fail",
-                    format!("{}: not found", config.qemu_bin.display()),
-                ),
-            }
-            for device in ["/dev/kvm", "/dev/vhost-vsock"] {
-                let status = if Path::new(device).exists() {
-                    "ok"
-                } else {
-                    "fail"
-                };
-                report.push(
-                    device,
-                    status,
-                    if status == "ok" { "present" } else { "missing" },
-                );
-            }
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(bridge) = &config.lan_bridge {
-            let found = std::process::Command::new("ip")
-                .args(["link", "show", bridge])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            report.push(
-                "lan_bridge",
-                if found { "ok" } else { "fail" },
-                if found {
-                    bridge.clone()
-                } else {
-                    format!("{bridge}: not found")
-                },
-            );
-        }
-    }
-
-    #[cfg(all(feature = "linux-net", target_os = "linux"))]
-    for (name, available, message) in [
-        (
-            "ovmf_code",
-            config.ovmf_code.exists(),
-            config.ovmf_code.display().to_string(),
-        ),
-        (
-            "ovmf_vars",
-            config.ovmf_vars.exists(),
-            config.ovmf_vars.display().to_string(),
-        ),
-        (
-            "qemu-img",
-            command_available("qemu-img"),
-            "cloud-image disk resize".into(),
-        ),
-        (
-            "mkfs.ext4",
-            command_available("mkfs.ext4"),
-            "volume creation".into(),
-        ),
-    ] {
-        report.push(name, if available { "ok" } else { "warn" }, message);
-    }
-    #[cfg(target_os = "macos")]
+    };
     report.push(
-        "qemu-img",
-        if command_available("qemu-img") {
-            "ok"
-        } else {
-            "warn"
-        },
-        "cloud-image conversion",
+        "images_base_url",
+        status,
+        message,
+        env_override("HUSKER_IMAGES_BASE_URL"),
     );
 
-    if let Some(size) = &config.default_disk_size {
-        match husker::parse_disk_size(size) {
-            Ok(_) => report.push("default_disk_size", "ok", size),
-            Err(error) => report.push("default_disk_size", "fail", error.to_string()),
-        }
+    #[cfg(all(feature = "linux-net", target_os = "linux"))]
+    check_host_backend(config, report);
+    #[cfg(target_os = "macos")]
+    {
+        let (status, message) = tool_check("qemu-img", "cloud images need it: brew install qemu");
+        report.push("qemu-img", status, message, None);
     }
-    if config.exec_timeout_max_secs < config.exec_timeout_secs {
+
+    if let Some(size) = &config.default_disk_size {
+        let (status, message) = match husker::parse_disk_size(size) {
+            Ok(_) => (CheckStatus::Ok, size.clone()),
+            Err(error) => (CheckStatus::Fail, error.to_string()),
+        };
         report.push(
-            "exec_timeout_max_secs",
-            "fail",
+            "default_disk_size",
+            status,
+            message,
+            env_override("HUSKER_DEFAULT_DISK_SIZE"),
+        );
+    }
+    let (status, message) = if config.exec_timeout_max_secs < config.exec_timeout_secs {
+        (
+            CheckStatus::Fail,
             format!(
-                "{} must be >= exec_timeout_secs ({})",
+                "{}: must be >= exec_timeout_secs ({})",
                 config.exec_timeout_max_secs, config.exec_timeout_secs
             ),
-        );
+        )
     } else {
-        report.push(
-            "exec_timeout_max_secs",
-            "ok",
-            config.exec_timeout_max_secs.to_string(),
-        );
-    }
+        (CheckStatus::Ok, config.exec_timeout_max_secs.to_string())
+    };
+    report.push(
+        "exec_timeout_max_secs",
+        status,
+        message,
+        numeric_env_override("HUSKER_EXEC_TIMEOUT_MAX_SECS"),
+    );
+
     let mut profile_names: Vec<&String> = config.profiles.keys().collect();
     profile_names.sort();
     for name in profile_names {
-        let profile = &config.profiles[name.as_str()];
-        let mut problems = Vec::new();
-        for key in &profile.ssh_keys {
-            let path = expand_tilde(key);
-            if !path.exists() {
-                problems.push(format!("ssh key {} not found", path.display()));
-            }
-        }
-        for path in [&profile.rootfs, &profile.kernel, &profile.initrd]
-            .into_iter()
-            .flatten()
-        {
-            if !path.exists() {
-                problems.push(format!("{} not found", path.display()));
-            }
-        }
-        if let Some(size) = &profile.disk_size
-            && let Err(error) = husker::parse_disk_size(size)
-        {
-            problems.push(format!("disk_size: {error}"));
-        }
-        if let Some(vmm) = &profile.vmm
-            && let Err(error) = vmm.parse::<husker_vmm::VmmKind>()
-        {
-            problems.push(format!("vmm: {error}"));
-        }
-        for entry in &profile.env {
-            if !entry.contains('=') {
-                problems.push(format!("env entry '{entry}' is not KEY=VALUE"));
-            }
-        }
-        report.push(
-            format!("profile.{name}"),
-            if problems.is_empty() { "ok" } else { "fail" },
-            if problems.is_empty() {
-                "valid".into()
-            } else {
-                problems.join("; ")
-            },
-        );
+        let problems = profile_problems(&config.profiles[name.as_str()]);
+        let (status, message) = if problems.is_empty() {
+            (CheckStatus::Ok, "valid".to_string())
+        } else {
+            (CheckStatus::Fail, problems.join("; "))
+        };
+        report.push(format!("profile.{name}"), status, message, None);
     }
-
-    report.finish();
-    print_config_check_json(&report)?;
-    if report.status == "error" {
-        std::process::exit(exit_code::GENERAL);
-    }
-    Ok(())
 }
 
-/// Compiled only where a config check calls it: Linux with the networking
-/// stack, and macOS.
-#[cfg(any(all(feature = "linux-net", target_os = "linux"), target_os = "macos"))]
-fn command_available(command: &str) -> bool {
-    std::process::Command::new(command)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn print_config_check_json(report: &ConfigCheckReport) -> Result<()> {
-    let value = structured_output("config check", report)?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
-}
-
-/// Validate the configuration file and report results.
-fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()> {
-    if output == OutputFormat::Json {
-        return check_config_json(explicit_path);
-    }
-    let path = resolve_config_path(explicit_path);
-    let mut all_ok = true;
-
-    let mut config = match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            println!("Config: {}", path.display());
-            match toml::from_str::<Config>(&contents) {
-                Ok(config) => config,
-                Err(e) => {
-                    println!("  parse .............. FAIL ({e})");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if explicit_path.is_some() {
-                println!("Config: {} (not found)", path.display());
-                println!("  config file .............. FAIL (not found)");
-                std::process::exit(1);
-            } else {
-                println!("Config: (defaults, no config file found)");
-                Config::default()
-            }
-        }
-        Err(e) => {
-            println!("Config: {}", path.display());
-            println!("  config file .............. FAIL ({e})");
-            std::process::exit(1);
-        }
-    };
-
-    apply_env_overrides(&mut config);
-
-    let dd_from_env = std::env::var("HUSKER_DATA_DIR").is_ok();
-    let kernel_from_env = std::env::var("HUSKER_DEFAULT_KERNEL").is_ok();
-
-    // data_dir
-    let dd = &config.data_dir;
-    let dd_env_hint = if dd_from_env {
-        " (from HUSKER_DATA_DIR)"
-    } else {
-        ""
-    };
-    match data_dir_status(dd) {
-        ("ok", _) => println!("  data_dir ({}) ... OK{dd_env_hint}", dd.display()),
-        ("warn", _) => println!(
-            "  data_dir ({}) ... not created yet (the daemon creates it on first start){dd_env_hint}",
-            dd.display()
+/// The Linux host side: the selected backend and its binaries, the network
+/// uplink, and the tools behind cloud images and volumes.
+#[cfg(all(feature = "linux-net", target_os = "linux"))]
+fn check_host_backend(config: &Config, report: &mut ConfigCheckReport) {
+    // `apply_env_overrides` keeps the file's backend when HUSKER_VMM names an
+    // unknown one, so the override is reported here rather than credited.
+    let vmm_from_env = std::env::var("HUSKER_VMM").ok();
+    let ignored_override = vmm_from_env.as_deref().and_then(|value| {
+        value
+            .parse::<husker_vmm::VmmKind>()
+            .err()
+            .map(|error| format!("HUSKER_VMM={value} is ignored: {error}"))
+    });
+    match ignored_override {
+        Some(reason) => report.push(
+            "vmm",
+            CheckStatus::Warn,
+            format!("{}; {reason}", config.vmm),
+            None,
         ),
-        (_, detail) => {
-            println!(
-                "  data_dir ({}) ... FAIL ({detail}){dd_env_hint}",
-                dd.display()
-            );
-            all_ok = false;
-        }
+        None => report.push(
+            "vmm",
+            CheckStatus::Ok,
+            config.vmm.to_string(),
+            vmm_from_env.map(|_| "HUSKER_VMM"),
+        ),
     }
 
-    // default_kernel
-    let kernel = &config.default_kernel;
-    let kernel_env_hint = if kernel_from_env {
-        " (from HUSKER_DEFAULT_KERNEL)"
-    } else {
-        ""
-    };
-    if kernel.is_file() {
-        println!(
-            "  default_kernel ({}) ... OK{kernel_env_hint}",
-            kernel.display()
-        );
-    } else if kernel.exists() {
-        println!(
-            "  default_kernel ({}) ... FAIL (not a regular file){kernel_env_hint}",
-            kernel.display()
-        );
-        all_ok = false;
-    } else {
-        println!(
-            "  default_kernel ({}) ... FAIL (not found){kernel_env_hint}",
-            kernel.display()
-        );
-        all_ok = false;
-    }
-
-    // default_rootfs
-    let rootfs = &config.default_rootfs;
-    let rootfs_env_hint = if std::env::var("HUSKER_DEFAULT_ROOTFS").is_ok() {
-        " (from HUSKER_DEFAULT_ROOTFS)"
-    } else {
-        ""
-    };
-    if rootfs.is_file() {
-        println!(
-            "  default_rootfs ({}) ... OK{rootfs_env_hint}",
-            rootfs.display()
-        );
-    } else if rootfs.exists() {
-        println!(
-            "  default_rootfs ({}) ... FAIL (not a regular file){rootfs_env_hint}",
-            rootfs.display()
-        );
-        all_ok = false;
-    } else {
-        println!(
-            "  default_rootfs ({}) ... FAIL (not found){rootfs_env_hint}",
-            rootfs.display()
-        );
-        all_ok = false;
-    }
-
-    // default_initrd (optional)
-    if let Some(initrd) = &config.default_initrd {
-        let initrd_env_hint = if std::env::var("HUSKER_DEFAULT_INITRD").is_ok() {
-            " (from HUSKER_DEFAULT_INITRD)"
-        } else {
-            ""
-        };
-        if initrd.is_file() {
-            println!(
-                "  default_initrd ({}) ... OK{initrd_env_hint}",
-                initrd.display()
-            );
-        } else if !initrd.exists() && is_derived_initrd(&config, initrd) {
-            println!(
-                "  default_initrd ({}) ... not downloaded yet (VMs boot without an initrd){initrd_env_hint}",
-                initrd.display()
-            );
-        } else if initrd.exists() {
-            println!(
-                "  default_initrd ({}) ... FAIL (not a regular file){initrd_env_hint}",
-                initrd.display()
-            );
-            all_ok = false;
-        } else {
-            println!(
-                "  default_initrd ({}) ... FAIL (not found){initrd_env_hint}",
-                initrd.display()
-            );
-            all_ok = false;
-        }
-    }
-
-    // images_base_url
-    let url = &config.images_base_url;
-    let base_url_env_hint = if std::env::var("HUSKER_IMAGES_BASE_URL").is_ok() {
-        " [HUSKER_IMAGES_BASE_URL override]"
-    } else {
-        ""
-    };
-    match reqwest::Url::parse(url) {
-        Ok(_) => println!("  images_base_url ({url}) ... OK{base_url_env_hint}"),
-        Err(err) => println!("  images_base_url ({url}) ... FAIL ({err}){base_url_env_hint}"),
-    }
-
-    #[cfg(all(feature = "linux-net", target_os = "linux"))]
-    {
-        let fc_from_env = std::env::var("HUSKER_FIRECRACKER_BIN").is_ok();
-        let iface_from_env = std::env::var("HUSKER_HOST_INTERFACE").is_ok();
-        let subnet_from_env = std::env::var("HUSKER_BRIDGE_SUBNET").is_ok();
-
-        // firecracker_bin
-        let fc = &config.firecracker_bin;
-        let fc_env_hint = if fc_from_env {
-            " (from HUSKER_FIRECRACKER_BIN)"
-        } else {
-            ""
-        };
-        match find_in_path(fc) {
-            Some(resolved) => {
-                if fc.is_absolute() {
-                    println!("  firecracker_bin ({}) ... OK{fc_env_hint}", fc.display());
-                } else {
-                    println!(
-                        "  firecracker_bin ({}) ... OK ({}){fc_env_hint}",
-                        fc.display(),
-                        resolved.display()
-                    );
-                }
-            }
-            None => {
-                println!(
-                    "  firecracker_bin ({}) ... FAIL (not found){fc_env_hint}",
-                    fc.display()
-                );
-                all_ok = false;
-            }
-        }
-
-        // QEMU backend prerequisites (only when vmm = "qemu" is selected).
-        #[cfg(target_os = "linux")]
-        if config.vmm == husker_vmm::VmmKind::Qemu {
-            let qemu_env_hint = if std::env::var("HUSKER_QEMU_BIN").is_ok() {
-                " (from HUSKER_QEMU_BIN)"
+    let (status, message) = program_check(&config.firecracker_bin);
+    report.push(
+        "firecracker_bin",
+        status,
+        message,
+        env_override("HUSKER_FIRECRACKER_BIN"),
+    );
+    if config.vmm == husker_vmm::VmmKind::Qemu {
+        let (status, message) = program_check(&config.qemu_bin);
+        report.push("qemu_bin", status, message, env_override("HUSKER_QEMU_BIN"));
+        // QEMU needs hardware acceleration and the vsock host device.
+        for (device, remedy) in [
+            ("/dev/kvm", ""),
+            ("/dev/vhost-vsock", "; load the vhost_vsock kernel module"),
+        ] {
+            let (status, message) = if Path::new(device).exists() {
+                (CheckStatus::Ok, "present".to_string())
             } else {
-                ""
+                (CheckStatus::Fail, format!("missing{remedy}"))
             };
-            let qb = &config.qemu_bin;
-            match find_in_path(qb) {
-                Some(resolved) => {
-                    if qb.is_absolute() {
-                        println!("  qemu_bin ({}) ... OK{qemu_env_hint}", qb.display());
-                    } else {
-                        println!(
-                            "  qemu_bin ({}) ... OK ({}){qemu_env_hint}",
-                            qb.display(),
-                            resolved.display()
-                        );
-                    }
-                }
-                None => {
-                    println!(
-                        "  qemu_bin ({}) ... FAIL (not found){qemu_env_hint}",
-                        qb.display()
-                    );
-                    all_ok = false;
-                }
-            }
-            // QEMU needs hardware acceleration and the vsock host device.
-            for (dev, hint) in [
-                ("/dev/kvm", ""),
-                ("/dev/vhost-vsock", " (load the vhost_vsock kernel module)"),
-            ] {
-                if std::path::Path::new(dev).exists() {
-                    println!("  {dev} ... OK");
-                } else {
-                    println!("  {dev} ... FAIL (missing){hint}");
-                    all_ok = false;
-                }
-            }
-        }
-
-        // host_interface: resolve exactly like the daemon will ("auto" follows
-        // the default route) and fail on anything that breaks guest egress.
-        let iface_env_hint = if iface_from_env {
-            " (from HUSKER_HOST_INTERFACE)"
-        } else {
-            ""
-        };
-        let uplink = husker_net::resolve_host_interface(&config.host_interface);
-        let shown = if uplink.source == husker_net::HostInterfaceSource::Configured {
-            uplink.effective.clone()
-        } else {
-            format!("{} -> {}", config.host_interface, uplink.effective)
-        };
-        if uplink.warnings.is_empty() {
-            println!("  host_interface ({shown}) ... OK{iface_env_hint}");
-        } else {
-            println!(
-                "  host_interface ({shown}) ... FAIL ({}){iface_env_hint}",
-                uplink.warnings.join("; ")
-            );
-            all_ok = false;
-        }
-
-        // bridge_subnet
-        let subnet_env_hint = if subnet_from_env {
-            " (from HUSKER_BRIDGE_SUBNET)"
-        } else {
-            ""
-        };
-        match parse_cidr(&config.bridge_subnet) {
-            Ok(_) => println!(
-                "  bridge_subnet ({}) ... OK{subnet_env_hint}",
-                config.bridge_subnet
-            ),
-            Err(e) => {
-                println!(
-                    "  bridge_subnet ({}) ... FAIL ({e}){subnet_env_hint}",
-                    config.bridge_subnet
-                );
-                all_ok = false;
-            }
-        }
-
-        // lan_bridge (optional; when configured, the bridge must exist)
-        #[cfg(target_os = "linux")]
-        if let Some(ref bridge) = config.lan_bridge {
-            let bridge_env_hint = if std::env::var("HUSKER_LAN_BRIDGE").is_ok() {
-                " (from HUSKER_LAN_BRIDGE)"
-            } else {
-                ""
-            };
-            let ok = std::process::Command::new("ip")
-                .args(["link", "show", bridge.as_str()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok {
-                println!("  lan_bridge ({bridge}) ... OK{bridge_env_hint}");
-            } else {
-                println!("  lan_bridge ({bridge}) ... FAIL (bridge not found){bridge_env_hint}");
-                all_ok = false;
-            }
+            report.push(device, status, message, None);
         }
     }
 
-    #[cfg(all(feature = "linux-net", target_os = "linux"))]
-    {
-        let hint = if std::env::var("HUSKER_OVMF_CODE").is_ok() {
-            " (from HUSKER_OVMF_CODE)"
-        } else {
-            ""
-        };
-        if config.ovmf_code.exists() {
-            println!("  ovmf_code ({}) ... OK{hint}", config.ovmf_code.display());
-        } else {
-            println!(
-                "  ovmf_code ({}) ... MISSING (cloud-image boot unavailable){hint}",
-                config.ovmf_code.display()
-            );
-        }
-        let hint = if std::env::var("HUSKER_OVMF_VARS").is_ok() {
-            " (from HUSKER_OVMF_VARS)"
-        } else {
-            ""
-        };
-        if config.ovmf_vars.exists() {
-            println!("  ovmf_vars ({}) ... OK{hint}", config.ovmf_vars.display());
-        } else {
-            println!(
-                "  ovmf_vars ({}) ... MISSING (cloud-image boot unavailable){hint}",
-                config.ovmf_vars.display()
-            );
-        }
-        match std::process::Command::new("qemu-img")
-            .arg("--version")
-            .output()
-        {
-            Ok(out) if out.status.success() => println!("  qemu-img ... OK"),
-            _ => println!("  qemu-img ... MISSING (cloud-image disk resize unavailable)"),
-        }
-        match std::process::Command::new("mkfs.ext4")
-            .arg("--version")
-            .output()
-        {
-            Ok(out) if out.status.success() || !out.stderr.is_empty() => {
-                println!("  mkfs.ext4 ... OK")
-            }
-            _ => println!("  mkfs.ext4 ... MISSING (volumes unavailable)"),
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let ok = std::process::Command::new("qemu-img")
-            .arg("--version")
+    // The uplink resolves exactly like the daemon's ("auto" follows the
+    // default route), and anything that breaks guest egress is a failure.
+    let uplink = husker_net::resolve_host_interface(&config.host_interface);
+    let shown = if uplink.source == husker_net::HostInterfaceSource::Configured {
+        uplink.effective.clone()
+    } else {
+        format!("{} -> {}", config.host_interface, uplink.effective)
+    };
+    let (status, message) = if uplink.warnings.is_empty() {
+        (CheckStatus::Ok, shown)
+    } else {
+        (
+            CheckStatus::Fail,
+            format!("{shown}: {}", uplink.warnings.join("; ")),
+        )
+    };
+    report.push(
+        "host_interface",
+        status,
+        message,
+        env_override("HUSKER_HOST_INTERFACE"),
+    );
+    let (status, message) = match parse_cidr(&config.bridge_subnet) {
+        Ok(_) => (CheckStatus::Ok, config.bridge_subnet.clone()),
+        Err(error) => (
+            CheckStatus::Fail,
+            format!("{}: {error}", config.bridge_subnet),
+        ),
+    };
+    report.push(
+        "bridge_subnet",
+        status,
+        message,
+        env_override("HUSKER_BRIDGE_SUBNET"),
+    );
+    // A configured LAN bridge is pre-created by the administrator, so it has
+    // to exist already.
+    if let Some(bridge) = &config.lan_bridge {
+        let found = std::process::Command::new("ip")
+            .args(["link", "show", bridge])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success());
-        if ok {
-            println!("  qemu-img ... OK (cloud-image conversion available)");
+            .is_ok_and(|status| status.success());
+        let (status, message) = if found {
+            (CheckStatus::Ok, bridge.clone())
         } else {
-            println!("  qemu-img ... MISSING (cloud images need it: brew install qemu)");
-        }
-    }
-    if let Some(ref size) = config.default_disk_size {
-        match husker::parse_disk_size(size) {
-            Ok(_) => println!("  default_disk_size ({size}) ... OK"),
-            Err(e) => {
-                println!("  default_disk_size ({size}) ... FAIL ({e})");
-                all_ok = false;
-            }
-        }
-    }
-
-    if config.exec_timeout_max_secs < config.exec_timeout_secs {
-        println!(
-            "  exec_timeout_max_secs ({}) ... FAIL (must be >= exec_timeout_secs ({}))",
-            config.exec_timeout_max_secs, config.exec_timeout_secs
-        );
-        all_ok = false;
-    } else {
-        println!(
-            "  exec_timeout_max_secs ({}) ... OK",
-            config.exec_timeout_max_secs
+            (CheckStatus::Fail, format!("{bridge}: not found"))
+        };
+        report.push(
+            "lan_bridge",
+            status,
+            message,
+            env_override("HUSKER_LAN_BRIDGE"),
         );
     }
 
-    let mut profile_names: Vec<&String> = config.profiles.keys().collect();
-    profile_names.sort();
-    for name in profile_names {
-        let p = &config.profiles[name.as_str()];
-        let mut problems: Vec<String> = Vec::new();
-        for key in &p.ssh_keys {
-            let expanded = expand_tilde(key);
-            if !expanded.exists() {
-                problems.push(format!("ssh key {} not found", expanded.display()));
-            }
-        }
-        for path in [&p.rootfs, &p.kernel, &p.initrd].into_iter().flatten() {
-            if !path.exists() {
-                problems.push(format!("{} not found", path.display()));
-            }
-        }
-        if let Some(ref size) = p.disk_size
-            && let Err(e) = husker::parse_disk_size(size)
-        {
-            problems.push(format!("disk_size: {e}"));
-        }
-        if let Some(ref v) = p.vmm
-            && let Err(error) = v.parse::<husker_vmm::VmmKind>()
-        {
-            problems.push(format!("vmm: {error}"));
-        }
-        for e in &p.env {
-            if !e.contains('=') {
-                problems.push(format!("env entry '{e}' is not KEY=VALUE"));
-            }
-        }
-        if problems.is_empty() {
-            println!("  profile {name} ... OK");
-        } else {
-            println!("  profile {name} ... FAIL ({})", problems.join("; "));
-            all_ok = false;
-        }
-    }
+    let (status, message) = optional_file_check(&config.ovmf_code, "cloud-image boot unavailable");
+    report.push(
+        "ovmf_code",
+        status,
+        message,
+        env_override("HUSKER_OVMF_CODE"),
+    );
+    let (status, message) = optional_file_check(&config.ovmf_vars, "cloud-image boot unavailable");
+    report.push(
+        "ovmf_vars",
+        status,
+        message,
+        env_override("HUSKER_OVMF_VARS"),
+    );
+    let (status, message) = tool_check("qemu-img", "cloud-image disk resize unavailable");
+    report.push("qemu-img", status, message, None);
+    let (status, message) = tool_check("mkfs.ext4", "volumes unavailable");
+    report.push("mkfs.ext4", status, message, None);
+}
 
-    if all_ok {
-        Ok(())
-    } else {
-        std::process::exit(1);
+/// Everything wrong with a profile, in the order its keys are checked.
+fn profile_problems(profile: &Profile) -> Vec<String> {
+    let mut problems = Vec::new();
+    for key in &profile.ssh_keys {
+        let path = expand_tilde(key);
+        if !path.exists() {
+            problems.push(format!("ssh key {} not found", path.display()));
+        }
     }
+    for path in [&profile.rootfs, &profile.kernel, &profile.initrd]
+        .into_iter()
+        .flatten()
+    {
+        if !path.exists() {
+            problems.push(format!("{} not found", path.display()));
+        }
+    }
+    if let Some(size) = &profile.disk_size
+        && let Err(error) = husker::parse_disk_size(size)
+    {
+        problems.push(format!("disk_size: {error}"));
+    }
+    if let Some(vmm) = &profile.vmm
+        && let Err(error) = vmm.parse::<husker_vmm::VmmKind>()
+    {
+        problems.push(format!("vmm: {error}"));
+    }
+    for entry in &profile.env {
+        if !entry.contains('=') {
+            problems.push(format!("env entry '{entry}' is not KEY=VALUE"));
+        }
+    }
+    problems
+}
+
+/// The text rendering of a report: where the configuration came from, then
+/// one `[ok  /warn/FAIL] name: message` line per check in the report's order
+/// and words, naming the variable an environment override came from.
+fn render_config_check_text(report: &ConfigCheckReport) -> String {
+    let mut lines = vec![match &report.config_file {
+        Some(path) => format!("Config: {path}"),
+        None => "Config: defaults (no config file found)".to_string(),
+    }];
+    for check in &report.checks {
+        let mut line = format!(
+            "[{}] {}: {}",
+            status_tag(check.status),
+            check.name,
+            check.message
+        );
+        if let Some(var) = check.env_override {
+            line.push_str(&format!(" (from {var})"));
+        }
+        lines.push(line);
+    }
+    lines.join("\n") + "\n"
+}
+
+/// Validate the configuration and report it in the requested format. One
+/// report feeds both renderings, and the exit code follows its status.
+fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()> {
+    let report = build_config_check_report(explicit_path);
+    if output == OutputFormat::Json {
+        let value = structured_output("config check", &report)?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print!("{}", render_config_check_text(&report));
+    }
+    if report.has_failure() {
+        std::process::exit(exit_code::GENERAL);
+    }
+    Ok(())
 }
 
 /// Default guest path the working-tree archive is uploaded to for `--sync-cwd`.
@@ -7105,6 +6884,136 @@ mod tests {
         let targets = without_initrd.image_pull_targets("aarch64");
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[1].0, "rootfs-aarch64.ext4");
+    }
+
+    /// The text rendering is a projection of the report: the source line, then
+    /// one line per check in the report's order, with the failure tag in
+    /// capitals and the override's variable named on its own check.
+    #[test]
+    fn config_check_text_renders_every_check_from_the_report() {
+        let mut report = ConfigCheckReport {
+            status: "ok",
+            config_file: Some("/etc/husker/config.toml".into()),
+            source: "file",
+            checks: Vec::new(),
+        };
+        report.push(
+            "default_kernel",
+            CheckStatus::Ok,
+            "/srv/vmlinux",
+            Some("HUSKER_DEFAULT_KERNEL"),
+        );
+        report.push(
+            "data_dir",
+            CheckStatus::Warn,
+            "/srv/data: not created yet",
+            None,
+        );
+        report.push("images_base_url", CheckStatus::Fail, "nope: bad url", None);
+        report.finish();
+        assert_eq!(report.status, "error");
+        assert_eq!(
+            render_config_check_text(&report),
+            "Config: /etc/husker/config.toml\n\
+             [ok  ] default_kernel: /srv/vmlinux (from HUSKER_DEFAULT_KERNEL)\n\
+             [warn] data_dir: /srv/data: not created yet\n\
+             [FAIL] images_base_url: nope: bad url\n"
+        );
+    }
+
+    #[test]
+    fn config_check_text_names_the_defaults_when_no_file_was_found() {
+        let report = ConfigCheckReport {
+            status: "ok",
+            config_file: None,
+            source: "defaults",
+            checks: Vec::new(),
+        };
+        assert_eq!(
+            render_config_check_text(&report),
+            "Config: defaults (no config file found)\n"
+        );
+    }
+
+    /// A file that does not parse yields a report whose only check is the
+    /// failing file, so neither rendering shows checks of a configuration
+    /// that was never loaded.
+    #[test]
+    fn a_config_file_that_does_not_parse_is_the_report_s_only_check() {
+        let dir = temp_test_dir("config-check-parse");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is = = invalid\n").unwrap();
+        let report = build_config_check_report(Some(&path));
+        assert_eq!(report.status, "error");
+        assert_eq!(report.source, "file");
+        assert_eq!(report.config_file.as_deref(), Some(path.to_str().unwrap()));
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, "config_file");
+        assert_eq!(report.checks[0].status, CheckStatus::Fail);
+        assert!(
+            report.checks[0].message.starts_with("parse error: "),
+            "{}",
+            report.checks[0].message
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_explicit_config_path_that_does_not_exist_is_the_report_s_only_check() {
+        let dir = temp_test_dir("config-check-missing");
+        let path = dir.join("absent.toml");
+        let report = build_config_check_report(Some(&path));
+        assert_eq!(report.status, "error");
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, "config_file");
+        assert_eq!(report.checks[0].status, CheckStatus::Fail);
+        assert_eq!(report.checks[0].message, "not found");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The daemon ignores a numeric override that does not parse, so the check
+    /// credits the variable only when the daemon would have used it.
+    #[test]
+    fn a_numeric_override_is_credited_only_when_it_parses() {
+        let _guard = env_mutex().lock().unwrap();
+        {
+            let _env = EnvVarGuard::set("HUSKER_EXEC_TIMEOUT_MAX_SECS", "ninety");
+            assert_eq!(numeric_env_override("HUSKER_EXEC_TIMEOUT_MAX_SECS"), None);
+        }
+        let _env = EnvVarGuard::set("HUSKER_EXEC_TIMEOUT_MAX_SECS", "90");
+        assert_eq!(
+            numeric_env_override("HUSKER_EXEC_TIMEOUT_MAX_SECS"),
+            Some("HUSKER_EXEC_TIMEOUT_MAX_SECS")
+        );
+    }
+
+    /// An image path that followed `HUSKER_DATA_DIR` is attributed to that
+    /// variable; one the operator named in the file stays attributed to the
+    /// file even while the data directory moved.
+    #[test]
+    fn an_image_path_moved_by_the_data_dir_override_is_attributed_to_it() {
+        let _guard = env_mutex().lock().unwrap();
+        let _env = EnvVarGuard::set("HUSKER_DATA_DIR", "/tmp/husker-attribution-test");
+        let mut config: Config = toml::from_str("default_kernel = \"/custom/vmlinux\"\n").unwrap();
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            image_path_override(
+                &config,
+                "HUSKER_DEFAULT_KERNEL",
+                &config.default_kernel,
+                husker::default_kernel_path_for,
+            ),
+            None
+        );
+        assert_eq!(
+            image_path_override(
+                &config,
+                "HUSKER_DEFAULT_ROOTFS",
+                &config.default_rootfs,
+                husker::default_rootfs_path_for,
+            ),
+            Some("HUSKER_DATA_DIR")
+        );
     }
 
     #[test]

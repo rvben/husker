@@ -38,7 +38,11 @@ one of them is refused before any request reaches the daemon, with the
 `invalid_usage` kind and a hint naming the supported form (text output, or the
 command's non-streaming JSON variant), rather than emitting a partial or mixed
 stream. `config check` is structured: it emits one report with a stable overall
-status and an array of named checks.
+status and an array of named checks. Each check carries `name`, `status`
+(`ok`, `warn` or `fail`) and `message`, plus `env_override` naming the
+`HUSKER_*` variable the checked value came from when one is in effect. The
+text rendering is produced from the same report, so both forms list the same
+checks in the same order with the same words.
 
 ## Examples
 
