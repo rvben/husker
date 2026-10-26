@@ -238,10 +238,6 @@ pub(crate) async fn events(
 ) -> Result<()> {
     segment(name)?;
     segment(id)?;
-    ensure!(
-        !follow || output != OutputFormat::Json,
-        "events --follow streams bytes; use --output text or poll JSON pages with --after"
-    );
     loop {
         let request = daemon.get(format!("/v1/vms/{name}/sessions/{id}/events?after={after}"));
         let page: SessionEventsResponse = daemon.execute_json(request, "session events").await?;

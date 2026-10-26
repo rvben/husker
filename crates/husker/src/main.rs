@@ -103,19 +103,36 @@ fn command_requires_text_output(command: &Commands) -> bool {
     )
 }
 
-/// Commands whose output is not a JSON document, so an explicit
-/// `--output json` is refused rather than ignored.
-fn command_rejects_json_output(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Daemon { .. }
-            | Commands::Shell { .. }
-            | Commands::Setup {
-                action: SetupAction::Storage { .. }
-            }
-            | Commands::Completions { .. }
-            | Commands::GuestAgent
-    )
+/// Why a command has no JSON document to print, so an explicit
+/// `--output json` is refused up front rather than ignored or discovered
+/// after a round trip. The hint names the way to get the data the caller
+/// was after. Every command listed here is also one that
+/// `command_requires_text_output` resolves to text under `auto`, so only an
+/// explicit request ever reaches the refusal.
+fn json_output_refusal(command: &Commands) -> Option<&'static str> {
+    Some(match command {
+        Commands::Daemon { .. } => {
+            "the daemon serves HTTP and logs to stderr; it prints no document"
+        }
+        Commands::Shell { .. } => {
+            "an interactive shell is a byte stream; use `exec --output json` for a structured result"
+        }
+        Commands::Setup {
+            action: SetupAction::Storage { .. },
+        } => "storage setup reports its progress as text",
+        Commands::Completions { .. } => "completions emit a shell script",
+        Commands::GuestAgent => "the guest agent serves the host over vsock and prints nothing",
+        Commands::Logs { follow: true, .. } => {
+            "use --output text to follow, or drop --follow for a JSON snapshot"
+        }
+        Commands::Events { follow: true, .. } => {
+            "use --output text to follow, or drop --follow and poll JSON pages with --after"
+        }
+        Commands::Preview { .. } => {
+            "the preview prints its local URL and relays bytes until Ctrl-C; use --output text"
+        }
+        _ => return None,
+    })
 }
 
 /// Fetch a diagnostics report from the daemon's `GET /v1/diagnostics` endpoint.
@@ -735,10 +752,16 @@ async fn run(cli: Cli) -> Result<()> {
     if let Commands::Context { action } = command {
         return context_command(action, output);
     }
-    if output == OutputFormat::Json && command_rejects_json_output(&command) {
+    if output == OutputFormat::Json
+        && let Some(hint) = json_output_refusal(&command)
+    {
         exit_with_error(
             output,
-            "this command does not support --output json; use text output",
+            ApiFailure::with_kind(
+                CliErrorKind::InvalidUsage,
+                "this command does not support --output json; use text output",
+                Some(hint.into()),
+            ),
         );
     }
     // Inside a macOS guest this binary is the guest agent; it needs no config,
@@ -1679,12 +1702,6 @@ async fn run(cli: Cli) -> Result<()> {
             }
 
             if follow {
-                if output == OutputFormat::Json {
-                    exit_with_error(
-                        output,
-                        "json output is not supported with --follow for streaming logs",
-                    );
-                }
                 use tokio::io::AsyncWriteExt;
                 let mut stream = resp.bytes_stream();
                 let mut stdout = tokio::io::stdout();
@@ -6093,7 +6110,46 @@ mod tests {
             resolve_command_format(cli.output, &cli.command),
             OutputFormat::Json
         );
-        assert!(command_rejects_json_output(&cli.command));
+        assert!(json_output_refusal(&cli.command).is_some());
+    }
+
+    #[test]
+    fn commands_without_a_json_document_refuse_json_with_a_way_out() {
+        for args in [
+            vec!["husker", "daemon"],
+            vec!["husker", "shell", "vm"],
+            vec!["husker", "setup", "storage"],
+            vec!["husker", "completions", "bash"],
+            vec!["husker", "guest-agent"],
+            vec!["husker", "logs", "vm", "--follow"],
+            vec!["husker", "logs", "vm", "--follow", "--userdata"],
+            vec!["husker", "events", "vm", "sid", "--follow"],
+            vec!["husker", "preview", "vm", "8080"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("should parse");
+            let hint = json_output_refusal(&cli.command)
+                .unwrap_or_else(|| panic!("{args:?} must refuse --output json"));
+            assert!(!hint.is_empty(), "{args:?} needs a hint");
+            // A refused command must never be steered into JSON by `auto`,
+            // or a pipe would hit the refusal without asking for JSON.
+            assert!(
+                command_requires_text_output(&cli.command),
+                "{args:?} refuses JSON but auto would select it when piped"
+            );
+        }
+        for args in [
+            vec!["husker", "logs", "vm"],
+            vec!["husker", "logs", "vm", "--userdata"],
+            vec!["husker", "events", "vm", "sid"],
+            vec!["husker", "list"],
+            vec!["husker", "exec", "vm", "--", "true"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("should parse");
+            assert!(
+                json_output_refusal(&cli.command).is_none(),
+                "{args:?} has a JSON form and must not be refused"
+            );
+        }
     }
 
     #[test]
