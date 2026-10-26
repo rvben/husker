@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use husker_api::{ExecRequest, ExecResponse};
 
 use crate::cli::OutputFormat;
-use crate::cli_contract::structured_output;
+use crate::cli_contract::{CliErrorKind, structured_output};
 use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent};
 use crate::guest_file::{GuestFile, read_guest_file};
 use crate::schema::exit_code;
@@ -21,7 +21,7 @@ use crate::vm_creation::PreparedVmCreationPlan;
 use crate::{
     SYNC_ARCHIVE_GUEST_PATH, SYNC_MANIFEST_GUEST_PATH, SYNC_OUTPUT_GUEST_PATH, SYNC_WORKDIR,
     apply_dns_hosts, build_sync_archive, collect_sync_paths, extract_archive_over,
-    serial_boot_hint, wrap_sync_command,
+    serial_boot_hint, wait_for_vm_ready, wrap_sync_command,
 };
 
 /// Resolve the `(command, args)` to exec for a non-`--sync-cwd` job. An empty
@@ -316,20 +316,20 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
         }
     }
 
-    // 2. Boot-mode-aware readiness wait (mirrors Commands::Wait logic).
+    // 2. Boot-mode-aware readiness wait, the same wait `husker wait` performs.
     let vm = daemon.vm(name).await?;
-    let deadline = std::time::Instant::now() + husker_core::default_ready_timeout(vm.boot_mode);
-    let mut backoff = std::time::Duration::from_millis(200);
-    loop {
-        if daemon.ready(name).await?.ready {
-            break;
-        }
-        if std::time::Instant::now() + backoff >= deadline {
-            let hint = serial_boot_hint(daemon, name).await;
-            anyhow::bail!("timed out waiting for VM '{name}' to become ready{hint}");
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    let timeout = husker_core::default_ready_timeout(vm.boot_mode);
+    if !wait_for_vm_ready(daemon, name, timeout).await? {
+        let hint = serial_boot_hint(daemon, name).await;
+        return Err(ApiFailure::with_kind(
+            CliErrorKind::Timeout,
+            format!(
+                "timed out after {}s waiting for VM '{name}' to become ready{hint}",
+                timeout.as_secs()
+            ),
+            None,
+        )
+        .into());
     }
 
     // 2.4 Apply per-VM DNS / host overrides before running the command.

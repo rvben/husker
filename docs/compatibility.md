@@ -24,6 +24,11 @@
 - A destructive command that does not pass its confirmation gate changes
   nothing and exits 6: `confirmation_required` when stdin is not a TTY and
   `--yes` is absent, `confirmation_declined` when the prompt was answered no.
+- An operation that does not finish in time exits 1 with the `timeout` kind:
+  `wait` and `job` past their ready deadline, a preview handshake that never
+  completes, and a command the daemon ended at its run timeout (the API's
+  `exec_timeout`). It is not marked retryable, since a timed-out command may
+  have completed in the guest.
 
 ## Error contract
 

@@ -307,6 +307,7 @@ fn schema_advertises_every_stable_cli_error_kind() {
         "out_matched_nothing",
         "job_cleanup_failed",
         "vm_not_running",
+        "timeout",
     ] {
         assert!(kinds.contains(kind), "missing error kind '{kind}'");
     }

@@ -331,7 +331,13 @@ impl DaemonClient {
             tokio_tungstenite::connect_async(request),
         )
         .await
-        .context("guest preview handshake timed out")?
+        .map_err(|_elapsed| {
+            ApiFailure::with_kind(
+                CliErrorKind::Timeout,
+                "guest preview handshake timed out",
+                None,
+            )
+        })?
         .context("opening authenticated guest preview tunnel")?;
         Ok(socket)
     }

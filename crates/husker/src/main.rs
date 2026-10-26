@@ -288,6 +288,22 @@ pub(crate) async fn serial_boot_hint(daemon: &DaemonClient, name: &str) -> Strin
     )
 }
 
+/// The failure for a VM that did not report ready within `timeout`. The guest
+/// may still be booting, so the hint points at a longer wait and the console.
+fn ready_timeout(name: &str, timeout: std::time::Duration) -> ApiFailure {
+    ApiFailure::with_kind(
+        CliErrorKind::Timeout,
+        format!(
+            "timed out after {}s waiting for VM '{name}' to become ready",
+            timeout.as_secs()
+        ),
+        Some(format!(
+            "the guest may still be booting; re-run with a longer --timeout, \
+             or inspect `husker logs --source serial {name}`"
+        )),
+    )
+}
+
 /// Parse a `--add-host name:ip` value into `(hostname, ip)`. The split is on the
 /// FIRST `:` so IPv6 addresses (which contain colons) work
 /// (`db:2001:db8::1` -> `("db", "2001:db8::1")`); the IP must parse.
@@ -404,7 +420,7 @@ pub(crate) async fn apply_dns_hosts(
 /// Poll a VM's `/ready` endpoint until it reports ready or the deadline passes.
 /// Returns `Ok(true)` when ready, `Ok(false)` on timeout, and `Err` if the VM is
 /// gone or the daemon errors.
-async fn wait_for_vm_ready(
+pub(crate) async fn wait_for_vm_ready(
     daemon: &DaemonClient,
     name: &str,
     timeout: std::time::Duration,
@@ -1053,9 +1069,12 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
                 if !ready {
                     let hint = serial_boot_hint(&client, &name).await;
-                    anyhow::bail!(
-                        "VM '{name}' did not become ready to apply --dns/--add-host{hint}"
-                    );
+                    return Err(ApiFailure::with_kind(
+                        CliErrorKind::Timeout,
+                        format!("VM '{name}' did not become ready to apply --dns/--add-host{hint}"),
+                        None,
+                    )
+                    .into());
                 }
                 apply_dns_hosts(&client, &name, &dns, &add_host).await?;
                 if output == OutputFormat::Text {
@@ -1749,26 +1768,14 @@ async fn run(cli: Cli) -> Result<()> {
                     husker_core::default_ready_timeout(vm.boot_mode)
                 }
             };
-            let deadline = std::time::Instant::now() + timeout;
-            let mut backoff = std::time::Duration::from_millis(200);
-            loop {
-                if client.ready(&name).await?.ready {
-                    print_output(
-                        output,
-                        &serde_json::json!({"status":"ok","action":"wait","vm":name,"ready":true}),
-                        format!("{name} is ready"),
-                    );
-                    break;
-                }
-                if std::time::Instant::now() + backoff >= deadline {
-                    exit_with_error(
-                        output,
-                        format!("timed out waiting for VM '{name}' to become ready"),
-                    );
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            if !wait_for_vm_ready(&client, &name, timeout).await? {
+                exit_with_error(output, ready_timeout(&name, timeout));
             }
+            print_output(
+                output,
+                &serde_json::json!({"status":"ok","action":"wait","vm":name,"ready":true}),
+                format!("{name} is ready"),
+            );
             Ok(())
         }
         Commands::Shell { name, command } => {

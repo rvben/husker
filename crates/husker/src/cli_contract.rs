@@ -352,10 +352,11 @@ pub(crate) enum CliErrorKind {
     OutMatchedNothing,
     JobCleanupFailed,
     VmNotRunning,
+    Timeout,
 }
 
 impl CliErrorKind {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::Error,
         Self::NotFound,
         Self::InvalidUsage,
@@ -367,6 +368,7 @@ impl CliErrorKind {
         Self::OutMatchedNothing,
         Self::JobCleanupFailed,
         Self::VmNotRunning,
+        Self::Timeout,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -382,6 +384,7 @@ impl CliErrorKind {
             Self::OutMatchedNothing => "out_matched_nothing",
             Self::JobCleanupFailed => "job_cleanup_failed",
             Self::VmNotRunning => "vm_not_running",
+            Self::Timeout => "timeout",
         }
     }
 
@@ -397,9 +400,11 @@ impl CliErrorKind {
             Self::ConfirmationRequired | Self::ConfirmationDeclined => {
                 exit_code::CONFIRMATION_REQUIRED
             }
-            Self::Error | Self::OutMatchedNothing | Self::JobCleanupFailed | Self::VmNotRunning => {
-                exit_code::GENERAL
-            }
+            Self::Error
+            | Self::OutMatchedNothing
+            | Self::JobCleanupFailed
+            | Self::VmNotRunning
+            | Self::Timeout => exit_code::GENERAL,
         }
     }
 
@@ -424,6 +429,7 @@ impl CliErrorKind {
             Self::OutMatchedNothing => "A requested job output pattern matched nothing",
             Self::JobCleanupFailed => "A completed job VM could not be destroyed",
             Self::VmNotRunning => "The requested VM is not running",
+            Self::Timeout => "The operation did not finish in time",
         }
     }
 
@@ -441,6 +447,18 @@ impl CliErrorKind {
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
+
+    /// The CLI kind for a kind the daemon sent. A daemon kind that names a
+    /// CLI kind maps to it. The daemon's operation-specific timeout kinds fold
+    /// into `Timeout`, since the CLI reports every "did not finish in time"
+    /// outcome under one kind. Any other daemon kind is unknown here and is
+    /// classified by exit code instead.
+    pub(crate) fn from_daemon_kind(name: &str) -> Option<Self> {
+        match name {
+            "exec_timeout" => Some(Self::Timeout),
+            other => Self::from_name(other),
+        }
+    }
 }
 
 impl fmt::Display for CliErrorKind {
@@ -453,7 +471,7 @@ impl fmt::Display for CliErrorKind {
 /// are useful inside the HTTP API, but the CLI normalizes them to its stable
 /// status category unless they are explicitly part of the CLI contract.
 pub(crate) fn normalize_error_kind(kind: Option<&str>, exit_code: i32) -> CliErrorKind {
-    kind.and_then(CliErrorKind::from_name)
+    kind.and_then(CliErrorKind::from_daemon_kind)
         .unwrap_or_else(|| CliErrorKind::from_exit_code(exit_code))
 }
 
@@ -490,6 +508,22 @@ mod tests {
         assert_eq!(
             normalize_error_kind(Some("vm_not_running"), 1),
             CliErrorKind::VmNotRunning
+        );
+    }
+
+    #[test]
+    fn a_daemon_exec_timeout_is_reported_as_a_timeout() {
+        let timeout = normalize_error_kind(Some("exec_timeout"), 1);
+        assert_eq!(timeout, CliErrorKind::Timeout);
+        assert_eq!(timeout.name(), "timeout");
+        assert_eq!(timeout.exit_code(), exit_code::GENERAL);
+        // A timed-out command may have run to completion in the guest, so a
+        // blind retry could repeat its effect.
+        assert!(!timeout.retryable());
+        // The exit code alone does not say an operation timed out.
+        assert_eq!(
+            CliErrorKind::from_exit_code(exit_code::GENERAL),
+            CliErrorKind::Error
         );
     }
 

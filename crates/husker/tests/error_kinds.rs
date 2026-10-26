@@ -185,3 +185,72 @@ async fn a_log_snapshot_keeps_its_json_form() {
     assert_eq!(document["logs"], "boot ok\n");
     assert_eq!(fixture.requests().len(), 1);
 }
+
+#[tokio::test]
+async fn a_vm_that_never_reports_ready_times_out_under_its_own_kind() {
+    let fixture = Fixture::start(|method, target| {
+        if method == "GET" && target == "/v1/vms/vm/ready" {
+            (StatusCode::OK, r#"{"vm":"vm","ready":false}"#.into())
+        } else {
+            no_route(method, target)
+        }
+    })
+    .await;
+    let output = fixture
+        .husker(&["--output", "json", "wait", "vm", "--timeout", "1"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["kind"], "timeout", "{stderr}");
+    assert_eq!(
+        error["message"],
+        "timed out after 1s waiting for VM 'vm' to become ready"
+    );
+    assert!(error["hint"].as_str().unwrap().contains("--timeout"));
+    assert!(output.stdout.is_empty());
+    assert!(
+        fixture
+            .requests()
+            .iter()
+            .all(|(_, target)| target == "/v1/vms/vm/ready"),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
+async fn a_command_the_daemon_timed_out_is_reported_as_a_timeout() {
+    let fixture = Fixture::start(|method, target| {
+        if method == "POST" && target == "/v1/vms/vm/exec" {
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                concat!(
+                    r#"{"kind":"exec_timeout","#,
+                    r#""message":"command execution timed out and the agent did not respond","#,
+                    r#""hint":"increase exec timeout policy or optimize guest command runtime"}"#
+                )
+                .into(),
+            )
+        } else {
+            no_route(method, target)
+        }
+    })
+    .await;
+    let output = fixture
+        .husker(&["--output", "json", "exec", "vm", "--", "sleep", "999"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["kind"], "timeout", "{stderr}");
+    assert_eq!(
+        error["message"],
+        "command execution timed out and the agent did not respond"
+    );
+    assert_eq!(
+        error["hint"],
+        "increase exec timeout policy or optimize guest command runtime"
+    );
+    assert!(output.stdout.is_empty());
+}
