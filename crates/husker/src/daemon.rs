@@ -1694,4 +1694,18 @@ mod runtime_tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
     }
+
+    /// A config file that sets no API key must hand the daemon the policy
+    /// husker-api applies on its own, so the two cannot drift apart.
+    #[test]
+    fn an_unset_config_yields_the_api_policy_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        let auth = DaemonAuth {
+            api_token: None,
+            metrics_token: None,
+        };
+        let runtime =
+            DaemonRuntimeConfig::from_config(&config, auth, "127.0.0.1:0".parse().unwrap());
+        assert_eq!(runtime.api_policy, husker_api::ApiPolicy::default());
+    }
 }

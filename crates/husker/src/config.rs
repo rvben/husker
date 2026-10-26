@@ -277,28 +277,32 @@ fn default_ovmf_vars() -> PathBuf {
     PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd")
 }
 
+// The API policy defaults live in husker-api; the config only mirrors them,
+// so a file that leaves a key out yields exactly the policy the API would
+// apply on its own.
+
 fn default_api_max_request_bytes() -> usize {
-    2 * 1024 * 1024
+    husker_api::ApiPolicy::default().max_request_bytes
 }
 
 fn default_api_max_file_read_bytes() -> usize {
-    1024 * 1024
+    husker_api::ApiPolicy::default().max_file_read_bytes
 }
 
 fn default_api_max_file_write_bytes() -> usize {
-    1024 * 1024
+    husker_api::ApiPolicy::default().max_file_write_bytes
 }
 
 fn default_api_sensitive_rate_limit_per_minute() -> u32 {
-    120
+    husker_api::ApiPolicy::default().sensitive_rate_limit_per_minute
 }
 
 pub(crate) fn default_exec_timeout_secs() -> u64 {
-    30
+    husker_api::ApiPolicy::default().exec_timeout_secs
 }
 
 pub(crate) fn default_exec_timeout_max_secs() -> u64 {
-    3600
+    husker_api::ApiPolicy::default().exec_timeout_max_secs
 }
 
 fn default_service_reconcile_interval() -> u64 {

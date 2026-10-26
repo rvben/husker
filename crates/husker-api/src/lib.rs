@@ -86,7 +86,7 @@ use router::{is_protected_route, is_rate_limited_route};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ApiPolicy {
     pub max_request_bytes: usize,
     pub max_file_read_bytes: usize,
