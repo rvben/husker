@@ -1362,10 +1362,49 @@ pub fn interface_operstate(iface: &str) -> Option<String> {
 
 // ── Port Forwarding ───────────────────────────────────────────────────
 
+/// The prerouting DNAT rule for one port forward, as an `nft` argument vector
+/// (after `add rule ip <table> prerouting`). Returned as data so the match
+/// terms can be unit-tested without running `nft`.
+///
+/// The rule rewrites only traffic that arrives from outside the guest bridge
+/// and is addressed to one of the host's own addresses. The prerouting hook
+/// sees every packet the host receives, the guests' own outbound packets
+/// included: without the ingress guard a guest connecting to any remote host
+/// on the forwarded port would have that connection silently rewritten to the
+/// forward's target, and without the local-address guard the host would also
+/// rewrite traffic it merely routes for other networks.
+fn port_forward_rule(
+    bridge: &str,
+    host_port: u16,
+    guest_ip: Ipv4Addr,
+    guest_port: u16,
+    tap_name: &str,
+) -> Vec<String> {
+    vec![
+        "iifname".into(),
+        "!=".into(),
+        bridge.into(),
+        "fib".into(),
+        "daddr".into(),
+        "type".into(),
+        "local".into(),
+        "tcp".into(),
+        "dport".into(),
+        host_port.to_string(),
+        "counter".into(),
+        "dnat".into(),
+        "to".into(),
+        format!("{guest_ip}:{guest_port}"),
+        "comment".into(),
+        format!("\"husker-pf:{tap_name}:{host_port}\""),
+    ]
+}
+
 /// Add a port forward from `host_port` to `guest_ip:guest_port` in the nftables table for `bridge_name`.
 ///
-/// Creates a DNAT rule in the prerouting chain. The bridge-level forward rules already allow all
-/// traffic to/from the bridge, so no per-port-forward accept rule is needed.
+/// Creates a DNAT rule in the prerouting chain (see [`port_forward_rule`] for
+/// the match terms). The bridge-level forward rules already allow all traffic
+/// to/from the bridge, so no per-port-forward accept rule is needed.
 pub async fn add_port_forward(
     host_port: u16,
     guest_ip: Ipv4Addr,
@@ -1374,32 +1413,13 @@ pub async fn add_port_forward(
     bridge_name: &str,
 ) -> Result<(), NetError> {
     let table = nft_table_for_bridge(bridge_name);
-    let comment = format!("\"husker-pf:{}:{}\"", tap_name, host_port);
-    let dnat_target = format!("{}:{}", guest_ip, guest_port);
 
     info!(host_port, %guest_ip, guest_port, tap = tap_name, "adding port forward");
 
-    // DNAT rule in prerouting chain
-    run_cmd(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "ip",
-            &table,
-            "prerouting",
-            "tcp",
-            "dport",
-            &host_port.to_string(),
-            "counter",
-            "dnat",
-            "to",
-            &dnat_target,
-            "comment",
-            &comment,
-        ],
-    )
-    .await?;
+    let rule = port_forward_rule(bridge_name, host_port, guest_ip, guest_port, tap_name);
+    let mut args = vec!["add", "rule", "ip", &table, "prerouting"];
+    args.extend(rule.iter().map(String::as_str));
+    run_cmd("nft", &args).await?;
 
     Ok(())
 }
@@ -1899,6 +1919,54 @@ mod tests {
         assert!(joined[0].contains("arp daddr ip 172.20.0.1"));
         assert!(!joined[0].contains("accept comment \"husker-egress:husker9:default"));
         assert!(joined[1].contains("drop"));
+    }
+
+    // ── Port forward rule ──────────────────────────────────────────────
+
+    /// The DNAT rule must be the exact vector `nft` receives: the two guards
+    /// first, then the port match, then the rewrite and the comment that
+    /// `remove_port_forward` later finds the rule by.
+    #[test]
+    fn port_forward_rule_is_guarded_by_ingress_and_local_destination() {
+        let rule = port_forward_rule("husker0", 2222, "192.0.2.2".parse().unwrap(), 22, "hsk3");
+        assert_eq!(
+            rule_str(&rule),
+            "iifname != husker0 fib daddr type local tcp dport 2222 counter dnat to \
+             192.0.2.2:22 comment \"husker-pf:hsk3:2222\""
+        );
+    }
+
+    /// A guest's outbound packet enters prerouting with the bridge as its
+    /// ingress interface, so the ingress guard has to name the bridge the
+    /// forward was created on, not a fixed interface. Both guards sit before
+    /// the port match so a reader of `nft list ruleset` sees what the rule is
+    /// scoped to before what it rewrites; `nft` requires every match to
+    /// precede the `dnat` statement, which ends the rule.
+    #[test]
+    fn port_forward_rule_guards_precede_the_port_match_for_any_bridge() {
+        for bridge in ["husker0", "hskbr9"] {
+            let rule = port_forward_rule(bridge, 8080, "192.0.2.9".parse().unwrap(), 80, "hsk1");
+            let ingress = rule
+                .windows(3)
+                .position(|w| w == ["iifname", "!=", bridge])
+                .expect("ingress guard names the bridge");
+            let local = rule
+                .windows(4)
+                .position(|w| w == ["fib", "daddr", "type", "local"])
+                .expect("local-destination guard present");
+            let port = rule
+                .windows(3)
+                .position(|w| w == ["tcp", "dport", "8080"])
+                .expect("port match present");
+            assert!(
+                ingress < port,
+                "ingress guard precedes the port match: {rule:?}"
+            );
+            assert!(
+                local < port,
+                "local guard precedes the port match: {rule:?}"
+            );
+        }
     }
 
     #[test]

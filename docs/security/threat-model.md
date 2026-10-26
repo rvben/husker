@@ -29,6 +29,7 @@ Last updated: 2026-10-26
 | Denial of Service | Abuse via shell/exec/files endpoints | Sliding-window per-client rate limit on sensitive routes; request body max limit | Rate-limit middleware tests (429 path) |
 | Elevation of Privilege | Dangerous guest commands or env injection | Exec allow/deny policy, env allowlist, timeout | Exec policy tests in API crate |
 | Tampering/DoS | State/network drift after crash/restart | Startup reconciliation of persisted port forwards; idempotent lifecycle ops | Core startup reconciliation + lifecycle tests |
+| Spoofing / Elevation of Privilege | A guest's outbound connection on a forwarded port, or transit traffic the host routes for another network, is rewritten by a port forward's DNAT rule | The DNAT rule matches only packets that enter from outside the guest bridge and are addressed to a host-local address (`iifname != <bridge>`, `fib daddr type local`) | `husker-net` port-forward rule unit tests; bridge E2E |
 
 ## Residual risk
 
