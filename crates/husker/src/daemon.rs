@@ -758,22 +758,41 @@ async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
     match core.list_services() {
         Ok(services) => {
             for svc in &services {
-                let o = core.reconcile_service(svc).await;
-                if !o.created.is_empty() || !o.destroyed.is_empty() || !o.failed.is_empty() {
-                    tracing::info!(
-                        service = %svc.name,
-                        created = o.created.len(),
-                        destroyed = o.destroyed.len(),
-                        failed = o.failed.len(),
-                        "startup service reconcile"
-                    );
-                }
+                let outcome = core.reconcile_service(svc).await;
+                log_reconcile_outcome("startup service reconcile", &svc.name, &outcome);
             }
         }
         Err(e) => tracing::warn!(error = %e, "failed to list services for startup reconcile"),
     }
     if let Err(e) = core.create_service_ordinal_index() {
         tracing::warn!(error = %e, "failed to create service ordinal index");
+    }
+}
+
+/// Log one service's reconcile outcome under `phase`.
+///
+/// Every instance that could not be created or destroyed gets its own
+/// warning carrying the instance name and the error, so an operator reading
+/// the journal sees what failed and why. The count summary that follows is
+/// emitted only when the reconcile changed or failed anything, so a quiet
+/// tick stays silent.
+fn log_reconcile_outcome(phase: &str, service: &str, outcome: &husker_core::ReconcileOutcome) {
+    for (instance, error) in &outcome.failed {
+        tracing::warn!(
+            service,
+            instance,
+            error,
+            "{phase}: instance reconcile failed"
+        );
+    }
+    if !outcome.created.is_empty() || !outcome.destroyed.is_empty() || !outcome.failed.is_empty() {
+        tracing::info!(
+            service,
+            created = outcome.created.len(),
+            destroyed = outcome.destroyed.len(),
+            failed = outcome.failed.len(),
+            "{phase}"
+        );
     }
 }
 
@@ -1239,16 +1258,8 @@ fn spawn_service_reconcile_loop<B: husker_vmm::VmmBackend + 'static>(
                         }
                     };
                     for svc in &services {
-                        let o = core.reconcile_service(svc).await;
-                        if !o.created.is_empty() || !o.destroyed.is_empty() || !o.failed.is_empty() {
-                            tracing::info!(
-                                service = %svc.name,
-                                created = o.created.len(),
-                                destroyed = o.destroyed.len(),
-                                failed = o.failed.len(),
-                                "reconcile loop"
-                            );
-                        }
+                        let outcome = core.reconcile_service(svc).await;
+                        log_reconcile_outcome("reconcile loop", &svc.name, &outcome);
                     }
                     // Attempt to create the unique ordinal index after reconciling all
                     // services. It is idempotent (CREATE UNIQUE INDEX IF NOT EXISTS) and
@@ -1427,6 +1438,102 @@ mod runtime_tests {
 
     fn record(events: &Events, event: &'static str) {
         events.lock().expect("events lock poisoned").push(event);
+    }
+
+    /// A tracing writer that keeps everything logged in memory.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log lock poisoned").clone())
+                .expect("log output is UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with a plain-text tracing subscriber and return what it logged.
+    fn capture_log(f: impl FnOnce()) -> String {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        log.contents()
+    }
+
+    #[test]
+    fn reconcile_outcome_logs_each_failed_instance_with_its_error() {
+        let outcome = husker_core::ReconcileOutcome {
+            created: vec!["web-0".into()],
+            destroyed: vec![],
+            failed: vec![
+                (
+                    "web-1".into(),
+                    "rootfs not found: /images/missing.ext4".into(),
+                ),
+                ("web-2".into(), "no free vsock CID".into()),
+            ],
+        };
+
+        let log = capture_log(|| log_reconcile_outcome("reconcile loop", "web", &outcome));
+        let lines: Vec<&str> = log.lines().collect();
+
+        assert_eq!(lines.len(), 3, "{log}");
+        let first = lines[0];
+        assert!(first.contains("WARN"), "{first}");
+        assert!(first.contains("instance reconcile failed"), "{first}");
+        assert!(first.contains("service=\"web\""), "{first}");
+        assert!(first.contains("instance=\"web-1\""), "{first}");
+        assert!(
+            first.contains("error=\"rootfs not found: /images/missing.ext4\""),
+            "{first}"
+        );
+        let second = lines[1];
+        assert!(second.contains("instance=\"web-2\""), "{second}");
+        assert!(second.contains("error=\"no free vsock CID\""), "{second}");
+
+        let summary = lines[2];
+        assert!(summary.contains("INFO"), "{summary}");
+        assert!(summary.contains("reconcile loop"), "{summary}");
+        assert!(summary.contains("created=1"), "{summary}");
+        assert!(summary.contains("destroyed=0"), "{summary}");
+        assert!(summary.contains("failed=2"), "{summary}");
+    }
+
+    #[test]
+    fn reconcile_outcome_without_changes_logs_nothing() {
+        let outcome = husker_core::ReconcileOutcome {
+            created: vec![],
+            destroyed: vec![],
+            failed: vec![],
+        };
+        let log = capture_log(|| log_reconcile_outcome("reconcile loop", "web", &outcome));
+        assert!(log.is_empty(), "{log}");
     }
 
     #[tokio::test]
