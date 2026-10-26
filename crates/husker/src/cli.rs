@@ -1102,7 +1102,8 @@ pub(crate) enum MacosAction {
     /// Install macOS from a restore image into a new named image. Without
     /// --ipsw, downloads the latest restore image this host supports.
     Install {
-        /// Image name (letters, digits, `-`, `_`, `.`)
+        /// Image name (up to 64 letters, digits, `-`, `_`, `.`; not starting
+        /// with `.`)
         name: String,
         /// Local restore image (.ipsw) to install from. Read in place and
         /// never deleted

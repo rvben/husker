@@ -18,37 +18,58 @@ pub fn macos_images_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(MACOS_IMAGES_DIR)
 }
 
-/// Whether `name` can name a bundle under `<data_dir>/macos/`: ASCII
-/// alphanumerics plus `-`, `_` and `.`, not starting with `.` (which keeps
-/// `..` and the install staging directories out of the namespace).
-pub fn is_valid_macos_image_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+/// Check that `name` can name a bundle under `<data_dir>/macos/`. A bundle
+/// name follows the rules of every other resource name (at most 64 ASCII
+/// alphanumerics plus `-`, `_` and `.`, not starting with `.`), which keeps
+/// `..` and the install staging directories out of the namespace.
+pub fn validate_macos_image_name(name: &str) -> Result<(), CoreError> {
+    validate_resource_name("macOS image", name)
 }
 
-/// Resolve a `macos_image` reference. A value containing `/` is a bundle
-/// directory path; anything else names an installed bundle under
+/// A `macos_image` reference as the user wrote it. A value containing `/` is
+/// a bundle directory path; anything else names an installed bundle under
 /// `<data_dir>/macos/`, so a bare name can never escape that directory.
-pub fn resolve_macos_bundle(data_dir: &Path, image: &str) -> Result<MacOsBundle, CoreError> {
-    if image.contains('/') {
-        let path = Path::new(image);
-        if path.is_dir() {
-            return Ok(MacOsBundle::new(path));
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacOsImageRef {
+    Path(PathBuf),
+    Name(String),
+}
+
+impl MacOsImageRef {
+    /// Classify `image`, refusing a bare name outside the resource name rules
+    /// before anything looks at the filesystem.
+    pub fn parse(image: &str) -> Result<Self, CoreError> {
+        if image.contains('/') {
+            return Ok(Self::Path(PathBuf::from(image)));
         }
-        return Err(CoreError::InvalidArgument(format!(
-            "macOS image path {image} is not a directory"
-        )));
+        validate_macos_image_name(image)?;
+        Ok(Self::Name(image.to_string()))
     }
-    let named = macos_images_dir(data_dir).join(image);
-    if is_valid_macos_image_name(image) && named.is_dir() {
-        return Ok(MacOsBundle::new(named));
+
+    /// The bundle this reference names, which must exist.
+    pub fn resolve(&self, data_dir: &Path) -> Result<MacOsBundle, CoreError> {
+        match self {
+            Self::Path(path) if path.is_dir() => Ok(MacOsBundle::new(path)),
+            Self::Path(path) => Err(CoreError::InvalidArgument(format!(
+                "macOS image path {} is not a directory",
+                path.display()
+            ))),
+            Self::Name(name) => {
+                let named = macos_images_dir(data_dir).join(name);
+                if named.is_dir() {
+                    return Ok(MacOsBundle::new(named));
+                }
+                Err(CoreError::InvalidArgument(format!(
+                    "macOS image '{name}' is not installed (install one with `husker macos install <name>`)"
+                )))
+            }
+        }
     }
-    Err(CoreError::InvalidArgument(format!(
-        "macOS image '{image}' is not installed (install one with `husker macos install <name>`)"
-    )))
+}
+
+/// Resolve a `macos_image` reference to an existing bundle.
+pub fn resolve_macos_bundle(data_dir: &Path, image: &str) -> Result<MacOsBundle, CoreError> {
+    MacOsImageRef::parse(image)?.resolve(data_dir)
 }
 
 /// Reject request fields a macOS guest cannot honour, before any resource
@@ -345,15 +366,71 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         // `..` from the macos dir is the data dir itself, which exists.
         std::fs::create_dir_all(macos_images_dir(data.path())).unwrap();
-        for name in ["missing", ".", "..", ""] {
+        let err = resolve_macos_bundle(data.path(), "missing").unwrap_err();
+        assert!(err.to_string().contains("husker macos install"), "{err}");
+        for name in [".", "..", ""] {
             let err = resolve_macos_bundle(data.path(), name).unwrap_err();
             assert!(
-                err.to_string().contains("husker macos install"),
-                "{name}: {err}"
+                err.to_string().contains("macOS image name"),
+                "a name outside the rules is refused as such, not reported as uninstalled: {name}: {err}"
             );
         }
         let err = resolve_macos_bundle(data.path(), "/nonexistent/bundle").unwrap_err();
         assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn a_reference_is_a_path_when_it_contains_a_slash_and_a_checked_name_otherwise() {
+        assert_eq!(
+            MacOsImageRef::parse("/bundles/sequoia").unwrap(),
+            MacOsImageRef::Path(PathBuf::from("/bundles/sequoia"))
+        );
+        assert_eq!(
+            MacOsImageRef::parse("./sequoia").unwrap(),
+            MacOsImageRef::Path(PathBuf::from("./sequoia"))
+        );
+        assert_eq!(
+            MacOsImageRef::parse("sequoia").unwrap(),
+            MacOsImageRef::Name("sequoia".into())
+        );
+        let err = MacOsImageRef::parse(&"c".repeat(65)).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum length"),
+            "a bare name is checked before resolution: {err}"
+        );
+    }
+
+    #[test]
+    fn bundle_names_follow_the_resource_name_rules() {
+        let longest = "a".repeat(64);
+        validate_macos_image_name(&longest).unwrap();
+        validate_macos_image_name("sequoia-15.1_beta").unwrap();
+        for (name, reason) in [
+            ("a".repeat(65), "exceeds maximum length"),
+            (".hidden".into(), "cannot start with"),
+            ("se quoia".into(), "invalid character"),
+            (String::new(), "cannot be empty"),
+        ] {
+            let err = validate_macos_image_name(&name).unwrap_err();
+            assert!(
+                matches!(&err, CoreError::InvalidArgument(m) if m.contains(reason)),
+                "{name:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_installed_bundle_with_a_name_outside_the_rules_does_not_resolve() {
+        // The cap applies to resolution as well as to install, so a directory
+        // that appeared under the images dir by other means is not a bundle.
+        let data = tempfile::tempdir().unwrap();
+        let too_long = "b".repeat(65);
+        write_bundle(
+            &macos_images_dir(data.path()).join(&too_long),
+            &manifest(2, 4096),
+        );
+        let err = resolve_macos_bundle(data.path(), &too_long).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum length"), "{err}");
     }
 
     #[cfg(not(feature = "linux-net"))]

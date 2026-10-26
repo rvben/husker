@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use anyhow::{Context, Result, bail};
-use husker_core::macos_guest::{is_valid_macos_image_name, macos_images_dir, resolve_macos_bundle};
+use husker_core::macos_guest::{MacOsImageRef, macos_images_dir, validate_macos_image_name};
 use husker_vmm::macos_bundle::{BundleLock, MacOsBundle, MacOsBundleManifest};
 use serde::Serialize;
 
@@ -76,7 +76,6 @@ fn failure(kind: CliErrorKind, message: String, hint: Option<&str>) -> anyhow::E
     ApiFailure::with_kind(kind, message, hint.map(str::to_string)).into()
 }
 
-#[cfg(target_os = "macos")]
 fn usage_failure(message: String) -> anyhow::Error {
     failure(CliErrorKind::InvalidUsage, message, None)
 }
@@ -169,7 +168,7 @@ fn installed_images(data_dir: &Path) -> Result<Vec<MacosImage>> {
     };
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_valid_macos_image_name(&name) || !entry.path().is_dir() {
+        if validate_macos_image_name(&name).is_err() || !entry.path().is_dir() {
             continue;
         }
         let bundle = MacOsBundle::new(entry.path());
@@ -238,10 +237,8 @@ async fn install(
     } = request;
     let name = name.as_str();
 
-    if !is_valid_macos_image_name(name) {
-        return Err(usage_failure(format!(
-            "invalid macOS image name '{name}': use letters, digits, '-', '_' and '.', not starting with '.'"
-        )));
+    if let Err(e) = validate_macos_image_name(name) {
+        return Err(usage_failure(e.to_string()));
     }
     // Checked here as well as by the installer, so a bad size fails before
     // a restore image is downloaded for it.
@@ -509,13 +506,16 @@ async fn write_download(
 /// and the marker that skips Setup Assistant so a headless guest boots
 /// straight to a running system.
 fn provision(data_dir: &Path, image: &str) -> Result<MacosImage> {
-    let bundle = resolve_macos_bundle(data_dir, image).map_err(|e| {
-        failure(
-            CliErrorKind::NotFound,
-            e.to_string(),
-            Some("under sudo, pass the bundle directory path; sudo may change HOME and with it the data dir"),
-        )
-    })?;
+    let bundle = MacOsImageRef::parse(image)
+        .map_err(|e| usage_failure(e.to_string()))?
+        .resolve(data_dir)
+        .map_err(|e| {
+            failure(
+                CliErrorKind::NotFound,
+                e.to_string(),
+                Some("under sudo, pass the bundle directory path; sudo may change HOME and with it the data dir"),
+            )
+        })?;
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err(failure(
@@ -1136,6 +1136,27 @@ mod tests {
     }
 
     #[test]
+    fn provision_refuses_a_name_outside_the_rules_as_invalid_usage() {
+        // A bad name is a usage error, not a missing bundle, so it gets neither
+        // the not-found kind nor the sudo hint that explains a missing one.
+        let data = tempfile::tempdir().unwrap();
+        for name in ["d".repeat(65), ".hidden".into(), "..".into()] {
+            let err = provision(data.path(), &name).unwrap_err();
+            let failure = err
+                .downcast_ref::<ApiFailure>()
+                .expect("structured failure");
+            assert_eq!(
+                failure.kind,
+                CliErrorKind::InvalidUsage,
+                "{name:?}: {err:#}"
+            );
+            assert!(failure.message.contains("macOS image name"), "{err:#}");
+            assert_eq!(failure.hint, None, "{err:#}");
+        }
+        assert!(!macos_images_dir(data.path()).exists());
+    }
+
+    #[test]
     fn provision_refuses_a_missing_image_and_a_non_root_caller() {
         let data = tempfile::tempdir().unwrap();
         let err = provision(data.path(), "missing").unwrap_err();
@@ -1328,6 +1349,40 @@ mod tests {
         let err = run().await.unwrap_err();
         assert!(err.downcast_ref::<ApiFailure>().is_none(), "{err:#}");
         assert!(!staging.join("disk.img").exists(), "stale staging removed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_name_outside_the_resource_rules_is_refused_before_any_download() {
+        let data = tempfile::tempdir().unwrap();
+        let downloads = data.path().join("downloads");
+        let err = install(
+            data.path(),
+            InstallOptions {
+                name: "s".repeat(65),
+                source: IpswSource::Download {
+                    dir: Some(downloads.clone()),
+                    keep: false,
+                },
+                disk_size_bytes: 64 << 30,
+                cpus: None,
+                memory: None,
+            },
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        let failure = err
+            .downcast_ref::<ApiFailure>()
+            .expect("structured failure");
+        assert_eq!(failure.kind, CliErrorKind::InvalidUsage, "{err:#}");
+        assert!(
+            failure.message.contains("exceeds maximum length"),
+            "{}",
+            failure.message
+        );
+        assert!(!downloads.exists(), "nothing was downloaded");
+        assert!(!macos_images_dir(data.path()).exists());
     }
 
     #[cfg(target_os = "macos")]
