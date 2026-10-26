@@ -2775,8 +2775,12 @@ mod tests {
         };
         let err = core.create_vm(req).await.unwrap_err();
         assert!(
-            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("firecracker")),
-            "expected InvalidArgument mentioning firecracker, got {err:?}"
+            matches!(
+                err,
+                CoreError::InvalidArgument(ref msg)
+                    if msg.contains("firecracker") && msg.contains("qemu")
+            ),
+            "expected InvalidArgument naming firecracker and qemu, got {err:?}"
         );
     }
 

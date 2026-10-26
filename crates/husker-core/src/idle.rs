@@ -1,5 +1,75 @@
 use super::*;
 
+/// The idle policy a VM is created with, as persisted on its record. A VM that
+/// did not opt in carries no timeout and no TTL and auto-resumes, so a later
+/// connect never has to consult the daemon defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdleSettings {
+    pub(crate) idle_timeout_secs: Option<u64>,
+    pub(crate) suspend_ttl_secs: Option<u64>,
+    pub(crate) auto_resume: bool,
+}
+
+impl IdleSettings {
+    const NOT_OPTED_IN: Self = Self {
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+    };
+}
+
+/// Resolve a create request's idle policy against the daemon defaults and the
+/// selected backend.
+///
+/// An explicit `idle_timeout_secs` wins; otherwise the bare `idle` flag opts in
+/// with the default window. The window is resolved without a sentinel so an
+/// explicit `--idle-timeout 0` (suspend as soon as idle) is not overwritten by
+/// the default. A suspend TTL default of zero means no TTL.
+///
+/// Idle suspend relies on a full-state snapshot, so an opt-in on a backend
+/// without one is rejected here, before any host resource is allocated.
+pub(crate) fn resolve_idle_settings(
+    req: &CreateVmRequest,
+    defaults: &IdlePolicyConfig,
+    backend: BackendKind,
+) -> Result<IdleSettings, CoreError> {
+    let Some(idle_timeout_secs) = req.idle_timeout_secs.or_else(|| {
+        req.idle
+            .unwrap_or(false)
+            .then_some(defaults.default_idle_timeout_secs)
+    }) else {
+        return Ok(IdleSettings::NOT_OPTED_IN);
+    };
+    require_snapshot_backend(backend)?;
+    Ok(IdleSettings {
+        idle_timeout_secs: Some(idle_timeout_secs),
+        suspend_ttl_secs: req.suspend_ttl_secs.or_else(|| {
+            (defaults.default_suspend_ttl_secs > 0).then_some(defaults.default_suspend_ttl_secs)
+        }),
+        auto_resume: req.auto_resume.unwrap_or(defaults.default_auto_resume),
+    })
+}
+
+/// Reject an idle opt-in on a backend that cannot take a full-state snapshot.
+/// The message lists the backends that can, read from their capabilities, so
+/// it stays true when a backend gains or loses snapshot support.
+fn require_snapshot_backend(backend: BackendKind) -> Result<(), CoreError> {
+    let can_snapshot =
+        |kind: BackendKind| husker_vmm::Capabilities::for_backend_kind(kind).snapshot;
+    if can_snapshot(backend) {
+        return Ok(());
+    }
+    let capable = BackendKind::ALL
+        .into_iter()
+        .filter(|kind| can_snapshot(*kind))
+        .map(BackendKind::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(CoreError::InvalidArgument(format!(
+        "idle policy requires a full-state snapshot backend ({capable}), not {backend}"
+    )))
+}
+
 impl<B: VmmBackend> HuskerCore<B> {
     /// Record control-plane activity (an exec/shell/API touch) against a VM's
     /// idle clock.
@@ -266,5 +336,145 @@ impl<B: VmmBackend> HuskerCore<B> {
     pub(crate) fn set_last_active_for_test(&self, id: Uuid, at: std::time::Instant) {
         self.control_plane_last_active.lock().insert(id, at);
         self.network_last_active.lock().insert(id, at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> IdlePolicyConfig {
+        IdlePolicyConfig {
+            poll_interval_secs: 30,
+            default_idle_timeout_secs: 1800,
+            default_suspend_ttl_secs: 0,
+            default_auto_resume: true,
+        }
+    }
+
+    fn can_snapshot(backend: BackendKind) -> bool {
+        husker_vmm::Capabilities::for_backend_kind(backend).snapshot
+    }
+
+    fn snapshot_backend() -> BackendKind {
+        BackendKind::ALL
+            .into_iter()
+            .find(|backend| can_snapshot(*backend))
+            .expect("at least one backend takes full-state snapshots")
+    }
+
+    #[test]
+    fn a_request_without_an_opt_in_resolves_to_no_policy_on_every_backend() {
+        let requests = [
+            CreateVmRequest::default(),
+            CreateVmRequest {
+                idle: Some(false),
+                ..Default::default()
+            },
+        ];
+        for backend in BackendKind::ALL {
+            for req in &requests {
+                let settings = resolve_idle_settings(req, &defaults(), backend).unwrap();
+                assert_eq!(settings, IdleSettings::NOT_OPTED_IN, "{backend}: {req:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_opt_in_is_accepted_exactly_on_the_backends_with_full_state_snapshots() {
+        let req = CreateVmRequest {
+            idle: Some(true),
+            ..Default::default()
+        };
+        for backend in BackendKind::ALL {
+            let result = resolve_idle_settings(&req, &defaults(), backend);
+            assert_eq!(
+                result.is_ok(),
+                can_snapshot(backend),
+                "{backend}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_names_the_rejected_backend_and_every_snapshot_backend() {
+        let req = CreateVmRequest {
+            idle_timeout_secs: Some(60),
+            ..Default::default()
+        };
+        let capable: Vec<&str> = BackendKind::ALL
+            .into_iter()
+            .filter(|backend| can_snapshot(*backend))
+            .map(BackendKind::as_str)
+            .collect();
+        assert!(!capable.is_empty());
+        for backend in BackendKind::ALL
+            .into_iter()
+            .filter(|backend| !can_snapshot(*backend))
+        {
+            let err = resolve_idle_settings(&req, &defaults(), backend).unwrap_err();
+            let CoreError::InvalidArgument(message) = err else {
+                panic!("{backend}: expected InvalidArgument, got {err:?}");
+            };
+            assert!(message.contains(backend.as_str()), "{message}");
+            for name in &capable {
+                assert!(message.contains(name), "{message} does not name {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_timeout_wins_over_the_bare_flag_and_the_default_window() {
+        let req = CreateVmRequest {
+            idle: Some(true),
+            idle_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        let settings = resolve_idle_settings(&req, &defaults(), snapshot_backend()).unwrap();
+        assert_eq!(settings.idle_timeout_secs, Some(0));
+    }
+
+    #[test]
+    fn the_bare_flag_opts_in_with_the_daemon_defaults() {
+        let defaults = IdlePolicyConfig {
+            default_idle_timeout_secs: 90,
+            default_suspend_ttl_secs: 600,
+            default_auto_resume: false,
+            ..defaults()
+        };
+        let req = CreateVmRequest {
+            idle: Some(true),
+            ..Default::default()
+        };
+        let settings = resolve_idle_settings(&req, &defaults, snapshot_backend()).unwrap();
+        assert_eq!(
+            settings,
+            IdleSettings {
+                idle_timeout_secs: Some(90),
+                suspend_ttl_secs: Some(600),
+                auto_resume: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_zero_default_ttl_means_no_ttl_and_explicit_values_win_over_the_defaults() {
+        let bare = CreateVmRequest {
+            idle: Some(true),
+            ..Default::default()
+        };
+        let settings = resolve_idle_settings(&bare, &defaults(), snapshot_backend()).unwrap();
+        assert_eq!(settings.suspend_ttl_secs, None);
+        assert!(settings.auto_resume);
+
+        let explicit = CreateVmRequest {
+            idle: Some(true),
+            suspend_ttl_secs: Some(5),
+            auto_resume: Some(false),
+            ..Default::default()
+        };
+        let settings = resolve_idle_settings(&explicit, &defaults(), snapshot_backend()).unwrap();
+        assert_eq!(settings.suspend_ttl_secs, Some(5));
+        assert!(!settings.auto_resume);
     }
 }

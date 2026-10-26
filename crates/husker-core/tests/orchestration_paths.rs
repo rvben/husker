@@ -945,6 +945,59 @@ async fn create_vm_missing_kernel_returns_storage_error() {
     );
 }
 
+/// An idle opt-in on a backend without full-state snapshots is refused before
+/// any resource is allocated, and the error names both the rejected backend
+/// and the backends that would accept it.
+#[tokio::test]
+async fn create_vm_rejects_an_idle_opt_in_on_a_backend_without_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let kernel = tmp.path().join("vmlinux");
+    let rootfs = tmp.path().join("rootfs.ext4");
+    // An ARM64 Image header, so the macOS kernel-format check lets the request
+    // reach the idle gate.
+    let mut header = vec![0u8; 64];
+    header[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, &header).unwrap();
+    std::fs::write(&rootfs, b"rootfs").unwrap();
+
+    let mock = MockVmm::new().with_selection_backend(BackendKind::AppleVz);
+    let core = build_core(
+        mock.clone(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+    let err = core
+        .create_vm(CreateVmRequest {
+            name: "idle-on-vz".into(),
+            kernel_path: Some(kernel),
+            rootfs_path: Some(rootfs),
+            idle: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let CoreError::InvalidArgument(message) = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert!(
+        message.contains("apple_vz") && message.contains("firecracker"),
+        "unexpected message: {message}"
+    );
+    assert!(
+        mock.inner.vms.lock().await.is_empty(),
+        "no VM may be created"
+    );
+    assert!(
+        core.list_vms().unwrap().is_empty(),
+        "nothing may be persisted"
+    );
+}
+
 #[tokio::test]
 async fn create_vm_replaces_stopped_vm_before_validation() {
     let tmp = tempfile::tempdir().unwrap();

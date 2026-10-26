@@ -293,37 +293,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             })
             .map_err(backend_selection_error)?;
 
-        // Resolve the idle policy: an explicit `idle_timeout_secs` wins; otherwise the
-        // bare `--idle` flag opts in using the daemon default window. Resolved without
-        // a sentinel so an explicit `--idle-timeout 0` (suspend as soon as idle) is not
-        // silently overwritten by the default.
-        let idle_timeout_secs = req.idle_timeout_secs.or_else(|| {
-            req.idle
-                .unwrap_or(false)
-                .then_some(self.idle_policy.default_idle_timeout_secs)
-        });
-        let idle_opted_in = idle_timeout_secs.is_some();
-        if idle_opted_in
-            && !husker_vmm::Capabilities::for_backend_kind(backend_selection.backend()).snapshot
-        {
-            return Err(CoreError::InvalidArgument(
-                "idle policy requires a full-state snapshot backend (firecracker)".into(),
-            ));
-        }
-        let suspend_ttl_secs = if idle_opted_in {
-            req.suspend_ttl_secs.or_else(|| {
-                (self.idle_policy.default_suspend_ttl_secs > 0)
-                    .then_some(self.idle_policy.default_suspend_ttl_secs)
-            })
-        } else {
-            None
-        };
-        let auto_resume = if idle_opted_in {
-            req.auto_resume
-                .unwrap_or(self.idle_policy.default_auto_resume)
-        } else {
-            true
-        };
+        let idle = crate::idle::resolve_idle_settings(
+            &req,
+            &self.idle_policy,
+            backend_selection.backend(),
+        )?;
 
         // NAT mode: allocate a static IP. Bridged mode: skip allocation; the LAN DHCP
         // server assigns the address. The rollback field stays None so unwind skips it.
@@ -700,9 +674,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             },
             last_activity_at: now,
             suspended_at: None,
-            idle_timeout_secs,
-            suspend_ttl_secs,
-            auto_resume,
+            idle_timeout_secs: idle.idle_timeout_secs,
+            suspend_ttl_secs: idle.suspend_ttl_secs,
+            auto_resume: idle.auto_resume,
             forked_from: None,
         };
 
@@ -779,15 +753,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             })
             .map_err(backend_selection_error)?;
 
-        // Idle policy requires a full-state snapshot backend (Firecracker); Apple VZ
-        // has no snapshot/restore support, so any opt-in is rejected before any host
-        // resource is allocated. Opt-in is an explicit `idle_timeout_secs` or the
-        // bare `--idle` flag.
-        if req.idle_timeout_secs.is_some() || req.idle.unwrap_or(false) {
-            return Err(CoreError::InvalidArgument(
-                "idle policy requires a full-state snapshot backend (firecracker)".into(),
-            ));
-        }
+        let idle = crate::idle::resolve_idle_settings(
+            &req,
+            &self.idle_policy,
+            backend_selection.backend(),
+        )?;
 
         let cid = self.state.allocate_cid()?;
         resources.cid = Some(cid);
@@ -973,9 +943,9 @@ impl<B: VmmBackend> HuskerCore<B> {
                 egress_policy: None,
                 last_activity_at: now,
                 suspended_at: None,
-                idle_timeout_secs: None,
-                suspend_ttl_secs: None,
-                auto_resume: true,
+                idle_timeout_secs: idle.idle_timeout_secs,
+                suspend_ttl_secs: idle.suspend_ttl_secs,
+                auto_resume: idle.auto_resume,
                 forked_from: None,
             };
 
@@ -1095,9 +1065,9 @@ impl<B: VmmBackend> HuskerCore<B> {
             egress_policy: None,
             last_activity_at: now,
             suspended_at: None,
-            idle_timeout_secs: None,
-            suspend_ttl_secs: None,
-            auto_resume: true,
+            idle_timeout_secs: idle.idle_timeout_secs,
+            suspend_ttl_secs: idle.suspend_ttl_secs,
+            auto_resume: idle.auto_resume,
             forked_from: None,
         };
 
