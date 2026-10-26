@@ -190,26 +190,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await?;
 
         if let Some(serialized) = source.egress_policy.as_deref() {
-            let persisted = crate::egress::parse_persisted_rules(serialized)?;
-            let resolvers = self
-                .dns_servers
-                .iter()
-                .filter_map(|value| value.parse().ok())
-                .collect::<Vec<_>>();
-            let rules = persisted
-                .iter()
-                .map(|rule| husker_net::EgressRule {
-                    destination: rule.destination,
-                    protocol: if rule.protocol == "tcp" {
-                        husker_net::EgressProtocol::Tcp
-                    } else {
-                        husker_net::EgressProtocol::Udp
-                    },
-                    port: rule.port,
-                })
-                .collect::<Vec<_>>();
-            self.host_network
-                .apply_egress_policy(&tap_name, &self.bridge_name, gateway, &resolvers, &rules)
+            self.apply_persisted_egress_policy(&tap_name, serialized)
                 .await?;
         }
 

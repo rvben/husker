@@ -437,6 +437,12 @@ impl<B: VmmBackend> HuskerCore<B> {
                     .update_vm_state(record.id, VmLifecycleState::Running)?;
             }
             VmLifecycleState::Suspended => {
+                // The guest must never run with its TAP disconnected or its
+                // egress policy missing: a host reboot drops both while the
+                // snapshot survives, and the startup restore can fail. Restore
+                // the network first; a failure keeps the VM suspended.
+                #[cfg(feature = "linux-net")]
+                self.restore_suspended_vm_network(&record).await?;
                 self.restore_from_suspend(&record).await?;
             }
             VmLifecycleState::Running => {

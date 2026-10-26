@@ -56,6 +56,77 @@ impl RecordingVmm {
     }
 }
 
+/// Host network whose every operation succeeds. Resuming a suspended NAT VM
+/// reattaches its TAP and re-applies its egress policy before the guest runs;
+/// these tests cover the suspend/resume state machine, not the host network.
+#[cfg(feature = "linux-net")]
+struct AcceptingHostNetwork;
+
+#[cfg(feature = "linux-net")]
+impl husker_net::HostNetwork for AcceptingHostNetwork {
+    fn create_tap<'a>(&'a self, _name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn delete_tap<'a>(&'a self, _name: &'a str) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn attach_to_bridge<'a>(
+        &'a self,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn add_port_forward<'a>(
+        &'a self,
+        _host_port: u16,
+        _guest_ip: std::net::Ipv4Addr,
+        _guest_port: u16,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn remove_port_forward<'a>(
+        &'a self,
+        _host_port: u16,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn remove_all_port_forwards<'a>(
+        &'a self,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_all_port_forward_counters<'a>(
+        &'a self,
+        _bridge_name: &'a str,
+    ) -> husker_net::NetworkFuture<'a, HashMap<String, (u64, u64)>> {
+        Box::pin(async { Ok(HashMap::new()) })
+    }
+
+    fn apply_egress_policy<'a>(
+        &'a self,
+        _tap_name: &'a str,
+        _bridge_name: &'a str,
+        _gateway: std::net::Ipv4Addr,
+        _resolvers: &'a [std::net::Ipv4Addr],
+        _rules: &'a [husker_net::EgressRule],
+    ) -> husker_net::NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// Newtype so we can implement `VmmBackend` for a shared `Arc<RecordingVmm>`
 /// without violating the orphan rule (Arc is foreign, VmmBackend is foreign).
 struct SharedRecordingVmm(Arc<RecordingVmm>);
@@ -222,7 +293,8 @@ fn core_with_running_vm_backend(
         vcpu_count: 1,
         mem_size_mib: 128,
         vsock_cid: 3,
-        tap_device: None,
+        // A NAT VM keeps its TAP name across suspend; resume reattaches it.
+        tap_device: Some(format!("tap-{name}")),
         host_ip: None,
         guest_ip: None,
         kernel_path: "/boot/vmlinux".into(),
@@ -262,15 +334,18 @@ fn core_with_running_vm_backend(
     inner.vms.lock().unwrap().insert(id, vm_info);
 
     #[cfg(feature = "linux-net")]
-    let core = Arc::new(HuskerCore::new(
-        vmm,
-        state_store,
-        husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
-        storage,
-        "husker0".into(),
-        vec!["8.8.8.8".into(), "1.1.1.1".into()],
-        tmp.path().join("run"),
-    ));
+    let core = Arc::new(
+        HuskerCore::new(
+            vmm,
+            state_store,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec!["8.8.8.8".into(), "1.1.1.1".into()],
+            tmp.path().join("run"),
+        )
+        .with_host_network(Arc::new(AcceptingHostNetwork)),
+    );
     #[cfg(not(feature = "linux-net"))]
     let core = Arc::new(HuskerCore::new(
         vmm,

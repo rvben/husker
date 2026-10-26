@@ -353,25 +353,15 @@ impl<B: VmmBackend> HuskerCore<B> {
                 &self.bridge_name
             };
             if !resolved_egress.is_empty() {
-                let resolvers = self
-                    .dns_servers
-                    .iter()
-                    .filter_map(|value| value.parse().ok())
-                    .collect::<Vec<_>>();
-                let rules = resolved_egress
-                    .iter()
-                    .map(|rule| husker_net::EgressRule {
-                        destination: rule.destination,
-                        protocol: if rule.protocol == "tcp" {
-                            husker_net::EgressProtocol::Tcp
-                        } else {
-                            husker_net::EgressProtocol::Udp
-                        },
-                        port: rule.port,
-                    })
-                    .collect::<Vec<_>>();
+                let rules = crate::egress::net_rules(resolved_egress);
                 self.host_network
-                    .apply_egress_policy(&tap_name, &self.bridge_name, gateway, &resolvers, &rules)
+                    .apply_egress_policy(
+                        &tap_name,
+                        &self.bridge_name,
+                        gateway,
+                        &self.egress_resolvers(),
+                        &rules,
+                    )
                     .await?;
             }
             self.host_network

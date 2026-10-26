@@ -112,6 +112,14 @@ impl husker_net::HostNetwork for TestHostNetwork {
                 .lock()
                 .await
                 .push(format!("attach:{tap_name}"));
+            // Like the kernel, enslaving a TAP that does not exist fails
+            // before any injected failure gets a chance to.
+            if !self.taps.lock().await.contains(tap_name) {
+                return Err(husker_net::NetError::CommandFailed {
+                    cmd: "ip link set master".into(),
+                    message: format!("Cannot find device \"{tap_name}\""),
+                });
+            }
             if self
                 .fail_next_attach
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -497,16 +505,25 @@ impl VmmBackend for FailingVmm {
         _src: &SnapshotPaths,
         target: RestoreTarget,
     ) -> Result<VmInfo, VmmError> {
-        let RestoreTarget::Fork {
-            id,
-            name,
-            vcpu_count,
-            mem_size_mib,
-            vsock_cid,
-            ..
-        } = target
-        else {
-            return Err(VmmError::Unsupported("mock".into()));
+        // A fork is restored without a pid so `vsock_connect` serves the
+        // fake agent its network re-home needs; a resume carries a pid so the
+        // guest clock reconciliation sees "no agent" and moves on at once.
+        let (id, name, vcpu_count, mem_size_mib, vsock_cid, pid) = match target {
+            RestoreTarget::Fork {
+                id,
+                name,
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+                ..
+            } => (id, name, vcpu_count, mem_size_mib, vsock_cid, None),
+            RestoreTarget::Resume {
+                id,
+                name,
+                vcpu_count,
+                mem_size_mib,
+                vsock_cid,
+            } => (id, name, vcpu_count, mem_size_mib, vsock_cid, Some(4321)),
         };
         let info = VmInfo {
             id,
@@ -515,7 +532,7 @@ impl VmmBackend for FailingVmm {
             mem_size_mib,
             vsock_cid,
             state: VmState::Running,
-            pid: None,
+            pid,
         };
         self.vms.lock().await.insert(id, info.clone());
         Ok(info)
@@ -811,17 +828,248 @@ async fn create_applies_and_persists_pinned_egress_before_returning() {
     let policy = persisted.egress_policy.expect("concrete policy persisted");
     assert!(policy.contains("203.0.113.8"));
     assert!(policy.contains("\"port\":443"));
+}
 
-    network.egress.lock().await.clear();
-    assert_eq!(
-        core.reconcile_egress_policies_from_state().await.unwrap(),
-        1
+/// Drive a VM created by `core` into the suspended state through a second
+/// state-store handle on the same file, with a suspend slot a restore accepts.
+/// Models a daemon that suspended the VM and then restarted (or rebooted).
+#[cfg(feature = "linux-net")]
+fn suspend_committed_vm(data_dir: &std::path::Path, state_path: &std::path::Path, id: Uuid) {
+    let state = husker_state::StateStore::open(state_path).unwrap();
+    state
+        .update_vm_runtime(id, husker_core::VmLifecycleState::Suspended, None)
+        .unwrap();
+    let slot = data_dir.join("suspend").join(id.to_string());
+    std::fs::create_dir_all(&slot).unwrap();
+    std::fs::write(slot.join("memory"), b"mem").unwrap();
+    std::fs::write(slot.join("vmstate"), b"state").unwrap();
+    std::fs::write(
+        slot.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "full",
+            "backend": "firecracker",
+            "vmm_version": "test",
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+            "vsock_cid": 3,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn startup_recreates_the_vanished_tap_of_a_suspended_vm_and_reapplies_its_egress_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let state_path = tmp.path().join("state.db");
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
     );
-    let restored = network.egress.lock().await;
-    assert_eq!(restored.len(), 1);
+    let mut request = linux_create_request("pinned", &kernel, &rootfs);
+    request.network = Some("filtered".into());
+    request.egress = vec![husker_core::EgressRuleRequest {
+        host: "203.0.113.8".into(),
+        port: 443,
+        protocol: "tcp".into(),
+    }];
+    let created = core.create_vm(request).await.unwrap();
+    let tap = created.tap_device.clone().unwrap();
+    drop(core);
+    suspend_committed_vm(tmp.path(), &state_path, created.id);
+
+    // A host reboot: every TAP and every nftables rule is gone, the snapshot
+    // and the state database survive.
+    network.taps.lock().await.clear();
+    network.egress.lock().await.clear();
+    network.operations.lock().await.clear();
+
+    let restarted = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
     assert_eq!(
-        restored[0].1[0].destination,
+        restarted.restore_suspended_vm_networks().await.unwrap(),
+        husker_core::SuspendedNetworkRestore {
+            restored: 1,
+            recreated: 1,
+            failed: 0,
+        }
+    );
+    assert!(
+        network.has_tap(&tap).await,
+        "the TAP must exist again under its persisted name"
+    );
+    let applied = network.egress.lock().await;
+    assert_eq!(
+        applied.len(),
+        1,
+        "the persisted policy must be re-applied once"
+    );
+    assert_eq!(applied[0].0, tap);
+    assert_eq!(
+        applied[0].1[0].destination,
         "203.0.113.8".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+    drop(applied);
+    assert_eq!(
+        *network.operations.lock().await,
+        vec![
+            format!("egress:{tap}"),
+            format!("attach:{tap}"),
+            format!("attach:{tap}")
+        ],
+        "the policy goes on before the first attach attempt; the vanished TAP is attached again after recreation"
+    );
+
+    // A plain daemon restart (TAP preserved, bridge recreated) is the common
+    // case and must not recreate anything.
+    assert_eq!(
+        restarted.restore_suspended_vm_networks().await.unwrap(),
+        husker_core::SuspendedNetworkRestore {
+            restored: 1,
+            recreated: 0,
+            failed: 0,
+        }
+    );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn startup_keeps_restoring_other_suspended_vms_when_one_network_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let state_path = tmp.path().join("state.db");
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    let first = core
+        .create_vm(linux_create_request("first", &kernel, &rootfs))
+        .await
+        .unwrap();
+    let second = core
+        .create_vm(linux_create_request("second", &kernel, &rootfs))
+        .await
+        .unwrap();
+    drop(core);
+    suspend_committed_vm(tmp.path(), &state_path, first.id);
+    suspend_committed_vm(tmp.path(), &state_path, second.id);
+
+    let restarted = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    network.fail_next_attach();
+    assert_eq!(
+        restarted.restore_suspended_vm_networks().await.unwrap(),
+        husker_core::SuspendedNetworkRestore {
+            restored: 1,
+            recreated: 0,
+            failed: 1,
+        },
+        "one VM's attach failure must neither abort the pass nor hide the other VM's restore"
+    );
+    let operations = network.operations.lock().await;
+    assert!(
+        operations.contains(&format!("attach:{}", first.tap_device.as_deref().unwrap()))
+            && operations.contains(&format!("attach:{}", second.tap_device.as_deref().unwrap())),
+        "both VMs must be attempted: {operations:?}"
+    );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn resume_restores_the_network_itself_and_refuses_to_run_the_guest_unfiltered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let state_path = tmp.path().join("state.db");
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    let mut request = linux_create_request("pinned", &kernel, &rootfs);
+    request.network = Some("filtered".into());
+    request.egress = vec![husker_core::EgressRuleRequest {
+        host: "203.0.113.8".into(),
+        port: 443,
+        protocol: "tcp".into(),
+    }];
+    let created = core.create_vm(request).await.unwrap();
+    let tap = created.tap_device.clone().unwrap();
+    drop(core);
+    suspend_committed_vm(tmp.path(), &state_path, created.id);
+
+    // The host rebooted and the startup restore could not recreate the TAP
+    // (its attach failed), so the daemon came up with this VM unrestored.
+    network.taps.lock().await.clear();
+    network.egress.lock().await.clear();
+    let restarted = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    network.fail_next_attach();
+    assert_eq!(
+        restarted.restore_suspended_vm_networks().await.unwrap(),
+        husker_core::SuspendedNetworkRestore {
+            restored: 0,
+            recreated: 0,
+            failed: 1,
+        }
+    );
+    assert!(
+        !network.has_tap(&tap).await,
+        "a recreated TAP whose attach failed must not be left behind"
+    );
+
+    // Fail-closed: a resume whose egress policy cannot be installed must not
+    // start the guest, and the TAP must stay unattached. The startup pass
+    // installed the policy before its attach failed; forget it so the resume
+    // has to install its own.
+    network.operations.lock().await.clear();
+    network.egress.lock().await.clear();
+    network.fail_next_egress();
+    let error = restarted.resume_vm("pinned").await.unwrap_err();
+    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert_eq!(
+        restarted.get_vm("pinned").unwrap().state,
+        husker_core::VmLifecycleState::Suspended
+    );
+    assert_eq!(
+        *network.operations.lock().await,
+        vec![format!("egress:{tap}")],
+        "no attach may follow a failed policy install"
+    );
+    assert!(network.egress.lock().await.is_empty());
+
+    // Once the host cooperates, the same resume restores the network (policy
+    // first, then the recreated TAP) before the guest runs.
+    network.operations.lock().await.clear();
+    assert!(restarted.resume_vm("pinned").await.unwrap());
+    assert_eq!(
+        restarted.get_vm("pinned").unwrap().state,
+        husker_core::VmLifecycleState::Running
+    );
+    assert!(network.has_tap(&tap).await);
+    assert_eq!(network.egress.lock().await.len(), 1);
+    assert_eq!(
+        *network.operations.lock().await,
+        vec![
+            format!("egress:{tap}"),
+            format!("attach:{tap}"),
+            format!("attach:{tap}")
+        ]
     );
 }
 
@@ -1117,7 +1365,13 @@ async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
         husker_state::StateStore::open(&state_path).unwrap(),
         Arc::clone(&network),
     );
-    assert_eq!(restarted.recover_host_resource_leases().await.unwrap(), 1);
+    assert_eq!(
+        restarted.recover_host_resource_leases().await.unwrap(),
+        husker_core::HostResourceRecovery {
+            recovered: 1,
+            failed: 0,
+        }
+    );
     assert!(!network.has_tap("husker3").await);
 
     let created = restarted
@@ -1155,14 +1409,26 @@ async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {
         Arc::clone(&network),
     );
     network.fail_next_remove_forward();
-    let error = restarted.recover_host_resource_leases().await.unwrap_err();
-    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert_eq!(
+        restarted.recover_host_resource_leases().await.unwrap(),
+        husker_core::HostResourceRecovery {
+            recovered: 0,
+            failed: 1,
+        },
+        "a lease whose cleanup fails is kept, and the failure does not abort startup"
+    );
     assert!(
         !network.has_tap("husker3").await,
         "TAP cleanup must still run after nftables cleanup fails"
     );
 
-    assert_eq!(restarted.recover_host_resource_leases().await.unwrap(), 1);
+    assert_eq!(
+        restarted.recover_host_resource_leases().await.unwrap(),
+        husker_core::HostResourceRecovery {
+            recovered: 1,
+            failed: 0,
+        }
+    );
     let created = restarted
         .create_vm(linux_create_request("after-retry", &kernel, &rootfs))
         .await

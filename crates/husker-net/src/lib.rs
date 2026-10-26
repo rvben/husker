@@ -602,7 +602,7 @@ pub async fn delete_tap(name: &str) -> Result<(), NetError> {
     info!(tap = name, "deleting TAP device");
     match run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await {
         Ok(_) => Ok(()),
-        Err(error) if is_missing_interface_error(&error) => {
+        Err(error) if error.is_missing_interface(name) => {
             debug!(tap = name, "TAP already absent");
             Ok(())
         }
@@ -610,12 +610,21 @@ pub async fn delete_tap(name: &str) -> Result<(), NetError> {
     }
 }
 
-fn is_missing_interface_error(error: &NetError) -> bool {
-    matches!(
-        error,
-        NetError::CommandFailed { message, .. }
-            if message.contains("Cannot find device") || message.contains("does not exist")
-    )
+impl NetError {
+    /// Whether `ip` reported that the interface `name` does not exist. The
+    /// command names several interfaces when it enslaves one to another, so
+    /// the check is pinned to the quoted name: a missing bridge must not read
+    /// as a missing TAP. Deleting such a device is already done, and attaching
+    /// it means the device has to be recreated first (for example after a
+    /// host reboot removed a suspended VM's preserved TAP).
+    pub fn is_missing_interface(&self, name: &str) -> bool {
+        let NetError::CommandFailed { message, .. } = self else {
+            return false;
+        };
+        let quoted = format!("\"{name}\"");
+        (message.contains("Cannot find device") || message.contains("does not exist"))
+            && message.contains(&quoted)
+    }
 }
 
 // ── Guest network isolation ────────────────────────────────────────────
@@ -2598,12 +2607,29 @@ default via 192.168.1.1 dev eth0 proto dhcp metric 100
                 cmd: "ip tuntap del dev husker3 mode tap".into(),
                 message: message.into(),
             };
-            assert!(is_missing_interface_error(&error));
+            assert!(error.is_missing_interface("husker3"));
         }
-        assert!(!is_missing_interface_error(&NetError::CommandFailed {
-            cmd: "ip tuntap del dev husker3 mode tap".into(),
-            message: "Operation not permitted".into(),
-        }));
+        assert!(
+            !NetError::CommandFailed {
+                cmd: "ip tuntap del dev husker3 mode tap".into(),
+                message: "Operation not permitted".into(),
+            }
+            .is_missing_interface("husker3")
+        );
+    }
+
+    #[test]
+    fn a_missing_bridge_is_not_a_missing_tap() {
+        // `ip link set dev <tap> master <bridge>` with an absent bridge.
+        let error = NetError::CommandFailed {
+            cmd: "ip link set dev husker3 master husker0".into(),
+            message: "Error: argument \"husker0\" is wrong: Device does not exist".into(),
+        };
+        assert!(error.is_missing_interface("husker0"));
+        assert!(
+            !error.is_missing_interface("husker3"),
+            "recreating the TAP would not help; the bridge is what is missing"
+        );
     }
 
     #[test]

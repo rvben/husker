@@ -39,32 +39,49 @@ impl<B: VmmBackend> HuskerCore<B> {
     }
 
     /// Reclaim resources owned by VM creations interrupted before their final
-    /// VM record was committed. A lease is removed only after every recoverable
-    /// host resource is gone, so a failed startup can safely retry later.
-    pub async fn recover_host_resource_leases(&self) -> Result<usize, CoreError> {
-        let leases = self.state.list_host_resource_leases()?;
-        let mut recovered = 0;
-
-        for lease in leases {
-            if let Some(tap) = lease.tap_device.as_deref() {
-                self.remove_tap_host_resources(tap).await?;
+    /// VM record was committed. A lease is released only after every host
+    /// resource it names is gone, so a lease whose cleanup fails is kept and
+    /// retried at the next startup. Each lease is handled on its own: one
+    /// stuck lease blocks neither the other leases nor the daemon. Only a
+    /// state-store failure is fatal.
+    pub async fn recover_host_resource_leases(&self) -> Result<HostResourceRecovery, CoreError> {
+        let mut summary = HostResourceRecovery::default();
+        for lease in self.state.list_host_resource_leases()? {
+            match self.reclaim_leased_host_resources(&lease).await {
+                Ok(()) => {
+                    self.state.release_host_resource_lease(lease.id)?;
+                    summary.recovered += 1;
+                    info!(vm = %lease.vm_name, cid = lease.vsock_cid, "recovered interrupted VM host resources");
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    warn!(
+                        vm = %lease.vm_name,
+                        cid = lease.vsock_cid,
+                        error = %error,
+                        "could not reclaim interrupted VM host resources; keeping the lease for the next startup"
+                    );
+                }
             }
-
-            let vm_dir = self.storage.vm_dir(&lease.vm_name);
-            if let Err(error) = tokio::fs::remove_dir_all(&vm_dir).await
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(CoreError::Io(format!(
-                    "remove interrupted VM directory {}: {error}",
-                    vm_dir.display()
-                )));
-            }
-
-            self.state.release_host_resource_lease(lease.id)?;
-            recovered += 1;
-            info!(vm = %lease.vm_name, cid = lease.vsock_cid, "recovered interrupted VM host resources");
         }
+        Ok(summary)
+    }
 
-        Ok(recovered)
+    async fn reclaim_leased_host_resources(
+        &self,
+        lease: &husker_state::HostResourceLease,
+    ) -> Result<(), CoreError> {
+        if let Some(tap) = lease.tap_device.as_deref() {
+            self.remove_tap_host_resources(tap).await?;
+        }
+        let vm_dir = self.storage.vm_dir(&lease.vm_name);
+        match tokio::fs::remove_dir_all(&vm_dir).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CoreError::Io(format!(
+                "remove interrupted VM directory {}: {error}",
+                vm_dir.display()
+            ))),
+        }
     }
 }

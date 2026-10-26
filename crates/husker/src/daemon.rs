@@ -1018,29 +1018,38 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
         DaemonRuntimeMode::Basic => {}
         #[cfg(feature = "linux-net")]
         DaemonRuntimeMode::LinuxNet { .. } => {
-            let recovered = core
+            let recovery = core
                 .recover_host_resource_leases()
                 .await
                 .context("recovering interrupted VM host resources")?;
-            if recovered > 0 {
-                tracing::info!(recovered, "recovered interrupted VM creations");
-            }
-            let reattached = core
-                .reattach_suspended_vm_networks()
-                .await
-                .context("reattaching suspended VM networks")?;
-            if reattached > 0 {
+            if recovery.recovered > 0 {
                 tracing::info!(
-                    reattached,
-                    "reattached suspended VM networks to host bridges"
+                    recovered = recovery.recovered,
+                    "recovered interrupted VM creations"
                 );
             }
-            let restored_egress = core
-                .reconcile_egress_policies_from_state()
+            if recovery.failed > 0 {
+                tracing::warn!(
+                    failed = recovery.failed,
+                    "interrupted VM creations still hold host resources; their leases are retried at the next start"
+                );
+            }
+            let networks = core
+                .restore_suspended_vm_networks()
                 .await
-                .context("restoring per-VM egress policies")?;
-            if restored_egress > 0 {
-                tracing::info!(restored_egress, "restored persisted per-VM egress policies");
+                .context("restoring suspended VM networks")?;
+            if networks.restored > 0 {
+                tracing::info!(
+                    restored = networks.restored,
+                    recreated = networks.recreated,
+                    "restored suspended VM networks (egress policy and bridge attachment)"
+                );
+            }
+            if networks.failed > 0 {
+                tracing::warn!(
+                    failed = networks.failed,
+                    "suspended VMs whose network could not be restored will fail to resume until the host is repaired"
+                );
             }
             let reconcile = core.reconcile_port_forwards_from_state().await;
             if reconcile.restored > 0 {

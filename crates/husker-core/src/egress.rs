@@ -51,6 +51,25 @@ pub(crate) fn parse_persisted_rules(
     Ok(rules)
 }
 
+/// The nftables form of resolved rules. Both the request resolver and the
+/// persisted-rule parser admit only `tcp` and `udp`, so no other protocol
+/// reaches this conversion.
+#[cfg(feature = "linux-net")]
+pub(crate) fn net_rules(rules: &[ResolvedEgressRule]) -> Vec<husker_net::EgressRule> {
+    rules
+        .iter()
+        .map(|rule| husker_net::EgressRule {
+            destination: rule.destination,
+            protocol: if rule.protocol == "tcp" {
+                husker_net::EgressProtocol::Tcp
+            } else {
+                husker_net::EgressProtocol::Udp
+            },
+            port: rule.port,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod persisted_tests {
     use super::*;

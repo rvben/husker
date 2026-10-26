@@ -741,6 +741,34 @@ pub struct PortForwardReconcile {
     pub skipped_suspended: usize,
 }
 
+/// Result of [`HuskerCore::recover_host_resource_leases`]. A lease whose host
+/// resources could not be reclaimed is kept for the next startup and counted
+/// in `failed`; it never stops the daemon from serving the other VMs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostResourceRecovery {
+    /// Leases whose TAP, nftables rules and VM directory were reclaimed.
+    pub recovered: usize,
+    /// Leases retained because a host resource could not be removed.
+    pub failed: usize,
+}
+
+/// Result of [`HuskerCore::restore_suspended_vm_networks`]. Every suspended
+/// VM is handled independently so one whose network cannot be restored only
+/// degrades its own resume, not daemon startup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuspendedNetworkRestore {
+    /// Suspended VMs whose persisted egress policy is applied and whose TAP is
+    /// enslaved to its bridge again.
+    pub restored: usize,
+    /// The subset of `restored` whose TAP had vanished (typically a host
+    /// reboot) and was recreated under its persisted name.
+    pub recreated: usize,
+    /// Suspended VMs whose network could not be restored. Their guest stays
+    /// suspended: resume repeats the restore and fails with the same error
+    /// until the host is repaired.
+    pub failed: usize,
+}
+
 /// Result of one reconcile pass over a single service.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReconcileOutcome {
@@ -3100,7 +3128,8 @@ mod tests {
             "husker0".into(),
             vec![],
             runtime_dir,
-        );
+        )
+        .with_host_network(Arc::new(SuccessfulHostNetwork));
         (core, tmp)
     }
 
@@ -3137,6 +3166,9 @@ mod tests {
         rec.state = VmLifecycleState::Suspended;
         rec.vmm = BackendKind::Firecracker;
         rec.auto_resume = true;
+        // A suspended NAT VM keeps its TAP name; resume reattaches it before
+        // the guest runs.
+        rec.tap_device = Some("tap-aw".into());
         core.state.insert_vm(&rec).unwrap();
         stage_suspend_slot(tmp.path(), rec.id);
 
@@ -3227,7 +3259,7 @@ mod tests {
 
     #[cfg(feature = "linux-net")]
     #[tokio::test]
-    async fn startup_does_not_reattach_an_isolated_suspended_vm() {
+    async fn startup_does_not_restore_a_network_for_an_isolated_suspended_vm() {
         let core = test_core().await;
         let mut rec = sample_vm_record("isolated-suspended");
         rec.state = VmLifecycleState::Suspended;
@@ -3235,7 +3267,10 @@ mod tests {
         rec.tap_device = None;
         core.state.insert_vm(&rec).unwrap();
 
-        assert_eq!(core.reattach_suspended_vm_networks().await.unwrap(), 0);
+        assert_eq!(
+            core.restore_suspended_vm_networks().await.unwrap(),
+            SuspendedNetworkRestore::default()
+        );
     }
 
     #[cfg(feature = "linux-net")]
@@ -3264,6 +3299,8 @@ mod tests {
         let core = test_core().await;
         let mut rec = sample_vm_record("c1");
         rec.pid = Some(4321);
+        // A NAT VM keeps its TAP name across suspend; resume reattaches it.
+        rec.tap_device = Some("tap-c1".into());
         core.state.insert_vm(&rec).unwrap();
         core.mark_network_active(rec.id); // simulate old activity, pre-suspend
 

@@ -354,115 +354,156 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(self.state.list_port_forwards_for_vm(record.id)?)
     }
 
-    /// Reattach the preserved TAPs of suspended VMs after the daemon recreates
-    /// its managed bridge during startup.
-    ///
-    /// Suspending a Firecracker VM intentionally keeps its TAP so the snapshot
-    /// can resume with the same network identity. Deleting the managed bridge
-    /// during daemon shutdown detaches that TAP, however, and creating a bridge
-    /// with the same name does not restore the master relationship. This must
-    /// run after bridge creation and before resume listeners or the API become
-    /// reachable; otherwise a connect can resume a guest whose network is still
-    /// physically disconnected.
+    /// The IPv4 resolvers a pinned egress policy admits so the guest can still
+    /// resolve names. The policy lives in the bridge-family IPv4 rules, so a
+    /// configured resolver that is not an IPv4 address gets no carve-out and
+    /// stays denied like any other unlisted destination.
     #[cfg(feature = "linux-net")]
-    pub async fn reattach_suspended_vm_networks(&self) -> Result<usize, CoreError> {
-        let vms = self.state.list_vms()?;
-        let mut reattached = 0usize;
-
-        for vm in vms {
-            if vm.state != VmLifecycleState::Suspended {
-                continue;
-            }
-
-            let bridge = match vm.network {
-                NetworkMode::Isolated => continue,
-                NetworkMode::Nat => self.bridge_name.as_str(),
-                NetworkMode::Bridged => {
-                    self.lan_bridge
-                        .as_deref()
-                        .ok_or_else(|| CoreError::InvalidState {
-                            name: vm.name.clone(),
-                            actual:
-                                "suspended with bridged networking but no LAN bridge configured"
-                                    .into(),
-                            expected: "a configured LAN bridge".into(),
-                        })?
-                }
-            };
-
-            let tap = vm
-                .tap_device
-                .as_deref()
-                .ok_or_else(|| CoreError::InvalidState {
-                    name: vm.name.clone(),
-                    actual: "suspended without a preserved TAP device".into(),
-                    expected: "suspended with a preserved TAP device".into(),
-                })?;
-            if let Err(error) = self.host_network.attach_to_bridge(tap, bridge).await {
-                warn!(
-                    name = %vm.name,
-                    tap,
-                    bridge,
-                    error = %error,
-                    "failed to reattach suspended VM network during startup"
-                );
-                return Err(error.into());
-            }
-            reattached += 1;
-        }
-
-        Ok(reattached)
+    pub(crate) fn egress_resolvers(&self) -> Vec<Ipv4Addr> {
+        self.dns_servers
+            .iter()
+            .filter_map(|value| value.parse().ok())
+            .collect()
     }
 
-    /// Restore every persisted per-VM egress policy after daemon startup.
-    /// `init_nat` deliberately recreates the bridge-family table, so policy
-    /// restoration is part of admitting traffic, not an optional repair task.
+    /// Re-install a VM's persisted egress policy on its TAP. Persisted rules
+    /// are security state: a policy that no longer parses is an error, never
+    /// an empty allow-list.
     #[cfg(feature = "linux-net")]
-    pub async fn reconcile_egress_policies_from_state(&self) -> Result<usize, CoreError> {
-        let resolvers = self
-            .dns_servers
-            .iter()
-            .map(|value| {
-                value.parse::<Ipv4Addr>().map_err(|error| {
-                    CoreError::InvalidArgument(format!(
-                        "configured DNS server {value:?} is not IPv4: {error}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let gateway = self.ip_allocator.gateway();
-        let mut restored = 0;
-        for vm in self.state.list_vms()? {
-            let Some(serialized) = vm.egress_policy.as_deref() else {
-                continue;
-            };
-            let tap = vm
-                .tap_device
-                .as_deref()
-                .ok_or_else(|| CoreError::InvalidState {
-                    name: vm.name.clone(),
-                    actual: "persisted egress policy without a TAP device".into(),
-                    expected: "NAT networking with a TAP device".into(),
-                })?;
-            let persisted = crate::egress::parse_persisted_rules(serialized)?;
-            let rules = persisted
-                .iter()
-                .map(|rule| husker_net::EgressRule {
-                    destination: rule.destination,
-                    protocol: if rule.protocol == "tcp" {
-                        husker_net::EgressProtocol::Tcp
-                    } else {
-                        husker_net::EgressProtocol::Udp
-                    },
-                    port: rule.port,
-                })
-                .collect::<Vec<_>>();
-            self.host_network
-                .apply_egress_policy(tap, &self.bridge_name, gateway, &resolvers, &rules)
-                .await?;
-            restored += 1;
+    pub(crate) async fn apply_persisted_egress_policy(
+        &self,
+        tap: &str,
+        serialized: &str,
+    ) -> Result<(), CoreError> {
+        let persisted = crate::egress::parse_persisted_rules(serialized)?;
+        let rules = crate::egress::net_rules(&persisted);
+        self.host_network
+            .apply_egress_policy(
+                tap,
+                &self.bridge_name,
+                self.ip_allocator.gateway(),
+                &self.egress_resolvers(),
+                &rules,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The bridge a suspended VM's preserved TAP belongs to, or `None` for an
+    /// isolated VM that never had one.
+    #[cfg(feature = "linux-net")]
+    fn suspended_vm_bridge(&self, vm: &VmRecord) -> Result<Option<&str>, CoreError> {
+        match vm.network {
+            NetworkMode::Isolated => Ok(None),
+            NetworkMode::Nat => Ok(Some(self.bridge_name.as_str())),
+            NetworkMode::Bridged => {
+                self.lan_bridge
+                    .as_deref()
+                    .map(Some)
+                    .ok_or_else(|| CoreError::InvalidState {
+                        name: vm.name.clone(),
+                        actual: "suspended with bridged networking but no LAN bridge configured"
+                            .into(),
+                        expected: "a configured LAN bridge".into(),
+                    })
+            }
         }
-        Ok(restored)
+    }
+
+    /// Put a suspended VM's host network back the way its snapshot expects it
+    /// before the guest runs again: the persisted egress policy on the TAP,
+    /// then the TAP enslaved to its bridge. Both steps are idempotent, so this
+    /// is safe to run at every daemon start and again on every resume.
+    ///
+    /// Suspending keeps the TAP so the snapshot resumes with the same network
+    /// identity, but deleting the managed bridge at daemon shutdown detaches
+    /// it, and a host reboot removes it altogether while the snapshot on disk
+    /// survives. A detached TAP is re-enslaved; a vanished one is recreated
+    /// under its persisted name so the restore can open it.
+    ///
+    /// Returns whether the TAP had to be recreated (`false` for an isolated
+    /// VM, which has no host network). An error means the guest must not run:
+    /// the policy is applied before the attach, so a policy failure leaves the
+    /// TAP disconnected instead of connected and unfiltered.
+    #[cfg(feature = "linux-net")]
+    pub(crate) async fn restore_suspended_vm_network(
+        &self,
+        vm: &VmRecord,
+    ) -> Result<bool, CoreError> {
+        let Some(bridge) = self.suspended_vm_bridge(vm)? else {
+            return Ok(false);
+        };
+        let tap = vm
+            .tap_device
+            .as_deref()
+            .ok_or_else(|| CoreError::InvalidState {
+                name: vm.name.clone(),
+                actual: "suspended without a preserved TAP device".into(),
+                expected: "suspended with a preserved TAP device".into(),
+            })?;
+        if let Some(serialized) = vm.egress_policy.as_deref() {
+            self.apply_persisted_egress_policy(tap, serialized).await?;
+        }
+        match self.host_network.attach_to_bridge(tap, bridge).await {
+            Ok(()) => Ok(false),
+            Err(error) if error.is_missing_interface(tap) => {
+                info!(
+                    name = %vm.name,
+                    tap,
+                    "preserved TAP of suspended VM is gone; recreating it for the snapshot"
+                );
+                self.host_network.create_tap(tap).await?;
+                if let Err(error) = self.host_network.attach_to_bridge(tap, bridge).await {
+                    // A masterless TAP carries no traffic, but it would still
+                    // occupy the name on the next attempt.
+                    if let Err(cleanup) = self.host_network.delete_tap(tap).await {
+                        warn!(name = %vm.name, tap, error = %cleanup, "failed to remove the recreated TAP after its attach failed");
+                    }
+                    return Err(error.into());
+                }
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Restore the host network of every suspended VM during daemon startup.
+    ///
+    /// This must run after the managed bridge and nftables tables exist and
+    /// before resume listeners or the API become reachable; otherwise a
+    /// connect can resume a guest whose network is still disconnected. Each VM
+    /// is handled on its own: one whose network cannot be restored is logged
+    /// and counted, and its resume repeats the attempt and fails with the real
+    /// error, while every other VM and the daemon itself keep going. Only a
+    /// state-store failure is fatal, since nothing can be served without it.
+    #[cfg(feature = "linux-net")]
+    pub async fn restore_suspended_vm_networks(
+        &self,
+    ) -> Result<SuspendedNetworkRestore, CoreError> {
+        let mut summary = SuspendedNetworkRestore::default();
+        for vm in self.state.list_vms()? {
+            if vm.state != VmLifecycleState::Suspended || vm.network == NetworkMode::Isolated {
+                continue;
+            }
+            match self.restore_suspended_vm_network(&vm).await {
+                Ok(recreated) => {
+                    summary.restored += 1;
+                    if recreated {
+                        summary.recreated += 1;
+                    }
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    warn!(
+                        name = %vm.name,
+                        tap = vm.tap_device.as_deref().unwrap_or("-"),
+                        error = %error,
+                        "failed to restore suspended VM network during startup; its resume will retry and report this error"
+                    );
+                }
+            }
+        }
+        Ok(summary)
     }
 
     /// Rebuild nftables port-forward rules from persisted state on startup.
