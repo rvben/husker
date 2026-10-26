@@ -165,6 +165,11 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "storage_error",
             err.to_string(),
         ),
+        CoreError::State(husker_core::StateError::HostResourcesLeased(_)) => (
+            StatusCode::CONFLICT,
+            "host_resources_leased",
+            err.to_string(),
+        ),
         CoreError::State(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "state_error",
@@ -211,6 +216,14 @@ fn hint_for(err: &CoreError) -> Option<String> {
         CoreError::VolumeAttached { vm, .. } => Some(format!(
             "destroy the VM still holding it: `husker destroy {vm} --yes`"
         )),
+        // The daemon reclaims an interrupted creation's resources at startup
+        // and keeps the lease only when that failed, so the way out is on the
+        // host, not in the request.
+        CoreError::State(husker_core::StateError::HostResourcesLeased(_)) => Some(
+            "the daemon's startup log names the host resource it could not remove; \
+             repair it and restart the daemon, or choose another VM name"
+                .into(),
+        ),
         _ => None,
     }
 }

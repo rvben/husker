@@ -2546,6 +2546,24 @@ mod tests {
         );
     }
 
+    /// A name whose interrupted creation still holds host resources is a
+    /// conflict the operator resolves on the host, not an internal error. The
+    /// hint has to say where to look, since the message alone names only the VM.
+    #[test]
+    fn map_error_reports_retained_host_resources_as_a_conflict_with_a_hint() {
+        let (status, body) = map_error(CoreError::State(
+            husker_core::StateError::HostResourcesLeased("held".into()),
+        ));
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let payload = body.0;
+        assert_eq!(payload.kind, "host_resources_leased");
+        assert!(payload.message.contains("'held'"), "{}", payload.message);
+        let hint = payload.hint.expect("the conflict carries a recovery hint");
+        assert!(hint.contains("startup log"), "{hint}");
+        assert!(hint.contains("restart the daemon"), "{hint}");
+    }
+
     #[test]
     fn map_agent_connect_error_falls_back_for_non_agent_errors() {
         let (status, _) = map_agent_connect_error(CoreError::VmNotFound("vm".into()));

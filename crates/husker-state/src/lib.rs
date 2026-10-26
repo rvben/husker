@@ -78,6 +78,8 @@ pub enum StateError {
     VolumeAttached { volume: String, vm: String },
     #[error("port already forwarded: {0}")]
     PortAlreadyForwarded(u16),
+    #[error("host resources of an interrupted creation of VM '{0}' are still held")]
+    HostResourcesLeased(String),
     #[error("host-resource lease not found: {0}")]
     HostResourceLeaseNotFound(Uuid),
     #[error("VM record does not match host-resource lease: {0}")]
@@ -2301,7 +2303,7 @@ impl StateStore {
             guest_ip: None,
             created_at: Utc::now(),
         };
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO host_resource_leases
                 (id, vm_name, vsock_cid, tap_device, guest_ip, created_at)
              VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
@@ -2311,7 +2313,20 @@ impl StateStore {
                 lease.vsock_cid,
                 lease.created_at.to_rfc3339(),
             ],
-        )?;
+        );
+        if let Err(error) = inserted {
+            // The transaction rolls back with `tx`, so the refused attempt does
+            // not consume the CID it had picked.
+            return Err(match error {
+                rusqlite::Error::SqliteFailure(err, Some(ref message))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation
+                        && message.contains("host_resource_leases.vm_name") =>
+                {
+                    StateError::HostResourcesLeased(vm_name.to_string())
+                }
+                other => StateError::Database(other),
+            });
+        }
         tx.commit()?;
         debug!(
             cid = lease.vsock_cid,
@@ -3553,6 +3568,26 @@ mod tests {
         store.release_host_resource_lease(abandoned.id).unwrap();
         let reused = store.begin_host_resource_lease("after-cleanup").unwrap();
         assert_eq!(reused.vsock_cid, 3);
+    }
+
+    #[test]
+    fn a_second_lease_for_the_same_name_is_a_conflict_that_consumes_no_cid() {
+        let store = StateStore::open_memory().unwrap();
+        let first = store.begin_host_resource_lease("held").unwrap();
+
+        let err = store.begin_host_resource_lease("held").unwrap_err();
+        assert!(
+            matches!(&err, StateError::HostResourcesLeased(name) if name == "held"),
+            "expected the lease conflict, got {err:?}"
+        );
+
+        let next = store.begin_host_resource_lease("other").unwrap();
+        assert_eq!(
+            next.vsock_cid,
+            first.vsock_cid + 1,
+            "the refused attempt must not consume a CID"
+        );
+        assert_eq!(store.list_host_resource_leases().unwrap().len(), 2);
     }
 
     #[test]

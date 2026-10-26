@@ -395,6 +395,10 @@ impl husker_core::OciImageMaterializer for CatalogRacingOciMaterializer {
 struct FailingVmm {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     fail_ops: HashSet<&'static str>,
+    /// When set, every `create_vm` call waits for one `notify_one` before it
+    /// proceeds (and before any injected failure), which holds a creation open
+    /// at the VMM step for as long as a test needs.
+    create_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl FailingVmm {
@@ -402,6 +406,14 @@ impl FailingVmm {
         Self {
             vms: Mutex::new(HashMap::new()),
             fail_ops: fail_ops.iter().copied().collect(),
+            create_gate: None,
+        }
+    }
+
+    fn gated(fail_ops: &[&'static str], gate: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            create_gate: Some(gate),
+            ..Self::new(fail_ops)
         }
     }
 
@@ -426,6 +438,9 @@ impl VmmBackend for FailingVmm {
         selection: husker_vmm::BackendSelection,
         config: VmConfig,
     ) -> Result<CreatedVm, VmmError> {
+        if let Some(gate) = &self.create_gate {
+            gate.notified().await;
+        }
         if self.should_fail("create") {
             return Err(VmmError::ApiError("injected create failure".into()));
         }
@@ -681,7 +696,11 @@ fn fresh_core(
     data_dir: &std::path::Path,
     fail_ops: &[&'static str],
 ) -> Arc<HuskerCore<FailingVmm>> {
-    let vmm = FailingVmm::new(fail_ops);
+    fresh_core_with_vmm(data_dir, FailingVmm::new(fail_ops))
+}
+
+#[cfg(not(feature = "linux-net"))]
+fn fresh_core_with_vmm(data_dir: &std::path::Path, vmm: FailingVmm) -> Arc<HuskerCore<FailingVmm>> {
     let state_store = husker_state::StateStore::open_memory().unwrap();
     let storage = husker_storage::StorageConfig {
         data_dir: data_dir.to_path_buf(),
@@ -709,13 +728,23 @@ fn fresh_linux_core_with_state(
     state: husker_state::StateStore,
     network: Arc<TestHostNetwork>,
 ) -> Arc<HuskerCore<FailingVmm>> {
+    fresh_linux_core_with_vmm(data_dir, state, network, FailingVmm::new(&[]))
+}
+
+#[cfg(feature = "linux-net")]
+fn fresh_linux_core_with_vmm(
+    data_dir: &std::path::Path,
+    state: husker_state::StateStore,
+    network: Arc<TestHostNetwork>,
+    vmm: FailingVmm,
+) -> Arc<HuskerCore<FailingVmm>> {
     let storage = husker_storage::StorageConfig {
         data_dir: data_dir.to_path_buf(),
         state_dir: data_dir.to_path_buf(),
     };
     Arc::new(
         HuskerCore::new(
-            FailingVmm::new(&[]),
+            vmm,
             state,
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
             storage,
@@ -727,8 +756,10 @@ fn fresh_linux_core_with_state(
     )
 }
 
-#[cfg(feature = "linux-net")]
-fn linux_boot_fixture(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
+/// A kernel and rootfs that pass validation on every backend: the ext4
+/// superblock magic for the rootfs, and both the ELF header (Linux) and the
+/// ARM64 Image magic (Apple VZ) in the kernel.
+fn boot_fixture(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let rootfs = data_dir.join("rootfs.ext4");
     let mut rootfs_bytes = vec![0u8; 1024 * 1024];
     rootfs_bytes[1080] = 0x53;
@@ -743,8 +774,7 @@ fn linux_boot_fixture(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
     (kernel, rootfs)
 }
 
-#[cfg(feature = "linux-net")]
-fn linux_create_request(
+fn create_request(
     name: &str,
     kernel: &std::path::Path,
     rootfs: &std::path::Path,
@@ -759,13 +789,40 @@ fn linux_create_request(
     }
 }
 
+/// Wait, bounded, for a condition that a task nobody is awaiting any more
+/// brings about on its own.
+async fn eventually(what: &str, mut holds: impl AsyncFnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !holds().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Start a creation and stop waiting for it while the VMM step is still held
+/// by `gate`, the way an HTTP handler is dropped when its client disconnects.
+async fn abandon_create(core: &Arc<HuskerCore<FailingVmm>>, request: husker_core::CreateVmRequest) {
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        core.create_vm(request),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the gate must hold the creation open past the caller's patience"
+    );
+}
+
 #[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn create_uses_complete_disk_preparation_boundary() {
     use std::sync::atomic::Ordering;
 
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     let storage = Arc::new(PreparingStorage::default());
     let core = Arc::new(
@@ -785,7 +842,7 @@ async fn create_uses_complete_disk_preparation_boundary() {
         .with_storage_driver(storage.clone()),
     );
 
-    core.create_vm(linux_create_request("prepared", &kernel, &rootfs))
+    core.create_vm(create_request("prepared", &kernel, &rootfs))
         .await
         .unwrap();
 
@@ -801,10 +858,10 @@ async fn create_uses_complete_disk_preparation_boundary() {
 #[tokio::test]
 async fn create_applies_and_persists_pinned_egress_before_returning() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
-    let mut request = linux_create_request("egress-guarded", &kernel, &rootfs);
+    let mut request = create_request("egress-guarded", &kernel, &rootfs);
     request.network = Some("filtered".into());
     request.egress = vec![husker_core::EgressRuleRequest {
         host: "203.0.113.8".into(),
@@ -862,7 +919,7 @@ fn suspend_committed_vm(data_dir: &std::path::Path, state_path: &std::path::Path
 #[tokio::test]
 async fn startup_recreates_the_vanished_tap_of_a_suspended_vm_and_reapplies_its_egress_policy() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let state_path = tmp.path().join("state.db");
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core_with_state(
@@ -870,7 +927,7 @@ async fn startup_recreates_the_vanished_tap_of_a_suspended_vm_and_reapplies_its_
         husker_state::StateStore::open(&state_path).unwrap(),
         Arc::clone(&network),
     );
-    let mut request = linux_create_request("pinned", &kernel, &rootfs);
+    let mut request = create_request("pinned", &kernel, &rootfs);
     request.network = Some("filtered".into());
     request.egress = vec![husker_core::EgressRuleRequest {
         host: "203.0.113.8".into(),
@@ -943,7 +1000,7 @@ async fn startup_recreates_the_vanished_tap_of_a_suspended_vm_and_reapplies_its_
 #[tokio::test]
 async fn startup_keeps_restoring_other_suspended_vms_when_one_network_fails() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let state_path = tmp.path().join("state.db");
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core_with_state(
@@ -952,11 +1009,11 @@ async fn startup_keeps_restoring_other_suspended_vms_when_one_network_fails() {
         Arc::clone(&network),
     );
     let first = core
-        .create_vm(linux_create_request("first", &kernel, &rootfs))
+        .create_vm(create_request("first", &kernel, &rootfs))
         .await
         .unwrap();
     let second = core
-        .create_vm(linux_create_request("second", &kernel, &rootfs))
+        .create_vm(create_request("second", &kernel, &rootfs))
         .await
         .unwrap();
     drop(core);
@@ -990,7 +1047,7 @@ async fn startup_keeps_restoring_other_suspended_vms_when_one_network_fails() {
 #[tokio::test]
 async fn resume_restores_the_network_itself_and_refuses_to_run_the_guest_unfiltered() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let state_path = tmp.path().join("state.db");
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core_with_state(
@@ -998,7 +1055,7 @@ async fn resume_restores_the_network_itself_and_refuses_to_run_the_guest_unfilte
         husker_state::StateStore::open(&state_path).unwrap(),
         Arc::clone(&network),
     );
-    let mut request = linux_create_request("pinned", &kernel, &rootfs);
+    let mut request = create_request("pinned", &kernel, &rootfs);
     request.network = Some("filtered".into());
     request.egress = vec![husker_core::EgressRuleRequest {
         host: "203.0.113.8".into(),
@@ -1077,11 +1134,11 @@ async fn resume_restores_the_network_itself_and_refuses_to_run_the_guest_unfilte
 #[tokio::test]
 async fn egress_policy_failure_rolls_back_before_vm_boot_or_persistence() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     network.fail_next_egress();
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
-    let mut request = linux_create_request("egress-fails", &kernel, &rootfs);
+    let mut request = create_request("egress-fails", &kernel, &rootfs);
     request.network = Some("filtered".into());
     request.egress = vec![husker_core::EgressRuleRequest {
         host: "203.0.113.8".into(),
@@ -1297,12 +1354,12 @@ async fn oci_catalog_race_removes_the_losing_artifact() {
 #[tokio::test]
 async fn attach_failure_rolls_back_tap_and_ip() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
 
     let network = Arc::new(TestHostNetwork::default());
     network.fail_next_attach();
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
-    let request = |name: &str| linux_create_request(name, &kernel, &rootfs);
+    let request = |name: &str| create_request(name, &kernel, &rootfs);
 
     let error = core.create_vm(request("attach-fails")).await.unwrap_err();
     assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
@@ -1317,20 +1374,20 @@ async fn attach_failure_rolls_back_tap_and_ip() {
 #[tokio::test]
 async fn partial_tap_creation_is_owned_and_rolled_back() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     network.fail_next_create_tap();
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
 
     let error = core
-        .create_vm(linux_create_request("partial-tap", &kernel, &rootfs))
+        .create_vm(create_request("partial-tap", &kernel, &rootfs))
         .await
         .unwrap_err();
     assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
     assert!(!network.has_tap("husker3").await);
 
     let created = core
-        .create_vm(linux_create_request("after-partial", &kernel, &rootfs))
+        .create_vm(create_request("after-partial", &kernel, &rootfs))
         .await
         .unwrap();
     assert_eq!(created.vsock_cid, 3);
@@ -1341,7 +1398,7 @@ async fn partial_tap_creation_is_owned_and_rolled_back() {
 #[tokio::test]
 async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let state_path = tmp.path().join("state.db");
     let network = Arc::new(TestHostNetwork::default());
     network.fail_next_attach();
@@ -1353,7 +1410,7 @@ async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
         Arc::clone(&network),
     );
     let error = core
-        .create_vm(linux_create_request("interrupted", &kernel, &rootfs))
+        .create_vm(create_request("interrupted", &kernel, &rootfs))
         .await
         .unwrap_err();
     assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
@@ -1375,7 +1432,7 @@ async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
     assert!(!network.has_tap("husker3").await);
 
     let created = restarted
-        .create_vm(linux_create_request("after-recovery", &kernel, &rootfs))
+        .create_vm(create_request("after-recovery", &kernel, &rootfs))
         .await
         .unwrap();
     assert_eq!(created.vsock_cid, 3);
@@ -1386,7 +1443,7 @@ async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
 #[tokio::test]
 async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let state_path = tmp.path().join("state.db");
     let network = Arc::new(TestHostNetwork::default());
     network.fail_next_attach();
@@ -1397,7 +1454,7 @@ async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {
         husker_state::StateStore::open(&state_path).unwrap(),
         Arc::clone(&network),
     );
-    core.create_vm(linux_create_request("retry-recovery", &kernel, &rootfs))
+    core.create_vm(create_request("retry-recovery", &kernel, &rootfs))
         .await
         .unwrap_err();
     assert!(network.has_tap("husker3").await);
@@ -1430,7 +1487,7 @@ async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {
         }
     );
     let created = restarted
-        .create_vm(linux_create_request("after-retry", &kernel, &rootfs))
+        .create_vm(create_request("after-retry", &kernel, &rootfs))
         .await
         .unwrap();
     assert_eq!(created.vsock_cid, 3);
@@ -1441,17 +1498,17 @@ async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {
 #[tokio::test]
 async fn incomplete_rollback_does_not_reuse_live_host_identity() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     network.fail_next_attach();
     network.fail_next_delete_tap();
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
 
-    core.create_vm(linux_create_request("leaked", &kernel, &rootfs))
+    core.create_vm(create_request("leaked", &kernel, &rootfs))
         .await
         .unwrap_err();
     let created = core
-        .create_vm(linux_create_request("while-leased", &kernel, &rootfs))
+        .create_vm(create_request("while-leased", &kernel, &rootfs))
         .await
         .unwrap();
 
@@ -1463,13 +1520,90 @@ async fn incomplete_rollback_does_not_reuse_live_host_identity() {
 
 #[cfg(feature = "linux-net")]
 #[tokio::test]
+async fn create_finishes_after_its_caller_stops_waiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let core = fresh_linux_core_with_vmm(
+        tmp.path(),
+        husker_state::StateStore::open_memory().unwrap(),
+        Arc::clone(&network),
+        FailingVmm::gated(&[], Arc::clone(&gate)),
+    );
+    let request = create_request("abandoned", &kernel, &rootfs);
+
+    abandon_create(&core, request.clone()).await;
+    assert!(
+        network.has_tap("husker3").await,
+        "the host resources were already allocated when the caller left"
+    );
+    assert!(core.get_vm("abandoned").is_err());
+
+    gate.notify_one();
+    eventually("the abandoned creation to commit its VM", async || {
+        core.get_vm("abandoned")
+            .is_ok_and(|vm| vm.state == "running")
+    })
+    .await;
+    assert!(network.has_tap("husker3").await);
+
+    let retry = core.create_vm(request).await.unwrap_err();
+    assert!(
+        matches!(retry, CoreError::VmAlreadyExists(_)),
+        "the name belongs to the committed VM, got {retry:?}"
+    );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn an_abandoned_create_still_rolls_back_when_it_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
+    let network = Arc::new(TestHostNetwork::default());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let core = fresh_linux_core_with_vmm(
+        tmp.path(),
+        husker_state::StateStore::open_memory().unwrap(),
+        Arc::clone(&network),
+        FailingVmm::gated(&["create"], Arc::clone(&gate)),
+    );
+    let request = create_request("abandoned", &kernel, &rootfs);
+
+    abandon_create(&core, request.clone()).await;
+    assert!(network.has_tap("husker3").await);
+
+    gate.notify_one();
+    eventually("the rollback to remove the TAP device", async || {
+        !network.has_tap("husker3").await
+    })
+    .await;
+    assert!(
+        !tmp.path().join("vms/abandoned").exists(),
+        "the rollback removes the VM directory"
+    );
+    assert!(core.get_vm("abandoned").is_err());
+
+    // The rollback released the lease: the retry gets as far as the VMM step
+    // (where the same failure is injected) instead of being refused for a
+    // name whose host resources are still held.
+    gate.notify_one();
+    let retry = core.create_vm(request).await.unwrap_err();
+    assert!(
+        matches!(retry, CoreError::Vmm(VmmError::ApiError(_))),
+        "got {retry:?}"
+    );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
 async fn nft_failure_does_not_persist_a_port_forward() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
 
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
-    core.create_vm(linux_create_request("forward-owner", &kernel, &rootfs))
+    core.create_vm(create_request("forward-owner", &kernel, &rootfs))
         .await
         .unwrap();
 
@@ -1487,10 +1621,10 @@ async fn nft_failure_does_not_persist_a_port_forward() {
 #[tokio::test]
 async fn nft_cleanup_failure_retains_the_port_forward_record() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
-    core.create_vm(linux_create_request("forward-owner", &kernel, &rootfs))
+    core.create_vm(create_request("forward-owner", &kernel, &rootfs))
         .await
         .unwrap();
     core.add_port_forward("forward-owner", 18080, 80, None)
@@ -1512,11 +1646,11 @@ async fn nft_cleanup_failure_retains_the_port_forward_record() {
 #[tokio::test]
 async fn destroy_cleanup_failure_retains_resource_ownership_for_retry() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
     let created = core
-        .create_vm(linux_create_request("cleanup-retry", &kernel, &rootfs))
+        .create_vm(create_request("cleanup-retry", &kernel, &rootfs))
         .await
         .unwrap();
 
@@ -1535,7 +1669,7 @@ async fn destroy_cleanup_failure_retains_resource_ownership_for_retry() {
         Err(CoreError::VmNotFound(_))
     ));
     let replacement = core
-        .create_vm(linux_create_request("after-destroy", &kernel, &rootfs))
+        .create_vm(create_request("after-destroy", &kernel, &rootfs))
         .await
         .unwrap();
     assert_eq!(replacement.vsock_cid, created.vsock_cid);
@@ -1546,11 +1680,11 @@ async fn destroy_cleanup_failure_retains_resource_ownership_for_retry() {
 #[tokio::test]
 async fn reclaim_cleanup_failure_keeps_the_vm_resource_fields_for_retry() {
     let tmp = tempfile::tempdir().unwrap();
-    let (kernel, rootfs) = linux_boot_fixture(tmp.path());
+    let (kernel, rootfs) = boot_fixture(tmp.path());
     let network = Arc::new(TestHostNetwork::default());
     let core = fresh_linux_core(tmp.path(), Arc::clone(&network));
     let created = core
-        .create_vm(linux_create_request("reclaim-retry", &kernel, &rootfs))
+        .create_vm(create_request("reclaim-retry", &kernel, &rootfs))
         .await
         .unwrap();
     core.stop_vm("reclaim-retry").await.unwrap();
@@ -1574,31 +1708,11 @@ async fn create_failure_rolls_back_and_leaves_no_vm_record() {
     // vm_id). The AllocatedResources rollback must unwind them so no partial VM
     // record is left behind.
     let tmp = tempfile::tempdir().unwrap();
-    let rootfs = tmp.path().join("rootfs.ext4");
-    // A 1 MiB file with the ext4 superblock magic (0xEF53 at byte offset 1080)
-    // so rootfs validation passes and create reaches the (failing) vmm step.
-    let mut rbytes = vec![0u8; 1024 * 1024];
-    rbytes[1080] = 0x53;
-    rbytes[1081] = 0xef;
-    std::fs::write(&rootfs, &rbytes).unwrap();
-    // A kernel large enough with the ARM64 Image magic at offset 56 (VZ) / an ELF
-    // header (Linux) so kernel validation passes on either backend.
-    let kernel = tmp.path().join("vmlinux");
-    let mut kbytes = vec![0u8; 128];
-    kbytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']); // ELF magic (Linux)
-    kbytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes()); // ARM64 Image magic (VZ)
-    std::fs::write(&kernel, &kbytes).unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
 
     let core = fresh_core(tmp.path(), &["create"]);
     let err = core
-        .create_vm(husker_core::CreateVmRequest {
-            name: "doomed".into(),
-            kernel_path: Some(kernel),
-            rootfs_path: Some(rootfs),
-            vcpu_count: Some(1),
-            mem_size_mib: Some(128),
-            ..Default::default()
-        })
+        .create_vm(create_request("doomed", &kernel, &rootfs))
         .await
         .unwrap_err();
     assert!(
@@ -1613,6 +1727,60 @@ async fn create_failure_rolls_back_and_leaves_no_vm_record() {
         core.get_vm("doomed").is_err(),
         "the rolled-back VM must not be looked up"
     );
+}
+
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn create_finishes_after_its_caller_stops_waiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let core = fresh_core_with_vmm(tmp.path(), FailingVmm::gated(&[], Arc::clone(&gate)));
+    let request = create_request("abandoned", &kernel, &rootfs);
+
+    abandon_create(&core, request.clone()).await;
+    assert!(
+        tmp.path().join("vms/abandoned").is_dir(),
+        "the VM directory was already prepared when the caller left"
+    );
+    assert!(core.get_vm("abandoned").is_err());
+
+    gate.notify_one();
+    eventually("the abandoned creation to commit its VM", async || {
+        core.get_vm("abandoned")
+            .is_ok_and(|vm| vm.state == "running")
+    })
+    .await;
+
+    let retry = core.create_vm(request).await.unwrap_err();
+    assert!(
+        matches!(retry, CoreError::VmAlreadyExists(_)),
+        "the name belongs to the committed VM, got {retry:?}"
+    );
+}
+
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn an_abandoned_create_still_rolls_back_when_it_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let core = fresh_core_with_vmm(
+        tmp.path(),
+        FailingVmm::gated(&["create"], Arc::clone(&gate)),
+    );
+    let request = create_request("abandoned", &kernel, &rootfs);
+
+    abandon_create(&core, request.clone()).await;
+    assert!(tmp.path().join("vms/abandoned").is_dir());
+
+    gate.notify_one();
+    eventually("the rollback to remove the VM directory", async || {
+        !tmp.path().join("vms/abandoned").exists()
+    })
+    .await;
+    assert!(core.get_vm("abandoned").is_err());
+    assert!(core.list_vms().unwrap().is_empty());
 }
 
 #[tokio::test]

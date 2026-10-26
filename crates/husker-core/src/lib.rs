@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 pub use husker_state::{
     BackendKind, BootKind, HostGroupRecord, ImageKind, ImageRecord, NetworkMode, PoolRecord,
-    SecretRecord, ServiceRecord, SnapshotRecord, UserdataStatus, VmExpirationRecord,
+    SecretRecord, ServiceRecord, SnapshotRecord, StateError, UserdataStatus, VmExpirationRecord,
     VmLifecycleState, VmRecord, VolumeRecord,
 };
 pub use husker_vmm::{VmInfo, VmState};
@@ -1013,6 +1013,33 @@ fn apply_boot_init(base: &str, boot_init: Option<&str>) -> String {
             format!("{base} init={path} husker.init=1")
         }
         _ => base.to_string(),
+    }
+}
+
+/// Run `work` on its own task so it finishes even when the caller stops
+/// waiting for it.
+///
+/// Resource-allocating operations (create, fork) go through this. An HTTP
+/// client that disconnects mid-request drops the handler future, and
+/// abandoning the work between two allocation steps would leave host
+/// resources behind with nothing left to roll them back. A caller that keeps
+/// waiting observes the result as usual; one that stops only stops observing,
+/// and the daemon log carries the outcome.
+pub async fn run_to_completion<T, F>(
+    operation: &'static str,
+    name: &str,
+    work: F,
+) -> Result<T, CoreError>
+where
+    F: Future<Output = Result<T, CoreError>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(CoreError::Io(format!(
+            "{operation} of VM '{name}' was interrupted: {error}"
+        ))),
     }
 }
 
@@ -5347,20 +5374,22 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         };
         let runtime_dir = tmp.path().join("run");
         // Provide a lan_bridge so that precondition doesn't fire first.
-        let core = HuskerCore::new(
-            husker_vmm::firecracker::FirecrackerBackend::new(
-                std::path::Path::new("firecracker"),
-                &runtime_dir,
-                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
-            ),
-            state,
-            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
-            storage,
-            "husker0".into(),
-            vec![],
-            runtime_dir,
-        )
-        .with_lan_bridge(Some("br-lan".into()));
+        let core = Arc::new(
+            HuskerCore::new(
+                husker_vmm::firecracker::FirecrackerBackend::new(
+                    std::path::Path::new("firecracker"),
+                    &runtime_dir,
+                    std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
+                ),
+                state,
+                husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+                storage,
+                "husker0".into(),
+                vec![],
+                runtime_dir,
+            )
+            .with_lan_bridge(Some("br-lan".into())),
+        );
 
         let req = CreateVmRequest {
             name: "vm1".into(),
@@ -5401,7 +5430,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         };
         let runtime_dir = tmp.path().join("run");
         // No with_lan_bridge call -> lan_bridge stays None.
-        let core = HuskerCore::new(
+        let core = Arc::new(HuskerCore::new(
             husker_vmm::firecracker::FirecrackerBackend::new(
                 std::path::Path::new("firecracker"),
                 &runtime_dir,
@@ -5413,7 +5442,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             "husker0".into(),
             vec![],
             runtime_dir,
-        );
+        ));
 
         let req = CreateVmRequest {
             name: "vm2".into(),
@@ -5541,12 +5570,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             state_dir: tmp.path().to_path_buf(),
         };
         let runtime_dir = tmp.path().join("run");
-        let core = HuskerCore::new(
+        let core = Arc::new(HuskerCore::new(
             husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
             state,
             storage,
             runtime_dir,
-        );
+        ));
 
         for (index, mode) in ["bridged", "none"].into_iter().enumerate() {
             // cloud_image skips the host-kernel validation. The topology guard
@@ -5646,7 +5675,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let mut vm = running_nat_vm("pf-stopped");
         vm.state = VmLifecycleState::Stopped;
         state.insert_vm(&vm).unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
         let err = core
             .add_port_forward("pf-stopped", 18080, 80, None)
             .await
@@ -5663,7 +5692,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let mut vm = running_nat_vm("pf-noip");
         vm.guest_ip = None;
         state.insert_vm(&vm).unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
         let err = core
             .add_port_forward("pf-noip", 18081, 80, None)
             .await
@@ -5723,7 +5752,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         b.vsock_cid = 4;
         state.insert_vm(&a).unwrap();
         state.insert_vm(&b).unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
         let host_port = {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
@@ -5755,7 +5784,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         state.insert_vm(&running_nat_vm("vm-c")).unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
         let host_port = {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
@@ -5786,7 +5815,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let image_path = write_qcow2_magic(tmp.path());
         let state = husker_state::StateStore::open_memory().unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
 
         let req = CreateVmRequest {
             name: "vm-vol".into(),
@@ -5827,7 +5856,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let image_path = write_qcow2_magic(tmp.path());
         let state = husker_state::StateStore::open_memory().unwrap();
         // Core built WITHOUT with_embedded_agent -> embedded_agent is &[].
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
 
         let req = CreateVmRequest {
             name: "vm-noagent".into(),
@@ -5868,7 +5897,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let bad_path = tmp.path().join("bad.img");
         std::fs::write(&bad_path, b"not a qcow").unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
-        let core = make_vz_core(state, tmp.path()).with_embedded_agent(b"fake-agent");
+        let core = Arc::new(make_vz_core(state, tmp.path()).with_embedded_agent(b"fake-agent"));
 
         let req = CreateVmRequest {
             name: "vm-badmagic".into(),
@@ -5933,7 +5962,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         std::fs::write(&bad_qcow2, &data).unwrap();
 
         let state = husker_state::StateStore::open_memory().unwrap();
-        let core = make_vz_core(state, tmp.path()).with_embedded_agent(b"fake-agent");
+        let core = Arc::new(make_vz_core(state, tmp.path()).with_embedded_agent(b"fake-agent"));
 
         let vm_name = "vm-rollback";
         let req = CreateVmRequest {
@@ -5983,7 +6012,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         use husker_vmm::macos_bundle::{MACOS_BUNDLE_FORMAT, MacOsBundle, MacOsBundleManifest};
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
         let dir = crate::macos_guest::macos_images_dir(tmp.path()).join("img");
         std::fs::create_dir_all(&dir).unwrap();
         let bundle = MacOsBundle::new(&dir);
@@ -6091,13 +6120,19 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let rootfs_path = tmp.path().join("rootfs.ext4");
         std::fs::write(&rootfs_path, b"rootfs").unwrap();
 
-        let core = HuskerCore::new(
-            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
-            state,
-            storage,
-            runtime_dir,
-        )
-        .with_default_images(Some(kernel_path.clone()), Some(rootfs_path.clone()), None);
+        let core = Arc::new(
+            HuskerCore::new(
+                husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+                state,
+                storage,
+                runtime_dir,
+            )
+            .with_default_images(
+                Some(kernel_path.clone()),
+                Some(rootfs_path.clone()),
+                None,
+            ),
+        );
 
         // A request with no explicit kernel/rootfs should not return the
         // "no kernel specified" error; it should get past validation and
@@ -6142,7 +6177,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     async fn missing_kernel_without_defaults_returns_invalid_argument() {
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
-        let core = make_vz_core(state, tmp.path());
+        let core = Arc::new(make_vz_core(state, tmp.path()));
 
         let req = CreateVmRequest {
             name: "test-no-defaults".into(),

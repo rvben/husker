@@ -14,8 +14,33 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// source can coexist. Attached volumes are rejected because their writable
     /// backing files are outside the rootfs clone. Existing TCP/vsock connections
     /// must reconnect after restore; guest processes and disk state survive.
+    ///
+    /// The fork finishes (or rolls back) even when the caller stops waiting
+    /// for it (see [`crate::run_to_completion`]).
     #[cfg(feature = "linux-net")]
-    pub async fn fork_vm(&self, source_name: &str, fork_name: &str) -> Result<VmRecord, CoreError> {
+    pub async fn fork_vm(
+        self: &Arc<Self>,
+        source_name: &str,
+        fork_name: &str,
+    ) -> Result<VmRecord, CoreError>
+    where
+        B: 'static,
+    {
+        let core = Arc::clone(self);
+        let source = source_name.to_string();
+        let fork = fork_name.to_string();
+        crate::run_to_completion("fork", fork_name, async move {
+            core.fork_vm_inner(&source, &fork).await
+        })
+        .await
+    }
+
+    #[cfg(feature = "linux-net")]
+    async fn fork_vm_inner(
+        &self,
+        source_name: &str,
+        fork_name: &str,
+    ) -> Result<VmRecord, CoreError> {
         info!(%source_name, %fork_name, "forking VM");
         // Validate the caller-supplied fork name before it is used to build any
         // filesystem path (the fork's vm_dir is `data_dir/vms/<fork_name>`, which is

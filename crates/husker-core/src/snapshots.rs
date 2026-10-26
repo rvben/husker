@@ -84,10 +84,13 @@ impl<B: VmmBackend> HuskerCore<B> {
 
     /// Restore a snapshot into a new VM.
     pub async fn restore_snapshot(
-        &self,
+        self: &Arc<Self>,
         snapshot_name: &str,
         req: RestoreSnapshotRequest,
-    ) -> Result<VmRecord, CoreError> {
+    ) -> Result<VmRecord, CoreError>
+    where
+        B: 'static,
+    {
         validate_resource_name("vm", &req.name)?;
         let snapshot = self.get_snapshot(snapshot_name)?;
         self.create_vm(CreateVmRequest {

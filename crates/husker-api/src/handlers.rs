@@ -1179,20 +1179,28 @@ pub(crate) async fn create_vm<B: VmmBackend + 'static>(
         }
     }
 
-    let record = match expires_after_secs {
-        Some(seconds) => core
-            .create_ephemeral_vm(vm, seconds, owner)
-            .await
-            .map_err(map_error)?,
-        None if owner.is_some() => {
-            return Err(map_error(husker_core::CoreError::InvalidArgument(
-                "owner requires expires_after_secs".into(),
-            )));
-        }
-        None => core.create_vm(vm).await.map_err(map_error)?,
-    };
+    if expires_after_secs.is_none() && owner.is_some() {
+        return Err(map_error(husker_core::CoreError::InvalidArgument(
+            "owner requires expires_after_secs".into(),
+        )));
+    }
 
-    core.spawn_userdata(&record).await;
+    // Creation and the userdata launch form one unit that finishes even when
+    // the client disconnects first: the core already completes the creation
+    // on its own, and this keeps a VM from being left with its userdata
+    // pending forever because the request vanished between the two steps.
+    let name = vm.name.clone();
+    let worker = Arc::clone(&core);
+    let record = husker_core::run_to_completion("creation", &name, async move {
+        let record = match expires_after_secs {
+            Some(seconds) => worker.create_ephemeral_vm(vm, seconds, owner).await?,
+            None => worker.create_vm(vm).await?,
+        };
+        worker.spawn_userdata(&record).await;
+        Ok(record)
+    })
+    .await
+    .map_err(map_error)?;
 
     let expiration = core.get_vm_expiration(record.id).map_err(map_error)?;
     Ok((

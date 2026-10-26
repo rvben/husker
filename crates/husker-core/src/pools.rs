@@ -115,11 +115,16 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Check a fresh VM out of a pool: fork the suspended template into a new,
     /// isolated VM with its own identity (CoW rootfs, fresh IP/CID/MAC), in
     /// sub-second. The template stays suspended and reusable. Firecracker only.
+    /// Like any fork, the checkout finishes or rolls back even when the caller
+    /// stops waiting for it.
     pub async fn checkout_pool(
-        &self,
+        self: &Arc<Self>,
         pool_name: &str,
         vm_name: Option<&str>,
-    ) -> Result<VmRecord, CoreError> {
+    ) -> Result<VmRecord, CoreError>
+    where
+        B: 'static,
+    {
         // Resolve the source by the durable identity stored in the pool. Pool
         // and template names may legitimately diverge across legacy state or a
         // future rename; the UUID is the aggregate ownership key.

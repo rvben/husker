@@ -3511,16 +3511,18 @@ mod kernel_args_composition {
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let storage = Arc::new(PreparingStorage::default());
-        let core = HuskerCore::new(
-            MockVmm::new(),
-            StateStore::open_memory().unwrap(),
-            StorageConfig {
-                data_dir: data_dir.clone(),
-                state_dir: data_dir.clone(),
-            },
-            runtime_dir,
-        )
-        .with_storage_driver(storage.clone());
+        let core = Arc::new(
+            HuskerCore::new(
+                MockVmm::new(),
+                StateStore::open_memory().unwrap(),
+                StorageConfig {
+                    data_dir: data_dir.clone(),
+                    state_dir: data_dir.clone(),
+                },
+                runtime_dir,
+            )
+            .with_storage_driver(storage.clone()),
+        );
 
         core.create_vm(CreateVmRequest {
             name: "prepared-at-boundary".into(),

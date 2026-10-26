@@ -5,9 +5,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     ///
     /// Allocates network, storage, and VMM resources. On failure, all
     /// partially allocated resources are rolled back. A stopped or failed VM
-    /// with the same name is automatically replaced.
-    pub async fn create_vm(&self, req: CreateVmRequest) -> Result<VmRecord, CoreError> {
-        self.create_vm_record_inner(req, None, true, None).await
+    /// with the same name is automatically replaced. The creation finishes
+    /// (or rolls back) even when the caller stops waiting for it.
+    pub async fn create_vm(self: &Arc<Self>, req: CreateVmRequest) -> Result<VmRecord, CoreError>
+    where
+        B: 'static,
+    {
+        self.create_to_completion(req, None, true, None).await
     }
 
     /// Create a VM with a durable hard lifetime.
@@ -16,11 +20,14 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// external orchestrator can crash after a successful response without
     /// leaking the guest indefinitely. Activity does not extend the deadline.
     pub async fn create_ephemeral_vm(
-        &self,
+        self: &Arc<Self>,
         req: CreateVmRequest,
         expires_after_secs: u64,
         owner: Option<String>,
-    ) -> Result<VmRecord, CoreError> {
+    ) -> Result<VmRecord, CoreError>
+    where
+        B: 'static,
+    {
         if expires_after_secs == 0 {
             return Err(CoreError::InvalidArgument(
                 "expires_after_secs must be greater than zero".into(),
@@ -38,7 +45,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let expires_at = chrono::Utc::now()
             .checked_add_signed(chrono::Duration::seconds(seconds))
             .ok_or_else(|| CoreError::InvalidArgument("expiration deadline overflows".into()))?;
-        self.create_vm_record_inner(
+        self.create_to_completion(
             req,
             None,
             true,
@@ -93,13 +100,38 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// same-named VM is auto-replaced (public API: true; reconciler: false to
     /// avoid clobbering a foreign stopped VM).
     pub async fn create_vm_record(
-        &self,
+        self: &Arc<Self>,
         req: CreateVmRequest,
         tags: Option<ServiceTag>,
         replace_existing_stopped: bool,
-    ) -> Result<VmRecord, CoreError> {
-        self.create_vm_record_inner(req, tags, replace_existing_stopped, None)
+    ) -> Result<VmRecord, CoreError>
+    where
+        B: 'static,
+    {
+        self.create_to_completion(req, tags, replace_existing_stopped, None)
             .await
+    }
+
+    /// Run the creation on its own task (see [`crate::run_to_completion`]):
+    /// every allocation step is followed by its commit or its rollback, even
+    /// when the request that started it is gone.
+    async fn create_to_completion(
+        self: &Arc<Self>,
+        req: CreateVmRequest,
+        tags: Option<ServiceTag>,
+        replace_existing_stopped: bool,
+        expiration: Option<PendingVmExpiration>,
+    ) -> Result<VmRecord, CoreError>
+    where
+        B: 'static,
+    {
+        let core = Arc::clone(self);
+        let name = req.name.clone();
+        crate::run_to_completion("creation", &name, async move {
+            core.create_vm_record_inner(req, tags, replace_existing_stopped, expiration)
+                .await
+        })
+        .await
     }
 
     async fn create_vm_record_inner(
