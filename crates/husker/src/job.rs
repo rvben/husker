@@ -20,8 +20,8 @@ use crate::schema::exit_code;
 use crate::vm_creation::PreparedVmCreationPlan;
 use crate::{
     SYNC_ARCHIVE_GUEST_PATH, SYNC_MANIFEST_GUEST_PATH, SYNC_OUTPUT_GUEST_PATH, SYNC_WORKDIR,
-    apply_dns_hosts, build_sync_archive, collect_sync_paths, extract_archive_over,
-    serial_boot_hint, wait_for_vm_ready, wrap_sync_command,
+    apply_dns_hosts, boot_diagnosis, build_sync_archive, collect_sync_paths, extract_archive_over,
+    wait_for_vm_ready, wrap_sync_command,
 };
 
 /// Resolve the `(command, args)` to exec for a non-`--sync-cwd` job. An empty
@@ -320,14 +320,15 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
     let vm = daemon.vm(name).await?;
     let timeout = husker_core::default_ready_timeout(vm.boot_mode);
     if !wait_for_vm_ready(daemon, name, timeout).await? {
-        let hint = serial_boot_hint(daemon, name).await;
+        let diagnosis = boot_diagnosis(daemon, name).await;
         return Err(ApiFailure::with_kind(
             CliErrorKind::Timeout,
             format!(
-                "timed out after {}s waiting for VM '{name}' to become ready{hint}",
-                timeout.as_secs()
+                "timed out after {}s waiting for VM '{name}' to become ready{}",
+                timeout.as_secs(),
+                diagnosis.console_block()
             ),
-            None,
+            Some(diagnosis.hint),
         )
         .into());
     }
@@ -1697,6 +1698,77 @@ mod tests {
         assert!(
             failure.hint.is_some(),
             "the user needs to be told what prevents the manifest from being written"
+        );
+        server.abort();
+    }
+
+    // --- Boot diagnosis: what a ready timeout reports about the console ------
+
+    fn serial_console_route(tail: &'static str) -> Router {
+        Router::new().route(
+            "/v1/vms/{name}/logs",
+            get(move || async move { tail.to_string() }),
+        )
+    }
+
+    /// The console tail is evidence and goes in the message block; the remedy
+    /// is the hint, and a kernel module mismatch in the console names itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_console_with_a_module_mismatch_names_the_rebuild_in_the_hint() {
+        let console = "[    0.9] virtio_net: Invalid module format\n[    1.0] boot stalled\n";
+        let (api_url, server) = serve_stub(serial_console_route(console)).await;
+        let client = DaemonClient::new(&api_url, None);
+
+        let diagnosis = boot_diagnosis(&client, "job-x").await;
+
+        assert_eq!(
+            diagnosis.console_block(),
+            "\n--- guest serial console (tail) ---\n\
+             [    0.9] virtio_net: Invalid module format\n[    1.0] boot stalled"
+        );
+        assert_eq!(
+            diagnosis.hint,
+            format!(
+                "run `husker logs --source serial job-x` for the full guest console; {}",
+                husker_core::kernel_module_mismatch_hint(console).unwrap()
+            )
+        );
+        assert!(
+            !diagnosis.hint.contains("---"),
+            "the console belongs in the message, not the hint: {}",
+            diagnosis.hint
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_healthy_console_points_at_the_full_log_only() {
+        let (api_url, server) = serve_stub(serial_console_route("[    1.0] login:\n")).await;
+        let client = DaemonClient::new(&api_url, None);
+
+        let diagnosis = boot_diagnosis(&client, "job-x").await;
+
+        assert_eq!(diagnosis.console_tail.as_deref(), Some("[    1.0] login:"));
+        assert_eq!(
+            diagnosis.hint,
+            "run `husker logs --source serial job-x` for the full guest console"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_console_says_so_without_a_console_block() {
+        let (api_url, server) = serve_stub(serial_console_route("")).await;
+        let client = DaemonClient::new(&api_url, None);
+
+        let diagnosis = boot_diagnosis(&client, "job-x").await;
+
+        assert!(diagnosis.console_tail.is_none());
+        assert_eq!(diagnosis.console_block(), "");
+        assert_eq!(
+            diagnosis.hint,
+            "the guest serial console has no output yet; \
+             run `husker logs --source serial job-x` to inspect it"
         );
         server.abort();
     }

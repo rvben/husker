@@ -18,7 +18,9 @@
   - `husker schema` is the canonical machine-readable command contract
   - command payload keys are additive-only within a major release
   - documented field types are stable within a major release
-  - error JSON always uses `{ "error": { "kind", "message", "hint"? } }`
+  - error JSON always uses `{ "error": { "kind", "message", "hint"? } }`;
+    `message` says what failed and `hint` is the only field that carries a
+    remedy (see `docs/api/cli-output-json.md`)
   - error kinds are the finite set `husker schema` lists under `errors`; a
     kind a newer daemon sends is normalized to that set by exit code
 - A destructive command that does not pass its confirmation gate changes

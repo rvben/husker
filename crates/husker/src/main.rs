@@ -263,12 +263,32 @@ fn merge_env(env_files: &[PathBuf], env_flags: Vec<String>) -> anyhow::Result<Ve
     Ok(merged)
 }
 
-/// Best-effort boot-failure hint for a VM that never became ready: the tail of
-/// its guest serial console plus a pointer to the full log, so a `job` that
-/// times out waiting for boot is diagnosable without the user knowing to reach
-/// for `husker logs`. Returns a string with a leading newline (or a shorter
-/// pointer if the console is empty or unreachable).
-pub(crate) async fn serial_boot_hint(daemon: &DaemonClient, name: &str) -> String {
+/// What the guest serial console says about a VM that never became ready, so
+/// a `job` or `run` that times out waiting for boot is diagnosable without
+/// the user knowing to reach for `husker logs`. The console tail is evidence
+/// and belongs in the failure message; the remedy is a hint.
+pub(crate) struct BootDiagnosis {
+    /// The last lines of the guest serial console, when it has any.
+    pub(crate) console_tail: Option<String>,
+    /// Where to look next, naming a kernel module mismatch when the console
+    /// shows one.
+    pub(crate) hint: String,
+}
+
+impl BootDiagnosis {
+    /// The console tail as a block to append to a failure message, empty
+    /// when the console had no output.
+    pub(crate) fn console_block(&self) -> String {
+        self.console_tail
+            .as_deref()
+            .map(|tail| format!("\n--- guest serial console (tail) ---\n{tail}"))
+            .unwrap_or_default()
+    }
+}
+
+/// Best-effort: an unreachable or empty console yields a diagnosis that
+/// says so rather than a failure of its own.
+pub(crate) async fn boot_diagnosis(daemon: &DaemonClient, name: &str) -> BootDiagnosis {
     let path = format!("/v1/vms/{name}/logs?source=serial&tail=20");
     let body = match daemon.try_send(daemon.get(path)).await {
         Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
@@ -276,18 +296,23 @@ pub(crate) async fn serial_boot_hint(daemon: &DaemonClient, name: &str) -> Strin
     };
     let tail = body.trim_end();
     if tail.is_empty() {
-        return format!(
-            "\nhint: the guest serial console has no output yet; \
-             run `husker logs --source serial {name}` to inspect it"
-        );
+        return BootDiagnosis {
+            console_tail: None,
+            hint: format!(
+                "the guest serial console has no output yet; \
+                 run `husker logs --source serial {name}` to inspect it"
+            ),
+        };
     }
-    let module_hint = husker_core::kernel_module_mismatch_hint(tail)
-        .map(|h| format!("\nhint: {h}"))
-        .unwrap_or_default();
-    format!(
-        "\n--- guest serial console (tail) ---\n{tail}\n\
-         hint: run `husker logs --source serial {name}` for the full guest console{module_hint}"
-    )
+    let mut hint = format!("run `husker logs --source serial {name}` for the full guest console");
+    if let Some(module_hint) = husker_core::kernel_module_mismatch_hint(tail) {
+        hint.push_str("; ");
+        hint.push_str(module_hint);
+    }
+    BootDiagnosis {
+        console_tail: Some(tail.to_string()),
+        hint,
+    }
 }
 
 /// The failure for a VM that did not report ready within `timeout`. The guest
@@ -532,6 +557,9 @@ fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
         eprintln!("{structured}");
     } else {
         eprintln!("Error: {}", err.message);
+        if let Some(hint) = &err.hint {
+            eprintln!("hint: {hint}");
+        }
         eprintln!("{structured}");
     }
     std::process::exit(err.exit_code);
@@ -1022,8 +1050,9 @@ async fn run(cli: Cli) -> Result<()> {
             if !resp.status().is_success() {
                 let mut full = client.error(resp, &format!("VM '{name}'")).await;
                 if full.message.contains("already exists") {
-                    full.message.push_str(&format!(
-                        " (hint: if it is suspended, resume it with `husker resume {name}`; otherwise stop or destroy it first with `husker destroy {name}`)"
+                    full.add_hint(format!(
+                        "if it is suspended, resume it with `husker resume {name}`; \
+                         otherwise stop or destroy it first with `husker destroy {name}`"
                     ));
                 }
                 exit_with_error(output, full);
@@ -1070,11 +1099,14 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
                 if !ready {
-                    let hint = serial_boot_hint(&client, &name).await;
+                    let diagnosis = boot_diagnosis(&client, &name).await;
                     return Err(ApiFailure::with_kind(
                         CliErrorKind::Timeout,
-                        format!("VM '{name}' did not become ready to apply --dns/--add-host{hint}"),
-                        None,
+                        format!(
+                            "VM '{name}' did not become ready to apply --dns/--add-host{}",
+                            diagnosis.console_block()
+                        ),
+                        Some(diagnosis.hint),
                     )
                     .into());
                 }
@@ -1258,7 +1290,7 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
-                    msg.message.push_str(" (hint: VM is already stopped)");
+                    msg.add_hint("the VM is already stopped; nothing to do");
                 }
                 exit_with_error(output, msg);
             }
@@ -1283,8 +1315,7 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
-                    msg.message
-                        .push_str(" (hint: start the VM first with `husker run`)");
+                    msg.add_hint("start the VM first with `husker run`");
                 }
                 exit_with_error(output, msg);
             }
@@ -1309,11 +1340,9 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
-                    msg.message
-                        .push_str(" (hint: start the VM first with `husker run`)");
+                    msg.add_hint("start the VM first with `husker run`");
                 } else if msg.message.contains("running") {
-                    msg.message
-                        .push_str(" (hint: VM is already running, nothing to resume)");
+                    msg.add_hint("the VM is already running; nothing to resume");
                 }
                 exit_with_error(output, msg);
             }
@@ -1339,8 +1368,7 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let mut msg = client.error(resp, &format!("VM '{name}'")).await;
                 if msg.message.contains("stopped") {
-                    msg.message
-                        .push_str(" (hint: VM must be running to suspend)");
+                    msg.add_hint("the VM must be running to suspend; start it with `husker run`");
                 }
                 exit_with_error(output, msg);
             }
@@ -3786,21 +3814,18 @@ async fn run_shell_ws(
     let vm = client.vm(name).await?;
     let state = vm.state.as_str();
     if state != "running" {
-        let mut message = format!("VM '{name}' is {state}, expected running");
-        if state == "stopped" {
-            message.push_str(" (hint: start the VM first with `husker run`)");
-        } else if state == "paused" {
-            message.push_str(&format!(
-                " (hint: resume the VM first with `husker resume {name}`)"
-            ));
-        }
+        let hint = match state {
+            "stopped" => Some("start the VM first with `husker run`".to_string()),
+            "paused" => Some(format!("resume the VM first with `husker resume {name}`")),
+            _ => None,
+        };
         exit_with_error(
             output,
             ApiFailure {
-                message,
+                message: format!("VM '{name}' is {state}, expected running"),
                 kind: Some("vm_not_running".into()),
                 exit_code: exit_code::CONFLICT,
-                hint: None,
+                hint,
             },
         );
     }

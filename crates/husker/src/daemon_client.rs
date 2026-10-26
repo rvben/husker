@@ -58,7 +58,13 @@ fn rate_limit_delay(headers: &reqwest::header::HeaderMap, attempt: u32) -> Durat
     delay.clamp(RATE_LIMIT_MIN_DELAY, RATE_LIMIT_MAX_DELAY)
 }
 
+/// The remedy for a daemon the CLI cannot connect to.
+const DAEMON_UNREACHABLE_HINT: &str =
+    "start it with `husker daemon`, or point at a running daemon via --api-url / HUSKER_API_URL";
+
 /// A failure returned by the daemon and suitable for the CLI error envelope.
+/// `message` states what failed and `hint` carries the remedy, so a consumer
+/// that keys on the message never has to strip one.
 #[derive(Debug, Clone)]
 pub(crate) struct ApiFailure {
     pub(crate) message: String,
@@ -68,6 +74,16 @@ pub(crate) struct ApiFailure {
 }
 
 impl ApiFailure {
+    /// Add a remedy the CLI knows for this failure. A hint the daemon sent
+    /// stays first, since it describes the refusal itself.
+    pub(crate) fn add_hint(&mut self, hint: impl Into<String>) {
+        let hint = hint.into();
+        self.hint = Some(match self.hint.take() {
+            Some(existing) => format!("{existing}; {hint}"),
+            None => hint,
+        });
+    }
+
     /// A failure the CLI raises itself, filed under one of its own error
     /// kinds so the kind and exit code cannot disagree.
     pub(crate) fn with_kind(
@@ -90,7 +106,11 @@ impl ApiFailure {
             return failure.clone();
         }
         if error.chain().any(|cause| cause.is::<DaemonUnreachable>()) {
-            return Self::with_kind(CliErrorKind::DaemonUnreachable, format!("{error:#}"), None);
+            return Self::with_kind(
+                CliErrorKind::DaemonUnreachable,
+                format!("{error:#}"),
+                Some(DAEMON_UNREACHABLE_HINT.into()),
+            );
         }
         Self {
             message: format!("{error:#}"),
@@ -700,12 +720,8 @@ impl DaemonClient {
     async fn send_once(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         request.send().await.map_err(|error| {
             if error.is_connect() {
-                anyhow::Error::new(DaemonUnreachable).context(format!(
-                    "cannot connect to daemon at {}\n\
-                     hint: start it with `husker daemon`, or point at a running daemon via \
-                     --api-url / HUSKER_API_URL",
-                    self.base_url
-                ))
+                anyhow::Error::new(DaemonUnreachable)
+                    .context(format!("cannot connect to daemon at {}", self.base_url))
             } else {
                 anyhow::anyhow!(error)
             }
@@ -872,6 +888,32 @@ mod tests {
         let failure = ApiFailure::from_error(&error);
         assert_eq!(failure.kind.as_deref(), Some("daemon_unreachable"));
         assert_eq!(failure.exit_code, exit_code::DAEMON_UNREACHABLE);
+        assert!(
+            !failure.message.contains("hint"),
+            "the remedy belongs in the hint field: {}",
+            failure.message
+        );
+        assert_eq!(failure.hint.as_deref(), Some(DAEMON_UNREACHABLE_HINT));
+    }
+
+    #[test]
+    fn a_cli_hint_follows_the_daemons_own() {
+        let mut failure = ApiFailure::from_frame(
+            Some("vm_conflict".into()),
+            "VM is busy".into(),
+            Some("stop it first".into()),
+            Some(409),
+        );
+        failure.add_hint("or pick another name");
+        assert_eq!(
+            failure.hint.as_deref(),
+            Some("stop it first; or pick another name")
+        );
+
+        let mut bare = ApiFailure::from("plain failure");
+        bare.add_hint("retry");
+        assert_eq!(bare.hint.as_deref(), Some("retry"));
+        assert_eq!(bare.message, "plain failure");
     }
 
     #[tokio::test]

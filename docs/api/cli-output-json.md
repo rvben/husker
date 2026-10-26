@@ -102,10 +102,15 @@ Structured errors are a single JSON line on stderr:
 }
 ```
 
-`hint` is optional. `husker schema` publishes the finite set of stable CLI
-error kinds and their exit codes. More specific error kinds received from a
-newer daemon are normalized to the CLI's stable categories, so the advertised
-set remains exhaustive.
+`message` states what failed and `hint`, when present, is the only place a
+remedy appears: a message never embeds one, so a consumer that keys on the
+message does not have to strip a suffix. A hint the CLI knows for a daemon
+refusal is appended to the daemon's own hint, separated by `; `. Text output
+prints the hint on its own `hint:` line between the `Error:` line and the
+envelope. `husker schema` publishes the finite set of stable CLI error kinds
+and their exit codes. More specific error kinds received from a newer daemon
+are normalized to the CLI's stable categories, so the advertised set remains
+exhaustive.
 
 ## Stability policy
 

@@ -81,6 +81,15 @@ impl Fixture {
         Self { url, temp, stub }
     }
 
+    /// A target no daemon listens on: a port that was bound and released.
+    async fn unreachable() -> Self {
+        let mut fixture = Self::start(no_route).await;
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        fixture.url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        fixture
+    }
+
     /// Run the CLI against the stub with the given arguments after the
     /// connection flags; `--output` goes in `args` so a test states it.
     async fn husker(&self, args: &[&str]) -> Output {
@@ -299,6 +308,77 @@ async fn a_guest_command_that_fails_is_reported_as_its_own_result() {
     assert_eq!(document["result"]["exit_code"], 3);
     assert_eq!(document["result"]["stderr"], "boom\n");
     assert_no_envelope(&output);
+}
+
+#[tokio::test]
+async fn an_unreachable_daemon_carries_its_remedy_in_the_hint() {
+    let fixture = Fixture::unreachable().await;
+    let output = fixture.husker(&["--output", "json", "info", "vm"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(5), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["kind"], "daemon_unreachable", "{stderr}");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("cannot connect to daemon at http://127.0.0.1:"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("hint"),
+        "the remedy belongs in the hint field, not the message: {message}"
+    );
+    assert!(
+        error["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("`husker daemon`")),
+        "{error}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn text_output_prints_the_hint_on_its_own_line() {
+    let fixture = Fixture::unreachable().await;
+    let output = fixture.husker(&["--output", "text", "info", "vm"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(5), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines[0].starts_with("Error: cannot connect to daemon at "),
+        "{stderr}"
+    );
+    let printed_hint = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("hint: "))
+        .unwrap_or_else(|| panic!("no hint line:\n{stderr}"));
+    // The envelope stays the last line and carries the same hint.
+    assert_eq!(envelope(&output)["error"]["hint"], printed_hint, "{stderr}");
+    assert!(printed_hint.contains("`husker daemon`"), "{printed_hint}");
+}
+
+#[tokio::test]
+async fn a_hint_the_cli_adds_keeps_the_daemons_message_intact() {
+    let fixture = Fixture::start(|method, target| {
+        if method == "POST" && target == "/v1/vms/vm/pause" {
+            (
+                StatusCode::CONFLICT,
+                r#"{"kind":"vm_not_running","message":"VM 'vm' is stopped"}"#.into(),
+            )
+        } else {
+            no_route(method, target)
+        }
+    })
+    .await;
+    let output = fixture.husker(&["--output", "json", "pause", "vm"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["kind"], "vm_not_running", "{stderr}");
+    assert_eq!(error["message"], "VM 'vm' is stopped", "{stderr}");
+    assert_eq!(
+        error["hint"], "start the VM first with `husker run`",
+        "{stderr}"
+    );
 }
 
 #[tokio::test]
