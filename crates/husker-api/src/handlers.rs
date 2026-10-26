@@ -1760,6 +1760,7 @@ async fn send_exec_ws_output(ws: &mut WebSocket, output: &WsExecOutput) -> Resul
     responses(
         (status = 200, description = "File content (base64-encoded)", body = ReadFileResponse),
         (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 413, description = "File larger than one response carries; read it with offset/len", body = ErrorResponse),
         (status = 501, description = "Guest agent cannot read from a byte offset", body = ErrorResponse),
         (status = 503, description = "Agent not ready", body = ErrorResponse)
     )
@@ -1785,25 +1786,59 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
         .agent_connect(&name)
         .await
         .map_err(map_agent_connect_error)?;
+    // The limit bounds one response, so the guest is asked for one byte past
+    // it and no more: an oversized file then costs a single extra byte to
+    // detect instead of a transfer up to the agent's own ceiling that is
+    // thrown away on arrival. A guest too old to honour `len` answers with the
+    // whole file, which the size check below still refuses.
+    let cap = policy.max_file_read_bytes as u64 + 1;
+    let len = Some(req.len.map_or(cap, |len| len.min(cap)));
     let read = conn
-        .read_file_range(&req.path, req.offset, req.len)
+        .read_file_range(&req.path, req.offset, len)
         .await
         .map_err(|e| map_error(e.into()))?;
     let data = read.data;
     if data.len() > policy.max_file_read_bytes {
-        // The limit bounds one response, so a ranged caller stays under it by
-        // asking for smaller slices. The hint says so, because "increase the
-        // policy" is the wrong lesson for a client that can simply chunk.
+        // A ranged caller stays under the limit by asking for smaller slices.
+        // The hint says so, because "increase the policy" is the wrong lesson
+        // for a client that can simply chunk.
+        let message = match read.total_size {
+            Some(total) => format!(
+                "file is {total} bytes; one response carries at most {} bytes",
+                policy.max_file_read_bytes
+            ),
+            None => format!(
+                "read result exceeds limit ({} bytes > {} bytes)",
+                data.len(),
+                policy.max_file_read_bytes
+            ),
+        };
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_response_with_hint(
+                "read_file_too_large",
+                message,
+                "request a byte range with offset/len, or increase max_file_read_bytes policy",
+            ),
+        ));
+    }
+    // A request without `len` asks for the file to its end. The cap above
+    // turns it into a ranged read on the guest, whose own per-response ceiling
+    // may then cut the answer short instead of refusing it; such a prefix must
+    // not be served as the file.
+    if req.len.is_none()
+        && let Some(total) = read.total_size
+        && req.offset.saturating_add(data.len() as u64) < total
+    {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             error_response_with_hint(
                 "read_file_too_large",
                 format!(
-                    "read result exceeds limit ({} bytes > {} bytes)",
-                    data.len(),
-                    policy.max_file_read_bytes
+                    "guest agent returned {} of {total} bytes in one response",
+                    data.len()
                 ),
-                "request a byte range with offset/len, or increase max_file_read_bytes policy",
+                "request byte ranges with offset/len to read the rest",
             ),
         ));
     }

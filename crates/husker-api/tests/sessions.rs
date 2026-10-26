@@ -730,3 +730,109 @@ async fn shell_applies_the_exec_command_policy_before_contacting_the_guest() {
     let _ = allowed.close(None).await;
     server.abort();
 }
+
+/// The read limit bounds one response, so the guest must be asked for no more
+/// than that plus one byte: a file far above the limit is then refused after a
+/// single extra byte instead of after a transfer the daemon throws away. The
+/// file here is larger than the agent's own 16 MiB ceiling, so without the cap
+/// the agent refuses the unranged read outright and the daemon reports an
+/// agent error, not the policy refusal a client branches on to start chunking.
+#[tokio::test]
+async fn read_file_detects_an_oversized_file_without_transferring_it() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            husker_api::set_policy(husker_api::ApiPolicy::default());
+        }
+    }
+    let f = Fixture::new().await;
+    let _reset = Reset;
+    husker_api::set_policy(husker_api::ApiPolicy {
+        max_file_read_bytes: 1024,
+        ..Default::default()
+    });
+    let total: u64 = 20 * 1024 * 1024;
+    let path = f._temp.path().join("large.bin");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(total)
+        .unwrap();
+
+    let (status, body) = f
+        .request("POST", "/v1/vms/dev/files/read", json!({ "path": path }))
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["kind"], "read_file_too_large", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("file is {total} bytes")),
+        "the refusal names the file size so a client can plan its ranges: {body}"
+    );
+
+    // A range under the limit is served from the same file.
+    let (status, body) = f
+        .request(
+            "POST",
+            "/v1/vms/dev/files/read",
+            json!({ "path": path, "offset": total - 100, "len": 1024 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["size"], 100, "{body}");
+    assert_eq!(body["total_size"], total, "{body}");
+}
+
+/// A read without `len` asks for the file to its end. The cap the daemon adds
+/// makes it a ranged read on the guest, and a guest clamps a ranged read at
+/// its own per-response ceiling instead of refusing it, so the daemon has to
+/// notice the short answer itself rather than serve a prefix as the file.
+#[tokio::test]
+async fn read_file_refuses_a_prefix_when_the_guest_ceiling_cuts_a_whole_file_read_short() {
+    // The agent runs in this process and reads its ceiling per request. The
+    // variable is process-global, which nextest's one-process-per-test keeps
+    // from leaking into other tests.
+    unsafe { std::env::set_var("HUSKER_AGENT_MAX_READ_BYTES", "65536") };
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("HUSKER_AGENT_MAX_READ_BYTES") };
+        }
+    }
+    let _unset = Unset;
+    let f = Fixture::new().await;
+    let path = f._temp.path().join("medium.bin");
+    let content: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+
+    let (status, body) = f
+        .request("POST", "/v1/vms/dev/files/read", json!({ "path": path }))
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["kind"], "read_file_too_large", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("65536 of 100000 bytes"),
+        "{body}"
+    );
+
+    // The same file arrives whole as two ranges.
+    let mut assembled = Vec::new();
+    for offset in [0u64, 65536] {
+        let (status, body) = f
+            .request(
+                "POST",
+                "/v1/vms/dev/files/read",
+                json!({ "path": path, "offset": offset, "len": 65536 }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_size"], 100_000, "{body}");
+        assembled
+            .extend(husker_agent_proto::base64_decode(body["data"].as_str().unwrap()).unwrap());
+    }
+    assert_eq!(assembled, content);
+}
