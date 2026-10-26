@@ -560,9 +560,20 @@ pub(crate) async fn fetch_daemon_profiles(
     ))
 }
 
+/// A request bound for Firecracker is checked against the local binary before
+/// it is sent. A request naming another backend, or one the daemon will reject
+/// as unknown, skips the check so the daemon's own error is the one the user
+/// sees.
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 fn needs_firecracker_preflight(body: &husker_core::CreateVmRequest) -> bool {
-    body.cloud_image.is_none() && body.macos_image.is_none() && body.vmm.as_deref() != Some("qemu")
+    let firecracker_bound = match body.vmm.as_deref() {
+        None => true,
+        Some(vmm) => matches!(
+            vmm.parse::<husker_vmm::VmmKind>(),
+            Ok(husker_vmm::VmmKind::Firecracker)
+        ),
+    };
+    body.cloud_image.is_none() && body.macos_image.is_none() && firecracker_bound
 }
 
 #[cfg(not(all(target_os = "linux", feature = "linux-net")))]
@@ -588,6 +599,18 @@ mod tests {
 
         request.vmm = Some("qemu".into());
         assert!(!needs_firecracker_preflight(&request));
+
+        request.vmm = Some("kvm".into());
+        assert!(
+            !needs_firecracker_preflight(&request),
+            "an alias the daemon accepts routes the same way as its canonical name"
+        );
+
+        request.vmm = Some("xen".into());
+        assert!(
+            !needs_firecracker_preflight(&request),
+            "an unknown backend is the daemon's error to report, not a missing Firecracker"
+        );
 
         request.vmm = None;
         request.cloud_image = Some("/img.qcow2".into());

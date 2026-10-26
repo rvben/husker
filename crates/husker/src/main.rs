@@ -4164,7 +4164,7 @@ fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
             report.push("host_interface", "fail", uplink.warnings.join("; "));
         }
         #[cfg(target_os = "linux")]
-        if config.vmm == VmmSelection::Qemu {
+        if config.vmm == husker_vmm::VmmKind::Qemu {
             match find_in_path(&config.qemu_bin) {
                 Some(path) => report.push("qemu_bin", "ok", path.display().to_string()),
                 None => report.push(
@@ -4289,9 +4289,9 @@ fn check_config_json(explicit_path: Option<&Path>) -> Result<()> {
             problems.push(format!("disk_size: {error}"));
         }
         if let Some(vmm) = &profile.vmm
-            && !["firecracker", "qemu"].contains(&vmm.as_str())
+            && let Err(error) = vmm.parse::<husker_vmm::VmmKind>()
         {
-            problems.push(format!("unknown vmm '{vmm}'"));
+            problems.push(format!("vmm: {error}"));
         }
         for entry in &profile.env {
             if !entry.contains('=') {
@@ -4530,7 +4530,7 @@ fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()
 
         // QEMU backend prerequisites (only when vmm = "qemu" is selected).
         #[cfg(target_os = "linux")]
-        if config.vmm == VmmSelection::Qemu {
+        if config.vmm == husker_vmm::VmmKind::Qemu {
             let qemu_env_hint = if std::env::var("HUSKER_QEMU_BIN").is_ok() {
                 " (from HUSKER_QEMU_BIN)"
             } else {
@@ -4741,9 +4741,9 @@ fn check_config(explicit_path: Option<&Path>, output: OutputFormat) -> Result<()
             problems.push(format!("disk_size: {e}"));
         }
         if let Some(ref v) = p.vmm
-            && !["firecracker", "qemu"].contains(&v.as_str())
+            && let Err(error) = v.parse::<husker_vmm::VmmKind>()
         {
-            problems.push(format!("unknown vmm '{v}'"));
+            problems.push(format!("vmm: {error}"));
         }
         for e in &p.env {
             if !e.contains('=') {
@@ -7468,16 +7468,30 @@ default_auto_resume = false
         }
     }
 
-    #[cfg(all(feature = "linux-net", target_os = "linux"))]
+    #[cfg(feature = "linux-net")]
     #[test]
-    fn vmm_selection_parses() {
-        assert_eq!(VmmSelection::from_env_str("qemu"), Some(VmmSelection::Qemu));
+    fn apply_env_overrides_parses_husker_vmm_through_the_backend_table() {
+        let _guard = env_mutex().lock().unwrap();
+        let mut config = Config::default();
+        assert_eq!(config.vmm, husker_vmm::VmmKind::Firecracker);
+        {
+            let _var = EnvVarGuard::set("HUSKER_VMM", "KVM");
+            apply_env_overrides(&mut config);
+        }
         assert_eq!(
-            VmmSelection::from_env_str("FC"),
-            Some(VmmSelection::Firecracker)
+            config.vmm,
+            husker_vmm::VmmKind::Qemu,
+            "an alias in any case selects its backend"
         );
-        assert_eq!(VmmSelection::from_env_str("xen"), None);
-        assert_eq!(VmmSelection::default(), VmmSelection::Firecracker);
+        {
+            let _var = EnvVarGuard::set("HUSKER_VMM", "xen");
+            apply_env_overrides(&mut config);
+        }
+        assert_eq!(
+            config.vmm,
+            husker_vmm::VmmKind::Qemu,
+            "an unknown backend leaves the configured one in place"
+        );
     }
 
     fn sample_profile() -> Profile {

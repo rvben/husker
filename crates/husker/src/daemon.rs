@@ -8,8 +8,6 @@ use husker_api::BearerToken;
 use husker_net::DaemonNetwork as _;
 
 use crate::config::Config;
-#[cfg(all(feature = "linux-net", target_os = "linux"))]
-use crate::config::VmmSelection;
 use crate::vm_creation::profile_to_daemon;
 
 pub(crate) fn validate_daemon_bind(
@@ -580,11 +578,7 @@ pub(crate) async fn start_daemon(
                 );
                 let qemu =
                     husker_vmm::qemu::QemuKvmBackend::new(&config.qemu_bin, &runtime_dir, cgroup);
-                let default_kind = match config.vmm {
-                    VmmSelection::Qemu => husker_vmm::VmmKind::Qemu,
-                    VmmSelection::Firecracker => husker_vmm::VmmKind::Firecracker,
-                };
-                let vmm = husker_vmm::LinuxDispatchBackend::new(firecracker, qemu, default_kind);
+                let vmm = husker_vmm::LinuxDispatchBackend::new(firecracker, qemu, config.vmm);
                 if husker::agent_embedded() {
                     tracing::info!("cloud-image support enabled (guest agent embedded)");
                 } else {
@@ -629,6 +623,11 @@ pub(crate) async fn start_daemon(
             let core = {
                 // linux-net without target_os=linux (not a real deployment target):
                 // no QEMU/vsock available, so Firecracker only.
+                anyhow::ensure!(
+                    config.vmm == husker_vmm::VmmKind::Firecracker,
+                    "vmm = \"{}\" is only available on Linux; this build runs Firecracker only",
+                    config.vmm
+                );
                 let vmm = husker_vmm::firecracker::FirecrackerBackend::new(
                     &config.firecracker_bin,
                     &runtime_dir,

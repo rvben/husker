@@ -211,7 +211,7 @@ pub(crate) enum Commands {
         add_host: Vec<String>,
 
         /// Backend to run this VM on
-        #[arg(long, value_parser = ["firecracker", "qemu"])]
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(husker_vmm::VmmKind::ALL.map(husker_vmm::VmmKind::as_str)))]
         vmm: Option<String>,
 
         /// Boot a cloud image: a catalog image name or a qcow2/img path. Uses QEMU/OVMF on
@@ -451,7 +451,7 @@ pub(crate) enum Commands {
         add_host: Vec<String>,
 
         /// Backend to run this VM on
-        #[arg(long, value_parser = ["firecracker", "qemu"])]
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(husker_vmm::VmmKind::ALL.map(husker_vmm::VmmKind::as_str)))]
         vmm: Option<String>,
 
         /// Boot a cloud image: a catalog image name or a qcow2/img path. Uses QEMU/OVMF on

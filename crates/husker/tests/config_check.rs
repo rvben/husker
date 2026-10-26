@@ -328,3 +328,37 @@ fn config_check_fails_when_the_data_dir_path_is_a_file() {
         "{check}"
     );
 }
+
+/// A profile's `vmm` is checked against the same backend table the daemon
+/// parses with, so an alias the daemon accepts passes and an unknown name
+/// fails naming every backend that would have been accepted.
+#[test]
+fn config_check_validates_a_profile_vmm_against_the_backend_table() {
+    let (_dir, config) = valid_config_fixture();
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str("\n[profiles.alias]\nvmm = \"kvm\"\n\n[profiles.unknown]\nvmm = \"xen\"\n");
+    fs::write(&config, contents).unwrap();
+    let output = Command::cargo_bin("husker")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "json",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    let checks = report["checks"].as_array().unwrap();
+    let find = |name: &str| checks.iter().find(|check| check["name"] == name).unwrap();
+    assert_eq!(find("profile.alias")["status"], "ok", "{report}");
+    let unknown = find("profile.unknown");
+    assert_eq!(unknown["status"], "fail", "{report}");
+    let message = unknown["message"].as_str().unwrap();
+    assert!(message.contains("unknown vmm 'xen'"), "{message}");
+    assert!(message.contains("firecracker, qemu"), "{message}");
+}

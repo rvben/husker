@@ -145,11 +145,44 @@ impl CreatedVm {
 
 /// Which VMM backend runs a VM. The canonical backend identity used by the
 /// per-VM dispatcher; the wire/persistence layer carries its lowercase string form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// This enum is the single table of selectable backends: the CLI's `--vmm`
+/// values, the `vmm` config key, `HUSKER_VMM`, profile validation and the
+/// API all derive their accepted names and their error text from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VmmKind {
+    #[default]
     Firecracker,
     Qemu,
+}
+
+impl VmmKind {
+    /// Every selectable backend, in the order user-facing lists show them.
+    pub const ALL: [Self; 2] = [Self::Firecracker, Self::Qemu];
+
+    /// The canonical lowercase name: what the CLI offers, the config file
+    /// takes and the persistence layer stores.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Firecracker => "firecracker",
+            Self::Qemu => "qemu",
+        }
+    }
+
+    /// Alternative spellings accepted wherever a backend is parsed from
+    /// free text (the API, `HUSKER_VMM`, a profile).
+    const fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Firecracker => &["fc"],
+            Self::Qemu => &["kvm"],
+        }
+    }
+
+    /// The canonical names joined for an error message or a hint.
+    pub fn names() -> String {
+        Self::ALL.map(Self::as_str).join(", ")
+    }
 }
 
 /// Inputs that affect backend routing before host resources are allocated.
@@ -230,21 +263,20 @@ impl BackendSelection {
 
 impl std::fmt::Display for VmmKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            VmmKind::Firecracker => "firecracker",
-            VmmKind::Qemu => "qemu",
-        })
+        f.write_str(self.as_str())
     }
 }
 
 impl std::str::FromStr for VmmKind {
     type Err = VmmError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "firecracker" | "fc" => Ok(VmmKind::Firecracker),
-            "qemu" | "kvm" => Ok(VmmKind::Qemu),
-            other => Err(VmmError::InvalidConfig(format!("unknown vmm '{other}'"))),
-        }
+        let wanted = s.to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == wanted || kind.aliases().contains(&wanted.as_str()))
+            .ok_or_else(|| {
+                VmmError::InvalidConfig(format!("unknown vmm '{s}' (valid: {})", Self::names()))
+            })
     }
 }
 
@@ -743,15 +775,36 @@ mod tests {
     }
 
     #[test]
-    fn vmm_kind_parse_and_display() {
-        use std::str::FromStr;
-        assert_eq!(VmmKind::from_str("qemu").unwrap(), VmmKind::Qemu);
-        assert_eq!(
-            VmmKind::from_str("FireCracker").unwrap(),
-            VmmKind::Firecracker
-        );
-        assert!(VmmKind::from_str("xen").is_err());
-        assert_eq!(VmmKind::Qemu.to_string(), "qemu");
+    fn every_vmm_kind_round_trips_through_its_canonical_name_and_its_aliases() {
+        for kind in VmmKind::ALL {
+            assert_eq!(kind.to_string(), kind.as_str());
+            assert_eq!(kind.as_str().parse::<VmmKind>().unwrap(), kind);
+            assert_eq!(
+                kind.as_str()
+                    .to_ascii_uppercase()
+                    .parse::<VmmKind>()
+                    .unwrap(),
+                kind,
+                "parsing is case-insensitive"
+            );
+            for alias in kind.aliases() {
+                assert_eq!(alias.parse::<VmmKind>().unwrap(), kind, "alias {alias}");
+            }
+        }
+        assert_eq!("fc".parse::<VmmKind>().unwrap(), VmmKind::Firecracker);
+        assert_eq!("kvm".parse::<VmmKind>().unwrap(), VmmKind::Qemu);
+        assert_eq!(VmmKind::default(), VmmKind::Firecracker);
+    }
+
+    #[test]
+    fn vmm_kind_names_and_the_parse_error_list_every_backend_once() {
+        let names = VmmKind::names();
+        for kind in VmmKind::ALL {
+            assert_eq!(names.matches(kind.as_str()).count(), 1, "{names}");
+        }
+        let error = "xen".parse::<VmmKind>().unwrap_err().to_string();
+        assert!(error.contains("'xen'"), "{error}");
+        assert!(error.contains(&names), "{error}");
     }
 
     #[test]

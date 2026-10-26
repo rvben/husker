@@ -15,7 +15,7 @@ pub(crate) struct Config {
     pub(crate) firecracker_bin: PathBuf,
     #[cfg(feature = "linux-net")]
     #[serde(default)]
-    pub(crate) vmm: VmmSelection,
+    pub(crate) vmm: husker_vmm::VmmKind,
     #[cfg(all(feature = "linux-net", target_os = "linux"))]
     #[serde(default = "default_qemu_bin")]
     pub(crate) qemu_bin: PathBuf,
@@ -262,28 +262,6 @@ fn default_firecracker_bin() -> PathBuf {
     PathBuf::from("firecracker")
 }
 
-#[cfg(feature = "linux-net")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum VmmSelection {
-    #[default]
-    Firecracker,
-    #[cfg(target_os = "linux")]
-    Qemu,
-}
-
-#[cfg(feature = "linux-net")]
-impl VmmSelection {
-    pub(crate) fn from_env_str(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "firecracker" | "fc" => Some(Self::Firecracker),
-            #[cfg(target_os = "linux")]
-            "qemu" | "kvm" => Some(Self::Qemu),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(all(feature = "linux-net", target_os = "linux"))]
 fn default_qemu_bin() -> PathBuf {
     PathBuf::from("qemu-system-x86_64")
@@ -375,7 +353,7 @@ impl Default for Config {
             #[cfg(feature = "linux-net")]
             firecracker_bin: default_firecracker_bin(),
             #[cfg(feature = "linux-net")]
-            vmm: VmmSelection::default(),
+            vmm: husker_vmm::VmmKind::default(),
             #[cfg(all(feature = "linux-net", target_os = "linux"))]
             qemu_bin: default_qemu_bin(),
             #[cfg(all(feature = "linux-net", target_os = "linux"))]
@@ -688,11 +666,12 @@ pub(crate) fn apply_env_overrides(config: &mut Config) {
             config.ovmf_vars = PathBuf::from(val);
         }
         if let Ok(val) = std::env::var("HUSKER_VMM") {
-            match VmmSelection::from_env_str(&val) {
-                Some(sel) => config.vmm = sel,
-                None => tracing::warn!(
+            match val.parse::<husker_vmm::VmmKind>() {
+                Ok(kind) => config.vmm = kind,
+                Err(error) => tracing::warn!(
                     value = %val,
-                    "HUSKER_VMM: unrecognised or unsupported backend on this platform, ignoring (valid: firecracker, qemu)"
+                    "HUSKER_VMM: {error}; keeping {}",
+                    config.vmm
                 ),
             }
         }
