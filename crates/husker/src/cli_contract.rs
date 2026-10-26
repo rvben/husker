@@ -391,7 +391,9 @@ impl CliErrorKind {
     pub(crate) const fn exit_code(self) -> i32 {
         match self {
             Self::NotFound | Self::InvalidUsage => exit_code::NOT_FOUND,
-            Self::Conflict => exit_code::CONFLICT,
+            // A VM in the wrong state for a command is a conflict: the daemon
+            // answers 409 for it, so a refusal the CLI makes itself exits alike.
+            Self::Conflict | Self::VmNotRunning => exit_code::CONFLICT,
             Self::PermissionDenied => exit_code::DENIED,
             Self::DaemonUnreachable => exit_code::DAEMON_UNREACHABLE,
             // Both confirmation outcomes leave the system unchanged, so a
@@ -400,11 +402,9 @@ impl CliErrorKind {
             Self::ConfirmationRequired | Self::ConfirmationDeclined => {
                 exit_code::CONFIRMATION_REQUIRED
             }
-            Self::Error
-            | Self::OutMatchedNothing
-            | Self::JobCleanupFailed
-            | Self::VmNotRunning
-            | Self::Timeout => exit_code::GENERAL,
+            Self::Error | Self::OutMatchedNothing | Self::JobCleanupFailed | Self::Timeout => {
+                exit_code::GENERAL
+            }
         }
     }
 
@@ -531,6 +531,19 @@ mod tests {
         assert_eq!(
             CliErrorKind::from_exit_code(exit_code::GENERAL),
             CliErrorKind::Error
+        );
+    }
+
+    #[test]
+    fn a_vm_in_the_wrong_state_exits_as_a_conflict() {
+        let not_running = CliErrorKind::VmNotRunning;
+        assert_eq!(not_running.exit_code(), exit_code::CONFLICT);
+        assert_eq!(not_running.exit_code(), CliErrorKind::Conflict.exit_code());
+        // The exit code says the VM's state refused the command; only the
+        // kind says that the state was "not running".
+        assert_eq!(
+            CliErrorKind::from_exit_code(not_running.exit_code()),
+            CliErrorKind::Conflict
         );
     }
 
