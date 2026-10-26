@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use husker_core::{
     BootKind, CommitVmImageRequest, CoreError, CreateHostGroupRequest, CreateSecretRequest,
-    CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, ExportImageRequest, HuskerCore,
-    ImageKind, ImageRecord, ImportImageRequest, NetworkMode, RestoreSnapshotRequest,
+    CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, DrainReport, ExportImageRequest,
+    HuskerCore, ImageKind, ImageRecord, ImportImageRequest, NetworkMode, RestoreSnapshotRequest,
     RotateSecretRequest, UserdataStatus,
 };
 #[cfg(feature = "linux-net")]
@@ -30,9 +30,21 @@ fn userdata_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// How the mock answers `stop_vm` for one VM. Absent means a normal stop.
+#[derive(Clone)]
+enum StopBehavior {
+    /// Return an error without touching the VM.
+    Fail,
+    /// Never return, like a backend whose process wait wedges.
+    Hang,
+    /// Wait for every other participant on the barrier before stopping, so
+    /// the stop only completes when the drain runs the stops concurrently.
+    Rendezvous(Arc<tokio::sync::Barrier>),
+}
+
 struct MockInner {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
-    stop_failures: Mutex<HashSet<Uuid>>,
+    stop_behaviors: Mutex<HashMap<Uuid, StopBehavior>>,
     stop_calls: Mutex<Vec<Uuid>>,
     create_gate: Mutex<Option<Arc<CreateGate>>>,
     #[cfg(not(feature = "linux-net"))]
@@ -74,7 +86,7 @@ impl MockVmm {
         Self {
             inner: Arc::new(MockInner {
                 vms: Mutex::new(HashMap::new()),
-                stop_failures: Mutex::new(HashSet::new()),
+                stop_behaviors: Mutex::new(HashMap::new()),
                 stop_calls: Mutex::new(Vec::new()),
                 create_gate: Mutex::new(None),
                 #[cfg(not(feature = "linux-net"))]
@@ -101,12 +113,16 @@ impl MockVmm {
         self.inner.vms.lock().await.insert(info.id, info);
     }
 
+    async fn set_stop_behavior(&self, id: Uuid, behavior: StopBehavior) {
+        self.inner.stop_behaviors.lock().await.insert(id, behavior);
+    }
+
     async fn mark_stop_failure(&self, id: Uuid) {
-        self.inner.stop_failures.lock().await.insert(id);
+        self.set_stop_behavior(id, StopBehavior::Fail).await;
     }
 
     async fn clear_stop_failure(&self, id: Uuid) {
-        self.inner.stop_failures.lock().await.remove(&id);
+        self.inner.stop_behaviors.lock().await.remove(&id);
     }
 
     async fn stop_call_count(&self) -> usize {
@@ -174,8 +190,16 @@ impl VmmBackend for MockVmm {
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
         self.inner.stop_calls.lock().await.push(id);
-        if self.inner.stop_failures.lock().await.contains(&id) {
-            return Err(VmmError::ProcessError("injected stop failure".into()));
+        let behavior = self.inner.stop_behaviors.lock().await.get(&id).cloned();
+        match behavior {
+            Some(StopBehavior::Fail) => {
+                return Err(VmmError::ProcessError("injected stop failure".into()));
+            }
+            Some(StopBehavior::Hang) => std::future::pending::<()>().await,
+            Some(StopBehavior::Rendezvous(barrier)) => {
+                barrier.wait().await;
+            }
+            None => {}
         }
         let mut vms = self.inner.vms.lock().await;
         match vms.get_mut(&id) {
@@ -467,7 +491,13 @@ async fn drain_vms_stops_running_and_paused() {
 
     let core = build_core(mock.clone(), state, &data_dir, &runtime_dir);
     let drained = core.drain_vms().await;
-    assert_eq!(drained, 2);
+    assert_eq!(
+        drained,
+        DrainReport {
+            stopped: 2,
+            unclean: 0
+        }
+    );
     assert_eq!(mock.stop_call_count().await, 2);
     let running = core.get_vm("running-vm").unwrap();
     assert_eq!(running.state, "stopped");
@@ -509,7 +539,13 @@ async fn drain_vms_continues_when_stop_fails() {
 
     let core = build_core(mock.clone(), state, &data_dir, &runtime_dir);
     let drained = core.drain_vms().await;
-    assert_eq!(drained, 1);
+    assert_eq!(
+        drained,
+        DrainReport {
+            stopped: 1,
+            unclean: 1
+        }
+    );
     assert_eq!(mock.stop_call_count().await, 1);
     assert_eq!(core.get_vm("vm-fail").unwrap().state, "stopped");
 }
@@ -537,7 +573,112 @@ async fn drain_vms_returns_zero_when_no_vm_needs_drain() {
         .unwrap();
 
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
-    assert_eq!(core.drain_vms().await, 0);
+    assert_eq!(core.drain_vms().await, DrainReport::default());
+}
+
+/// Two live VMs whose stops only complete once both are in flight: a serial
+/// drain parks on the first barrier forever, a concurrent drain finishes.
+#[tokio::test]
+async fn drain_vms_stops_live_vms_concurrently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut ids = Vec::new();
+    for (ordinal, name) in ["first-vm", "second-vm"].into_iter().enumerate() {
+        let id = Uuid::new_v4();
+        state
+            .insert_vm(&vm_record(
+                id, name, "running", None, None, None, None, None,
+            ))
+            .unwrap();
+        mock.upsert_vm(VmInfo {
+            id,
+            name: name.into(),
+            state: VmState::Running,
+            pid: Some(20 + ordinal as u32),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 20 + ordinal as u32,
+        })
+        .await;
+        mock.set_stop_behavior(id, StopBehavior::Rendezvous(Arc::clone(&barrier)))
+            .await;
+        ids.push(id);
+    }
+
+    let core = build_core(mock.clone(), state, &data_dir, &runtime_dir);
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), core.drain_vms())
+        .await
+        .expect("a drain that stops VMs one after another never passes the rendezvous");
+    assert_eq!(
+        drained,
+        DrainReport {
+            stopped: 2,
+            unclean: 0
+        }
+    );
+    assert_eq!(mock.stop_call_count().await, 2);
+    for name in ["first-vm", "second-vm"] {
+        assert_eq!(core.get_vm(name).unwrap().state, "stopped");
+    }
+}
+
+/// A backend stop that never returns must not hold the drain: the VM is
+/// counted unclean, its state is still reconciled, and the drain completes
+/// within the per-VM stop timeout.
+#[tokio::test(start_paused = true)]
+async fn drain_vms_bounds_a_stop_that_never_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let mock = MockVmm::new();
+    let vm_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            vm_id, "vm-hang", "running", None, None, None, None, None,
+        ))
+        .unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: "vm-hang".into(),
+        state: VmState::Running,
+        pid: Some(5),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 11,
+    })
+    .await;
+    mock.set_stop_behavior(vm_id, StopBehavior::Hang).await;
+
+    let core = build_core(mock.clone(), state, &data_dir, &runtime_dir);
+    let started = tokio::time::Instant::now();
+    let bound = husker_core::DRAIN_STOP_TIMEOUT + std::time::Duration::from_secs(60);
+    let drained = tokio::time::timeout(bound, core.drain_vms())
+        .await
+        .expect("the drain must give up on a stop that never returns");
+    assert_eq!(
+        drained,
+        DrainReport {
+            stopped: 1,
+            unclean: 1
+        }
+    );
+    assert!(
+        started.elapsed() >= husker_core::DRAIN_STOP_TIMEOUT,
+        "the drain must give the stop its full timeout before giving up"
+    );
+    assert_eq!(mock.stop_call_count().await, 1);
+    assert_eq!(core.get_vm("vm-hang").unwrap().state, "stopped");
 }
 
 #[tokio::test]
@@ -1336,7 +1477,7 @@ async fn shutdown_drain_cancels_userdata_and_refuses_late_jobs() {
         "the atomic pending-to-running claim must reject duplicate execution"
     );
 
-    assert_eq!(core.drain_vms().await, 1);
+    assert_eq!(core.drain_vms().await.stopped, 1);
     let vm = core.get_vm("vm-drain-userdata").unwrap();
     assert_eq!(vm.state, VmLifecycleState::Stopped);
     assert_eq!(vm.userdata_status, Some(UserdataStatus::Interrupted));

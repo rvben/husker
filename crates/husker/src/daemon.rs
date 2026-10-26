@@ -1358,17 +1358,33 @@ fn spawn_log_rotation<B: husker_vmm::VmmBackend + 'static>(
     })
 }
 
-/// Drain all running/paused VMs with a 30-second timeout.
+/// Outer bound on the whole shutdown drain. The core stops every live VM
+/// concurrently under its own per-VM timeout, so this only has to cover that
+/// timeout plus the state bookkeeping around it.
+const DRAIN_DEADLINE: std::time::Duration =
+    husker_core::DRAIN_STOP_TIMEOUT.saturating_add(std::time::Duration::from_secs(15));
+
+/// Drain all running/paused VMs before the daemon exits.
 async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(core: &husker_core::HuskerCore<B>) {
     tracing::info!("shutting down, draining VMs");
-    match tokio::time::timeout(std::time::Duration::from_secs(30), core.drain_vms()).await {
-        Ok(count) => {
-            if count > 0 {
-                tracing::info!(count, "drained VMs on shutdown");
+    match tokio::time::timeout(DRAIN_DEADLINE, core.drain_vms()).await {
+        Ok(report) if report.unclean > 0 => {
+            tracing::warn!(
+                stopped = report.stopped,
+                unclean = report.unclean,
+                "drained VMs on shutdown; some stops failed or timed out"
+            );
+        }
+        Ok(report) => {
+            if report.stopped > 0 {
+                tracing::info!(count = report.stopped, "drained VMs on shutdown");
             }
         }
         Err(_) => {
-            tracing::warn!("VM drain timed out after 30s");
+            tracing::warn!(
+                deadline_secs = DRAIN_DEADLINE.as_secs(),
+                "VM drain did not finish within the shutdown deadline"
+            );
         }
     }
 }
