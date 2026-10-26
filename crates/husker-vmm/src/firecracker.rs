@@ -1110,6 +1110,40 @@ mod tests {
         )
     }
 
+    /// A daemon running one backend answers every selection with that backend
+    /// and refuses a request for another one instead of substituting its own.
+    #[test]
+    fn a_single_backend_grants_only_a_request_for_itself() {
+        use crate::{BackendKind, BackendRequirements, BootKind, VmmBackend, VmmKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend(dir.path().join("firecracker"), dir.path());
+        let requirements = |requested| BackendRequirements {
+            requested,
+            boot: BootKind::DirectKernel,
+            has_host_shares: false,
+        };
+
+        let unrequested = backend.select_backend(requirements(None)).unwrap();
+        assert_eq!(unrequested.backend(), BackendKind::Firecracker);
+        let own = backend
+            .select_backend(requirements(Some(VmmKind::Firecracker)))
+            .unwrap();
+        assert_eq!(own.backend(), BackendKind::Firecracker);
+        assert_eq!(own.requirements().requested, Some(VmmKind::Firecracker));
+
+        let error = backend
+            .select_backend(requirements(Some(VmmKind::Qemu)))
+            .unwrap_err();
+        let VmmError::InvalidConfig(message) = error else {
+            panic!("expected InvalidConfig, got {error:?}");
+        };
+        assert!(
+            message.contains("\"qemu\"") && message.contains("firecracker only"),
+            "message must name the request and the running backend: {message}"
+        );
+    }
+
     #[test]
     fn recover_aliased_rootfs_restores_real_disk_over_stale_symlink() {
         // Simulate a fork that crashed mid-load: source is a stale symlink to a

@@ -545,17 +545,24 @@ pub trait VmmBackend: Send + Sync {
     /// The returned token is passed unchanged to [`Self::create_vm`], binding
     /// pre-allocation capability checks, execution routing, and persisted
     /// backend identity to one decision. Single-backend implementations derive
-    /// their answer from [`Self::backend_kind`].
+    /// their answer from [`Self::backend_kind`] and refuse a request for any
+    /// other backend, so a `--vmm` choice is never silently replaced.
     fn select_backend(
         &self,
         requirements: BackendRequirements,
     ) -> Result<BackendSelection, VmmError> {
-        Ok(BackendSelection::new(
-            requirements,
-            self.backend_kind()
-                .parse()
-                .map_err(|error: InvalidBackendKind| VmmError::InvalidConfig(error.to_string()))?,
-        ))
+        let backend: BackendKind = self
+            .backend_kind()
+            .parse()
+            .map_err(|error: InvalidBackendKind| VmmError::InvalidConfig(error.to_string()))?;
+        if let Some(requested) = requirements.requested
+            && BackendKind::from(requested) != backend
+        {
+            return Err(VmmError::InvalidConfig(format!(
+                "vmm \"{requested}\" was requested, but this daemon runs {backend} only"
+            )));
+        }
+        Ok(BackendSelection::new(requirements, backend))
     }
 
     /// Select a backend from an already-complete configuration.

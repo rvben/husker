@@ -738,10 +738,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             ));
         }
 
+        // This build runs a single backend, so the only thing a request for one
+        // can do is fail. It still goes to the backend, which decides whether it
+        // is the one running; dropping it here would turn `--vmm qemu` into a
+        // VM on whatever this daemon happens to run.
+        let requested_vmm_kind = req
+            .vmm
+            .as_deref()
+            .map(str::parse::<husker_vmm::VmmKind>)
+            .transpose()
+            .map_err(backend_selection_error)?;
         let backend_selection = self
             .vmm
             .select_backend(husker_vmm::BackendRequirements {
-                requested: None,
+                requested: requested_vmm_kind,
                 boot: if req.macos_image.is_some() {
                     husker_vmm::BootKind::MacOs
                 } else if req.cloud_image.is_some() {
@@ -896,7 +906,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 vsock_cid: cid,
                 tap_device: None,
                 guest_mac: None,
-                vmm: None,
+                vmm: requested_vmm_kind,
                 boot,
                 seed_path: Some(seed_path),
                 balloon: req.balloon,
@@ -1018,7 +1028,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vsock_cid: cid,
             tap_device: None,
             guest_mac: None,
-            vmm: None,
+            vmm: requested_vmm_kind,
             boot: husker_vmm::BootMode::DirectKernel,
             seed_path: None,
             balloon: req.balloon,

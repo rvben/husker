@@ -172,7 +172,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             vsock_cid: cid,
             tap_device: None,
             guest_mac: None,
-            vmm: None,
+            vmm: backend_selection.requirements().requested,
             boot,
             seed_path: None,
             balloon: req.balloon,

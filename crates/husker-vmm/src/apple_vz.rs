@@ -893,6 +893,36 @@ mod tests {
         });
     }
 
+    /// No `--vmm` name maps to Apple VZ, so every explicit backend request is
+    /// refused here rather than answered with an Apple VZ VM.
+    #[test]
+    fn every_vmm_request_is_refused_by_the_apple_backend() {
+        use crate::{BackendKind, BackendRequirements, BootKind, VmmKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = AppleVzBackend::new(dir.path());
+        let requirements = |requested| BackendRequirements {
+            requested,
+            boot: BootKind::DirectKernel,
+            has_host_shares: false,
+        };
+
+        let unrequested = backend.select_backend(requirements(None)).unwrap();
+        assert_eq!(unrequested.backend(), BackendKind::AppleVz);
+        for requested in VmmKind::ALL {
+            let error = backend
+                .select_backend(requirements(Some(requested)))
+                .unwrap_err();
+            let VmmError::InvalidConfig(message) = error else {
+                panic!("expected InvalidConfig for {requested}, got {error:?}");
+            };
+            assert!(
+                message.contains(&format!("\"{requested}\"")) && message.contains("apple_vz only"),
+                "message must name the request and the running backend: {message}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn vm_not_found_errors() {
         let dir = tempfile::tempdir().unwrap();

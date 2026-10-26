@@ -3205,6 +3205,67 @@ async fn cloud_image_rejected_on_non_qemu_platform() {
     assert!(matches!(err, CoreError::InvalidArgument(_)), "got {err:?}");
 }
 
+/// The host-networking-free create path runs one backend, but a `--vmm`
+/// request still reaches that backend's selection instead of being dropped.
+/// The mock grants whatever is requested, so the forwarded request shows up
+/// as the persisted backend and in the configuration the backend received;
+/// the real single-backend refusal is tested against the backends themselves.
+/// A name outside the backend table fails before anything is allocated.
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn create_vm_forwards_a_vmm_request_to_the_single_backend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let kernel = tmp.path().join("vmlinux");
+    let mut kernel_bytes = vec![0u8; 64];
+    kernel_bytes[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+    std::fs::write(&kernel, kernel_bytes).unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"rootfs").unwrap();
+
+    let mock = MockVmm::new().with_selection_backend(BackendKind::AppleVz);
+    let core = build_core(
+        mock.clone(),
+        StateStore::open_memory().unwrap(),
+        &data_dir,
+        &runtime_dir,
+    );
+    let request = |name: &str, vmm: &str| CreateVmRequest {
+        name: name.into(),
+        kernel_path: Some(kernel.clone()),
+        rootfs_path: Some(rootfs.clone()),
+        vcpu_count: Some(1),
+        mem_size_mib: Some(128),
+        vmm: Some(vmm.into()),
+        ..Default::default()
+    };
+
+    let err = core.create_vm(request("unknown", "xen")).await.unwrap_err();
+    let CoreError::InvalidArgument(message) = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert!(message.contains("unknown vmm 'xen'"), "{message}");
+    assert!(
+        mock.inner.vms.lock().await.is_empty() && core.list_vms().unwrap().is_empty(),
+        "an unknown backend name must not allocate or persist anything"
+    );
+
+    let created = core.create_vm(request("forwarded", "kvm")).await.unwrap();
+    assert_eq!(
+        created.vmm,
+        BackendKind::Qemu,
+        "the persisted backend must be the backend's answer to the request, not the daemon default"
+    );
+    assert_eq!(
+        mock.last_config().await.unwrap().vmm,
+        Some(husker_vmm::VmmKind::Qemu),
+        "the backend must receive the request it was selected for"
+    );
+}
+
 #[tokio::test]
 async fn create_vm_persists_the_selected_backend() {
     let tmp = tempfile::tempdir().unwrap();
