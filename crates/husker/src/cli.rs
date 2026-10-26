@@ -244,7 +244,7 @@ pub(crate) enum Commands {
         profile: Option<String>,
     },
 
-    /// List running VMs
+    /// List VMs in creation order, one page at a time
     #[command(alias = "ls")]
     List {
         /// Maximum number of VMs to return

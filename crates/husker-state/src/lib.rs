@@ -1271,7 +1271,7 @@ impl StateStore {
                     service_id, service_ordinal, vmm, boot_mode, balloon, volume,
                     network, last_activity_at, suspended_at, idle_timeout_secs,
                     suspend_ttl_secs, auto_resume, forked_from, egress_policy
-             FROM vms ORDER BY created_at",
+             FROM vms ORDER BY created_at, rowid",
         )?;
 
         let records = stmt

@@ -1188,46 +1188,49 @@ async fn vm_response_json_structure() {
 
 // ── List with Pre-populated State ────────────────────────────────────
 
+/// A running VM named `vm-{i}` created at `created_at`, for the list tests.
+fn fleet_record(i: u32, created_at: chrono::DateTime<chrono::Utc>) -> husker_state::VmRecord {
+    husker_state::VmRecord {
+        id: uuid::Uuid::new_v4(),
+        name: format!("vm-{i}"),
+        state: VmLifecycleState::Running,
+        pid: Some(1000 + i),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 3 + i,
+        tap_device: None,
+        host_ip: None,
+        guest_ip: None,
+        kernel_path: "/boot/vmlinux".into(),
+        rootfs_path: "/images/rootfs.ext4".into(),
+        created_at,
+        updated_at: created_at,
+        userdata: None,
+        userdata_status: None,
+        userdata_env: None,
+        service_id: None,
+        service_ordinal: None,
+        vmm: BackendKind::Firecracker,
+        boot_mode: BootKind::DirectKernel,
+        balloon: false,
+        volume: None,
+        network: NetworkMode::Nat,
+        last_activity_at: created_at,
+        suspended_at: None,
+        idle_timeout_secs: None,
+        suspend_ttl_secs: None,
+        auto_resume: true,
+        forked_from: None,
+        egress_policy: None,
+    }
+}
+
 #[tokio::test]
 async fn list_vms_returns_all_records() {
     let state = husker_state::StateStore::open_memory().unwrap();
     let now = chrono::Utc::now();
-
     for i in 0..3 {
-        let record = husker_state::VmRecord {
-            id: uuid::Uuid::new_v4(),
-            name: format!("vm-{i}"),
-            state: VmLifecycleState::Running,
-            pid: Some(1000 + i),
-            vcpu_count: 1,
-            mem_size_mib: 128,
-            vsock_cid: 3 + i,
-            tap_device: None,
-            host_ip: None,
-            guest_ip: None,
-            kernel_path: "/boot/vmlinux".into(),
-            rootfs_path: "/images/rootfs.ext4".into(),
-            created_at: now,
-            updated_at: now,
-            userdata: None,
-            userdata_status: None,
-            userdata_env: None,
-            service_id: None,
-            service_ordinal: None,
-            vmm: BackendKind::Firecracker,
-            boot_mode: BootKind::DirectKernel,
-            balloon: false,
-            volume: None,
-            network: NetworkMode::Nat,
-            last_activity_at: now,
-            suspended_at: None,
-            idle_timeout_secs: None,
-            suspend_ttl_secs: None,
-            auto_resume: true,
-            forked_from: None,
-            egress_policy: None,
-        };
-        state.insert_vm(&record).unwrap();
+        state.insert_vm(&fleet_record(i, now)).unwrap();
     }
 
     let storage = husker_storage::StorageConfig {
@@ -1243,6 +1246,7 @@ async fn list_vms_returns_all_records() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-total-count"], "3");
     let json = response_json(response).await;
     let arr = json.as_array().unwrap();
     assert_eq!(arr.len(), 3);
@@ -1252,6 +1256,66 @@ async fn list_vms_returns_all_records() {
     assert!(names.contains(&"vm-0"));
     assert!(names.contains(&"vm-1"));
     assert!(names.contains(&"vm-2"));
+}
+
+#[tokio::test]
+async fn list_vms_pages_in_creation_order_and_reports_the_fleet_size() {
+    let state = husker_state::StateStore::open_memory().unwrap();
+    let now = chrono::Utc::now();
+    for i in 0..3 {
+        let created_at = now + chrono::Duration::seconds(i64::from(i));
+        state.insert_vm(&fleet_record(i, created_at)).unwrap();
+    }
+
+    let storage = husker_storage::StorageConfig {
+        data_dir: PathBuf::from("/tmp/husker-test"),
+        state_dir: PathBuf::from("/tmp/husker-test"),
+    };
+    let core = make_core(state, storage, PathBuf::from("/tmp/husker-test/run"));
+    let app = router(core);
+
+    let page = |query: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::get(format!("/v1/vms{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            let total = response.headers()["x-total-count"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let names: Vec<String> = response_json(response)
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|vm| vm["name"].as_str().unwrap().to_string())
+                .collect();
+            (names, total)
+        }
+    };
+
+    assert_eq!(
+        page("?limit=2&offset=1").await,
+        (
+            vec!["vm-1".to_string(), "vm-2".to_string()],
+            "3".to_string()
+        )
+    );
+    assert_eq!(page("?offset=3").await, (vec![], "3".to_string()));
+    assert_eq!(page("?limit=0").await, (vec![], "3".to_string()));
+
+    let malformed = app
+        .oneshot(Request::get("/v1/vms?limit=x").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
 }
 
 // ── Exec with Missing Required Fields ────────────────────────────────

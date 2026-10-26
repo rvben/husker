@@ -1575,27 +1575,44 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.vmm.backend_kind()
     }
 
-    /// List all VMs with their state refreshed against the backend.
+    /// List one page of VMs, in creation order, with the state of each
+    /// returned VM refreshed against the backend.
     ///
-    /// Detects guest-initiated shutdowns (process exited without the daemon
-    /// observing it). Prefer this for user-facing reads; use `list_vms` for
-    /// internal callers that do not need a liveness check (e.g. the health
-    /// endpoint, which is called on a tight monitoring loop and can tolerate
-    /// VM counts lagging one reconcile interval).
+    /// The refresh detects guest-initiated shutdowns (process exited without
+    /// the daemon observing it). Prefer this for user-facing reads; use
+    /// `list_vms` for internal callers that do not need a liveness check
+    /// (e.g. the health endpoint, which is called on a tight monitoring loop
+    /// and can tolerate VM counts lagging one reconcile interval).
     ///
-    /// Note: guest-IP discovery runs serially per VM. In the worst case (N
-    /// running EFI VMs all lacking IPs, all with slow or unresponsive agents)
-    /// this adds up to N x 2 seconds of latency (two 1-second timeouts per VM).
-    pub async fn list_vms_refreshed(&self) -> Result<Vec<VmRecord>, CoreError> {
+    /// The page is cut before the refresh, so a consumer walking a large
+    /// fleet pays the liveness probes only for the VMs it receives. `total`
+    /// is the size of the whole fleet at the time of the read; an offset past
+    /// the end yields an empty page, and `limit: None` returns every VM from
+    /// `offset` on.
+    ///
+    /// Guest-IP discovery costs up to two 1-second timeouts per running EFI
+    /// VM without an IP whose agent is slow or unresponsive. Probes run at
+    /// most 16 at a time, so a page of N such VMs takes roughly N / 16 x 2
+    /// seconds in the worst case.
+    pub async fn list_vms_page(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<VmPage, CoreError> {
         use futures_util::stream::StreamExt;
         let vms = self.state.list_vms()?;
+        let total = vms.len();
+        let page = vms
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX));
         // Each VM's refresh does a backend liveness probe and (for EFI VMs) a vsock
         // round-trip that can each block up to ~1s. Running them sequentially makes
         // `list` O(N x 2s) worst-case; overlap the I/O waits with bounded, in-order
         // concurrency instead. `buffered` preserves input order and never runs more
         // than the cap at once, so a large fleet cannot fan out unbounded connects.
         const MAX_CONCURRENT_REFRESHES: usize = 16;
-        let out = futures_util::stream::iter(vms)
+        let items = futures_util::stream::iter(page)
             .map(|vm| async move {
                 let mut refreshed = self.refresh_vm_liveness(&vm).await;
                 self.discover_guest_ip(&mut refreshed).await;
@@ -1604,7 +1621,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             .buffered(MAX_CONCURRENT_REFRESHES)
             .collect::<Vec<VmRecord>>()
             .await;
-        Ok(out)
+        Ok(VmPage { items, total })
     }
 
     /// Get info about a specific VM.

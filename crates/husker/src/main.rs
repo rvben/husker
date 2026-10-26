@@ -53,6 +53,27 @@ fn resolve_format(fmt: OutputFormat) -> OutputFormat {
     }
 }
 
+/// Cut the page `husker list` prints from a daemon's `/v1/vms` response.
+///
+/// A daemon that pages returns only the requested VMs and reports the fleet
+/// size in `X-Total-Count`. An older daemon ignores `limit` and `offset` and
+/// returns every VM, so the page is cut here and the body length is the
+/// fleet size.
+fn vm_page(
+    body: Vec<serde_json::Value>,
+    fleet_size: Option<usize>,
+    offset: usize,
+    limit: usize,
+) -> (Vec<serde_json::Value>, usize) {
+    match fleet_size {
+        Some(total) => (body, total),
+        None => {
+            let total = body.len();
+            (body.into_iter().skip(offset).take(limit).collect(), total)
+        }
+    }
+}
+
 /// Commands without a finite JSON document keep text output when `auto` is
 /// redirected. This is essential for daemon/service scripts: redirecting logs
 /// must not silently turn `husker daemon` into an unsupported JSON invocation.
@@ -1012,22 +1033,19 @@ async fn run(cli: Cli) -> Result<()> {
             fields,
         } => {
             let client = target.daemon().clone();
-            let mut url = format!("/v1/vms?limit={limit}&offset={offset}");
-            if let Some(ref f) = fields {
-                url.push_str(&format!("&fields={}", f));
-            }
+            let url = format!("/v1/vms?limit={limit}&offset={offset}");
             // When the daemon is unreachable, return an empty list so agents and
             // scripts get a valid, paginatable response instead of a hard error.
             // A diagnostic message goes to stderr.
             let resp_result = client.send(client.get(&url)).await;
             let mut daemon_reachable = true;
-            let vms: Vec<serde_json::Value> = match resp_result {
+            let (vms, total): (Vec<serde_json::Value>, usize) = match resp_result {
                 Err(ref e) if e.chain().any(|c| c.is::<DaemonUnreachable>()) => {
                     eprintln!(
                         "daemon not reachable; showing empty list (start with `husker daemon`)"
                     );
                     daemon_reachable = false;
-                    vec![]
+                    (vec![], 0)
                 }
                 Err(e) => return Err(e),
                 Ok(resp) => {
@@ -1035,10 +1053,15 @@ async fn run(cli: Cli) -> Result<()> {
                         let msg = client.error(resp, "listing VMs").await;
                         exit_with_error(output, msg);
                     }
-                    resp.json().await?
+                    let fleet_size = resp
+                        .headers()
+                        .get(husker_api::X_TOTAL_COUNT)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse().ok());
+                    let body: Vec<serde_json::Value> = resp.json().await?;
+                    vm_page(body, fleet_size, offset as usize, limit as usize)
                 }
             };
-            let total = vms.len();
             let fmt = resolve_format(output);
             if fmt == OutputFormat::Json {
                 // Apply field filtering when --fields is specified.
@@ -1072,7 +1095,11 @@ async fn run(cli: Cli) -> Result<()> {
                     "",
                 );
             } else if vms.is_empty() {
-                println!("No VMs found");
+                if total == 0 {
+                    println!("No VMs found");
+                } else {
+                    println!("No VMs at offset {offset}; the fleet has {total}");
+                }
             } else {
                 println!(
                     "{:<20} {:<12} {:>4}   {:<10} {:<16}",
@@ -1086,6 +1113,13 @@ async fn run(cli: Cli) -> Result<()> {
                         vm["vcpu_count"],
                         vm["mem_size_mib"],
                         vm["guest_ip"].as_str().unwrap_or("-"),
+                    );
+                }
+                let shown = offset as usize + vms.len();
+                if shown < total {
+                    println!(
+                        "{} of {total} VMs shown; use --offset {shown} for the next page",
+                        vms.len()
                     );
                 }
             }
@@ -5043,6 +5077,28 @@ mod tests {
     use clap::Parser;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn vm_page_trusts_a_paging_daemon_and_cuts_a_whole_fleet_response() {
+        let fleet: Vec<serde_json::Value> = (0..3)
+            .map(|i| serde_json::json!({"name": format!("vm-{i}")}))
+            .collect();
+
+        // A daemon that paged already applied limit and offset; its header
+        // is the fleet size even though the body is one page.
+        let (items, total) = vm_page(fleet[1..2].to_vec(), Some(3), 1, 1);
+        assert_eq!(items, fleet[1..2].to_vec());
+        assert_eq!(total, 3);
+
+        // A daemon without the header returned the whole fleet.
+        let (items, total) = vm_page(fleet.clone(), None, 1, 1);
+        assert_eq!(items, fleet[1..2].to_vec());
+        assert_eq!(total, 3);
+
+        let (items, total) = vm_page(fleet.clone(), None, 3, 10);
+        assert!(items.is_empty());
+        assert_eq!(total, 3);
+    }
 
     #[test]
     fn env_file_parses_pairs_skips_comments_and_blanks() {

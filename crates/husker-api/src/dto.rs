@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use husker_core::{BootKind, DaemonProfile, ImageKind, UserdataStatus};
 
@@ -473,6 +473,24 @@ pub struct GuestInfoResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ProfilesResponse {
     pub profiles: HashMap<String, DaemonProfile>,
+}
+
+// ── List Types ───────────────────────────────────────────────────────
+
+/// Response header carrying the fleet size on `GET /v1/vms`, so a paged
+/// response still tells the consumer how many VMs there are in total.
+pub const X_TOTAL_COUNT: &str = "x-total-count";
+
+/// Offset pagination for `GET /v1/vms`. Both fields are optional so a request
+/// without them returns the whole fleet.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListVmsQuery {
+    /// Maximum number of VMs to return; omitted returns every VM after `offset`.
+    pub limit: Option<usize>,
+    /// Number of VMs to skip, in creation order.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 // ── Logs Types ───────────────────────────────────────────────────────

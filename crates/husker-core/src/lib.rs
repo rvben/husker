@@ -46,6 +46,14 @@ pub use husker_state::{
 };
 pub use husker_vmm::{VmInfo, VmState};
 
+/// One page of the VM list together with the size of the whole fleet, so a
+/// consumer can walk the list with offset pagination.
+#[derive(Debug)]
+pub struct VmPage {
+    pub items: Vec<VmRecord>,
+    pub total: usize,
+}
+
 pub use agent_client::{
     AgentClient, AgentConnection, AgentError, ExecResult, ExecStreamEvent, ShellEvent,
 };

@@ -629,6 +629,57 @@ async fn list_vms_returns_inserted_records() {
 }
 
 #[tokio::test]
+async fn list_vms_page_cuts_the_page_in_creation_order_and_reports_the_fleet_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    for name in ["vm-0", "vm-1", "vm-2"] {
+        state
+            .insert_vm(&vm_record(
+                Uuid::new_v4(),
+                name,
+                "stopped",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+    }
+    let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
+
+    let names = |page: husker_core::VmPage| -> (Vec<String>, usize) {
+        (
+            page.items.into_iter().map(|vm| vm.name).collect(),
+            page.total,
+        )
+    };
+    let fleet = vec!["vm-0".to_string(), "vm-1".to_string(), "vm-2".to_string()];
+
+    assert_eq!(
+        names(core.list_vms_page(0, None).await.unwrap()),
+        (fleet, 3)
+    );
+    assert_eq!(
+        names(core.list_vms_page(1, Some(1)).await.unwrap()),
+        (vec!["vm-1".to_string()], 3)
+    );
+    assert_eq!(
+        names(core.list_vms_page(3, None).await.unwrap()),
+        (vec![], 3)
+    );
+    assert_eq!(
+        names(core.list_vms_page(0, Some(0)).await.unwrap()),
+        (vec![], 3)
+    );
+}
+
+#[tokio::test]
 async fn refreshed_vm_retires_the_identity_of_a_missing_vmm() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("run");

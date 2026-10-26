@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use axum::response::IntoResponse;
 use tracing::{debug, info, warn};
 
@@ -1089,28 +1089,48 @@ pub(crate) async fn restore_snapshot<B: VmmBackend + 'static>(
     get,
     path = "/v1/vms",
     tag = "vms",
+    params(ListVmsQuery),
     responses(
-        (status = 200, description = "List of all VMs", body = Vec<VmResponse>),
+        (
+            status = 200,
+            description = "The requested page of VMs in creation order",
+            body = Vec<VmResponse>,
+            headers(
+                ("X-Total-Count" = usize, description = "Number of VMs in the fleet before paging")
+            )
+        ),
+        (status = 400, description = "Malformed limit or offset", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     )
 )]
 pub(crate) async fn list_vms<B: VmmBackend + 'static>(
     State(core): State<AppState<B>>,
-) -> Result<Json<Vec<VmResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let vms = core.list_vms_refreshed().await.map_err(map_error)?;
+    Query(query): Query<ListVmsQuery>,
+) -> Result<([(HeaderName, String); 1], Json<Vec<VmResponse>>), (StatusCode, Json<ErrorResponse>)> {
+    let page = core
+        .list_vms_page(query.offset, query.limit)
+        .await
+        .map_err(map_error)?;
     let mut expirations: HashMap<_, _> = core
         .list_vm_expirations()
         .map_err(map_error)?
         .into_iter()
         .map(|value| (value.vm_id, value))
         .collect();
-    Ok(Json(
-        vms.into_iter()
-            .map(|vm| {
-                let expiration = expirations.remove(&vm.id);
-                record_to_response(vm, expiration)
-            })
-            .collect(),
+    let items = page
+        .items
+        .into_iter()
+        .map(|vm| {
+            let expiration = expirations.remove(&vm.id);
+            record_to_response(vm, expiration)
+        })
+        .collect();
+    Ok((
+        [(
+            HeaderName::from_static(X_TOTAL_COUNT),
+            page.total.to_string(),
+        )],
+        Json(items),
     ))
 }
 
