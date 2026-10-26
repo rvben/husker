@@ -823,6 +823,56 @@ async fn create_service_with_zero_instances_succeeds() {
     assert_eq!(json["outcome"]["created"], serde_json::json!([]));
 }
 
+/// A service listing whose instance count cannot be read is an error, not a
+/// list of services with zero instances: an orchestrator comparing
+/// `current_instances` against `desired_instances` would scale up a service
+/// whose instances are all still running.
+#[tokio::test]
+async fn list_services_fails_when_the_instance_count_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("husker.db");
+    let state = husker_state::StateStore::open(&db).unwrap();
+    let storage = husker_storage::StorageConfig {
+        data_dir: dir.path().to_path_buf(),
+        state_dir: dir.path().to_path_buf(),
+    };
+    let app = router(make_core(state, storage, dir.path().join("run")));
+    let body = serde_json::json!({
+        "name": "api",
+        "desired_instances": 0,
+        "rootfs_path": "/tmp/r",
+        "kernel_path": "/tmp/k"
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Take the VM table away underneath the core's own connection, so the
+    // service row still reads while its instance count cannot.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("ALTER TABLE vms RENAME TO vms_unavailable")
+        .unwrap();
+
+    let response = app
+        .oneshot(Request::get("/v1/services").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let error = rejected(response, StatusCode::INTERNAL_SERVER_ERROR, "state_error").await;
+    assert!(
+        error["message"].as_str().is_some_and(|m| m.contains("vms")),
+        "the error must name the table that could not be read: {error}"
+    );
+}
+
 // ── GET VM Not Found ─────────────────────────────────────────────────
 
 #[tokio::test]

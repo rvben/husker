@@ -578,7 +578,8 @@ pub(crate) async fn list_services<B: VmmBackend + 'static>(
         services
             .into_iter()
             .map(|s| service_to_response(&core, s))
-            .collect::<Vec<_>>(),
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_error)?,
     ))
 }
 
@@ -602,7 +603,7 @@ pub(crate) async fn create_service<B: VmmBackend + 'static>(
     Ok((
         StatusCode::CREATED,
         Json(ServiceMutationResponse {
-            service: service_to_response(&core, service),
+            service: service_to_response(&core, service).map_err(map_error)?,
             outcome: outcome_to_response(outcome),
         }),
     ))
@@ -624,7 +625,7 @@ pub(crate) async fn get_service<B: VmmBackend + 'static>(
 ) -> Result<Json<ServiceDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
     let service = core.get_service(&name).map_err(map_error)?;
     let id = service.id;
-    let service_resp = service_to_response(&core, service);
+    let service_resp = service_to_response(&core, service).map_err(map_error)?;
     let mut instances: Vec<ServiceInstance> = core
         .list_vms_for_service(id)
         .map_err(map_error)?
@@ -687,7 +688,7 @@ pub(crate) async fn scale_service<B: VmmBackend + 'static>(
         .await
         .map_err(map_error)?;
     Ok(Json(ServiceMutationResponse {
-        service: service_to_response(&core, service),
+        service: service_to_response(&core, service).map_err(map_error)?,
         outcome: outcome_to_response(outcome),
     }))
 }
@@ -2723,19 +2724,20 @@ fn outcome_to_response(o: husker_core::ReconcileOutcome) -> ReconcileOutcomeResp
     }
 }
 
+/// Render a service with its running instance count. A count the state store
+/// cannot answer is an error, never zero: an orchestrator reading
+/// `current_instances == 0` would scale up a service whose instances are all
+/// still running.
 fn service_to_response<B: VmmBackend + 'static>(
     core: &SharedCore<B>,
     r: ServiceRecord,
-) -> ServiceResponse {
+) -> Result<ServiceResponse, CoreError> {
     let current_instances = core
-        .list_vms_for_service(r.id)
-        .map(|vs| {
-            vs.iter()
-                .filter(|v| v.state == VmLifecycleState::Running)
-                .count() as u32
-        })
-        .unwrap_or(0);
-    ServiceResponse {
+        .list_vms_for_service(r.id)?
+        .iter()
+        .filter(|v| v.state == VmLifecycleState::Running)
+        .count() as u32;
+    Ok(ServiceResponse {
         id: r.id.to_string(),
         name: r.name,
         host_group_id: r.host_group_id.map(|id| id.to_string()),
@@ -2750,7 +2752,7 @@ fn service_to_response<B: VmmBackend + 'static>(
         disk_size: r.disk_size,
         balloon: r.balloon,
         volume: r.volume,
-    }
+    })
 }
 
 fn image_to_response(r: ImageRecord) -> ImageResponse {
