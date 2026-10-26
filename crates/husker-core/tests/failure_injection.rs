@@ -1496,6 +1496,106 @@ async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
     assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.2"));
 }
 
+/// A lease names its VM directory and TAP by VM name. Creation refuses a
+/// taken name before leasing and commit replaces the lease with the record
+/// atomically, so a lease and a committed record never share a name; if they
+/// ever did, reclaiming the lease would delete the committed VM's disk and
+/// network. The conflict is constructed directly in the state store, which
+/// is the only way to reach it.
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn recovery_never_reclaims_the_resources_of_a_committed_vm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_path = tmp.path().join("state.db");
+    let state = husker_state::StateStore::open(&state_path).unwrap();
+    let lease = state.begin_host_resource_lease("committed").unwrap();
+    state
+        .set_host_resource_lease_network(lease.id, Some("husker3"), Some("172.20.0.2"))
+        .unwrap();
+    let now = chrono::Utc::now();
+    state
+        .insert_vm(&husker_state::VmRecord {
+            id: Uuid::new_v4(),
+            name: "committed".into(),
+            state: husker_state::VmLifecycleState::Running,
+            pid: Some(9999),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: lease.vsock_cid,
+            tap_device: Some("husker3".into()),
+            host_ip: Some("172.20.0.1".into()),
+            guest_ip: Some("172.20.0.2".into()),
+            kernel_path: tmp.path().join("vmlinux").to_string_lossy().into_owned(),
+            rootfs_path: tmp
+                .path()
+                .join("vms/committed/rootfs.ext4")
+                .to_string_lossy()
+                .into_owned(),
+            created_at: now,
+            updated_at: now,
+            userdata: None,
+            userdata_status: None,
+            userdata_env: None,
+            service_id: None,
+            service_ordinal: None,
+            vmm: BackendKind::Firecracker,
+            boot_mode: husker_core::BootKind::DirectKernel,
+            balloon: false,
+            volume: None,
+            network: NetworkMode::Nat,
+            egress_policy: None,
+            last_activity_at: now,
+            suspended_at: None,
+            idle_timeout_secs: None,
+            suspend_ttl_secs: None,
+            auto_resume: true,
+            forked_from: None,
+        })
+        .unwrap();
+    drop(state);
+
+    let vm_dir = tmp.path().join("vms").join("committed");
+    std::fs::create_dir_all(&vm_dir).unwrap();
+    let disk = vm_dir.join("rootfs.ext4");
+    std::fs::write(&disk, b"the committed VM's disk").unwrap();
+    let network = Arc::new(TestHostNetwork::default());
+    network.taps.lock().await.insert("husker3".into());
+
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::clone(&network),
+    );
+    let recovery = core.recover_host_resource_leases().await.unwrap();
+    assert!(
+        disk.exists(),
+        "the committed VM's disk must survive recovery"
+    );
+    assert!(
+        network.has_tap("husker3").await,
+        "the committed VM's TAP must survive recovery"
+    );
+    assert_eq!(
+        recovery,
+        husker_core::HostResourceRecovery {
+            recovered: 0,
+            failed: 1,
+        },
+        "a lease that names a committed VM is kept, never reclaimed"
+    );
+    assert_eq!(core.get_vm("committed").unwrap().name, "committed");
+    let leases = husker_state::StateStore::open(&state_path)
+        .unwrap()
+        .list_host_resource_leases()
+        .unwrap();
+    assert_eq!(
+        leases.len(),
+        1,
+        "the conflicting lease is kept for an operator"
+    );
+    assert_eq!(leases[0].id, lease.id);
+}
+
 #[cfg(feature = "linux-net")]
 #[tokio::test]
 async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {

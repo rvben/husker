@@ -44,9 +44,31 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// retried at the next startup. Each lease is handled on its own: one
     /// stuck lease blocks neither the other leases nor the daemon. Only a
     /// state-store failure is fatal.
+    ///
+    /// A lease names a VM directory and TAP by VM name, so it must never be
+    /// reclaimed while a committed record of that name exists: those
+    /// resources would be the VM's. Creation refuses a taken name before
+    /// leasing and commit inserts the record and deletes the lease in one
+    /// transaction, so the two do not coexist; should they ever, the lease
+    /// is kept, nothing is touched, and the conflict is logged for an
+    /// operator to resolve (deleting the VM lets the next startup reclaim).
     pub async fn recover_host_resource_leases(&self) -> Result<HostResourceRecovery, CoreError> {
         let mut summary = HostResourceRecovery::default();
         for lease in self.state.list_host_resource_leases()? {
+            match self.state.get_vm_by_name(&lease.vm_name) {
+                Ok(vm) => {
+                    summary.failed += 1;
+                    warn!(
+                        vm = %lease.vm_name,
+                        id = %vm.id,
+                        cid = lease.vsock_cid,
+                        "a creation lease names a committed VM; leaving its host resources untouched and keeping the lease"
+                    );
+                    continue;
+                }
+                Err(husker_state::StateError::VmNotFoundByName(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
             match self.reclaim_leased_host_resources(&lease).await {
                 Ok(()) => {
                     self.state.release_host_resource_lease(lease.id)?;

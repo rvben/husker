@@ -835,7 +835,8 @@ pub struct PortForwardReconcile {
 pub struct HostResourceRecovery {
     /// Leases whose TAP, nftables rules and VM directory were reclaimed.
     pub recovered: usize,
-    /// Leases retained because a host resource could not be removed.
+    /// Leases retained: a host resource could not be removed, or the lease
+    /// names a committed VM whose resources must not be touched.
     pub failed: usize,
 }
 
