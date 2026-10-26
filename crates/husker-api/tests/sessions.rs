@@ -619,6 +619,35 @@ async fn monitor_releases_idle_guard_while_suspended_and_reacquires_on_resume() 
     .unwrap();
 }
 
+/// A chunked upload through the REST write is the path the Python SDK takes.
+/// Against a current guest the chunks accumulate; the refusal of an older
+/// guest lives in the core write, where a scripted agent can report its age.
+#[tokio::test]
+async fn write_file_appends_chunks_on_a_guest_that_supports_append() {
+    let f = Fixture::new().await;
+    let path = f._temp.path().join("upload.bin");
+    for (index, chunk) in [b"first-".as_slice(), b"second".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let (status, body) = f
+            .request(
+                "POST",
+                "/v1/vms/dev/files/write",
+                json!({
+                    "path": path,
+                    "data": husker_agent_proto::base64_encode(chunk),
+                    "mode": null,
+                    "append": index > 0,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["bytes_written"], chunk.len(), "{body}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"first-second");
+}
+
 #[tokio::test]
 async fn shell_applies_the_exec_command_policy_before_contacting_the_guest() {
     struct Reset;

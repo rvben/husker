@@ -2546,6 +2546,28 @@ mod tests {
         );
     }
 
+    /// Same reasoning for a guest that cannot append: the image is what lacks
+    /// the feature, so the status must not invite a retry, and the kind lets a
+    /// chunking client tell "send it in one write" from a transient failure.
+    #[test]
+    fn map_error_reports_a_guest_that_cannot_append_as_not_implemented() {
+        let (status, body) = map_error(CoreError::Agent(
+            husker_core::AgentError::AppendUnsupported {
+                reported: 1,
+                required: husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND,
+            },
+        ));
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+
+        let payload = body.0;
+        assert_eq!(payload.kind, "guest_append_unsupported");
+        assert!(
+            payload.message.contains("current husker-agent"),
+            "the message must name the fix: {}",
+            payload.message
+        );
+    }
+
     /// A name whose interrupted creation still holds host resources is a
     /// conflict the operator resolves on the host, not an internal error. The
     /// hint has to say where to look, since the message alone names only the VM.

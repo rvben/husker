@@ -1833,6 +1833,8 @@ pub(crate) async fn read_file_handler<B: VmmBackend + 'static>(
         (status = 200, description = "File written", body = WriteFileResponse),
         (status = 400, description = "Invalid base64 data", body = ErrorResponse),
         (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 413, description = "Payload larger than one write carries", body = ErrorResponse),
+        (status = 501, description = "Guest agent cannot append (image predates protocol v2)", body = ErrorResponse),
         (status = 503, description = "Agent not ready", body = ErrorResponse)
     )
 )]

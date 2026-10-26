@@ -28,6 +28,13 @@ pub enum AgentError {
          husker-agent."
     )]
     RangedReadUnsupported { offset: u64, required: u32 },
+    #[error(
+        "the guest agent cannot append to a file: it reports protocol {reported}, and append-mode \
+         writes need protocol {required} or newer. An older agent truncates on every write, so a \
+         chunked upload would keep only its last chunk. Rebuild or re-import the VM's image with a \
+         current husker-agent, or send the file in one write."
+    )]
+    AppendUnsupported { reported: u32, required: u32 },
     #[error("agent not ready after {timeout:?}{detail}")]
     NotReady {
         timeout: Duration,
@@ -563,12 +570,15 @@ where
     /// Write a file to the guest filesystem. `append` opens the destination
     /// for append instead of truncating it, so a caller can send a large file
     /// as a sequence of chunks (first chunk `append = false`, later chunks
-    /// `append = true`). Callers that chunk must first confirm the connected
-    /// guest's protocol version is at least
-    /// [`husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND`] via
-    /// [`AgentConnection::guest_info`]; an older agent silently ignores
-    /// `append` and truncates on every write, which would corrupt the
-    /// destination to only the last chunk sent.
+    /// `append = true`).
+    ///
+    /// An agent older than
+    /// [`husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND`] has no append
+    /// path: it ignores the flag and truncates on every write, so a chunked
+    /// upload would end as its last chunk alone, reported as success. An
+    /// append-mode write therefore asks the guest its protocol version first
+    /// and is refused with [`AgentError::AppendUnsupported`] before any bytes
+    /// are sent, whichever caller (REST, SDK, CLI) asked for it.
     pub async fn write_file(
         &mut self,
         path: &str,
@@ -576,6 +586,13 @@ where
         mode: Option<u32>,
         append: bool,
     ) -> Result<u64, AgentError> {
+        if append {
+            let reported = self.guest_info().await?.protocol_version;
+            let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND;
+            if reported < required {
+                return Err(AgentError::AppendUnsupported { reported, required });
+            }
+        }
         let request = AgentRequest::WriteFile(WriteFileRequest {
             path: path.into(),
             data: base64_encode(data),

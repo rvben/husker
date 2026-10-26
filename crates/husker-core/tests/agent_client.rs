@@ -1011,3 +1011,98 @@ async fn stalled_session_response_has_a_bounded_transport_deadline() {
     drop(connection);
     responder.await.unwrap();
 }
+
+/// An agent older than protocol v2 has no append path and truncates on every
+/// write, so a chunked upload against it would end as its last chunk alone,
+/// reported as success. The refusal has to come before any bytes reach the
+/// guest: the scripted agent ends after answering the version query, so a
+/// write sent anyway shows up as a second message it must never see.
+#[tokio::test]
+async fn an_append_write_is_refused_before_reaching_a_guest_without_append_support() {
+    let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND;
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(
+            matches!(req, AgentRequest::GuestInfo),
+            "the guest's version is asked before anything is written, got {req:?}"
+        );
+        write_message(
+            &mut server,
+            &AgentResponse::GuestInfo(GuestInfoResponse {
+                ipv4: vec![],
+                protocol_version: required - 1,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            read_message::<AgentRequest, _>(&mut server)
+                .await
+                .unwrap()
+                .is_none(),
+            "no write may reach a guest that would truncate it"
+        );
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn
+        .write_file("/tmp/out", b"chunk two", None, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentError::AppendUnsupported { reported, required: r } if reported == required - 1 && r == required
+        ),
+        "{err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("last chunk") && text.contains("current husker-agent"),
+        "the message must say what would go wrong and how to fix it: {text}"
+    );
+    drop(conn);
+    server_task.await.unwrap();
+}
+
+/// A guest at or above protocol v2 is asked its version and then gets the
+/// write. A truncating write never asks, since it is safe on any guest.
+#[tokio::test]
+async fn an_append_write_reaches_a_guest_that_supports_it() {
+    let (client, mut server) = tokio::io::duplex(2048);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::GuestInfo), "got {req:?}");
+        write_message(
+            &mut server,
+            &AgentResponse::GuestInfo(GuestInfoResponse {
+                ipv4: vec![],
+                protocol_version: husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_APPEND,
+            }),
+        )
+        .await
+        .unwrap();
+        match read_message(&mut server).await.unwrap().unwrap() {
+            AgentRequest::WriteFile(write) => {
+                assert!(write.append);
+                assert_eq!(write.path, "/tmp/out");
+            }
+            other => panic!("expected the write to follow the version check, got {other:?}"),
+        }
+        write_message(
+            &mut server,
+            &AgentResponse::WriteFile(WriteFileResponse { bytes_written: 9 }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let written = conn
+        .write_file("/tmp/out", b"chunk two", None, true)
+        .await
+        .unwrap();
+    assert_eq!(written, 9);
+    server_task.await.unwrap();
+}

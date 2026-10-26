@@ -155,6 +155,11 @@ pub(crate) fn map_error(err: CoreError) -> (StatusCode, Json<ErrorResponse>) {
             "guest_ranged_read_unsupported",
             err.to_string(),
         ),
+        CoreError::Agent(husker_core::AgentError::AppendUnsupported { .. }) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "guest_append_unsupported",
+            err.to_string(),
+        ),
         CoreError::Io(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "io_error",
