@@ -87,24 +87,32 @@ sign-macos:
 check-macos:
 	cargo check --workspace --no-default-features
 
+# Test targets run nextest (one process per test, the isolation CI relies on)
+# and then `cargo test --doc`, because nextest does not run doctests. There is
+# no fallback to `cargo test`: a missing nextest fails loudly (`make setup`
+# installs it) instead of silently running the suite in a different harness.
+
 # Run tests on macOS (without linux-net feature)
 # Excludes husker-api; run its no-default-features suite via `test-macos-api`.
 test-macos:
-	cargo nextest run --workspace --no-default-features --exclude husker-api 2>/dev/null || cargo test --workspace --no-default-features --exclude husker-api
+	cargo nextest run --workspace --no-default-features --exclude husker-api
+	cargo test --workspace --no-default-features --exclude husker-api --doc
 
 # Run husker-api tests on the macOS (no-linux-net) build. test-macos excludes
 # husker-api, so this is the twin that exercises the cross-platform API surface
 # (e.g. boot-mode and port-forward logic that has linux-net-gated counterparts).
 test-macos-api:
-	cargo nextest run -p husker-api --no-default-features 2>/dev/null || cargo test -p husker-api --no-default-features
+	cargo nextest run -p husker-api --no-default-features
+	cargo test -p husker-api --no-default-features --doc
 
 # Run all tests
 test:
-	cargo nextest run --workspace 2>/dev/null || cargo test --workspace
+	cargo nextest run --workspace
+	cargo test --workspace --doc
 
 # Run unit tests only (fast)
 test-unit:
-	cargo nextest run --workspace --lib 2>/dev/null || cargo test --workspace --lib
+	cargo nextest run --workspace --lib
 
 # Lint
 lint: fmt-check clippy clippy-macos check-deploy-script
@@ -178,7 +186,7 @@ install-restart: install
 
 # Run E2E tests (requires running daemon and a booted VM)
 test-e2e:
-	cargo nextest run --package husker --test e2e -- --ignored 2>/dev/null || cargo test --package husker --test e2e -- --ignored
+	cargo nextest run --package husker --test e2e --run-ignored ignored-only
 
 # Run ignored husker e2e tests only when explicitly enabled.
 #
