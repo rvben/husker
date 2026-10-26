@@ -416,7 +416,9 @@ impl CliErrorKind {
         match self {
             Self::Error => "General client or server error",
             Self::NotFound => "Requested resource was not found",
-            Self::InvalidUsage => "Invalid command-line usage",
+            Self::InvalidUsage => {
+                "Invalid command-line usage, or a request argument the daemon rejected"
+            }
             Self::Conflict => "Resource exists or is in an incompatible state",
             Self::PermissionDenied => "Authentication, authorization, or policy failure",
             Self::DaemonUnreachable => "Cannot connect to the husker daemon",
@@ -433,13 +435,16 @@ impl CliErrorKind {
         }
     }
 
-    pub(crate) const fn from_exit_code(exit_code: i32) -> Self {
-        match exit_code {
-            2 => Self::NotFound,
-            3 => Self::Conflict,
-            4 => Self::PermissionDenied,
-            5 => Self::DaemonUnreachable,
-            6 => Self::ConfirmationRequired,
+    /// The CLI kind for the HTTP status of a refused daemon request whose
+    /// kind the CLI does not know. A 400 is a request argument the daemon
+    /// rejected: the caller's usage is at fault, exactly as with a flag the
+    /// parser refuses, so it is reported the same way.
+    pub(crate) const fn from_status(status: u16) -> Self {
+        match status {
+            400 => Self::InvalidUsage,
+            404 => Self::NotFound,
+            409 => Self::Conflict,
+            401 | 403 => Self::PermissionDenied,
             _ => Self::Error,
         }
     }
@@ -452,12 +457,23 @@ impl CliErrorKind {
     /// CLI kind maps to it. The daemon's operation-specific timeout kinds fold
     /// into `Timeout`, since the CLI reports every "did not finish in time"
     /// outcome under one kind. Any other daemon kind is unknown here and is
-    /// classified by exit code instead.
+    /// classified by status instead.
     pub(crate) fn from_daemon_kind(name: &str) -> Option<Self> {
         match name {
             "exec_timeout" => Some(Self::Timeout),
             other => Self::from_name(other),
         }
+    }
+
+    /// Keep the CLI's advertised error vocabulary finite. Daemon-specific
+    /// kinds are useful inside the HTTP API, but the CLI files a refusal under
+    /// its stable category unless the kind is explicitly part of the CLI
+    /// contract: a kind the CLI knows maps to it, any other is classified by
+    /// the status the daemon answered with, and a failure that carries
+    /// neither is a general error.
+    pub(crate) fn from_daemon(kind: Option<&str>, status: Option<u16>) -> Self {
+        kind.and_then(Self::from_daemon_kind)
+            .unwrap_or_else(|| status.map_or(Self::Error, Self::from_status))
     }
 }
 
@@ -465,14 +481,6 @@ impl fmt::Display for CliErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.name())
     }
-}
-
-/// Keep the CLI's advertised error vocabulary finite. Daemon-specific kinds
-/// are useful inside the HTTP API, but the CLI normalizes them to its stable
-/// status category unless they are explicitly part of the CLI contract.
-pub(crate) fn normalize_error_kind(kind: Option<&str>, exit_code: i32) -> CliErrorKind {
-    kind.and_then(CliErrorKind::from_daemon_kind)
-        .unwrap_or_else(|| CliErrorKind::from_exit_code(exit_code))
 }
 
 /// The `status` of a command that ran a guest command and passes its exit
@@ -508,30 +516,64 @@ mod tests {
 
     #[test]
     fn daemon_error_kinds_are_normalized_to_the_finite_cli_vocabulary() {
+        // A daemon kind the CLI does not list is classified by the status.
         assert_eq!(
-            normalize_error_kind(Some("vm_already_exists"), 3),
+            CliErrorKind::from_daemon(Some("vm_already_exists"), Some(409)),
             CliErrorKind::Conflict
         );
         assert_eq!(
-            normalize_error_kind(Some("vm_not_running"), 1),
+            CliErrorKind::from_daemon(Some("vm_not_found"), Some(404)),
+            CliErrorKind::NotFound
+        );
+        assert_eq!(
+            CliErrorKind::from_daemon(Some("denied"), Some(403)),
+            CliErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            CliErrorKind::from_daemon(Some("vmm_error"), Some(500)),
+            CliErrorKind::Error
+        );
+        // A daemon kind that names a CLI kind maps to it whatever the status.
+        assert_eq!(
+            CliErrorKind::from_daemon(Some("vm_not_running"), Some(500)),
             CliErrorKind::VmNotRunning
         );
+        // A refusal that names neither a kind nor a status is a general error.
+        assert_eq!(CliErrorKind::from_daemon(None, None), CliErrorKind::Error);
+        assert_eq!(
+            CliErrorKind::from_daemon(None, Some(404)),
+            CliErrorKind::NotFound
+        );
+    }
+
+    /// The daemon answers 400 for a request argument it rejects, under
+    /// `invalid_argument` or a handler-specific kind. Either way the caller's
+    /// usage is at fault, so the CLI reports it as it reports a flag the
+    /// parser refuses.
+    #[test]
+    fn a_request_argument_the_daemon_rejected_is_invalid_usage() {
+        for kind in [None, Some("invalid_argument"), Some("invalid_mount_spec")] {
+            assert_eq!(
+                CliErrorKind::from_daemon(kind, Some(400)),
+                CliErrorKind::InvalidUsage,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(CliErrorKind::from_status(400), CliErrorKind::InvalidUsage);
+        assert_eq!(CliErrorKind::InvalidUsage.exit_code(), 2);
     }
 
     #[test]
     fn a_daemon_exec_timeout_is_reported_as_a_timeout() {
-        let timeout = normalize_error_kind(Some("exec_timeout"), 1);
+        let timeout = CliErrorKind::from_daemon(Some("exec_timeout"), Some(408));
         assert_eq!(timeout, CliErrorKind::Timeout);
         assert_eq!(timeout.name(), "timeout");
         assert_eq!(timeout.exit_code(), exit_code::GENERAL);
         // A timed-out command may have run to completion in the guest, so a
         // blind retry could repeat its effect.
         assert!(!timeout.retryable());
-        // The exit code alone does not say an operation timed out.
-        assert_eq!(
-            CliErrorKind::from_exit_code(exit_code::GENERAL),
-            CliErrorKind::Error
-        );
+        // The status alone does not say an operation timed out.
+        assert_eq!(CliErrorKind::from_status(408), CliErrorKind::Error);
     }
 
     #[test]
@@ -539,12 +581,9 @@ mod tests {
         let not_running = CliErrorKind::VmNotRunning;
         assert_eq!(not_running.exit_code(), exit_code::CONFLICT);
         assert_eq!(not_running.exit_code(), CliErrorKind::Conflict.exit_code());
-        // The exit code says the VM's state refused the command; only the
+        // The daemon's 409 says the VM's state refused the command; only the
         // kind says that the state was "not running".
-        assert_eq!(
-            CliErrorKind::from_exit_code(not_running.exit_code()),
-            CliErrorKind::Conflict
-        );
+        assert_eq!(CliErrorKind::from_status(409), CliErrorKind::Conflict);
     }
 
     #[test]
@@ -558,9 +597,6 @@ mod tests {
             Some(declined)
         );
         assert!(!declined.retryable());
-        // A bare exit code only says the gate was not passed; the kind alone
-        // says that an operator answered no.
-        assert_eq!(CliErrorKind::from_exit_code(declined.exit_code()), required);
     }
 
     #[test]

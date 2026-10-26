@@ -15,9 +15,8 @@ use husker_vmm::macos_bundle::{BundleLock, MacOsBundle, MacOsBundleManifest};
 use serde::Serialize;
 
 use crate::cli::{MacosAction, OutputFormat};
-use crate::cli_contract::structured_output;
+use crate::cli_contract::{CliErrorKind, structured_output};
 use crate::daemon_client::ApiFailure;
-use crate::schema::exit_code;
 
 /// Where `macos provision` installs the agent inside the guest. `/usr/local`
 /// is firmlinked to the Data volume, so the file survives the sealed System
@@ -73,20 +72,13 @@ impl MacosImage {
     }
 }
 
-fn failure(kind: &str, exit_code: i32, message: String, hint: Option<&str>) -> anyhow::Error {
-    ApiFailure {
-        message,
-        kind: Some(kind.to_string()),
-        exit_code,
-        hint: hint.map(str::to_string),
-    }
-    .into()
+fn failure(kind: CliErrorKind, message: String, hint: Option<&str>) -> anyhow::Error {
+    ApiFailure::with_kind(kind, message, hint.map(str::to_string)).into()
 }
 
 #[cfg(target_os = "macos")]
 fn usage_failure(message: String) -> anyhow::Error {
-    let kind = crate::cli_contract::CliErrorKind::InvalidUsage;
-    failure(kind.name(), kind.exit_code(), message, None)
+    failure(CliErrorKind::InvalidUsage, message, None)
 }
 
 /// Check `--cpus`/`--memory` against the restore image before anything is
@@ -272,8 +264,7 @@ async fn install(
     let target = images_dir.join(name);
     if target.exists() {
         return Err(failure(
-            "conflict",
-            exit_code::CONFLICT,
+            CliErrorKind::Conflict,
             format!(
                 "macOS image '{name}' already exists at {}",
                 target.display()
@@ -384,7 +375,7 @@ async fn install(
 fn lock_or_conflict(path: &Path, held_message: &str) -> Result<std::fs::File> {
     crate::daemon::try_lock_exclusive(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::WouldBlock {
-            failure("conflict", exit_code::CONFLICT, held_message.into(), None)
+            failure(CliErrorKind::Conflict, held_message.into(), None)
         } else {
             anyhow::Error::new(e).context(format!("locking {}", path.display()))
         }
@@ -398,8 +389,7 @@ fn ensure_free_space(dir: &Path, needed: u64) -> Result<()> {
     let available = available_bytes(dir)?;
     if available < needed {
         return Err(failure(
-            "error",
-            exit_code::GENERAL,
+            CliErrorKind::Error,
             format!(
                 "the restore image needs {} MiB but only {} MiB is free in {}",
                 needed >> 20,
@@ -521,8 +511,7 @@ async fn write_download(
 fn provision(data_dir: &Path, image: &str) -> Result<MacosImage> {
     let bundle = resolve_macos_bundle(data_dir, image).map_err(|e| {
         failure(
-            "not_found",
-            exit_code::NOT_FOUND,
+            CliErrorKind::NotFound,
             e.to_string(),
             Some("under sudo, pass the bundle directory path; sudo may change HOME and with it the data dir"),
         )
@@ -530,8 +519,7 @@ fn provision(data_dir: &Path, image: &str) -> Result<MacosImage> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err(failure(
-            "permission_denied",
-            exit_code::DENIED,
+            CliErrorKind::PermissionDenied,
             "provisioning writes root-owned files into the guest disk and must run as root".into(),
             Some(&format!(
                 "sudo husker macos provision {}",
@@ -542,8 +530,7 @@ fn provision(data_dir: &Path, image: &str) -> Result<MacosImage> {
     let agent = std::env::current_exe().context("locating the husker binary")?;
     let bundle_dir = bundle.try_lock(true)?.ok_or_else(|| {
         failure(
-            "conflict",
-            exit_code::CONFLICT,
+            CliErrorKind::Conflict,
             format!(
                 "{} is in use: a VM is being created from it, or another provision is running",
                 bundle.dir().display()
@@ -1155,8 +1142,7 @@ mod tests {
         let failure = err
             .downcast_ref::<ApiFailure>()
             .expect("structured failure");
-        assert_eq!(failure.kind.as_deref(), Some("not_found"), "{err:#}");
-        assert_eq!(failure.exit_code, exit_code::NOT_FOUND);
+        assert_eq!(failure.kind, CliErrorKind::NotFound, "{err:#}");
         assert!(
             failure
                 .hint
@@ -1175,12 +1161,7 @@ mod tests {
         let failure = err
             .downcast_ref::<ApiFailure>()
             .expect("structured failure");
-        assert_eq!(
-            failure.kind.as_deref(),
-            Some("permission_denied"),
-            "{err:#}"
-        );
-        assert_eq!(failure.exit_code, exit_code::DENIED);
+        assert_eq!(failure.kind, CliErrorKind::PermissionDenied, "{err:#}");
         assert_eq!(
             failure.hint.as_deref(),
             Some(format!("sudo husker macos provision {}", bundle.dir().display()).as_str()),
@@ -1335,8 +1316,7 @@ mod tests {
         let failure = err
             .downcast_ref::<ApiFailure>()
             .expect("structured failure");
-        assert_eq!(failure.kind.as_deref(), Some("conflict"), "{err:#}");
-        assert_eq!(failure.exit_code, exit_code::CONFLICT);
+        assert_eq!(failure.kind, CliErrorKind::Conflict, "{err:#}");
         assert!(
             staging.join("disk.img").exists(),
             "running install untouched"
@@ -1374,11 +1354,7 @@ mod tests {
         let failure = err
             .downcast_ref::<ApiFailure>()
             .expect("structured failure");
-        assert_eq!(failure.kind.as_deref(), Some("invalid_usage"), "{err:#}");
-        assert_eq!(
-            failure.exit_code, 2,
-            "invalid_usage exits 2 per the CLI contract"
-        );
+        assert_eq!(failure.kind, CliErrorKind::InvalidUsage, "{err:#}");
         assert!(format!("{err:#}").contains("at least 32 GiB"), "{err:#}");
         assert!(!downloads.exists(), "nothing was downloaded");
         assert!(!macos_images_dir(data.path()).exists());

@@ -22,7 +22,8 @@
     `message` says what failed and `hint` is the only field that carries a
     remedy (see `docs/api/cli-output-json.md`)
   - error kinds are the finite set `husker schema` lists under `errors`; a
-    kind a newer daemon sends is normalized to that set by exit code
+    kind a newer daemon sends is normalized to that set by the HTTP status
+    the daemon answered with (a 400 is `invalid_usage`, exit 2)
 - A destructive command that does not pass its confirmation gate changes
   nothing and exits 6: `confirmation_required` when stdin is not a TTY and
   `--yes` is absent, `confirmation_declined` when the prompt was answered no.

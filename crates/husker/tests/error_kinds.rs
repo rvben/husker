@@ -390,6 +390,77 @@ async fn a_hint_the_cli_adds_keeps_the_daemons_message_intact() {
     );
 }
 
+/// A daemon that refuses VM creation with `kind`, as it does for a request
+/// argument its own validation rejects.
+fn creation_refused_with(kind: &'static str) -> impl Fn(&str, &str) -> (StatusCode, String) {
+    move |method, target| {
+        if method == "POST" && target == "/v1/vms" {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    concat!(
+                        r#"{{"kind":"{}","#,
+                        r#""message":"invalid argument: vmm \"qemu\" was requested, but this daemon runs apple_vz only","#,
+                        r#""hint":"omit --vmm to use the daemon's backend"}}"#
+                    ),
+                    kind
+                ),
+            )
+        } else {
+            no_route(method, target)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_request_argument_the_daemon_rejected_is_invalid_usage() {
+    let fixture = Fixture::start(creation_refused_with("invalid_argument")).await;
+    let output = fixture
+        .husker(&["--output", "json", "run", "--vmm", "qemu", "--name", "vm"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a request the daemon rejected exits like a flag the parser rejected: {stderr}"
+    );
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["kind"], "invalid_usage", "{stderr}");
+    assert_eq!(
+        error["message"],
+        "invalid argument: vmm \"qemu\" was requested, but this daemon runs apple_vz only",
+        "{stderr}"
+    );
+    assert_eq!(
+        error["hint"], "omit --vmm to use the daemon's backend",
+        "{stderr}"
+    );
+    assert!(
+        fixture
+            .requests()
+            .contains(&("POST".to_string(), "/v1/vms".to_string())),
+        "the refusal came from the daemon: {:?}",
+        fixture.requests()
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn a_daemon_400_kind_the_cli_does_not_list_is_still_invalid_usage() {
+    let fixture = Fixture::start(creation_refused_with("invalid_mount_spec")).await;
+    let output = fixture
+        .husker(&["--output", "json", "run", "--vmm", "qemu", "--name", "vm"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(
+        error["kind"], "invalid_usage",
+        "the status classifies a kind outside the CLI vocabulary: {stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
 #[tokio::test]
 async fn a_guest_command_that_succeeds_is_reported_ok() {
     let fixture = Fixture::start(exec_ended_with(0)).await;

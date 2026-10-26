@@ -16,7 +16,6 @@ use crate::cli::OutputFormat;
 use crate::cli_contract::{CliErrorKind, guest_command_status, structured_output};
 use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent};
 use crate::guest_file::{GuestFile, read_guest_file};
-use crate::schema::exit_code;
 use crate::vm_creation::PreparedVmCreationPlan;
 use crate::{
     SYNC_ARCHIVE_GUEST_PATH, SYNC_MANIFEST_GUEST_PATH, SYNC_OUTPUT_GUEST_PATH, SYNC_WORKDIR,
@@ -84,20 +83,19 @@ impl Retrieval {
         if self.unmatched_out.is_empty() {
             return None;
         }
-        Some(ApiFailure {
-            message: format!(
+        Some(ApiFailure::with_kind(
+            CliErrorKind::OutMatchedNothing,
+            format!(
                 "--out matched nothing on the guest: {}",
                 self.unmatched_out.join(", ")
             ),
-            kind: Some("out_matched_nothing".to_string()),
-            exit_code: exit_code::GENERAL,
-            hint: Some(
+            Some(
                 "--out patterns are relative to the synced working tree; a build that writes \
                  outside it (CARGO_TARGET_DIR on a --volume, an absolute output path) produces \
                  nothing for --out to match"
                     .to_string(),
             ),
-        })
+        ))
     }
 
     /// The retrieval as it appears in `--output json`, so a machine consumer
@@ -614,13 +612,17 @@ async fn cleanup_vm(req: &JobRequest<'_>) -> Option<ApiFailure> {
     }
 }
 
+/// A destroy that failed after the job itself succeeded. A general failure
+/// (a daemon 500, a connection error, a body without an envelope) is filed as
+/// the job's own cleanup kind so the consumer can tell it from the command
+/// failing; a specific refusal such as a permission denial keeps its kind.
 fn cleanup_failure(name: &str, mut failure: ApiFailure) -> ApiFailure {
     failure.message = format!(
         "job finished but VM '{name}' could not be destroyed: {}",
         failure.message
     );
-    if failure.kind.is_none() {
-        failure.kind = Some("job_cleanup_failed".into());
+    if failure.kind == CliErrorKind::Error {
+        failure.kind = CliErrorKind::JobCleanupFailed;
     }
     failure
 }
@@ -836,6 +838,17 @@ mod tests {
         delete_status: StatusCode,
         deletes: Arc<AtomicUsize>,
     ) -> Router {
+        lifecycle_stub_with_delete_body(exec_exit_code, delete_status, String::new(), deletes)
+    }
+
+    /// A daemon whose destroy route answers `delete_status` with `delete_body`,
+    /// so a test can hand the CLI a refusal that carries an error envelope.
+    fn lifecycle_stub_with_delete_body(
+        exec_exit_code: i32,
+        delete_status: StatusCode,
+        delete_body: String,
+        deletes: Arc<AtomicUsize>,
+    ) -> Router {
         Router::new()
             .route(
                 "/v1/vms",
@@ -845,9 +858,14 @@ mod tests {
                 "/v1/vms/{name}",
                 get(|| async { Json(running_vm_response()) }).delete(move || {
                     let deletes = deletes.clone();
+                    let body = delete_body.clone();
                     async move {
                         deletes.fetch_add(1, Ordering::SeqCst);
-                        delete_status
+                        (
+                            delete_status,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body,
+                        )
                     }
                 }),
             )
@@ -1257,7 +1275,68 @@ mod tests {
         let JobTermination::Failure(failure) = termination else {
             panic!("cleanup failure must fail an otherwise successful Job")
         };
-        assert_eq!(failure.kind.as_deref(), Some("job_cleanup_failed"));
+        assert_eq!(failure.kind, CliErrorKind::JobCleanupFailed);
+        assert!(failure.message.contains("could not be destroyed"));
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_destroy_the_daemon_failed_with_an_envelope_is_still_a_cleanup_failure() {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let (api_url, server) = serve_stub(lifecycle_stub_with_delete_body(
+            0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"kind":"vmm_error","message":"the backend stopped answering"}"#.into(),
+            deletes.clone(),
+        ))
+        .await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["true".to_string()];
+        let secret_env = HashMap::new();
+
+        let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
+
+        let JobTermination::Failure(failure) = termination else {
+            panic!("cleanup failure must fail an otherwise successful Job")
+        };
+        assert_eq!(
+            failure.kind,
+            CliErrorKind::JobCleanupFailed,
+            "a daemon-side destroy failure is the job's cleanup failing, whatever kind the daemon named"
+        );
+        assert_eq!(failure.daemon_kind.as_deref(), Some("vmm_error"));
+        assert!(
+            failure.message.contains("the backend stopped answering"),
+            "the daemon's message is preserved: {}",
+            failure.message
+        );
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_destroy_the_daemon_refused_keeps_the_specific_kind() {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let (api_url, server) = serve_stub(lifecycle_stub_with_delete_body(
+            0,
+            StatusCode::FORBIDDEN,
+            r#"{"kind":"denied","message":"token may not destroy VMs"}"#.into(),
+            deletes.clone(),
+        ))
+        .await;
+        let client = DaemonClient::new(&api_url, None);
+        let body = serde_json::json!({ "name": "job-x" });
+        let command = vec!["true".to_string()];
+        let secret_env = HashMap::new();
+
+        let termination = run_job(base_request(&client, &body, &command, &secret_env)).await;
+
+        let JobTermination::Failure(failure) = termination else {
+            panic!("a refused destroy must fail an otherwise successful Job")
+        };
+        assert_eq!(failure.kind, CliErrorKind::PermissionDenied);
         assert!(failure.message.contains("could not be destroyed"));
         assert_eq!(deletes.load(Ordering::SeqCst), 1);
         server.abort();
@@ -1593,7 +1672,7 @@ mod tests {
         let failure = retrieval
             .failure()
             .expect("an --out that matched nothing must fail the job");
-        assert_eq!(failure.kind.as_deref(), Some("out_matched_nothing"));
+        assert_eq!(failure.kind, CliErrorKind::OutMatchedNothing);
         assert!(
             failure.message.contains("dist/*.whl"),
             "the failure must name the pattern, got: {}",

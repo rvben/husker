@@ -22,7 +22,6 @@ use husker_api::{
 };
 
 use crate::cli_contract::CliErrorKind;
-use crate::schema::exit_code;
 
 /// Conservative decoded payload size for one guest-file write. The daemon's
 /// default policy accepts up to 1 MiB, but that configured limit is not yet
@@ -68,8 +67,14 @@ const DAEMON_UNREACHABLE_HINT: &str =
 #[derive(Debug, Clone)]
 pub(crate) struct ApiFailure {
     pub(crate) message: String,
-    pub(crate) kind: Option<String>,
-    pub(crate) exit_code: i32,
+    /// The CLI's own kind, which selects the exit code. A daemon refusal is
+    /// classified into it when the failure is built, so the kind the
+    /// envelope reports and the exit code cannot disagree.
+    pub(crate) kind: CliErrorKind,
+    /// The kind the daemon named, kept for the CLI's own handling of one
+    /// specific refusal. Absent for a failure the CLI raised itself or a
+    /// daemon answer that carried no envelope.
+    pub(crate) daemon_kind: Option<String>,
     pub(crate) hint: Option<String>,
 }
 
@@ -85,7 +90,7 @@ impl ApiFailure {
     }
 
     /// A failure the CLI raises itself, filed under one of its own error
-    /// kinds so the kind and exit code cannot disagree.
+    /// kinds.
     pub(crate) fn with_kind(
         kind: CliErrorKind,
         message: impl Into<String>,
@@ -93,8 +98,8 @@ impl ApiFailure {
     ) -> Self {
         Self {
             message: message.into(),
-            kind: Some(kind.name().into()),
-            exit_code: kind.exit_code(),
+            kind,
+            daemon_kind: None,
             hint,
         }
     }
@@ -112,18 +117,13 @@ impl ApiFailure {
                 Some(DAEMON_UNREACHABLE_HINT.into()),
             );
         }
-        Self {
-            message: format!("{error:#}"),
-            kind: None,
-            exit_code: exit_code::GENERAL,
-            hint: None,
-        }
+        Self::with_kind(CliErrorKind::Error, format!("{error:#}"), None)
     }
 
     /// The failure a WebSocket session reported in-band. `status` is the HTTP
-    /// status the REST routes answer with for the same failure, so it selects
-    /// the same exit code. A frame from a daemon older than this contract
-    /// carries neither it nor a kind and stays a general failure.
+    /// status the REST routes answer with for the same failure, so it files
+    /// the failure under the same kind. A frame from a daemon older than this
+    /// contract carries neither it nor a kind and stays a general failure.
     pub(crate) fn from_frame(
         kind: Option<String>,
         message: String,
@@ -132,20 +132,10 @@ impl ApiFailure {
     ) -> Self {
         Self {
             message,
-            kind,
-            exit_code: status.map_or(exit_code::GENERAL, exit_code_for_status),
+            kind: CliErrorKind::from_daemon(kind.as_deref(), status),
+            daemon_kind: kind,
             hint,
         }
-    }
-}
-
-/// The CLI exit code for the status of a refused daemon request.
-fn exit_code_for_status(status: u16) -> i32 {
-    match status {
-        404 => exit_code::NOT_FOUND,
-        409 => exit_code::CONFLICT,
-        401 | 403 => exit_code::DENIED,
-        _ => exit_code::GENERAL,
     }
 }
 
@@ -153,7 +143,7 @@ fn exit_code_for_status(status: u16) -> i32 {
 /// envelope when it sent one, the legacy `error` string or the raw body
 /// otherwise, and a message naming `subject` when the body is empty.
 fn decode_failure(status: reqwest::StatusCode, body: &str, subject: &str) -> ApiFailure {
-    let mut kind = None;
+    let mut daemon_kind = None;
     let mut hint = None;
     let message = if body.is_empty() {
         match status.as_u16() {
@@ -162,7 +152,7 @@ fn decode_failure(status: reqwest::StatusCode, body: &str, subject: &str) -> Api
             _ => format!("{subject}: {status}"),
         }
     } else if let Ok(error) = serde_json::from_str::<ErrorResponse>(body) {
-        kind = Some(error.kind);
+        daemon_kind = Some(error.kind);
         hint = error.hint;
         error.message
     } else {
@@ -175,8 +165,8 @@ fn decode_failure(status: reqwest::StatusCode, body: &str, subject: &str) -> Api
     };
     ApiFailure {
         message,
-        kind,
-        exit_code: exit_code_for_status(status.as_u16()),
+        kind: CliErrorKind::from_daemon(daemon_kind.as_deref(), Some(status.as_u16())),
+        daemon_kind,
         hint,
     }
 }
@@ -211,7 +201,7 @@ pub(crate) fn classify_handshake(
     let failure = decode_failure(status, &body, subject);
     let route_missing = matches!(status.as_u16(), 404 | 405)
         && matches!(
-            failure.kind.as_deref(),
+            failure.daemon_kind.as_deref(),
             None | Some("route_not_found") | Some("method_not_allowed")
         );
     if route_missing {
@@ -231,12 +221,7 @@ impl std::error::Error for ApiFailure {}
 
 impl From<String> for ApiFailure {
     fn from(message: String) -> Self {
-        Self {
-            message,
-            kind: None,
-            exit_code: exit_code::GENERAL,
-            hint: None,
-        }
+        Self::with_kind(CliErrorKind::Error, message, None)
     }
 }
 
@@ -889,8 +874,8 @@ mod tests {
         assert!(error.chain().any(|cause| cause.is::<DaemonUnreachable>()));
         assert!(format!("{error:#}").contains(&base_url));
         let failure = ApiFailure::from_error(&error);
-        assert_eq!(failure.kind.as_deref(), Some("daemon_unreachable"));
-        assert_eq!(failure.exit_code, exit_code::DAEMON_UNREACHABLE);
+        assert_eq!(failure.kind, CliErrorKind::DaemonUnreachable);
+        assert!(failure.daemon_kind.is_none());
         assert!(
             !failure.message.contains("hint"),
             "the remedy belongs in the hint field: {}",
@@ -940,10 +925,47 @@ mod tests {
 
         let failure = client.error(response, "VM 'x'").await;
 
-        assert_eq!(failure.kind.as_deref(), Some("vm_conflict"));
-        assert_eq!(failure.exit_code, exit_code::CONFLICT);
+        assert_eq!(failure.daemon_kind.as_deref(), Some("vm_conflict"));
+        assert_eq!(failure.kind, CliErrorKind::Conflict);
         assert_eq!(failure.message, "VM is busy");
         assert_eq!(failure.hint.as_deref(), Some("stop it first"));
+        task.abort();
+    }
+
+    /// The daemon answers 400 for a request argument it rejects. The CLI
+    /// files that under its own `invalid_usage`, exactly as it files a flag
+    /// the parser refused, and keeps the daemon's message and remedy.
+    #[tokio::test]
+    async fn error_files_a_rejected_request_argument_as_invalid_usage() {
+        let app = axum::Router::new().route(
+            "/v1/vms",
+            get(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "kind": "invalid_argument",
+                        "message": "vmm \"qemu\" was requested, but this daemon runs apple_vz only",
+                        "hint": "omit --vmm to use the daemon's backend"
+                    })),
+                )
+            }),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+        let response = client.send(client.get("/v1/vms")).await.unwrap();
+
+        let failure = client.error(response, "VM 'x'").await;
+
+        assert_eq!(failure.kind, CliErrorKind::InvalidUsage);
+        assert_eq!(failure.daemon_kind.as_deref(), Some("invalid_argument"));
+        assert_eq!(
+            failure.message,
+            "vmm \"qemu\" was requested, but this daemon runs apple_vz only"
+        );
+        assert_eq!(
+            failure.hint.as_deref(),
+            Some("omit --vmm to use the daemon's backend")
+        );
         task.abort();
     }
 
@@ -956,7 +978,8 @@ mod tests {
 
         let failure = client.error(response, "VM 'ghost'").await;
 
-        assert_eq!(failure.exit_code, exit_code::NOT_FOUND);
+        assert_eq!(failure.kind, CliErrorKind::NotFound);
+        assert!(failure.daemon_kind.is_none());
         assert_eq!(failure.message, "VM 'ghost' not found");
         task.abort();
     }
@@ -1008,13 +1031,13 @@ mod tests {
 
         let denied = client.send(client.get("/v1/denied")).await.unwrap();
         assert_eq!(
-            client.error(denied, "VM").await.exit_code,
-            exit_code::DENIED
+            client.error(denied, "VM").await.kind,
+            CliErrorKind::PermissionDenied
         );
 
         let conflict = client.send(client.get("/v1/conflict")).await.unwrap();
         let conflict = client.error(conflict, "VM 'demo'").await;
-        assert_eq!(conflict.exit_code, exit_code::CONFLICT);
+        assert_eq!(conflict.kind, CliErrorKind::Conflict);
         assert_eq!(conflict.message, "VM 'demo' already exists");
 
         let failure = client.send(client.get("/v1/failure")).await.unwrap();
@@ -1325,8 +1348,8 @@ mod tests {
             .unwrap_err();
 
         let failure = ApiFailure::from_error(&error);
-        assert_eq!(failure.kind.as_deref(), Some("vm_not_found"));
-        assert_eq!(failure.exit_code, exit_code::NOT_FOUND);
+        assert_eq!(failure.daemon_kind.as_deref(), Some("vm_not_found"));
+        assert_eq!(failure.kind, CliErrorKind::NotFound);
         assert_eq!(failure.message, "VM 'demo' not found");
         assert!(!delivered);
         task.abort();
@@ -1352,14 +1375,14 @@ mod tests {
         let HandshakeRefusal::Refused(failure) = classify_handshake(response, "VM 'demo'") else {
             panic!("a 403 is the daemon's answer");
         };
-        assert_eq!(failure.exit_code, exit_code::DENIED);
+        assert_eq!(failure.kind, CliErrorKind::PermissionDenied);
         assert_eq!(failure.message, "VM 'demo': 403 Forbidden");
     }
 
     /// The in-band error frame carries the REST envelope for the failure, and
-    /// `status` selects the exit code the REST path would have produced.
+    /// `status` files it under the kind the REST path would have produced.
     #[tokio::test]
-    async fn exec_stream_error_frame_keeps_the_daemon_kind_and_exit_code() {
+    async fn exec_stream_error_frame_keeps_the_daemon_kind_and_status() {
         let app = axum::Router::new().route(
             "/v1/vms/demo/exec/stream",
             get(|ws: WebSocketUpgrade| async move {
@@ -1389,8 +1412,8 @@ mod tests {
             .unwrap_err();
 
         let failure = ApiFailure::from_error(&error);
-        assert_eq!(failure.kind.as_deref(), Some("invalid_state"));
-        assert_eq!(failure.exit_code, exit_code::CONFLICT);
+        assert_eq!(failure.daemon_kind.as_deref(), Some("invalid_state"));
+        assert_eq!(failure.kind, CliErrorKind::Conflict);
         assert_eq!(failure.hint.as_deref(), Some("start the VM first"));
         assert_eq!(failure.message, "VM 'demo' is stopped, expected running");
         task.abort();
@@ -1401,11 +1424,21 @@ mod tests {
     #[test]
     fn from_frame_without_status_is_a_general_failure() {
         let failure = ApiFailure::from_frame(None, "exec failed".into(), None, None);
-        assert_eq!(failure.exit_code, exit_code::GENERAL);
-        assert!(failure.kind.is_none());
+        assert_eq!(failure.kind, CliErrorKind::Error);
+        assert!(failure.daemon_kind.is_none());
         assert_eq!(
-            ApiFailure::from_frame(None, "denied".into(), None, Some(403)).exit_code,
-            exit_code::DENIED
+            ApiFailure::from_frame(None, "denied".into(), None, Some(403)).kind,
+            CliErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            ApiFailure::from_frame(
+                Some("invalid_argument".into()),
+                "bad".into(),
+                None,
+                Some(400)
+            )
+            .kind,
+            CliErrorKind::InvalidUsage
         );
     }
 

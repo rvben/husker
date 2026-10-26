@@ -108,9 +108,13 @@ message does not have to strip a suffix. A hint the CLI knows for a daemon
 refusal is appended to the daemon's own hint, separated by `; `. Text output
 prints the hint on its own `hint:` line between the `Error:` line and the
 envelope. `husker schema` publishes the finite set of stable CLI error kinds
-and their exit codes. More specific error kinds received from a newer daemon
-are normalized to the CLI's stable categories, so the advertised set remains
-exhaustive.
+and their exit codes, and that set is exhaustive: a daemon kind the CLI lists
+is reported as that kind, and any other is classified by the HTTP status the
+daemon answered with. A 400 is a request argument the daemon rejected and is
+reported as `invalid_usage` (exit 2), exactly like a flag the parser refuses;
+404 is `not_found`, 409 `conflict`, 401 and 403 `permission_denied`, and
+anything else `error`. The daemon's message and hint are preserved in every
+case.
 
 ## Stability policy
 

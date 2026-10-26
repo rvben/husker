@@ -27,9 +27,7 @@ mod vm_creation;
 use crate::cli::*;
 #[cfg(test)]
 use crate::cli_contract::command_contract;
-use crate::cli_contract::{
-    CliErrorKind, guest_command_status, normalize_error_kind, select_fields, structured_output,
-};
+use crate::cli_contract::{CliErrorKind, guest_command_status, select_fields, structured_output};
 use crate::config::*;
 use crate::daemon::*;
 use crate::daemon_client::{
@@ -141,11 +139,9 @@ fn json_output_refusal(command: &Commands) -> Option<&'static str> {
 async fn fetch_diagnostics(
     daemon: &DaemonClient,
 ) -> anyhow::Result<husker_core::DiagnosticsReport> {
-    let resp = daemon
-        .send(daemon.get("/v1/diagnostics"))
-        .await?
-        .error_for_status()?;
-    Ok(resp.json().await?)
+    daemon
+        .execute_json(daemon.get("/v1/diagnostics"), "diagnostics")
+        .await
 }
 
 /// Commands that act on THIS machine's filesystem rather than on the daemon, and
@@ -549,10 +545,9 @@ fn command_path_for_output(value: &serde_json::Value) -> Option<&'static str> {
 
 fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
     let err = error.into();
-    let kind = normalize_error_kind(err.kind.as_deref(), err.exit_code);
     // The structured error envelope is always written to stderr as the last line.
     // Human-readable text mode also puts errors on stderr (no stdout pollution).
-    let structured = render_error_envelope(kind.name(), &err.message, err.hint.as_deref());
+    let structured = render_error_envelope(err.kind.name(), &err.message, err.hint.as_deref());
     if resolve_format(format) == OutputFormat::Json {
         eprintln!("{structured}");
     } else {
@@ -562,7 +557,7 @@ fn exit_with_error(format: OutputFormat, error: impl Into<ApiFailure>) -> ! {
         }
         eprintln!("{structured}");
     }
-    std::process::exit(err.exit_code);
+    std::process::exit(err.kind.exit_code());
 }
 
 /// Gate a destructive command on confirmation: a no-op when `yes` is set;
@@ -2086,17 +2081,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                Err(e) => {
-                    exit_with_error(
-                        output,
-                        ApiFailure {
-                            message: format!("daemon unreachable: {e}"),
-                            kind: None,
-                            exit_code: exit_code::DAEMON_UNREACHABLE,
-                            hint: None,
-                        },
-                    );
-                }
+                Err(e) => exit_with_error(output, ApiFailure::from_error(&e)),
             };
             render_diagnostics(&report, output);
             let code = doctor_exit_code(&report);
@@ -2175,14 +2160,11 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
             if !contexts.contexts.contains_key(&name) {
                 exit_with_error(
                     output,
-                    ApiFailure {
-                        message: format!(
-                            "unknown context '{name}' (list with `husker context list`)"
-                        ),
-                        kind: Some("not_found".into()),
-                        exit_code: exit_code::NOT_FOUND,
-                        hint: None,
-                    },
+                    ApiFailure::with_kind(
+                        CliErrorKind::NotFound,
+                        format!("unknown context '{name}' (list with `husker context list`)"),
+                        None,
+                    ),
                 );
             }
             contexts.current = Some(name.clone());
@@ -2197,12 +2179,11 @@ fn context_command(action: ContextAction, output: OutputFormat) -> Result<()> {
             if contexts.contexts.remove(&name).is_none() {
                 exit_with_error(
                     output,
-                    ApiFailure {
-                        message: format!("unknown context '{name}'"),
-                        kind: Some("not_found".into()),
-                        exit_code: exit_code::NOT_FOUND,
-                        hint: None,
-                    },
+                    ApiFailure::with_kind(
+                        CliErrorKind::NotFound,
+                        format!("unknown context '{name}'"),
+                        None,
+                    ),
                 );
             }
             if contexts.current.as_deref() == Some(name.as_str()) {
@@ -3837,15 +3818,14 @@ async fn run_shell(
             match classify_handshake(*response, &format!("VM '{name}'")) {
                 HandshakeRefusal::RouteMissing => exit_with_error(
                     output,
-                    ApiFailure {
-                        message: "the daemon does not serve the interactive shell route".into(),
-                        kind: Some("not_found".into()),
-                        exit_code: exit_code::NOT_FOUND,
-                        hint: Some(
+                    ApiFailure::with_kind(
+                        CliErrorKind::NotFound,
+                        "the daemon does not serve the interactive shell route",
+                        Some(
                             "upgrade the daemon; GET /api-docs/openapi.json lists the routes it serves"
                                 .into(),
                         ),
-                    },
+                    ),
                 ),
                 HandshakeRefusal::Refused(failure) => exit_with_error(output, failure),
             }
@@ -5126,8 +5106,7 @@ mod tests {
         assert!(shell_refusal("vm", "suspended", Some(true)).is_none());
 
         let stopped = shell_refusal("vm", "stopped", None).unwrap();
-        assert_eq!(stopped.kind.as_deref(), Some("vm_not_running"));
-        assert_eq!(stopped.exit_code, exit_code::CONFLICT);
+        assert_eq!(stopped.kind, CliErrorKind::VmNotRunning);
         assert_eq!(stopped.message, "VM 'vm' is stopped, expected running");
         assert_eq!(
             stopped.hint.as_deref(),
@@ -5142,15 +5121,14 @@ mod tests {
         assert_eq!(opted_out.hint.as_deref(), resume_hint);
 
         let creating = shell_refusal("vm", "creating", None).unwrap();
-        assert_eq!(creating.kind.as_deref(), Some("vm_not_running"));
+        assert_eq!(creating.kind, CliErrorKind::VmNotRunning);
         assert!(creating.hint.is_none());
     }
 
     #[test]
     fn a_declined_prompt_is_a_refusal_distinct_from_a_missing_terminal() {
         let declined = confirmation_declined("Destroy VM 'web'?");
-        assert_eq!(declined.kind.as_deref(), Some("confirmation_declined"));
-        assert_eq!(declined.exit_code, exit_code::CONFIRMATION_REQUIRED);
+        assert_eq!(declined.kind, CliErrorKind::ConfirmationDeclined);
         assert_eq!(
             declined.message,
             "Destroy VM 'web' was not confirmed; nothing was changed"
@@ -5158,8 +5136,7 @@ mod tests {
         assert!(declined.hint.as_deref().unwrap().contains("--yes"));
 
         let required = confirmation_required("Destroy VM 'web'?");
-        assert_eq!(required.kind.as_deref(), Some("confirmation_required"));
-        assert_eq!(required.exit_code, exit_code::CONFIRMATION_REQUIRED);
+        assert_eq!(required.kind, CliErrorKind::ConfirmationRequired);
         assert_eq!(required.message, "Destroy VM 'web'? requires confirmation");
         assert!(required.hint.as_deref().unwrap().contains("--yes"));
     }
