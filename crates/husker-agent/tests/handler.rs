@@ -321,6 +321,11 @@ async fn exec_nonexistent_command() {
     match response {
         AgentResponse::Error(e) => {
             assert!(e.message.contains("exec failed"), "got: {}", e.message);
+            assert!(
+                e.message.contains("nonexistent_command_12345"),
+                "the error names the program that failed to start, got: {}",
+                e.message
+            );
         }
         _ => panic!("expected Error response, got {response:?}"),
     }
@@ -1165,6 +1170,11 @@ async fn shell_nonexistent_command() {
             assert!(
                 e.message.contains("failed to start shell"),
                 "got: {}",
+                e.message
+            );
+            assert!(
+                e.message.contains("nonexistent_command_12345"),
+                "the error names the shell that failed to start, got: {}",
                 e.message
             );
         }

@@ -253,7 +253,10 @@ where
         Err(e) => {
             write_message(
                 stream,
-                &AgentResponse::Error(ErrorResponse::new(format!("exec failed: {e}"))),
+                &AgentResponse::Error(ErrorResponse::new(format!(
+                    "exec failed to start {}: {e}",
+                    program_name(&cmd)
+                ))),
             )
             .await?;
             return Ok(());
@@ -397,8 +400,9 @@ where
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let resp =
-                AgentResponse::Error(ErrorResponse::new(format!("failed to start shell: {e}")));
+            let resp = AgentResponse::Error(ErrorResponse::new(format!(
+                "failed to start shell {program}: {e}"
+            )));
             write_message(stream, &resp).await?;
             return Ok(());
         }
@@ -633,7 +637,10 @@ async fn run_exec_with_capture(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return AgentResponse::Error(ErrorResponse::new(format!("exec failed: {e}")));
+            return AgentResponse::Error(ErrorResponse::new(format!(
+                "exec failed to start {}: {e}",
+                program_name(&cmd)
+            )));
         }
     };
     let stdout = child.stdout.take().expect("piped stdout");
@@ -867,6 +874,12 @@ fn resolve_command_env(
 
 /// Build the child process shared by buffered and streaming exec paths, with
 /// the timeout it runs under: the request's own, or `default_timeout`.
+/// The program a command would run, so an error can name what failed to start
+/// rather than leave the operator to guess which path the OS could not find.
+fn program_name(cmd: &tokio::process::Command) -> String {
+    cmd.as_std().get_program().to_string_lossy().into_owned()
+}
+
 fn build_exec_command(
     req: &ExecRequest,
     default_timeout: std::time::Duration,
