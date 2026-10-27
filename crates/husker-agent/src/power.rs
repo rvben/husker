@@ -110,7 +110,9 @@ fn flush_guest_storage() {
 /// journal that holds nothing. The remount commits the journal and clears the
 /// flag, leaving the clone clean. It is best effort: a guest with files still
 /// open for writing (a systemd guest's journald, a running session) answers
-/// `EBUSY`, and the stop proceeds exactly as before.
+/// `EBUSY`, and the stop proceeds exactly as before. A guest whose `reboot(2)`
+/// fails (an agent without `CAP_SYS_BOOT`) lives on until the host ends it,
+/// so it gets its writable root back before the failure is reported.
 #[cfg(target_os = "linux")]
 fn end_guest(action: GuestPowerAction) -> std::io::Result<()> {
     let command = match action {
@@ -118,27 +120,44 @@ fn end_guest(action: GuestPowerAction) -> std::io::Result<()> {
         GuestPowerAction::Reboot => libc::RB_AUTOBOOT,
         GuestPowerAction::PowerOff => libc::RB_POWER_OFF,
     };
-    // SAFETY: sync() takes no pointers; `mount` reads only the root path,
-    // held for the call, and `MS_REMOUNT` neither reads the source nor the
-    // filesystem type nor the data pointer, which may all be null; reboot()
-    // takes no pointers and does not return on success.
-    unsafe {
-        libc::sync();
-        let root = c"/";
-        if libc::mount(
+    // SAFETY: sync() takes no pointers and has no preconditions.
+    unsafe { libc::sync() };
+    let read_only = remount_root(libc::MS_RDONLY);
+    if let Err(error) = &read_only {
+        tracing::debug!("root filesystem stays writable until the kernel ends: {error}");
+    }
+    // SAFETY: reboot() takes no pointers and does not return on success.
+    if unsafe { libc::reboot(command) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if read_only.is_ok()
+            && let Err(undo) = remount_root(0)
+        {
+            tracing::warn!("root filesystem stays read-only after the failed power action: {undo}");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Remount the root filesystem in place with `flags` on top of `MS_REMOUNT`:
+/// `MS_RDONLY` makes it read-only, no flag makes it writable again. The
+/// kernel keeps the source, type and options of the existing mount.
+#[cfg(target_os = "linux")]
+fn remount_root(flags: libc::c_ulong) -> std::io::Result<()> {
+    let root = c"/";
+    // SAFETY: `mount` with `MS_REMOUNT` reads only the target path, held for
+    // the call; the source, filesystem type and data pointers may be null.
+    let status = unsafe {
+        libc::mount(
             std::ptr::null(),
             root.as_ptr(),
             std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_RDONLY,
+            libc::MS_REMOUNT | flags,
             std::ptr::null(),
-        ) < 0
-        {
-            let error = std::io::Error::last_os_error();
-            tracing::debug!("root filesystem stays writable until the kernel ends: {error}");
-        }
-        if libc::reboot(command) < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        )
+    };
+    if status < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
