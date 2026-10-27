@@ -98,6 +98,11 @@
     returned, so list the sessions before retrying one. Daemons before 0.4.53
     answered this case with 504 `session_timeout`, and a slow tunnel connect
     with 504 `preview_connect_timeout`; both are now 503 `agent_not_ready`.
+- A VM create names a kernel or rootfs the daemon cannot find, or leaves one
+  to a daemon default that is not there, and gets 400 `invalid_argument`
+  either way; the default case carries a `hint` that names `husker images
+  pull`. Daemons before 0.4.53 answered a missing named image with 500
+  `storage_error`, as if the daemon rather than the request were at fault.
 
 ## Deprecation workflow
 
