@@ -418,6 +418,78 @@ pub async fn resize_disk(
     Ok(())
 }
 
+/// The e2fsprogs tools husker invokes on the host: `e2fsck` and `resize2fs`
+/// grow rootfs images, `dumpe2fs` and `e2fsck` replay a pending journal,
+/// `debugfs` refreshes the guest agent inside a rootfs clone, and `mkfs.ext4`
+/// formats volumes and OCI imports.
+pub const E2FSPROGS_TOOLS: [&str; 5] = ["e2fsck", "resize2fs", "dumpe2fs", "debugfs", "mkfs.ext4"];
+
+/// Directories searched for e2fsprogs tools after `PATH`.
+///
+/// Homebrew installs e2fsprogs keg-only because its `fsck` would shadow the
+/// system one, so on macOS the tools exist without ever being on a shell's
+/// PATH, let alone a daemon's. Linux distributions keep them in sbin
+/// directories that an unprivileged user's PATH often omits.
+#[cfg(target_os = "macos")]
+const E2FSPROGS_FALLBACK_DIRS: &[&str] = &[
+    "/opt/homebrew/opt/e2fsprogs/sbin",
+    "/usr/local/opt/e2fsprogs/sbin",
+];
+#[cfg(not(target_os = "macos"))]
+const E2FSPROGS_FALLBACK_DIRS: &[&str] = &["/usr/local/sbin", "/usr/sbin", "/sbin"];
+
+/// How to get e2fsprogs on this platform, appended to every "not runnable"
+/// error so the operator does not have to look up the package name.
+#[cfg(target_os = "macos")]
+const E2FSPROGS_INSTALL_HINT: &str = "install it with `brew install e2fsprogs`";
+#[cfg(not(target_os = "macos"))]
+const E2FSPROGS_INSTALL_HINT: &str = "install the e2fsprogs package";
+
+/// Find the executable `name` in the directories of `path` (a `PATH`-style
+/// list), then in `fallback_dirs`, in that order. Only a regular file with an
+/// execute bit counts, so a directory or a data file of the same name is
+/// skipped rather than reported as the tool.
+fn locate_tool(
+    name: &str,
+    path: Option<&std::ffi::OsStr>,
+    fallback_dirs: &[&str],
+) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let on_path = path.map(std::env::split_paths).into_iter().flatten();
+    let fallbacks = fallback_dirs.iter().map(PathBuf::from);
+    on_path
+        .chain(fallbacks)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// Where the e2fsprogs tool `name` is installed on this host: the first match
+/// on the process `PATH`, else in [`E2FSPROGS_FALLBACK_DIRS`].
+pub fn find_e2fsprogs_tool(name: &str) -> Option<PathBuf> {
+    locate_tool(
+        name,
+        std::env::var_os("PATH").as_deref(),
+        E2FSPROGS_FALLBACK_DIRS,
+    )
+}
+
+/// The program to spawn for the e2fsprogs tool `name`: its resolved path when
+/// it is installed, else the bare name, so that spawning a missing tool fails
+/// with the `NotFound` error the call sites turn into an install hint.
+fn e2fsprogs_tool(name: &str) -> PathBuf {
+    find_e2fsprogs_tool(name).unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// The message for an e2fsprogs tool that could not be started: which tool,
+/// why it was needed, the spawn error, and how to install it here.
+fn e2fsprogs_not_runnable(tool: &str, purpose: &str, error: &std::io::Error) -> String {
+    format!("{tool} not runnable ({error}); {purpose} needs e2fsprogs, {E2FSPROGS_INSTALL_HINT}")
+}
+
 /// Grow a raw ext4 rootfs image to `new_size_bytes` offline.
 ///
 /// Used for plain-rootfs VMs (`--disk-size` with a catalog/OCI image), which
@@ -453,14 +525,16 @@ pub async fn grow_rootfs_ext4(path: &Path, new_size_bytes: u64) -> Result<(), St
     // resize2fs refuses a filesystem that has not been checked since its last
     // mount; -f forces the check, -p auto-fixes. Exit code 1 means "errors
     // corrected", which is fine for a freshly cloned image.
-    let fsck = tokio::process::Command::new("e2fsck")
+    let fsck = tokio::process::Command::new(e2fsprogs_tool("e2fsck"))
         .arg("-fp")
         .arg(path)
         .output()
         .await
         .map_err(|e| {
-            StorageError::CommandFailed(format!(
-                "e2fsck not runnable ({e}); growing a rootfs image needs e2fsprogs"
+            StorageError::CommandFailed(e2fsprogs_not_runnable(
+                "e2fsck",
+                "growing a rootfs image",
+                &e,
             ))
         })?;
     if !matches!(fsck.status.code(), Some(0) | Some(1)) {
@@ -470,13 +544,15 @@ pub async fn grow_rootfs_ext4(path: &Path, new_size_bytes: u64) -> Result<(), St
             String::from_utf8_lossy(&fsck.stderr).trim()
         )));
     }
-    let resize = tokio::process::Command::new("resize2fs")
+    let resize = tokio::process::Command::new(e2fsprogs_tool("resize2fs"))
         .arg(path)
         .output()
         .await
         .map_err(|e| {
-            StorageError::CommandFailed(format!(
-                "resize2fs not runnable ({e}); growing a rootfs image needs e2fsprogs"
+            StorageError::CommandFailed(e2fsprogs_not_runnable(
+                "resize2fs",
+                "growing a rootfs image",
+                &e,
             ))
         })?;
     if !resize.status.success() {
@@ -505,14 +581,16 @@ pub enum JournalReplay {
 /// "clean": the callers use a clean answer to justify editing or publishing
 /// the image.
 async fn ext4_needs_recovery(path: &Path) -> Result<bool, StorageError> {
-    let out = tokio::process::Command::new("dumpe2fs")
+    let out = tokio::process::Command::new(e2fsprogs_tool("dumpe2fs"))
         .arg("-h")
         .arg(path)
         .output()
         .await
         .map_err(|e| {
-            StorageError::CommandFailed(format!(
-                "dumpe2fs not runnable ({e}); inspecting an ext4 journal needs e2fsprogs"
+            StorageError::CommandFailed(e2fsprogs_not_runnable(
+                "dumpe2fs",
+                "inspecting an ext4 journal",
+                &e,
             ))
         })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -545,7 +623,7 @@ pub async fn replay_ext4_journal(path: &Path) -> Result<JournalReplay, StorageEr
     if !ext4_needs_recovery(path).await? {
         return Ok(JournalReplay::Clean);
     }
-    let fsck = tokio::process::Command::new("e2fsck")
+    let fsck = tokio::process::Command::new(e2fsprogs_tool("e2fsck"))
         .arg("-y")
         .arg("-E")
         .arg("journal_only")
@@ -553,8 +631,10 @@ pub async fn replay_ext4_journal(path: &Path) -> Result<JournalReplay, StorageEr
         .output()
         .await
         .map_err(|e| {
-            StorageError::CommandFailed(format!(
-                "e2fsck not runnable ({e}); replaying an ext4 journal needs e2fsprogs"
+            StorageError::CommandFailed(e2fsprogs_not_runnable(
+                "e2fsck",
+                "replaying an ext4 journal",
+                &e,
             ))
         })?;
     // Exit code 1 means "errors corrected", which is what a replay reports.
@@ -623,7 +703,7 @@ async fn run_debugfs(
     script_path: &Path,
     writable: bool,
 ) -> std::io::Result<std::process::Output> {
-    let mut cmd = tokio::process::Command::new("debugfs");
+    let mut cmd = tokio::process::Command::new(e2fsprogs_tool("debugfs"));
     if writable {
         cmd.arg("-w");
     }
@@ -703,8 +783,10 @@ async fn refresh_in_work_dir(
     let dumped = match run_debugfs(image, &dump_script, false).await {
         Ok(out) => out,
         Err(e) => {
-            return Ok(AgentRefresh::Skipped(format!(
-                "debugfs not runnable ({e}); refreshing a rootfs image's guest agent needs e2fsprogs"
+            return Ok(AgentRefresh::Skipped(e2fsprogs_not_runnable(
+                "debugfs",
+                "refreshing a rootfs image's guest agent",
+                &e,
             )));
         }
     };
@@ -748,8 +830,10 @@ async fn refresh_in_work_dir(
     let write_script = work.join("write.debugfs");
     tokio::fs::write(&write_script, agent_replace_script(&source)).await?;
     let written = run_debugfs(image, &write_script, true).await.map_err(|e| {
-        StorageError::CommandFailed(format!(
-            "debugfs not runnable ({e}); refreshing a rootfs image's guest agent needs e2fsprogs"
+        StorageError::CommandFailed(e2fsprogs_not_runnable(
+            "debugfs",
+            "refreshing a rootfs image's guest agent",
+            &e,
         ))
     })?;
 
@@ -1175,7 +1259,7 @@ pub async fn create_volume_image(path: &Path, size_bytes: u64) -> Result<(), Sto
     create_sparse_file(path, size_bytes)?;
 
     // Format with mkfs.ext4.
-    let output = tokio::process::Command::new("mkfs.ext4")
+    let output = tokio::process::Command::new(e2fsprogs_tool("mkfs.ext4"))
         .arg("-F")
         .arg("-q")
         .arg(path)
@@ -1186,8 +1270,10 @@ pub async fn create_volume_image(path: &Path, size_bytes: u64) -> Result<(), Sto
         Err(e) => {
             // mkfs not found or failed to spawn; clean up and propagate.
             let _ = std::fs::remove_file(path);
-            Err(StorageError::VolumeImage(format!(
-                "mkfs.ext4 spawn failed: {e}"
+            Err(StorageError::VolumeImage(e2fsprogs_not_runnable(
+                "mkfs.ext4",
+                "creating a volume",
+                &e,
             )))
         }
         Ok(out) if !out.status.success() => {
@@ -1216,7 +1302,7 @@ pub async fn build_ext4_from_dir(
         tokio::fs::create_dir_all(parent).await?;
     }
     create_sparse_file(path, size_bytes)?;
-    let output = tokio::process::Command::new("mkfs.ext4")
+    let output = tokio::process::Command::new(e2fsprogs_tool("mkfs.ext4"))
         .arg("-F")
         .arg("-q")
         .arg("-d")
@@ -1227,8 +1313,10 @@ pub async fn build_ext4_from_dir(
     match output {
         Err(e) => {
             let _ = std::fs::remove_file(path);
-            Err(StorageError::VolumeImage(format!(
-                "mkfs.ext4 -d spawn failed: {e}"
+            Err(StorageError::VolumeImage(e2fsprogs_not_runnable(
+                "mkfs.ext4",
+                "building an ext4 image from a directory",
+                &e,
             )))
         }
         Ok(out) if !out.status.success() => {
@@ -1287,6 +1375,106 @@ mod tests {
     fn validate_kernel_missing_file() {
         let result = validate_kernel(Path::new("/nonexistent/vmlinux"));
         assert!(matches!(result, Err(StorageError::KernelNotFound(_))));
+    }
+
+    /// Create `dir/name` with the given mode and return its path.
+    fn place(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn path_list(dirs: &[&Path]) -> std::ffi::OsString {
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    #[test]
+    fn locate_tool_prefers_path_over_the_fallback_directories() {
+        let on_path = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let expected = place(on_path.path(), "debugfs", 0o755);
+        place(fallback.path(), "debugfs", 0o755);
+        let fallbacks = [fallback.path().to_str().unwrap()];
+
+        let found = locate_tool("debugfs", Some(&path_list(&[on_path.path()])), &fallbacks);
+
+        assert_eq!(found, Some(expected));
+    }
+
+    #[test]
+    fn locate_tool_falls_back_when_path_lacks_the_tool() {
+        let on_path = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let expected = place(fallback.path(), "debugfs", 0o755);
+        let fallbacks = [fallback.path().to_str().unwrap()];
+
+        let found = locate_tool("debugfs", Some(&path_list(&[on_path.path()])), &fallbacks);
+
+        assert_eq!(found, Some(expected));
+    }
+
+    /// A daemon started without any PATH at all (some service managers clear
+    /// the environment) still finds the tools in the fallback directories.
+    #[test]
+    fn locate_tool_searches_the_fallbacks_without_a_path() {
+        let fallback = tempfile::tempdir().unwrap();
+        let expected = place(fallback.path(), "e2fsck", 0o755);
+        let fallbacks = [fallback.path().to_str().unwrap()];
+
+        assert_eq!(locate_tool("e2fsck", None, &fallbacks), Some(expected));
+    }
+
+    /// A non-executable file, or a directory, named like the tool is not the
+    /// tool: spawning it would fail with a permission error that reads like a
+    /// broken install, so the search skips it and keeps looking.
+    #[test]
+    fn locate_tool_skips_entries_that_cannot_be_executed() {
+        let on_path = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        place(on_path.path(), "resize2fs", 0o644);
+        std::fs::create_dir(on_path.path().join("mkfs.ext4")).unwrap();
+        let expected = place(fallback.path(), "resize2fs", 0o755);
+        let fallbacks = [fallback.path().to_str().unwrap()];
+        let path = path_list(&[on_path.path()]);
+
+        assert_eq!(
+            locate_tool("resize2fs", Some(&path), &fallbacks),
+            Some(expected)
+        );
+        assert_eq!(locate_tool("mkfs.ext4", Some(&path), &fallbacks), None);
+    }
+
+    #[test]
+    fn locate_tool_reports_a_missing_tool_as_none() {
+        let empty = tempfile::tempdir().unwrap();
+        let fallbacks = [empty.path().to_str().unwrap()];
+
+        assert_eq!(
+            locate_tool("dumpe2fs", Some(&path_list(&[empty.path()])), &fallbacks),
+            None
+        );
+    }
+
+    /// A tool that is installed nowhere is spawned by its bare name, so the
+    /// spawn fails with `NotFound` and the error names the tool.
+    #[test]
+    fn a_missing_e2fsprogs_tool_is_spawned_by_name() {
+        let name = "husker-no-such-e2fsprogs-tool";
+        assert_eq!(e2fsprogs_tool(name), PathBuf::from(name));
+    }
+
+    #[test]
+    fn not_runnable_message_names_the_tool_the_purpose_and_the_install_hint() {
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let message = e2fsprogs_not_runnable("debugfs", "refreshing the guest agent", &error);
+        assert!(message.starts_with("debugfs not runnable ("), "{message}");
+        assert!(
+            message.contains("refreshing the guest agent needs e2fsprogs"),
+            "{message}"
+        );
+        assert!(message.ends_with(E2FSPROGS_INSTALL_HINT), "{message}");
     }
 
     /// `write` allocates a new inode, so an agent replaced without restoring

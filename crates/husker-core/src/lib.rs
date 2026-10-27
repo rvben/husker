@@ -2102,6 +2102,58 @@ fn binary_on_path(name: &str) -> bool {
     })
 }
 
+/// The `e2fsprogs` doctor check: where each tool husker invokes resolves to,
+/// through the same lookup the daemon uses when it spawns them. Advisory: a
+/// daemon without them still runs VMs, but rootfs clones keep the agent their
+/// image was imported with, and `--disk-size` on a rootfs image, volumes and
+/// OCI imports fail.
+fn e2fsprogs_check() -> CheckResult {
+    let (present, missing): (Vec<_>, Vec<_>) = husker_storage::E2FSPROGS_TOOLS
+        .iter()
+        .map(|tool| (*tool, husker_storage::find_e2fsprogs_tool(tool)))
+        .partition(|(_, path)| path.is_some());
+    let mut dirs: Vec<String> = present
+        .iter()
+        .filter_map(|(_, path)| path.as_ref()?.parent().map(|d| d.display().to_string()))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    let present_names: Vec<&str> = present.iter().map(|(tool, _)| *tool).collect();
+    let (status, message) = if missing.is_empty() {
+        (
+            CheckStatus::Ok,
+            format!(
+                "{} present in {}",
+                present_names.join(", "),
+                dirs.join(", ")
+            ),
+        )
+    } else {
+        let missing_names: Vec<&str> = missing.iter().map(|(tool, _)| *tool).collect();
+        let found = if present_names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({} present in {})",
+                present_names.join(", "),
+                dirs.join(", ")
+            )
+        };
+        (
+            CheckStatus::Warn,
+            format!(
+                "missing: {}{found}; without them rootfs clones keep their imported guest agent and --disk-size on rootfs images, volumes and OCI imports fail",
+                missing_names.join(", ")
+            ),
+        )
+    };
+    CheckResult {
+        name: "e2fsprogs".into(),
+        status,
+        message,
+    }
+}
+
 /// Inputs to [`build_diagnostics`]: the storage layout plus the daemon-config
 /// facts the host checks need. The CLI local probe fills these from its loaded
 /// config; the `/v1/diagnostics` handler fills them from the running manager.
@@ -2380,6 +2432,8 @@ pub fn build_diagnostics(input: &DiagnosticsInput<'_>) -> DiagnosticsReport {
             message,
         });
     }
+
+    checks.push(e2fsprogs_check());
 
     // migration helpers (advisory; needed by `setup storage`).
     let mkfs = binary_on_path("mkfs.xfs");
@@ -6560,6 +6614,25 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let report = build_diagnostics(&input);
         // Always includes the reflink and free-space checks by name.
         assert!(report.checks.iter().any(|c| c.name == "data-dir reflink"));
+        // The e2fsprogs check reports every tool husker spawns, by name, so an
+        // operator can tell a missing debugfs from a missing mkfs.ext4.
+        let e2fsprogs = report
+            .checks
+            .iter()
+            .find(|c| c.name == "e2fsprogs")
+            .expect("e2fsprogs check present on every platform");
+        assert!(
+            matches!(e2fsprogs.status, CheckStatus::Ok | CheckStatus::Warn),
+            "advisory check, never a failure: {:?}",
+            e2fsprogs.status
+        );
+        for tool in husker_storage::E2FSPROGS_TOOLS {
+            assert!(
+                e2fsprogs.message.contains(tool),
+                "message names {tool}: {}",
+                e2fsprogs.message
+            );
+        }
         assert!(
             report
                 .checks

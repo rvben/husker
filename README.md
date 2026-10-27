@@ -259,8 +259,12 @@ husker can boot stock cloud images (Ubuntu, Debian, etc.) on both platforms:
 #### macOS prerequisites
 
 ```bash
-brew install qemu   # qemu-img is used for qcow2-to-raw conversion
+brew install qemu        # qemu-img is used for qcow2-to-raw conversion
+brew install e2fsprogs   # debugfs/resize2fs: refresh the guest agent in rootfs clones, grow rootfs images
 ```
+
+Homebrew installs e2fsprogs keg-only; husker finds it in the keg without any
+PATH changes, and `husker doctor` reports which tools it found.
 
 #### Example (macOS)
 
