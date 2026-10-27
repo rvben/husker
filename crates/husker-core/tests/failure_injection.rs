@@ -579,7 +579,7 @@ impl VmmBackend for FailingVmm {
                 let response = match request {
                     AgentRequest::GuestInfo => AgentResponse::GuestInfo(GuestInfoResponse {
                         ipv4: vec![],
-                        protocol_version: 5,
+                        protocol_version: husker_agent_proto::PROTOCOL_VERSION,
                     }),
                     AgentRequest::RestoreGuest(request) => {
                         assert!(request.require_vmgenid);

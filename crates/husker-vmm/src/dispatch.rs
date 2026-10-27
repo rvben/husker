@@ -5,11 +5,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
-use husker_agent_proto::{
-    AGENT_VSOCK_PORT, AgentRequest, AgentResponse, read_message_with_timeout, write_message,
-};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -114,50 +110,6 @@ impl LinuxDispatchBackend {
             .copied()
             .ok_or(VmmError::VmNotFound(id))
     }
-
-    /// Send a `Shutdown` message to the in-guest agent and wait for the
-    /// acknowledgement, causing the agent to call `sync()` and unmount the data
-    /// volume so writes are durable before the host kills the VM process. The
-    /// ack arrives only after `sync()` returns, so the wait tracks the flush.
-    ///
-    /// Every failure mode (no agent, connection refused, timeout, dead VM) is
-    /// silently discarded. This is intentional: the flush is a best-effort
-    /// durability improvement and must never prevent a VM from being destroyed.
-    async fn graceful_flush(&self, id: Uuid) {
-        // Bound the WHOLE best-effort attempt (connect + write + ack) in one
-        // timeout: a wedged guest or a vsock connect that never completes must
-        // never delay the hard destroy that follows. 3 s is generous for a sync
-        // + umount on a microVM. Every failure mode (no agent, connection
-        // refused, timeout, protocol error, dead VM) is silently discarded.
-        // Phase 1 - connect + deliver the Shutdown with a SHORT bound: a dead,
-        // old, or wedged VM that does not accept the connection promptly is not
-        // worth waiting on, so fall through to the hard kill.
-        let connected = tokio::time::timeout(Duration::from_secs(3), async {
-            let mut stream = self.vsock_connect(id, AGENT_VSOCK_PORT).await.ok()?;
-            write_message(&mut stream, &AgentRequest::Shutdown)
-                .await
-                .ok()?;
-            Some(stream)
-        })
-        .await;
-        let Ok(Some(mut stream)) = connected else {
-            return;
-        };
-        // Phase 2 - the agent acks `ShuttingDown` only AFTER `sync()` returns, so
-        // waiting for the ack IS waiting for the volume to reach disk. Wait
-        // GENEROUSLY (a large dirty cache on a slow disk takes seconds to flush)
-        // but still bounded, so a guest stuck inside sync() can never block the
-        // destroy indefinitely. A timeout here just falls through to the kill.
-        // `tokio::time::timeout` bounds the WHOLE read, including the common
-        // "guest accepted the request but has not sent any bytes yet" case (a
-        // hang inside sync() before the length prefix), which the message-level
-        // timeout alone does not cover.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(30),
-            read_message_with_timeout::<AgentResponse, _>(&mut stream, Duration::from_secs(30)),
-        )
-        .await;
-    }
 }
 
 /// Selects the VMM backend kind for a new VM.
@@ -244,10 +196,6 @@ impl VmmBackend for LinuxDispatchBackend {
 
     async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
         let kind = self.kind_of(id).await?;
-        // Best-effort graceful flush before the hard kill. All errors are
-        // intentionally swallowed so a dead or agentless VM is destroyed
-        // just as before (no behavior change on failure paths).
-        self.graceful_flush(id).await;
         let result = match kind {
             VmmKind::Firecracker => self.firecracker.destroy_vm(id).await,
             VmmKind::Qemu => self.qemu.destroy_vm(id).await,

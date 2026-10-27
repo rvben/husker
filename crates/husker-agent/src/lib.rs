@@ -3,6 +3,8 @@
 mod pty;
 mod sessions;
 pub use sessions::SessionStore;
+mod power;
+pub use power::{NoPowerControl, PowerControl};
 mod restore;
 pub mod serve;
 
@@ -23,10 +25,10 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use husker_agent_proto::{
     AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ExecResponse,
-    ExecStreamData, ExecStreamExit, GuestInfoResponse, OCI_CONFIG_PATH, OciRuntimeConfig,
-    ProtocolError, ReadFileResponse, ReconfigureNetworkRequest, ReconfigureNetworkResponse,
-    ShellDataResponse, ShellExitResponse, ShellStartRequest, WriteFileResponse, base64_decode,
-    base64_encode, read_message, write_message,
+    ExecStreamData, ExecStreamExit, GuestInfoResponse, GuestPowerAction, OCI_CONFIG_PATH,
+    OciRuntimeConfig, ProtocolError, ReadFileResponse, ReconfigureNetworkRequest,
+    ReconfigureNetworkResponse, ShellDataResponse, ShellExitResponse, ShellStartRequest,
+    WriteFileResponse, base64_decode, base64_encode, read_message, write_message,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
@@ -76,11 +78,16 @@ impl AgentLimits {
     }
 }
 
-/// Handle a single connection with the process-wide session store and the
-/// default limits, processing requests until the stream closes. The entry
-/// point for embedders and tests that need a plain guest agent; the serving
-/// process uses [`handle_connection_with`] so every connection shares the
-/// limits it was started with.
+/// How long the agent waits, after acknowledging a `Shutdown` it will act on,
+/// for the host to close the connection before it ends the guest anyway.
+const HOST_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Handle a single connection with the process-wide session store, the
+/// default limits and no power control, processing requests until the stream
+/// closes. The entry point for embedders and tests that need a plain guest
+/// agent; the serving process uses [`handle_connection_with`] so every
+/// connection shares the limits it was started with, and only its vsock
+/// listeners hand out the kernel's power control.
 ///
 /// Generic over the stream type so it works with both Unix sockets (dev/test)
 /// and vsock streams (production in-VM).
@@ -88,16 +95,24 @@ pub async fn handle_connection<S>(stream: S) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handle_connection_with(stream, sessions::store().clone(), AgentLimits::default()).await
+    handle_connection_with(
+        stream,
+        sessions::store().clone(),
+        AgentLimits::default(),
+        std::sync::Arc::new(NoPowerControl),
+    )
+    .await
 }
 
-/// Serve a connection using an explicitly owned session store and explicit
-/// limits. All connections for one guest must share the store; an isolated
-/// integration test gives each guest its own store and its own limits.
+/// Serve a connection using an explicitly owned session store, explicit
+/// limits and an explicit power control. All connections for one guest must
+/// share the store; an isolated integration test gives each guest its own
+/// store, its own limits and a power control that cannot touch the host.
 pub async fn handle_connection_with<S>(
     mut stream: S,
     sessions: std::sync::Arc<SessionStore>,
     limits: AgentLimits,
+    power: std::sync::Arc<dyn PowerControl>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -166,11 +181,53 @@ where
                 // Shell takes over the connection — no more request/response loop
                 return handle_shell(&mut stream, req).await;
             }
+            AgentRequest::Shutdown { power: requested } => {
+                let planned = power.prepare(requested);
+                write_message(&mut stream, &AgentResponse::ShuttingDown { power: planned }).await?;
+                if planned == GuestPowerAction::Flush {
+                    continue;
+                }
+                // The acknowledgement has only certainly left the guest once
+                // the host has read it, and the host signals that by closing
+                // the connection. Ending the guest earlier could lose the ack
+                // inside a transport the VM takes down with it, so wait for
+                // the host's EOF, bounded for a host that never closes.
+                await_host_release(&mut stream).await;
+                power.apply(planned);
+                return Ok(());
+            }
             other => {
                 let response = handle_request_with_sessions(other, &sessions, limits).await;
                 write_message(&mut stream, &response).await?;
             }
         }
+    }
+}
+
+/// Wait until the host closes the connection or the stream errors, bounded by
+/// [`HOST_RELEASE_TIMEOUT`]. Anything the host still sends is discarded: the
+/// guest is about to end and no request can be served any more.
+async fn await_host_release<S>(stream: &mut S)
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let released = async {
+        let mut sink = [0u8; 256];
+        loop {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    };
+    if tokio::time::timeout(HOST_RELEASE_TIMEOUT, released)
+        .await
+        .is_err()
+    {
+        warn!(
+            "host kept the shutdown connection open for {}s; ending the guest without its release",
+            HOST_RELEASE_TIMEOUT.as_secs()
+        );
     }
 }
 
@@ -834,11 +891,6 @@ fn build_exec_command(
     Ok((cmd, timeout))
 }
 
-#[cfg(test)]
-async fn handle_request(request: AgentRequest) -> AgentResponse {
-    handle_request_with_sessions(request, sessions::store(), AgentLimits::default()).await
-}
-
 async fn handle_request_with_sessions(
     request: AgentRequest,
     sessions: &std::sync::Arc<SessionStore>,
@@ -1070,17 +1122,10 @@ async fn handle_request_with_sessions(
             ))),
         },
 
-        AgentRequest::Shutdown => {
-            // Flush all dirty pages and best-effort-unmount the data volume
-            // so writes to a `--volume` disk are durable before the host
-            // kills the VM process.
-            #[cfg(target_os = "linux")]
-            flush_and_unmount();
-            AgentResponse::ShuttingDown
-        }
-
-        // ShellStart is handled in handle_connection before reaching here.
-        // ShellData and ShellResize are only valid during an active shell session.
+        // Tunnel, ExecStream, ShellStart and Shutdown are handled in
+        // handle_connection_with before reaching here, because each one
+        // decides what happens to the connection itself. ShellData and
+        // ShellResize are only valid during an active shell session.
         AgentRequest::SessionStart(_)
         | AgentRequest::SessionGet { .. }
         | AgentRequest::SessionList
@@ -1091,43 +1136,10 @@ async fn handle_request_with_sessions(
         | AgentRequest::ExecStream(_)
         | AgentRequest::ShellStart(_)
         | AgentRequest::ShellData(_)
-        | AgentRequest::ShellResize(_) => AgentResponse::Error(ErrorResponse::new(
+        | AgentRequest::ShellResize(_)
+        | AgentRequest::Shutdown { .. } => AgentResponse::Error(ErrorResponse::new(
             "shell messages are not valid outside a shell session",
         )),
-    }
-}
-
-/// Flush all dirty pages to disk, then best-effort-unmount `/data` (the
-/// auto-mounted volume) and any virtiofs shares mounted by the supervisor.
-///
-/// Called on receiving a `Shutdown` request so that writes to named volumes
-/// are durable before the host force-kills the VM. All unmount errors are
-/// ignored: a `sync()` before any `umount2()` is the durability guarantee,
-/// and a lazy detach (`MNT_DETACH`) is sufficient even when the umount
-/// itself fails.
-#[cfg(target_os = "linux")]
-fn flush_and_unmount() {
-    // SAFETY: sync() takes no pointers and has no preconditions; it queues
-    // all dirty page-cache and buffer-cache writes to their respective block
-    // devices and waits for completion.
-    unsafe { libc::sync() };
-
-    // Best-effort lazy unmount of the auto-mounted data volume.
-    let data = std::ffi::CString::new("/data").expect("no NUL in /data");
-    // SAFETY: data is a valid CString held for the call; MNT_DETACH detaches
-    // the mount from the name-space immediately and waits for all in-flight
-    // I/O (already flushed by sync) to drain before freeing the superblock.
-    unsafe { libc::umount2(data.as_ptr(), libc::MNT_DETACH) };
-
-    // Best-effort lazy unmount of virtiofs shares the supervisor mounted.
-    // Errors are ignored: the sync above is the durability guarantee.
-    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
-        for (_tag, path, _ro) in supervisor::parse_shares(&cmdline) {
-            if let Ok(cpath) = std::ffi::CString::new(path.as_str()) {
-                // SAFETY: cpath is a valid CString held for the call.
-                unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) };
-            }
-        }
     }
 }
 
@@ -1529,16 +1541,112 @@ mod tests {
         );
     }
 
-    // The sync/umount syscalls are Linux-gated; the response variant is asserted
-    // on all platforms because handle_request is cross-platform and always returns
-    // ShuttingDown (the no-op non-Linux path omits the syscalls only).
+    /// A power control that records what it was asked to apply instead of
+    /// ending anything, and plans exactly what the host requested.
+    #[derive(Default)]
+    struct RecordingPower {
+        applied: std::sync::Mutex<Vec<GuestPowerAction>>,
+    }
+
+    impl RecordingPower {
+        fn applied(&self) -> Vec<GuestPowerAction> {
+            self.applied.lock().unwrap().clone()
+        }
+    }
+
+    impl PowerControl for RecordingPower {
+        fn prepare(&self, requested: GuestPowerAction) -> GuestPowerAction {
+            requested
+        }
+
+        fn apply(&self, action: GuestPowerAction) {
+            self.applied.lock().unwrap().push(action);
+        }
+    }
+
+    /// Serve one in-memory connection with `power` and an isolated session
+    /// store; returns the host's end and the agent task.
+    fn serve_in_memory(
+        power: std::sync::Arc<dyn PowerControl>,
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Result<()>>) {
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let agent = tokio::spawn(async move {
+            let _keep_store_dir = temp;
+            handle_connection_with(guest, store, AgentLimits::default(), power).await
+        });
+        (host, agent)
+    }
+
+    async fn request_shutdown(
+        host: &mut tokio::io::DuplexStream,
+        requested: GuestPowerAction,
+    ) -> AgentResponse {
+        write_message(host, &AgentRequest::Shutdown { power: requested })
+            .await
+            .unwrap();
+        read_message(host).await.unwrap().expect("ack before EOF")
+    }
+
     #[tokio::test]
-    async fn shutdown_returns_shutting_down() {
-        let response = handle_request(AgentRequest::Shutdown).await;
+    async fn shutdown_without_power_control_answers_flush_and_keeps_serving() {
+        let (mut host, _agent) = serve_in_memory(std::sync::Arc::new(NoPowerControl));
+        let ack = request_shutdown(&mut host, GuestPowerAction::Reboot).await;
         assert!(
-            matches!(response, AgentResponse::ShuttingDown),
-            "expected ShuttingDown, got {response:?}"
+            matches!(
+                ack,
+                AgentResponse::ShuttingDown {
+                    power: GuestPowerAction::Flush
+                }
+            ),
+            "expected a Flush acknowledgement, got {ack:?}"
         );
+        write_message(&mut host, &AgentRequest::Ping).await.unwrap();
+        let pong: AgentResponse = read_message(&mut host).await.unwrap().unwrap();
+        assert!(matches!(pong, AgentResponse::Pong), "got {pong:?}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_applies_the_planned_action_once_the_host_releases_the_connection() {
+        let power = std::sync::Arc::new(RecordingPower::default());
+        let (mut host, agent) = serve_in_memory(power.clone());
+        let ack = request_shutdown(&mut host, GuestPowerAction::PowerOff).await;
+        assert!(
+            matches!(
+                ack,
+                AgentResponse::ShuttingDown {
+                    power: GuestPowerAction::PowerOff
+                }
+            ),
+            "expected the requested action back, got {ack:?}"
+        );
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            power.applied().is_empty(),
+            "power was applied while the host still held the connection"
+        );
+        drop(host);
+        agent.await.unwrap().unwrap();
+        assert_eq!(power.applied(), vec![GuestPowerAction::PowerOff]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_applies_the_planned_action_when_the_host_never_releases() {
+        let power = std::sync::Arc::new(RecordingPower::default());
+        let (mut host, agent) = serve_in_memory(power.clone());
+        request_shutdown(&mut host, GuestPowerAction::Reboot).await;
+        let started = tokio::time::Instant::now();
+        agent.await.unwrap().unwrap();
+        assert!(
+            started.elapsed() >= HOST_RELEASE_TIMEOUT,
+            "ended the guest after {:?}, before the release timeout",
+            started.elapsed()
+        );
+        assert_eq!(power.applied(), vec![GuestPowerAction::Reboot]);
+        drop(host);
     }
 
     #[tokio::test]

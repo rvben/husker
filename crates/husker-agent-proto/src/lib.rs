@@ -68,11 +68,41 @@ pub enum AgentRequest {
     /// gateway, and DNS.
     ReconfigureNetwork(ReconfigureNetworkRequest),
 
-    /// Flush all dirty pages to disk and unmount the data volume, then signal
-    /// readiness to be destroyed. Sent by the host as the first step of
-    /// `destroy_vm` so that writes to a named volume (`--volume`) are durable
-    /// even when the guest process is killed immediately after.
-    Shutdown,
+    /// Flush all dirty pages to disk and unmount the data volume, acknowledge
+    /// with [`AgentResponse::ShuttingDown`], then apply `power`. Sent by the
+    /// host as the first step of a stop, a destroy and the daemon's shutdown
+    /// drain, so that writes to a named volume (`--volume`) are durable and
+    /// the guest ends itself instead of being killed mid-write.
+    Shutdown {
+        /// What to do with guest power once the flush is done. Absent on the
+        /// wire from hosts that predate the field, which means `Flush`.
+        #[serde(default)]
+        power: GuestPowerAction,
+    },
+}
+
+/// What the guest does with its power state after a [`AgentRequest::Shutdown`]
+/// has flushed and unmounted the data volume.
+///
+/// The host asks for the action its VMM exits on: Firecracker ends the VM
+/// process when the guest reboots but only halts it on power-off, while QEMU
+/// and Apple Virtualization end it on power-off. The agent answers with the
+/// action it will actually take, which is `Flush` when it has no control over
+/// guest power (an agent serving on a host-side Unix socket, or an embedder),
+/// so the host knows whether to wait for the VM process to exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestPowerAction {
+    /// Flush and unmount only; the host terminates the VM process itself.
+    /// The wire default, so a `Shutdown` or `ShuttingDown` without the field
+    /// means exactly what it meant before the field existed.
+    #[default]
+    Flush,
+    /// Reboot after flushing. Exits the VM process on Firecracker.
+    Reboot,
+    /// Power off after flushing. Exits the VM process on QEMU and Apple
+    /// Virtualization.
+    PowerOff,
 }
 
 /// Messages sent from the guest agent back to the host.
@@ -130,8 +160,16 @@ pub enum AgentResponse {
     ReconfigureNetwork(ReconfigureNetworkResponse),
 
     /// Acknowledgement that the guest has synced dirty pages and unmounted the
-    /// data volume; the host may now kill the VM process.
-    ShuttingDown,
+    /// data volume. `power` is the action the guest applies once the host
+    /// closes this connection: `Flush` means the host must end the VM process
+    /// itself, anything else means the host should wait for the process to
+    /// exit on its own.
+    ShuttingDown {
+        /// Absent on the wire from agents that predate the field, which means
+        /// `Flush`: such an agent never touches guest power.
+        #[serde(default)]
+        power: GuestPowerAction,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,7 +494,11 @@ pub const AGENT_VSOCK_PORT: u32 = 52;
 /// Bump this whenever the framed message contract changes in a way that a peer
 /// must be aware of. The agent reports it via [`GuestInfoResponse`], and the
 /// host warns when a connected guest reports a different (non-zero) version.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// v6 added [`GuestPowerAction`] to `Shutdown` and `ShuttingDown`. A v5 agent
+/// ignores the requested action and answers without one, which decodes as
+/// `Flush`, so a host needs no version check to stay correct against it.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Detached sessions and loopback TCP tunnels were added together in v5.
 pub const MIN_PROTOCOL_VERSION_FOR_SESSIONS: u32 = 5;
@@ -764,7 +806,7 @@ mod tests {
             }
             other => panic!("expected GuestInfo, got {other:?}"),
         }
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
         assert_eq!(MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM, 4);
     }
 
@@ -992,18 +1034,88 @@ mod tests {
 
     #[test]
     fn roundtrip_shutdown() {
-        let req = AgentRequest::Shutdown;
+        let req = AgentRequest::Shutdown {
+            power: GuestPowerAction::Reboot,
+        };
         let encoded = encode_message(&req).unwrap();
         let (decoded, consumed): (AgentRequest, usize) = decode_message(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
-        assert!(matches!(decoded, AgentRequest::Shutdown));
+        assert!(matches!(
+            decoded,
+            AgentRequest::Shutdown {
+                power: GuestPowerAction::Reboot
+            }
+        ));
 
-        let resp = AgentResponse::ShuttingDown;
+        let resp = AgentResponse::ShuttingDown {
+            power: GuestPowerAction::PowerOff,
+        };
         let encoded = encode_message(&resp).unwrap();
         let (decoded, consumed): (AgentResponse, usize) =
             decode_message(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
-        assert!(matches!(decoded, AgentResponse::ShuttingDown));
+        assert!(matches!(
+            decoded,
+            AgentResponse::ShuttingDown {
+                power: GuestPowerAction::PowerOff
+            }
+        ));
+    }
+
+    #[test]
+    fn shutdown_power_action_wire_names_are_stable() {
+        // The names are the contract with agents built from other versions,
+        // so pin them rather than whatever the derive currently emits.
+        let cases = [
+            (
+                GuestPowerAction::Flush,
+                r#"{"type":"Shutdown","power":"flush"}"#,
+            ),
+            (
+                GuestPowerAction::Reboot,
+                r#"{"type":"Shutdown","power":"reboot"}"#,
+            ),
+            (
+                GuestPowerAction::PowerOff,
+                r#"{"type":"Shutdown","power":"power_off"}"#,
+            ),
+        ];
+        for (power, wire) in cases {
+            assert_eq!(
+                serde_json::to_string(&AgentRequest::Shutdown { power }).unwrap(),
+                wire
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentResponse::ShuttingDown {
+                power: GuestPowerAction::PowerOff
+            })
+            .unwrap(),
+            r#"{"type":"ShuttingDown","power":"power_off"}"#
+        );
+    }
+
+    #[test]
+    fn shutdown_without_a_power_action_means_flush_on_both_sides() {
+        // A v5 host sends the bare variant and a v5 agent answers with the
+        // bare variant; both must keep their pre-v6 meaning. A v5 agent also
+        // ignores the field a v6 host sends, which the default on the
+        // response side turns into "the host ends the process itself".
+        let request: AgentRequest = serde_json::from_str(r#"{"type":"Shutdown"}"#).unwrap();
+        assert!(matches!(
+            request,
+            AgentRequest::Shutdown {
+                power: GuestPowerAction::Flush
+            }
+        ));
+        let response: AgentResponse = serde_json::from_str(r#"{"type":"ShuttingDown"}"#).unwrap();
+        assert!(matches!(
+            response,
+            AgentResponse::ShuttingDown {
+                power: GuestPowerAction::Flush
+            }
+        ));
+        assert_eq!(GuestPowerAction::default(), GuestPowerAction::Flush);
     }
 
     #[test]

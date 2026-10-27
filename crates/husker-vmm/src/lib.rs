@@ -28,6 +28,7 @@ pub mod macos_bundle;
 
 use std::path::PathBuf;
 
+use husker_agent_proto::GuestPowerAction;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
@@ -120,6 +121,18 @@ impl From<VmmKind> for BackendKind {
             VmmKind::Firecracker => BackendKind::Firecracker,
             VmmKind::Qemu => BackendKind::Qemu,
         }
+    }
+}
+
+/// The guest power action that makes `backend`'s VM process exit. Firecracker
+/// exits when the guest reboots and merely halts it on power-off; QEMU and
+/// Apple VZ exit on power-off and reboot in place. A host asking the guest
+/// agent to end the VM must ask for this one, or the guest ends up halted with
+/// its process still running.
+pub fn guest_power_action(backend: BackendKind) -> GuestPowerAction {
+    match backend {
+        BackendKind::Firecracker => GuestPowerAction::Reboot,
+        BackendKind::Qemu | BackendKind::AppleVz => GuestPowerAction::PowerOff,
     }
 }
 
@@ -971,6 +984,25 @@ mod tests {
         assert_eq!(
             p.manifest,
             std::path::PathBuf::from("/data/suspend/abc/manifest.json")
+        );
+    }
+
+    /// Pins the per-backend exit semantics verified on real hosts: Firecracker
+    /// exits on a guest reboot, QEMU and Apple VZ on a guest power-off.
+    #[test]
+    fn guest_power_action_is_the_one_each_backend_exits_on() {
+        use super::{BackendKind, GuestPowerAction, guest_power_action};
+        assert_eq!(
+            guest_power_action(BackendKind::Firecracker),
+            GuestPowerAction::Reboot
+        );
+        assert_eq!(
+            guest_power_action(BackendKind::Qemu),
+            GuestPowerAction::PowerOff
+        );
+        assert_eq!(
+            guest_power_action(BackendKind::AppleVz),
+            GuestPowerAction::PowerOff
         );
     }
 }

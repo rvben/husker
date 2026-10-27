@@ -1193,6 +1193,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
         }
         let interrupted = self.cancel_userdata_job(record.id).await;
+        self.shut_down_guest(&record).await;
         if let Err(error) = self.vmm.stop_vm(record.id).await {
             self.recover_userdata_after_lifecycle_failure_locked(&record, interrupted)
                 .await;
@@ -1394,6 +1395,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         // record disappear. The interruption flag lets recoverable callers
         // restart the job if destruction fails while the guest remains live.
         *interrupted = self.cancel_userdata_job(record.id).await;
+
+        // A live guest gets to flush and end itself before its process is
+        // killed; a stopped, failed or suspended one has no process to ask.
+        if record.state.is_live() {
+            self.shut_down_guest(record).await;
+        }
 
         match self.vmm.destroy_vm(record.id).await {
             Ok(()) => {}

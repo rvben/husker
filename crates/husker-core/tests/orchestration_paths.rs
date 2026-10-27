@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
+use husker_agent_proto::{
+    AgentRequest, AgentResponse, GuestPowerAction, read_message, write_message,
+};
 use husker_core::{
     BootKind, CommitVmImageRequest, CoreError, CreateHostGroupRequest, CreateSecretRequest,
     CreateServiceRequest, CreateSnapshotRequest, CreateVmRequest, DrainReport, ExportImageRequest,
@@ -17,6 +20,7 @@ use husker_vmm::{
     BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
     VmmBackend, VmmError,
 };
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
@@ -45,7 +49,8 @@ enum StopBehavior {
 struct MockInner {
     vms: Mutex<HashMap<Uuid, VmInfo>>,
     stop_behaviors: Mutex<HashMap<Uuid, StopBehavior>>,
-    stop_calls: Mutex<Vec<Uuid>>,
+    /// Every `stop_vm` call with the state the VM was in when it arrived.
+    stop_calls: Mutex<Vec<(Uuid, Option<VmState>)>>,
     create_gate: Mutex<Option<Arc<CreateGate>>>,
     #[cfg(not(feature = "linux-net"))]
     destroy_gate: Mutex<Option<Arc<DestroyGate>>>,
@@ -129,6 +134,26 @@ impl MockVmm {
         self.inner.stop_calls.lock().await.len()
     }
 
+    /// The state each `stop_vm` call found its VM in, in call order. A stop
+    /// that arrives after the guest ended itself sees `Stopped`.
+    async fn states_seen_by_stop(&self) -> Vec<Option<VmState>> {
+        self.inner
+            .stop_calls
+            .lock()
+            .await
+            .iter()
+            .map(|(_, state)| *state)
+            .collect()
+    }
+
+    /// The VM process exited on its own, as after a guest reboot or power-off.
+    async fn mark_exited(&self, id: Uuid) {
+        if let Some(vm) = self.inner.vms.lock().await.get_mut(&id) {
+            vm.state = VmState::Stopped;
+            vm.pid = None;
+        }
+    }
+
     #[cfg(not(feature = "linux-net"))]
     async fn block_next_create(&self) -> Arc<CreateGate> {
         let gate = Arc::new(CreateGate::default());
@@ -189,7 +214,12 @@ impl VmmBackend for MockVmm {
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        self.inner.stop_calls.lock().await.push(id);
+        let state_on_arrival = self.inner.vms.lock().await.get(&id).map(|vm| vm.state);
+        self.inner
+            .stop_calls
+            .lock()
+            .await
+            .push((id, state_on_arrival));
         let behavior = self.inner.stop_behaviors.lock().await.get(&id).cloned();
         match behavior {
             Some(StopBehavior::Fail) => {
@@ -1488,6 +1518,316 @@ async fn stop_failure_restarts_interrupted_userdata_on_the_live_generation() {
     let vm = core.get_vm("vm-userdata-stop-rollback").unwrap();
     assert_eq!(vm.state, VmLifecycleState::Stopped);
     assert_eq!(vm.userdata_status, Some(UserdataStatus::Interrupted));
+}
+
+/// A core over `mock` with one VM named `name`, recorded on `backend` in the
+/// state store and mirrored in the mock in `live` state.
+async fn core_with_vm(
+    mock: &MockVmm,
+    name: &str,
+    backend: BackendKind,
+    live: VmState,
+) -> (tempfile::TempDir, Arc<HuskerCore<MockVmm>>, Uuid) {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let vm_id = Uuid::new_v4();
+    let recorded = match live {
+        VmState::Paused => "paused",
+        _ => "running",
+    };
+    let mut record = vm_record(vm_id, name, recorded, None, None, None, None, None);
+    record.vmm = backend;
+    state.insert_vm(&record).unwrap();
+    mock.upsert_vm(VmInfo {
+        id: vm_id,
+        name: name.into(),
+        state: live,
+        pid: Some(21),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 23,
+    })
+    .await;
+
+    let core = build_core(mock.clone(), state, &data_dir, &runtime_dir);
+    (tmp, core, vm_id)
+}
+
+/// A guest agent stand-in for the shutdown request. It records the power
+/// action the host asks for, acknowledges it as planned, and once the host
+/// closes the connection ends the mock VM the way a real guest would, unless
+/// `exits` is false (a guest that acknowledges and then hangs).
+async fn spawn_shutdown_responder(
+    mock: MockVmm,
+    vm_id: Uuid,
+    exits: bool,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    Arc<std::sync::Mutex<Vec<GuestPowerAction>>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requested);
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: AgentRequest = read_message(&mut stream).await.unwrap().unwrap();
+            let AgentRequest::Shutdown { power } = request else {
+                panic!("the shutdown responder only answers Shutdown, got {request:?}");
+            };
+            seen.lock().unwrap().push(power);
+            write_message(&mut stream, &AgentResponse::ShuttingDown { power })
+                .await
+                .unwrap();
+            // The real agent acts only once the host has read the
+            // acknowledgement and closed the connection.
+            let mut sink = [0u8; 16];
+            while !matches!(stream.read(&mut sink).await, Ok(0) | Err(_)) {}
+            if exits {
+                mock.mark_exited(vm_id).await;
+            }
+        }
+    });
+
+    (dir, path, requested)
+}
+
+/// A guest that ends itself leaves the backend stop nothing to wait for: the
+/// request names the action the VM's backend exits on, and the stop reaches
+/// the backend only after the guest is gone.
+#[tokio::test]
+async fn stop_asks_the_guest_for_the_power_action_its_backend_exits_on() {
+    for (backend, expected) in [
+        (BackendKind::Firecracker, GuestPowerAction::Reboot),
+        (BackendKind::Qemu, GuestPowerAction::PowerOff),
+        (BackendKind::AppleVz, GuestPowerAction::PowerOff),
+    ] {
+        let mock = MockVmm::new();
+        let (_tmp, core, vm_id) =
+            core_with_vm(&mock, "vm-guest-stop", backend, VmState::Running).await;
+        let (_agent_dir, socket, requested) =
+            spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+        mock.set_agent_socket(Some(socket)).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            core.stop_vm("vm-guest-stop"),
+        )
+        .await
+        .expect("a guest that ends itself needs no grace period")
+        .unwrap();
+
+        assert_eq!(*requested.lock().unwrap(), vec![expected], "{backend:?}");
+        assert_eq!(
+            mock.states_seen_by_stop().await,
+            vec![Some(VmState::Stopped)],
+            "{backend:?}: the backend stop must run only after the guest ended itself"
+        );
+        assert_eq!(
+            core.get_vm("vm-guest-stop").unwrap().state,
+            VmLifecycleState::Stopped
+        );
+    }
+}
+
+#[tokio::test]
+async fn stop_resumes_a_paused_guest_so_it_can_end_itself() {
+    let mock = MockVmm::new();
+    let (_tmp, core, vm_id) = core_with_vm(
+        &mock,
+        "vm-paused-stop",
+        BackendKind::Firecracker,
+        VmState::Paused,
+    )
+    .await;
+    let (_agent_dir, socket, requested) = spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+    mock.set_agent_socket(Some(socket)).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        core.stop_vm("vm-paused-stop"),
+    )
+    .await
+    .expect("a resumed guest that ends itself needs no grace period")
+    .unwrap();
+
+    assert_eq!(*requested.lock().unwrap(), vec![GuestPowerAction::Reboot]);
+    assert_eq!(
+        mock.states_seen_by_stop().await,
+        vec![Some(VmState::Stopped)]
+    );
+    assert_eq!(
+        core.get_vm("vm-paused-stop").unwrap().state,
+        VmLifecycleState::Stopped
+    );
+}
+
+/// The real agent on a host has no power control, so it answers a flush and
+/// keeps running, like a guest image whose agent predates power control. The
+/// stop must then go to the backend at once instead of waiting for an exit.
+#[tokio::test]
+async fn stop_proceeds_from_the_host_when_the_agent_only_flushes() {
+    let mock = MockVmm::new();
+    let (_tmp, core, _vm_id) = core_with_vm(
+        &mock,
+        "vm-flush-only",
+        BackendKind::Firecracker,
+        VmState::Running,
+    )
+    .await;
+    let (_agent_dir, socket) = spawn_agent().await;
+    mock.set_agent_socket(Some(socket)).await;
+
+    let started = tokio::time::Instant::now();
+    core.stop_vm("vm-flush-only").await.unwrap();
+
+    assert!(
+        started.elapsed() < husker_core::GUEST_EXIT_TIMEOUT,
+        "a flush-only acknowledgement must not wait for a guest exit"
+    );
+    assert_eq!(
+        mock.states_seen_by_stop().await,
+        vec![Some(VmState::Running)]
+    );
+    assert_eq!(
+        core.get_vm("vm-flush-only").unwrap().state,
+        VmLifecycleState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn stop_proceeds_from_the_host_when_the_guest_is_unreachable() {
+    let mock = MockVmm::new();
+    let (_tmp, core, _vm_id) = core_with_vm(
+        &mock,
+        "vm-no-agent",
+        BackendKind::Firecracker,
+        VmState::Running,
+    )
+    .await;
+
+    let started = tokio::time::Instant::now();
+    core.stop_vm("vm-no-agent").await.unwrap();
+
+    assert!(started.elapsed() < husker_core::GUEST_SHUTDOWN_REQUEST_TIMEOUT);
+    assert_eq!(
+        mock.states_seen_by_stop().await,
+        vec![Some(VmState::Running)]
+    );
+    assert_eq!(
+        core.get_vm("vm-no-agent").unwrap().state,
+        VmLifecycleState::Stopped
+    );
+}
+
+/// A guest that acknowledges the power action and then hangs is given the
+/// exit timeout and no more; the backend stop then handles it as before.
+#[tokio::test(start_paused = true)]
+async fn stop_gives_up_on_a_guest_that_acknowledges_but_never_exits() {
+    let mock = MockVmm::new();
+    let (_tmp, core, vm_id) = core_with_vm(
+        &mock,
+        "vm-ack-hang",
+        BackendKind::Firecracker,
+        VmState::Running,
+    )
+    .await;
+    let (_agent_dir, socket, requested) =
+        spawn_shutdown_responder(mock.clone(), vm_id, false).await;
+    mock.set_agent_socket(Some(socket)).await;
+
+    let started = tokio::time::Instant::now();
+    core.stop_vm("vm-ack-hang").await.unwrap();
+
+    assert_eq!(*requested.lock().unwrap(), vec![GuestPowerAction::Reboot]);
+    assert!(
+        started.elapsed() >= husker_core::GUEST_EXIT_TIMEOUT,
+        "the guest gets the whole exit timeout before the host takes over"
+    );
+    assert!(
+        started.elapsed()
+            < husker_core::GUEST_EXIT_TIMEOUT + husker_core::GUEST_SHUTDOWN_REQUEST_TIMEOUT
+    );
+    assert_eq!(
+        mock.states_seen_by_stop().await,
+        vec![Some(VmState::Running)]
+    );
+    assert_eq!(
+        core.get_vm("vm-ack-hang").unwrap().state,
+        VmLifecycleState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn destroy_asks_a_live_guest_to_end_itself_first() {
+    let mock = MockVmm::new();
+    let (_tmp, core, vm_id) = core_with_vm(
+        &mock,
+        "vm-guest-destroy",
+        BackendKind::Firecracker,
+        VmState::Running,
+    )
+    .await;
+    let (_agent_dir, socket, requested) = spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+    mock.set_agent_socket(Some(socket)).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        core.destroy_vm("vm-guest-destroy"),
+    )
+    .await
+    .expect("a guest that ends itself needs no grace period")
+    .unwrap();
+
+    assert_eq!(*requested.lock().unwrap(), vec![GuestPowerAction::Reboot]);
+    assert!(matches!(
+        core.get_vm("vm-guest-destroy"),
+        Err(CoreError::VmNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn drain_asks_live_guests_to_end_themselves_first() {
+    let mock = MockVmm::new();
+    let (_tmp, core, vm_id) = core_with_vm(
+        &mock,
+        "vm-guest-drain",
+        BackendKind::Firecracker,
+        VmState::Running,
+    )
+    .await;
+    let (_agent_dir, socket, requested) = spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+    mock.set_agent_socket(Some(socket)).await;
+
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), core.drain_vms())
+        .await
+        .expect("a guest that ends itself needs no grace period");
+
+    assert_eq!(
+        drained,
+        DrainReport {
+            stopped: 1,
+            unclean: 0
+        }
+    );
+    assert_eq!(*requested.lock().unwrap(), vec![GuestPowerAction::Reboot]);
+    assert_eq!(
+        mock.states_seen_by_stop().await,
+        vec![Some(VmState::Stopped)]
+    );
+    assert_eq!(
+        core.get_vm("vm-guest-drain").unwrap().state,
+        VmLifecycleState::Stopped
+    );
 }
 
 #[tokio::test]

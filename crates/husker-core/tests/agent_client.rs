@@ -1,7 +1,7 @@
 use husker_agent_proto::{
     AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecResponse, GuestInfoResponse,
-    ReadFileResponse, ShellExitResponse, WriteFileResponse, base64_decode, read_message,
-    write_message,
+    GuestPowerAction, ReadFileResponse, ShellExitResponse, WriteFileResponse, base64_decode,
+    read_message, write_message,
 };
 use husker_core::agent_client::{AgentConnection, AgentError, ShellEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -229,6 +229,84 @@ async fn ping_rejects_unexpected_response_variant() {
     let err = conn.ping().await.unwrap_err();
     assert!(matches!(err, AgentError::UnexpectedResponse));
     server_task.await.unwrap();
+}
+
+/// The host sends the action its backend exits on and learns which one the
+/// guest will carry out; a guest may plan less than asked (a flush), never more.
+#[tokio::test]
+async fn shutdown_returns_the_action_the_agent_planned() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(
+            req,
+            AgentRequest::Shutdown {
+                power: GuestPowerAction::Reboot
+            }
+        ));
+        write_message(
+            &mut server,
+            &AgentResponse::ShuttingDown {
+                power: GuestPowerAction::Reboot,
+            },
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let planned = conn.shutdown(GuestPowerAction::Reboot).await.unwrap();
+    assert_eq!(planned, GuestPowerAction::Reboot);
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_maps_agent_error_response() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::Shutdown { .. }));
+        write_message(
+            &mut server,
+            &AgentResponse::Error(ErrorResponse::new("disk is read-only")),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.shutdown(GuestPowerAction::PowerOff).await.unwrap_err();
+    assert!(matches!(err, AgentError::Agent(msg) if msg == "disk is read-only"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_rejects_unexpected_response_variant() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server_task = tokio::spawn(async move {
+        let req: AgentRequest = read_message(&mut server).await.unwrap().unwrap();
+        assert!(matches!(req, AgentRequest::Shutdown { .. }));
+        write_message(&mut server, &AgentResponse::Pong)
+            .await
+            .unwrap();
+    });
+
+    let mut conn = AgentConnection::new(client);
+    let err = conn.shutdown(GuestPowerAction::Reboot).await.unwrap_err();
+    assert!(matches!(err, AgentError::UnexpectedResponse));
+    server_task.await.unwrap();
+}
+
+/// The agent running on the host has no power control, so whatever the host
+/// asks for it plans only a flush and keeps the connection usable.
+#[tokio::test]
+async fn shutdown_against_the_real_agent_is_answered_with_flush() {
+    let (_dir, path) = spawn_agent().await;
+
+    let mut conn = connect(&path).await;
+    let planned = conn.shutdown(GuestPowerAction::Reboot).await.unwrap();
+    assert_eq!(planned, GuestPowerAction::Flush);
+    conn.ping().await.unwrap();
 }
 
 #[tokio::test]

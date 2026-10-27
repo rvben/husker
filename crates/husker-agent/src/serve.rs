@@ -50,25 +50,32 @@ pub async fn serve() -> Result<()> {
 }
 
 /// Serve one accepted connection with the process-wide session store.
-fn serve_connection<S>(stream: S, limits: crate::AgentLimits)
-where
+fn serve_connection<S>(
+    stream: S,
+    limits: crate::AgentLimits,
+    power: std::sync::Arc<dyn crate::PowerControl>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let sessions = crate::sessions::store().clone();
-        if let Err(e) = crate::handle_connection_with(stream, sessions, limits).await {
+        if let Err(e) = crate::handle_connection_with(stream, sessions, limits, power).await {
             error!("connection error: {e}");
         }
     });
 }
 
+/// Serve on a Unix socket. The agent then runs on a host, not in a guest, so
+/// a `Shutdown` is answered with a flush and never touches the machine's
+/// storage or power.
 async fn listen_unix(path: &str, limits: crate::AgentLimits) -> Result<()> {
     info!("listening on Unix socket: {path}");
     let listener = tokio::net::UnixListener::bind(path).context("binding Unix socket")?;
+    let power: std::sync::Arc<dyn crate::PowerControl> = std::sync::Arc::new(crate::NoPowerControl);
 
     loop {
         let (stream, _) = listener.accept().await?;
-        serve_connection(stream, limits);
+        serve_connection(stream, limits, power.clone());
     }
 }
 
@@ -100,11 +107,15 @@ async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
 
     let addr = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, port);
     let listener = VsockListener::bind(addr).map_err(|e| vsock_bind_error(port, e))?;
+    // A vsock connection comes from the host of the VM this process runs in,
+    // so this is the one place the kernel's power control is handed out.
+    let power: std::sync::Arc<dyn crate::PowerControl> =
+        std::sync::Arc::new(crate::power::KernelPowerControl);
 
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("vsock connection from CID {}", addr.cid());
-        serve_connection(stream, limits);
+        serve_connection(stream, limits, power.clone());
     }
 }
 
@@ -149,6 +160,10 @@ async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
         .map_err(std::io::Error::from)
         .context("registering vsock listener")?;
     info!("listening on vsock port {port}");
+    // A vsock connection comes from the host of the VM this process runs in,
+    // so this is the one place the kernel's power control is handed out.
+    let power: std::sync::Arc<dyn crate::PowerControl> =
+        std::sync::Arc::new(crate::power::KernelPowerControl);
 
     loop {
         let mut ready = listener.readable().await?;
@@ -191,7 +206,7 @@ async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
                 }
             };
         info!("vsock connection accepted");
-        serve_connection(stream, limits);
+        serve_connection(stream, limits, power.clone());
     }
 }
 

@@ -11,6 +11,7 @@ mod agent_ops;
 mod diagnostics;
 mod egress;
 mod fork;
+mod guest_shutdown;
 #[cfg(feature = "linux-net")]
 mod host_resources;
 mod idle;
@@ -55,6 +56,7 @@ pub struct VmPage {
 
 pub use agent_client::{AgentConnection, AgentError, ExecResult, ExecStreamEvent, ShellEvent};
 pub use diagnostics::{DRAIN_STOP_TIMEOUT, DrainReport};
+pub use guest_shutdown::{GUEST_EXIT_TIMEOUT, GUEST_SHUTDOWN_REQUEST_TIMEOUT};
 #[cfg(feature = "linux-net")]
 pub use oci_materializer::{
     LocalOciImageMaterializer, MaterializedOciImage, OciImageMaterializer, OciMaterializationError,
@@ -3742,7 +3744,7 @@ mod tests {
             let response = match request {
                 AgentRequest::GuestInfo => AgentResponse::GuestInfo(GuestInfoResponse {
                     ipv4: vec![],
-                    protocol_version: 5,
+                    protocol_version: husker_agent_proto::PROTOCOL_VERSION,
                 }),
                 AgentRequest::RestoreGuest(_) => AgentResponse::GuestRestored,
                 AgentRequest::ReconfigureNetwork(req) => {

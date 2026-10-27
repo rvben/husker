@@ -93,7 +93,13 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// state. Returns whether the backend stop completed cleanly.
     async fn drain_one(&self, vm: &VmRecord) -> bool {
         info!(name = %vm.name, state = %vm.state, "draining VM");
-        let clean = match tokio::time::timeout(DRAIN_STOP_TIMEOUT, self.vmm.stop_vm(vm.id)).await {
+        // The guest's own shutdown shares the drain bound with the backend
+        // stop, so a guest that stalls still cannot hold the daemon past it.
+        let stop = async {
+            self.shut_down_guest(vm).await;
+            self.vmm.stop_vm(vm.id).await
+        };
+        let clean = match tokio::time::timeout(DRAIN_STOP_TIMEOUT, stop).await {
             Ok(Ok(())) => true,
             Ok(Err(e)) => {
                 warn!(name = %vm.name, error = %e, "failed to stop VM during drain");

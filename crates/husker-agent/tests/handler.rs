@@ -25,9 +25,14 @@ async fn spawn_agent_with(limits: AgentLimits) -> tokio::net::UnixStream {
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        husker_agent::handle_connection_with(stream, sessions, limits)
-            .await
-            .unwrap();
+        husker_agent::handle_connection_with(
+            stream,
+            sessions,
+            limits,
+            std::sync::Arc::new(husker_agent::NoPowerControl),
+        )
+        .await
+        .unwrap();
     });
 
     tokio::net::UnixStream::connect(&path).await.unwrap()

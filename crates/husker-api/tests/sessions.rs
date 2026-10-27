@@ -316,7 +316,13 @@ impl Fixture {
                             match legacy_guest {
                                 Some(guest) => serve_legacy_guest(stream, guest).await,
                                 None => {
-                                    let _ = husker_agent::handle_connection_with(stream, sessions, agent_limits).await;
+                                    let _ = husker_agent::handle_connection_with(
+                                        stream,
+                                        sessions,
+                                        agent_limits,
+                                        std::sync::Arc::new(husker_agent::NoPowerControl),
+                                    )
+                                    .await;
                                 }
                             }
                         });

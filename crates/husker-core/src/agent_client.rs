@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use husker_agent_proto::{
-    AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecRequest, ReadFileRequest,
-    ReconfigureNetworkRequest, ShellDataRequest, ShellResizeRequest, ShellStartRequest,
-    WriteFileRequest, base64_decode, base64_encode, read_message, write_message,
+    AgentErrorCode, AgentRequest, AgentResponse, ErrorResponse, ExecRequest, GuestPowerAction,
+    ReadFileRequest, ReconfigureNetworkRequest, ShellDataRequest, ShellResizeRequest,
+    ShellStartRequest, WriteFileRequest, base64_decode, base64_encode, read_message, write_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, warn};
@@ -325,6 +325,29 @@ where
             .ok_or(AgentError::UnexpectedResponse)?;
         match response {
             AgentResponse::Pong => Ok(()),
+            AgentResponse::Error(e) => Err(refusal(e)),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    /// Ask the guest to make its storage durable and, when `power` is not
+    /// [`GuestPowerAction::Flush`], to end itself once this connection closes.
+    ///
+    /// Returns the action the agent will carry out. The acknowledgement
+    /// arrives after the guest's `sync`, so a returned value means the flush
+    /// is done. An agent that predates power control answers `Flush` and keeps
+    /// running; the caller then stops the VM from the host. Dropping the
+    /// connection is the agent's cue that the acknowledgement was delivered.
+    pub async fn shutdown(
+        &mut self,
+        power: GuestPowerAction,
+    ) -> Result<GuestPowerAction, AgentError> {
+        write_message(&mut self.stream, &AgentRequest::Shutdown { power }).await?;
+        let response: AgentResponse = read_message(&mut self.stream)
+            .await?
+            .ok_or(AgentError::UnexpectedResponse)?;
+        match response {
+            AgentResponse::ShuttingDown { power } => Ok(power),
             AgentResponse::Error(e) => Err(refusal(e)),
             _ => Err(AgentError::UnexpectedResponse),
         }
