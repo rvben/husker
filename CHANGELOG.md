@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased](https://github.com/rvben/husker/compare/v0.4.52...HEAD)
+
+### Breaking Changes
+
+- **api**: `GET /v1/health` reports `vms` as `null` when the state store cannot be read; it used to report zero total and zero running, indistinguishable from an empty fleet ([b096365](https://github.com/rvben/husker/commit/b096365f6c143bb428d8805e3644c116944b7f2e)).
+- **api**: the exec-stream and shell WebSocket routes answer an unknown VM with 404 `vm_not_found` before the upgrade instead of after it, and their in-band error frames carry a typed `kind`; the CLI passes that kind and its exit code through ([115514a](https://github.com/rvben/husker/commit/115514a34f3ae7ba93d43e2841090a65896a3678)).
+- **api**: a guest agent that does not answer within the transport deadline is reported as 503 `agent_not_ready` instead of 504 `session_timeout` or `preview_connect_timeout`, the agent's session refusals carry typed kinds, and a tunnel to a closed guest port answers 502 `preview_unreachable` ([e7abffe](https://github.com/rvben/husker/commit/e7abffeb5f56184d5f1a7ab49205d7143a3e3dc4)).
+- **api**: `GET /v1/vms` applies `limit` and `offset` and reports the fleet size in an `X-Total-Count` header; `husker list --limit` and `--offset` page accordingly instead of printing the whole fleet ([2f44245](https://github.com/rvben/husker/commit/2f442454b2d9d6ba889d369c10a12198e2001f28)).
+- **api**: a VM create that names a kernel or rootfs the daemon cannot find, or relies on a daemon default that is not there, is answered 400 `invalid_argument` instead of 500 `storage_error` ([f1ca691](https://github.com/rvben/husker/commit/f1ca691765ea4a5ad7b822f95abe2f987ad4bc92)).
+- **cli**: `husker exec --output json` reports `status: "error"` when the guest command exits nonzero; it used to report a tool success carrying the exit code ([f3c9bed](https://github.com/rvben/husker/commit/f3c9beda630d6d8afbdbd9a02e87ea0fe1be36ad)).
+- **cli**: `husker config check` prints JSON when stdout is not a terminal (`--output text` keeps the prose) and no longer creates `data_dir` ([b6893f4](https://github.com/rvben/husker/commit/b6893f40f8c4a63eb04fc580a0d882e07bfacbae)).
+- **cli**: a declined `[y/N]` confirmation exits 6 with kind `confirmation_declined`; it used to print "Aborted." and exit 0 ([436f4e7](https://github.com/rvben/husker/commit/436f4e77f40e7cc457f44298dd486446fb2a1fed)).
+- **cli**: a request argument the daemon rejects with 400 is reported as `invalid_usage` with exit 2 instead of `error` with exit 1; a daemon kind the CLI does not list maps by status to `not_found`, `conflict` or `permission_denied` ([0e3d13b](https://github.com/rvben/husker/commit/0e3d13bb4dbf848d3b9409f36b0118ecfbb7a5a6)).
+- **cli**: every timed-out operation (`wait`, `job`, `run --dns`, a preview handshake, a command the daemon ended at its run timeout) reports the `timeout` error kind instead of `error` ([e5eb6db](https://github.com/rvben/husker/commit/e5eb6db6880d4b668247b044fd73b90613b1ed65)).
+- **cli**: `husker shell` always connects through the daemon's WebSocket route, never Firecracker's vsock socket directly, and refuses to start without a terminal with exit 2 `invalid_usage` before contacting the daemon ([02652ee](https://github.com/rvben/husker/commit/02652eee7876ea4e3146be8b8d0b891131cf78f4)).
+- **cli**: commands that have no JSON document (`logs --follow`, `events --follow`, `preview`, `daemon`, `shell`, `setup storage`, `completions`, `guest-agent`) refuse `--output json` before contacting the daemon, with a hint at the supported form ([515e9e5](https://github.com/rvben/husker/commit/515e9e5b4fc5133aa18f12f3a94a9470689a4bb1)).
+- **cli**: `husker schema` declares each command's `effects` explicitly (read-only, idempotent or non-idempotent) instead of deriving them from the command name; `exec`, `job`, `session start`, `prompt`, `dev new`, `port-forward add`, `snapshot restore`, `secret rotate` and `shell` are non-idempotent, and `session list`, `session get` and `events` are no longer marked mutating ([4ddd400](https://github.com/rvben/husker/commit/4ddd400d32e007ee4aea83f62b7899350b2fa96d)).
+- **cli**: `--config`, `--api-url` and `--api-token` are global flags and parse after the subcommand, as `husker schema` already advertised ([0c47891](https://github.com/rvben/husker/commit/0c4789102ef239fe6291305cfb42b09338a01b87)).
+- **sdk**: `exec(..., check=True)` raises `CommandFailed` instead of `HuskerError` with kind `exec_failed`, and `iter_file` raises `FileChanged` instead of `Conflict` with kind `file_changed` ([746c3f7](https://github.com/rvben/husker/commit/746c3f7a2ccc6d93629dd1160a6e740afcf31e64)).
+
 ## [0.4.52](https://github.com/rvben/husker/compare/v0.4.51...v0.4.52) - 2026-10-05
 
 ### Fixed
