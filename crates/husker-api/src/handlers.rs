@@ -2062,6 +2062,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
         .await;
         return;
     }
+    let (cols, rows) = applied_terminal_size(cols, rows);
     info!(
         audit = "shell_start",
         vm = %name,
@@ -2125,6 +2126,7 @@ async fn shell_ws_session<B: VmmBackend + 'static>(
                                 }
                             }
                             Ok(WsShellInput::Resize { cols, rows }) => {
+                                let (cols, rows) = applied_terminal_size(cols, rows);
                                 if let Err(e) = conn.shell_resize(cols, rows).await {
                                     warn!("shell_resize failed: {e}");
                                     break;

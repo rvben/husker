@@ -462,8 +462,12 @@ pub struct PortForwardResponse {
 pub enum WsShellInput {
     Start {
         command: Option<String>,
+        /// Terminal columns. Absent or zero means the client does not know,
+        /// and the guest PTY gets 80.
         #[serde(default = "default_cols")]
         cols: u16,
+        /// Terminal rows. Absent or zero means the client does not know, and
+        /// the guest PTY gets 24.
         #[serde(default = "default_rows")]
         rows: u16,
         /// Seconds to wait for the guest agent to become reachable, with the
@@ -474,6 +478,8 @@ pub enum WsShellInput {
     Data {
         data: String,
     },
+    /// A new terminal size; a zero axis means unknown and keeps the default
+    /// for that axis, as on `Start`.
     Resize {
         cols: u16,
         rows: u16,
@@ -485,6 +491,18 @@ fn default_cols() -> u16 {
 }
 fn default_rows() -> u16 {
     24
+}
+
+/// The terminal size the guest PTY gets. A client that cannot learn its
+/// terminal's size reports an axis as zero (a pty with no terminal behind it,
+/// as `ssh -tt` from a pipe or `script` allocates, answers `TIOCGWINSZ` with
+/// zeros), and a zero-sized PTY leaves every full-screen program in the guest
+/// without a width to work with, so each unknown axis takes the default an
+/// absent size gets.
+pub fn applied_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
+    let cols = if cols == 0 { default_cols() } else { cols };
+    let rows = if rows == 0 { default_rows() } else { rows };
+    (cols, rows)
 }
 
 // ── Ready Types ──────────────────────────────────────────────────────

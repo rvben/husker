@@ -1337,6 +1337,89 @@ async fn shell_waits_for_a_guest_that_is_still_booting() {
     let _ = ws.close(None).await;
 }
 
+/// Type `text` into the shell as a client would.
+async fn shell_type(ws: &mut WsClient, text: &str) {
+    let frame = json!({
+        "type": "data",
+        "data": husker_agent_proto::base64_encode(text.as_bytes()),
+    });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// Append the shell's output to `transcript` until `needle` appears in it. A
+/// shell that exits or goes quiet first fails the test with the transcript so
+/// far.
+async fn shell_read_until(ws: &mut WsClient, transcript: &mut String, needle: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !transcript.contains(needle) {
+        let frame = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("no {needle:?} within 10s; transcript: {transcript:?}"));
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["type"] != "data" {
+                    panic!(
+                        "shell ended before {needle:?} appeared: {event}; transcript: {transcript:?}"
+                    );
+                }
+                let bytes =
+                    husker_agent_proto::base64_decode(event["data"].as_str().unwrap()).unwrap();
+                transcript.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            Some(Ok(_)) => {}
+            other => panic!(
+                "shell socket ended before {needle:?} appeared: {other:?}; transcript: {transcript:?}"
+            ),
+        }
+    }
+}
+
+/// A client on a pty with no terminal behind it (`script`, `ssh -tt` from a
+/// pipe, an agent wrapper) learns its window as 0x0 and relays that on resize
+/// too. The guest PTY never sees the zeros: each unknown axis gets the default
+/// an absent size gets, so `stty size` in the guest answers `24 80`, and a
+/// resize that knows only its height keeps the default width.
+#[tokio::test]
+async fn a_zero_terminal_size_reaches_the_guest_as_the_default() {
+    let f = Fixture::new().await;
+    let served = f.serve().await;
+    let (mut ws, first) = served
+        .open(
+            "/v1/vms/dev/shell",
+            json!({ "type": "start", "command": "sh", "cols": 0, "rows": 0 }),
+        )
+        .await;
+    if first["type"] == "error"
+        && first["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("failed to open PTY"))
+    {
+        eprintln!("skipping, this host has no PTY: {first}");
+        return;
+    }
+    assert_eq!(first["type"], "started", "{first}");
+
+    let mut transcript = String::new();
+    shell_type(&mut ws, "stty size\n").await;
+    shell_read_until(&mut ws, &mut transcript, "24 80").await;
+
+    ws.send(Message::Text(
+        json!({ "type": "resize", "cols": 0, "rows": 50 })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    shell_type(&mut ws, "stty size\n").await;
+    shell_read_until(&mut ws, &mut transcript, "50 80").await;
+
+    shell_type(&mut ws, "exit\n").await;
+    let _ = ws.close(None).await;
+}
+
 /// A client that cannot wait for the default says so per request, on the file
 /// routes and the shell as on `exec`: an agent that is not up within
 /// `connect_timeout_secs` is reported with the `agent_not_ready` envelope that

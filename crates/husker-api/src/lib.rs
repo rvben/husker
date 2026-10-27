@@ -2829,6 +2829,17 @@ mod tests {
         }
     }
 
+    /// A client on a pty with no terminal behind it reports a 0x0 window. The
+    /// guest gets the size an absent one gets, per axis, so a resize that knows
+    /// only one dimension keeps the default for the other.
+    #[test]
+    fn a_zero_terminal_axis_takes_the_default_size() {
+        assert_eq!(applied_terminal_size(0, 0), (80, 24));
+        assert_eq!(applied_terminal_size(0, 50), (80, 50));
+        assert_eq!(applied_terminal_size(132, 0), (132, 24));
+        assert_eq!(applied_terminal_size(132, 50), (132, 50));
+    }
+
     #[tokio::test]
     async fn metrics_include_build_state_and_service_gauges() {
         // Core seeded with 1 running VM (owned by "svc"), 1 stopped VM, and a
