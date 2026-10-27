@@ -44,6 +44,17 @@ fn pty_unavailable(err: &str) -> bool {
         || err.contains("No such device")
 }
 
+/// A host without a PTY skips the shell tests. CI sets HUSKER_REQUIRE_PTY so
+/// a runner that lost its PTYs fails the test instead of silently dropping
+/// the coverage.
+fn skip_without_pty(msg: &str) {
+    assert!(
+        std::env::var_os("HUSKER_REQUIRE_PTY").is_none(),
+        "this host has no PTY but HUSKER_REQUIRE_PTY is set: {msg}"
+    );
+    eprintln!("skipping shell test: this host has no PTY: {msg}");
+}
+
 async fn shell_start_or_skip(
     conn: &mut AgentConnection<tokio::net::UnixStream>,
     command: Option<&str>,
@@ -53,7 +64,7 @@ async fn shell_start_or_skip(
         Err(err) => {
             let msg = err.to_string();
             if pty_unavailable(&msg) {
-                eprintln!("skipping shell test: {msg}");
+                skip_without_pty(&msg);
                 false
             } else {
                 panic!("shell_start failed unexpectedly: {msg}");
@@ -574,7 +585,7 @@ async fn shell_nonexistent_command_returns_error() {
         Err(err) => {
             let msg = err.to_string();
             if pty_unavailable(&msg) {
-                eprintln!("skipping shell test: {msg}");
+                skip_without_pty(&msg);
                 return;
             }
             assert!(

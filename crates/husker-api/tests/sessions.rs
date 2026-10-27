@@ -1377,6 +1377,17 @@ async fn shell_read_until(ws: &mut WsClient, transcript: &mut String, needle: &s
     }
 }
 
+/// A host without a PTY skips the shell test. CI sets HUSKER_REQUIRE_PTY so
+/// a runner that lost its PTYs fails the test instead of silently dropping
+/// the coverage.
+fn skip_without_pty(first: &serde_json::Value) {
+    assert!(
+        std::env::var_os("HUSKER_REQUIRE_PTY").is_none(),
+        "this host has no PTY but HUSKER_REQUIRE_PTY is set: {first}"
+    );
+    eprintln!("skipping, this host has no PTY: {first}");
+}
+
 /// A client on a pty with no terminal behind it (`script`, `ssh -tt` from a
 /// pipe, an agent wrapper) learns its window as 0x0 and relays that on resize
 /// too. The guest PTY never sees the zeros: each unknown axis gets the default
@@ -1397,7 +1408,7 @@ async fn a_zero_terminal_size_reaches_the_guest_as_the_default() {
             .as_str()
             .is_some_and(|message| message.contains("failed to open PTY"))
     {
-        eprintln!("skipping, this host has no PTY: {first}");
+        skip_without_pty(&first);
         return;
     }
     assert_eq!(first["type"], "started", "{first}");

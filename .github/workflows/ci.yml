@@ -55,6 +55,7 @@ jobs:
       - run: make test
         env:
           HUSKER_REQUIRE_QEMU_IMG: "1"
+          HUSKER_REQUIRE_PTY: "1"
       - run: make test-initramfs
       - run: make test-sdk
 
@@ -128,6 +129,7 @@ jobs:
       - run: make coverage-ci
         env:
           HUSKER_REQUIRE_QEMU_IMG: "1"
+          HUSKER_REQUIRE_PTY: "1"
 
   mutation:
     name: Mutation Gate
