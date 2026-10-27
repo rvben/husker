@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Mutex;
 
@@ -533,9 +534,14 @@ async fn configure_bridge(
     .await?;
     run_cmd("ip", &["link", "set", "dev", name, "up"]).await?;
 
-    // Bridge-local traffic should bypass nftables for performance.
-    // Non-fatal: the br_netfilter module may not be loaded.
-    if let Err(e) = run_cmd("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=0"]).await {
+    // Bridge-local traffic should bypass nftables for performance. Only a
+    // kernel with br_netfilter loaded hands bridged frames to iptables at
+    // all, so the sysctl exists only then; without the module the bypass
+    // is already in effect and there is nothing to warn about.
+    if !bridge_nf_switch_present(Path::new(PROC_SYS_NET)) {
+        debug!("br_netfilter is not loaded; bridged traffic already bypasses iptables");
+    } else if let Err(e) = run_cmd("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=0"]).await
+    {
         warn!(
             "could not disable bridge-nf-call-iptables: {e} \
              (inter-VM traffic will still work via nftables forward rules)"
@@ -543,6 +549,20 @@ async fn configure_bridge(
     }
 
     Ok(())
+}
+
+/// Root of the kernel's network sysctl tree.
+const PROC_SYS_NET: &str = "/proc/sys/net";
+
+/// Whether the kernel exposes the switch that hands bridged frames to
+/// iptables. The `net.bridge` sysctl directory exists only while
+/// `br_netfilter` is loaded; a kernel without it never consults iptables
+/// for bridged traffic, which is the state the sysctl asks for.
+fn bridge_nf_switch_present(proc_sys_net: &Path) -> bool {
+    proc_sys_net
+        .join("bridge")
+        .join("bridge-nf-call-iptables")
+        .is_file()
 }
 
 /// Delete a Linux bridge device.
@@ -1256,7 +1276,7 @@ pub fn resolve_host_interface(configured: &str) -> HostInterfaceResolution {
     resolve_host_interface_with(
         configured,
         default_route_interface().as_deref(),
-        |iface| std::path::Path::new(&format!("/sys/class/net/{iface}")).exists(),
+        |iface| Path::new(&format!("/sys/class/net/{iface}")).exists(),
         interface_operstate,
     )
 }
@@ -1859,6 +1879,31 @@ pub async fn check_subnet_conflict(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // ── Bridge netfilter switch ────────────────────────────────────────
+
+    #[test]
+    fn the_bridge_nf_switch_is_present_only_while_br_netfilter_is_loaded() {
+        let proc_sys_net = tempfile::tempdir().expect("tempdir");
+        let root = proc_sys_net.path();
+        assert!(
+            !bridge_nf_switch_present(root),
+            "no net.bridge directory means br_netfilter is not loaded"
+        );
+
+        let bridge = root.join("bridge");
+        std::fs::create_dir(&bridge).expect("create bridge dir");
+        assert!(
+            !bridge_nf_switch_present(root),
+            "a net.bridge directory without the iptables switch is not the switch"
+        );
+
+        std::fs::write(bridge.join("bridge-nf-call-iptables"), "1\n").expect("write switch");
+        assert!(
+            bridge_nf_switch_present(root),
+            "the switch file is what the sysctl writes to"
+        );
+    }
 
     // ── Guest isolation rules ──────────────────────────────────────────
 

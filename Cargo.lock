@@ -1185,6 +1185,7 @@ version = "0.4.52"
 dependencies = [
  "proptest",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
