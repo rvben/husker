@@ -13,6 +13,19 @@ RestartSec=5
 # (~30s); this ceiling keeps a wedged client from stranding the stop indefinitely.
 TimeoutStopSec=60
 
+# Signal only the daemon on stop. The default KillMode=control-group delivers
+# the SIGTERM to every Firecracker/QEMU process in the unit at the same instant,
+# so the guests die before the daemon's drain can ask them to flush and shut
+# down, and whatever they had not synced is lost on every restart. With `mixed`
+# the daemon alone receives the SIGTERM, stops every guest itself, and systemd
+# SIGKILLs only what is still left once the daemon has exited.
+KillMode=mixed
+
+# Delegate the cgroup subtree so the daemon can create per-VM cgroups for the
+# opt-in resource limits (memory.max / cpu.max). Harmless while limits are off;
+# the daemon refuses to start with `resource_limits = true` without it.
+Delegate=yes
+
 # Hardening.
 #
 # NoNewPrivileges is left off because the daemon spawns the Firecracker/QEMU
