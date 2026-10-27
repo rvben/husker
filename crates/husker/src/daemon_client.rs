@@ -511,18 +511,21 @@ impl DaemonClient {
     }
 
     /// Read one byte range from a guest file through the shared API contract.
+    /// `connect_timeout_secs` is how long the daemon may wait for the guest
+    /// agent to come up; `None` leaves it to the daemon's boot-mode default.
     pub(crate) async fn read_file(
         &self,
         name: &str,
         path: &str,
         offset: u64,
         len: Option<u64>,
+        connect_timeout_secs: Option<u64>,
     ) -> Result<FileReadOutcome> {
         let request = ReadFileRequest {
             path: path.to_string(),
             offset,
             len,
-            connect_timeout_secs: None,
+            connect_timeout_secs,
         };
         let subject = format!("VM '{name}'");
         let response = self
@@ -598,13 +601,16 @@ impl DaemonClient {
     }
 
     /// Write a complete byte buffer, splitting large files into append-mode
-    /// requests after verifying that the guest agent supports them.
+    /// requests after verifying that the guest agent supports them. Every
+    /// request carries `connect_timeout_secs`, the wait for the guest agent
+    /// the caller allows (`None` for the daemon's boot-mode default).
     pub(crate) async fn write_file_bytes(
         &self,
         name: &str,
         path: &str,
         data: &[u8],
         mode: Option<u32>,
+        connect_timeout_secs: Option<u64>,
     ) -> Result<u64> {
         if data.len() <= FILE_WRITE_CHUNK_BYTES {
             return Ok(self
@@ -615,7 +621,7 @@ impl DaemonClient {
                         data: husker_agent_proto::base64_encode(data),
                         mode,
                         append: false,
-                        connect_timeout_secs: None,
+                        connect_timeout_secs,
                     },
                 )
                 .await?
@@ -642,7 +648,7 @@ impl DaemonClient {
                         data: husker_agent_proto::base64_encode(chunk),
                         mode,
                         append: index > 0,
-                        connect_timeout_secs: None,
+                        connect_timeout_secs,
                     },
                 )
                 .await?
@@ -1215,6 +1221,7 @@ mod tests {
                     assert_eq!(request["path"], "/tmp/result");
                     assert_eq!(request["offset"], 12);
                     assert_eq!(request["len"], 64);
+                    assert_eq!(request["connect_timeout_secs"], 7);
                     Json(json!({
                         "data": "aGVsbG8=",
                         "size": 5,
@@ -1228,7 +1235,7 @@ mod tests {
         let client = DaemonClient::new(base_url, None);
 
         let file = client
-            .read_file("demo", "/tmp/result", 12, Some(64))
+            .read_file("demo", "/tmp/result", 12, Some(64), Some(7))
             .await
             .unwrap();
 
@@ -1257,7 +1264,7 @@ mod tests {
         let client = DaemonClient::new(base_url, None);
 
         let error = client
-            .read_file("demo", "/tmp/result", 0, None)
+            .read_file("demo", "/tmp/result", 0, None, None)
             .await
             .unwrap_err();
 
@@ -1710,6 +1717,43 @@ mod tests {
         task.abort();
     }
 
+    /// A payload that fits one request takes the direct path, which has to
+    /// carry the caller's agent wait like the chunked path does: `cp` relies
+    /// on it for every file size.
+    #[tokio::test]
+    async fn a_single_request_write_carries_the_callers_agent_wait() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&writes);
+        let app = axum::Router::new().route(
+            "/v1/vms/demo/files/write",
+            axum::routing::post(
+                move |ExtractJson(request): ExtractJson<serde_json::Value>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured.lock().unwrap().push(request);
+                        Json(json!({ "bytes_written": 5 }))
+                    }
+                },
+            ),
+        );
+        let (base_url, task) = serve(app).await;
+        let client = DaemonClient::new(base_url, None);
+
+        let bytes = client
+            .write_file_bytes("demo", "/tmp/hosts", b"hello", Some(0o644), Some(5))
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, 5);
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "a small payload is one request");
+        assert_eq!(writes[0]["path"], "/tmp/hosts");
+        assert_eq!(writes[0]["append"], false);
+        assert_eq!(writes[0]["mode"], 0o644);
+        assert_eq!(writes[0]["connect_timeout_secs"], 5);
+        task.abort();
+    }
+
     #[tokio::test]
     async fn complete_file_write_chunks_large_payloads_in_order() {
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -1746,7 +1790,7 @@ mod tests {
         let data = vec![0x5a; FILE_WRITE_CHUNK_BYTES + 17];
 
         let bytes = client
-            .write_file_bytes("demo", "/tmp/archive.tar.gz", &data, Some(0o600))
+            .write_file_bytes("demo", "/tmp/archive.tar.gz", &data, Some(0o600), Some(9))
             .await
             .unwrap();
 
@@ -1757,6 +1801,14 @@ mod tests {
         assert_eq!(writes[0]["append"], false);
         assert_eq!(writes[1]["append"], true);
         assert_eq!(writes[0]["mode"], 0o600);
+        assert_eq!(
+            writes[0]["connect_timeout_secs"], 9,
+            "the first chunk carries the caller's agent wait"
+        );
+        assert_eq!(
+            writes[1]["connect_timeout_secs"], 9,
+            "a later chunk carries the same agent wait"
+        );
         assert_eq!(
             husker_agent_proto::base64_decode(writes[0]["data"].as_str().unwrap())
                 .unwrap()
@@ -1788,7 +1840,7 @@ mod tests {
         let data = vec![0; FILE_WRITE_CHUNK_BYTES + 1];
 
         let error = client
-            .write_file_bytes("demo", "/tmp/archive.tar.gz", &data, None)
+            .write_file_bytes("demo", "/tmp/archive.tar.gz", &data, None, None)
             .await
             .unwrap_err();
 

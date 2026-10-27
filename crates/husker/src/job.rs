@@ -353,7 +353,7 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
             eprintln!("[job] {}", archive.summary());
         }
         daemon
-            .write_file_bytes(name, SYNC_ARCHIVE_GUEST_PATH, &archive.bytes, None)
+            .write_file_bytes(name, SYNC_ARCHIVE_GUEST_PATH, &archive.bytes, None, None)
             .await?;
         // --write-back returns the synced files as the command left them
         // (modifications only; new build artifacts are never pulled back).
@@ -676,7 +676,7 @@ async fn retrieve_outputs(
     retrieve_paths: &[PathBuf],
     out: &[PathBuf],
 ) -> Result<Retrieval> {
-    let manifest = match read_guest_file(daemon, name, SYNC_MANIFEST_GUEST_PATH).await? {
+    let manifest = match read_guest_file(daemon, name, SYNC_MANIFEST_GUEST_PATH, None).await? {
         GuestFile::Read(bytes) => bytes,
         GuestFile::Failed(failure) => {
             return Ok(Retrieval {
@@ -722,7 +722,7 @@ async fn retrieve_outputs(
         });
     }
 
-    let archive = match read_guest_file(daemon, name, SYNC_OUTPUT_GUEST_PATH).await? {
+    let archive = match read_guest_file(daemon, name, SYNC_OUTPUT_GUEST_PATH, None).await? {
         GuestFile::Read(bytes) => bytes,
         GuestFile::Failed(failure) => {
             return Ok(Retrieval {

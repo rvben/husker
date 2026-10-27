@@ -476,7 +476,7 @@ async fn write_guest_file(
     data: &[u8],
 ) -> anyhow::Result<()> {
     daemon
-        .write_file_bytes(name, path, data, None)
+        .write_file_bytes(name, path, data, None, None)
         .await
         .with_context(|| format!("writing {path}"))?;
     Ok(())
@@ -489,7 +489,7 @@ async fn read_guest_file_or_empty(
     name: &str,
     path: &str,
 ) -> anyhow::Result<String> {
-    let result = match daemon.read_file(name, path, 0, None).await? {
+    let result = match daemon.read_file(name, path, 0, None, None).await? {
         crate::daemon_client::FileReadOutcome::Read(result) => result,
         crate::daemon_client::FileReadOutcome::Failed { .. } => return Ok(String::new()),
     };
@@ -1657,7 +1657,12 @@ async fn run(cli: Cli) -> Result<()> {
                 job::JobTermination::Failure(failure) => exit_with_error(output, failure),
             }
         }
-        Commands::Cp { source, dest, mode } => {
+        Commands::Cp {
+            source,
+            dest,
+            mode,
+            connect_timeout,
+        } => {
             let src = parse_cp_path(&source);
             let dst = parse_cp_path(&dest);
 
@@ -1667,7 +1672,9 @@ async fn run(cli: Cli) -> Result<()> {
                         .with_context(|| format!("reading {}", local.display()))?;
                     let client = target.daemon().clone();
 
-                    let bytes = client.write_file_bytes(&name, &path, &data, mode).await?;
+                    let bytes = client
+                        .write_file_bytes(&name, &path, &data, mode, connect_timeout)
+                        .await?;
                     print_output(
                         output,
                         &serde_json::json!({
@@ -1686,7 +1693,8 @@ async fn run(cli: Cli) -> Result<()> {
                     // can carry, so the size of an artifact is not a reason it
                     // cannot be copied out.
                     let client = target.daemon().clone();
-                    let data = match read_guest_file(&client, &name, &path).await? {
+                    let data = match read_guest_file(&client, &name, &path, connect_timeout).await?
+                    {
                         GuestFile::Read(data) => data,
                         GuestFile::Failed(failure) => exit_with_error(output, failure),
                     };
@@ -1834,9 +1842,11 @@ async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Commands::Shell { name, command } => {
-            run_shell(&target, &name, command.as_deref(), output).await
-        }
+        Commands::Shell {
+            name,
+            command,
+            connect_timeout,
+        } => run_shell(&target, &name, command.as_deref(), connect_timeout, output).await,
         Commands::Version => {
             // The daemon's version and, when its state store could be read,
             // the (total, running) VM counts. A daemon reports `vms` as null
@@ -3823,11 +3833,13 @@ fn add_state_remedy(failure: &mut ApiFailure, name: &str) {
 ///
 /// Every shell goes through the daemon's WebSocket route, on every host, so
 /// the session guard, audit log, metrics and agent readiness wait apply to it
-/// like to any other guest access.
+/// like to any other guest access. `connect_timeout_secs` bounds that wait;
+/// `None` leaves it to the daemon's boot-mode default.
 async fn run_shell(
     target: &DaemonTarget,
     name: &str,
     command: Option<&str>,
+    connect_timeout_secs: Option<u64>,
     output: OutputFormat,
 ) -> Result<()> {
     // A shell bridges the terminal's raw stdin, so a pipe cannot drive it.
@@ -3902,7 +3914,7 @@ async fn run_shell(
         command: command.map(String::from),
         cols,
         rows,
-        connect_timeout_secs: None,
+        connect_timeout_secs,
     })?;
     ws_sink
         .send(tungstenite::Message::Text(start_msg.into()))

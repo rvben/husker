@@ -30,7 +30,10 @@ fn vmm_value_parser() -> clap::builder::PossibleValuesParser {
     }))
 }
 
-fn exec_connect_timeout_help() -> String {
+/// Help for the `--connect-timeout` flag shared by every command that talks to
+/// the guest agent (`exec`, `cp`, `shell`), so all three describe the same
+/// daemon-side wait and clamp.
+fn connect_timeout_help() -> String {
     format!(
         "Seconds to wait for the guest agent to become reachable before failing \
          (server default: {}; at most {})",
@@ -394,7 +397,7 @@ pub(crate) enum Commands {
         #[arg(long = "secret")]
         secret: Vec<String>,
 
-        #[arg(long, help = exec_connect_timeout_help())]
+        #[arg(long, help = connect_timeout_help())]
         connect_timeout: Option<u64>,
 
         #[arg(long, help = exec_run_timeout_help())]
@@ -574,6 +577,9 @@ pub(crate) enum Commands {
         /// File mode (octal, e.g. 755) when copying to VM
         #[arg(long, value_parser = crate::parse_octal_mode)]
         mode: Option<u32>,
+
+        #[arg(long, help = connect_timeout_help())]
+        connect_timeout: Option<u64>,
     },
 
     /// Manage port forwards for a VM
@@ -649,6 +655,9 @@ pub(crate) enum Commands {
         /// Shell command (default: /bin/sh)
         #[arg(long)]
         command: Option<String>,
+
+        #[arg(long, help = connect_timeout_help())]
+        connect_timeout: Option<u64>,
     },
 
     /// Show serial console output from a VM
@@ -1857,25 +1866,29 @@ mod tests {
     /// Every default the daemon applies to a timeout flag is named in that
     /// flag's help, for every boot mode, so a changed default or a new boot
     /// mode cannot leave the help describing a wait the daemon no longer uses.
+    /// Every command that talks to the guest agent carries the connect flag.
     #[test]
     fn timeout_help_names_every_default_the_daemon_applies() {
         let root = Cli::command();
-        let exec = root.find_subcommand("exec").unwrap();
 
-        let connect = numbers_in(&help_of(exec, "connect_timeout"));
-        for kind in BootKind::ALL {
-            let secs = husker_api::resolve_exec_connect_timeout(None, kind).as_secs();
+        for name in ["exec", "cp", "shell"] {
+            let command = root.find_subcommand(name).unwrap();
+            let connect = numbers_in(&help_of(command, "connect_timeout"));
+            for kind in BootKind::ALL {
+                let secs = husker_api::resolve_exec_connect_timeout(None, kind).as_secs();
+                assert!(
+                    connect.contains(&secs),
+                    "{name} --connect-timeout help omits the {kind:?} default of {secs}s: {connect:?}"
+                );
+            }
+            let max = husker_api::MAX_EXEC_CONNECT_TIMEOUT_SECS;
             assert!(
-                connect.contains(&secs),
-                "exec --connect-timeout help omits the {kind:?} default of {secs}s: {connect:?}"
+                connect.contains(&max),
+                "{name} --connect-timeout help omits the {max}s ceiling: {connect:?}"
             );
         }
-        let max = husker_api::MAX_EXEC_CONNECT_TIMEOUT_SECS;
-        assert!(
-            connect.contains(&max),
-            "exec --connect-timeout help omits the {max}s ceiling: {connect:?}"
-        );
 
+        let exec = root.find_subcommand("exec").unwrap();
         let run = numbers_in(&help_of(exec, "timeout"));
         let default = crate::config::default_exec_timeout_secs();
         let max = crate::config::default_exec_timeout_max_secs();

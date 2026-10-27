@@ -69,10 +69,14 @@ pub(crate) enum GuestFile {
 /// failure, a guest that cannot serve the file, and a transfer that cannot be
 /// completed correctly all come back as [`GuestFile::Failed`] carrying the
 /// reason, so no caller has to infer one.
+///
+/// `connect_timeout_secs` is the wait for the guest agent the caller allows on
+/// each request, `None` for the daemon's boot-mode default.
 pub(crate) async fn read_guest_file(
     daemon: &DaemonClient,
     vm: &str,
     path: &str,
+    connect_timeout_secs: Option<u64>,
 ) -> Result<GuestFile> {
     let mut buf: Vec<u8> = Vec::new();
     // What the first response said about the file, re-checked against every
@@ -86,7 +90,13 @@ pub(crate) async fn read_guest_file(
     loop {
         let offset = buf.len() as u64;
         let body = match daemon
-            .read_file(vm, path, offset, Some(GUEST_READ_CHUNK_BYTES))
+            .read_file(
+                vm,
+                path,
+                offset,
+                Some(GUEST_READ_CHUNK_BYTES),
+                connect_timeout_secs,
+            )
             .await?
         {
             FileReadOutcome::Read(body) => body,
@@ -279,7 +289,7 @@ mod tests {
         let (api_url, server) = serve_stub(ranged_file_route(content.clone(), calls.clone())).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/artifact.bin")
+        let got = read_guest_file(&client, "vm-x", "/artifact.bin", None)
             .await
             .expect("the stub daemon is reachable");
 
@@ -302,7 +312,7 @@ mod tests {
         let (api_url, server) = serve_stub(ranged_file_route(content.clone(), calls.clone())).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/small.txt")
+        let got = read_guest_file(&client, "vm-x", "/small.txt", None)
             .await
             .unwrap();
 
@@ -337,7 +347,7 @@ mod tests {
         let (api_url, server) = serve_stub(app).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/f").await.unwrap();
+        let got = read_guest_file(&client, "vm-x", "/f", None).await.unwrap();
 
         match got {
             GuestFile::Read(bytes) => assert_eq!(bytes, b"legacy contents"),
@@ -375,7 +385,7 @@ mod tests {
         let (api_url, server) = serve_stub(app).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/moving.bin")
+        let got = read_guest_file(&client, "vm-x", "/moving.bin", None)
             .await
             .unwrap();
 
@@ -425,7 +435,7 @@ mod tests {
         let (api_url, server) = serve_stub(app).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/replaced.bin")
+        let got = read_guest_file(&client, "vm-x", "/replaced.bin", None)
             .await
             .unwrap();
 
@@ -461,7 +471,7 @@ mod tests {
         let (api_url, server) = serve_stub(app).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/stalled.bin")
+        let got = read_guest_file(&client, "vm-x", "/stalled.bin", None)
             .await
             .unwrap();
 
@@ -501,7 +511,9 @@ mod tests {
         let (api_url, server) = serve_stub(app).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/big.bin").await.unwrap();
+        let got = read_guest_file(&client, "vm-x", "/big.bin", None)
+            .await
+            .unwrap();
 
         match got {
             GuestFile::Read(_) => panic!("a refused read must not report success"),
@@ -541,7 +553,9 @@ mod tests {
         let (api_url, server) = serve_stub(app).await;
 
         let client = DaemonClient::new(&api_url, None);
-        let got = read_guest_file(&client, "vm-x", "/big.bin").await.unwrap();
+        let got = read_guest_file(&client, "vm-x", "/big.bin", None)
+            .await
+            .unwrap();
 
         match got {
             GuestFile::Read(_) => panic!("a refused read must not report success"),
