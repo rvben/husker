@@ -407,7 +407,9 @@ test-initramfs:
 
 # Build k3s-ready rootfs image (requires root, debootstrap)
 K3S_ROOTFS ?= k3s-rootfs.ext4
-build-k3s-rootfs: build-agent
+# The image follows the host architecture, so the agent build does too.
+build-k3s-rootfs:
+	$(MAKE) $(if $(filter aarch64 arm64,$(shell uname -m)),build-agent-aarch64,build-agent)
 	sudo guest/build-k3s-rootfs.sh $(K3S_ROOTFS)
 
 # Build k3s-compatible kernel. This layers Kubernetes networking features over

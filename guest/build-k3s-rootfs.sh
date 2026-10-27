@@ -8,7 +8,8 @@
 # Requires: debootstrap, e2fsprogs, curl (run as root)
 # Usage:  sudo ./guest/build-k3s-rootfs.sh [output.ext4] [size_mb]
 #
-# The script auto-detects architecture for the k3s binary download.
+# The image is built for the host architecture (x86_64 or aarch64): the Ubuntu
+# userland, the k3s binary and the guest agent all follow `uname -m`.
 
 set -euo pipefail
 
@@ -16,27 +17,29 @@ OUTPUT="${1:-k3s-rootfs.ext4}"
 SIZE_MB="${2:-2048}"
 ARCH="$(uname -m)"
 
-# Map architecture to k3s download suffix
+# Everything that goes into the image (the Ubuntu userland, k3s and the agent)
+# must match the host architecture the image is named after.
 case "$ARCH" in
-    x86_64)  K3S_SUFFIX="" ;;
-    aarch64) K3S_SUFFIX="-arm64" ;;
+    x86_64)
+        K3S_SUFFIX=""
+        DEBOOTSTRAP_ARCH="amd64"
+        UBUNTU_MIRROR="http://archive.ubuntu.com/ubuntu"
+        AGENT_TARGET="build-agent"
+        ;;
+    aarch64)
+        K3S_SUFFIX="-arm64"
+        DEBOOTSTRAP_ARCH="arm64"
+        UBUNTU_MIRROR="http://ports.ubuntu.com/ubuntu-ports"
+        AGENT_TARGET="build-agent-aarch64"
+        ;;
     *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# Locate the husker-agent binary
-AGENT_BIN=""
-for candidate in \
-    "target/x86_64-unknown-linux-musl/agent/husker-agent" \
-    "target/aarch64-unknown-linux-musl/agent/husker-agent" \
-    "target/release/husker-agent" \
-    "target/debug/husker-agent"; do
-    if [[ -f "$candidate" ]]; then
-        AGENT_BIN="$candidate"
-        break
-    fi
-done
-if [[ -z "$AGENT_BIN" ]]; then
-    echo "Error: husker-agent binary not found. Run 'make build-agent' first."
+# The agent is a static musl build for the same architecture. A host-target
+# build would link against the host's glibc, which the guest need not match.
+AGENT_BIN="target/${ARCH}-unknown-linux-musl/agent/husker-agent"
+if [[ ! -f "$AGENT_BIN" ]]; then
+    echo "Error: $AGENT_BIN not found. Run 'make $AGENT_TARGET' first."
     exit 1
 fi
 
@@ -56,10 +59,11 @@ echo "==> Mounting image"
 mount -o loop "$OUTPUT" "$MOUNT_DIR"
 
 echo "==> Running debootstrap (Ubuntu 22.04 Jammy)"
-debootstrap --arch=amd64 jammy "$MOUNT_DIR" http://archive.ubuntu.com/ubuntu
+debootstrap --arch="$DEBOOTSTRAP_ARCH" jammy "$MOUNT_DIR" "$UBUNTU_MIRROR"
 
 echo "==> Installing packages via chroot"
 chroot "$MOUNT_DIR" /bin/bash -c '
+    set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq \
@@ -67,8 +71,7 @@ chroot "$MOUNT_DIR" /bin/bash -c '
         iptables conntrack ethtool socat \
         curl ca-certificates \
         openssh-server \
-        iproute2 procps kmod \
-        2>&1 | tail -5
+        iproute2 procps kmod
     apt-get clean
     rm -rf /var/lib/apt/lists/*
 
