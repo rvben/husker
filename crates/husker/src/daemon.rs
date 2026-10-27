@@ -313,9 +313,57 @@ pub(crate) fn remove_orphan_clone_dirs(
     removed
 }
 
+/// The VM id a runtime-dir entry belongs to. Every backend names its runtime
+/// files `<uuid>.<kind>` (`sock`, `vsock`, `qmp`, `pid`, `serial.log`,
+/// `boot.log`, `userdata.log`, `OVMF_VARS.fd`) or `<uuid>-fs<n>.sock`, so the
+/// id is the hyphenated UUID that opens the name, followed by a `.` or `-`.
+/// Anything else in the directory is not a VM's and yields `None`.
+pub(crate) fn runtime_file_vm_id(name: &str) -> Option<uuid::Uuid> {
+    let (id, rest) = name.split_at_checked(36)?;
+    if !rest.starts_with(['.', '-']) {
+        return None;
+    }
+    uuid::Uuid::parse_str(id).ok()
+}
+
+/// Remove the files in `runtime_dir` that belong to a VM id with no record:
+/// sockets, logs and firmware variables left behind when a destroy was
+/// interrupted after the record was deleted, or by a daemon that crashed
+/// mid-create. Files whose id is known, files not named after a VM at all, and
+/// subdirectories are left alone. The runtime dir sits beside this daemon's
+/// state database, so every VM-named file in it was written on behalf of a
+/// record in that database.
+pub(crate) fn remove_orphan_runtime_files(
+    runtime_dir: &Path,
+    known_ids: &std::collections::HashSet<uuid::Uuid>,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(runtime_file_vm_id)
+        else {
+            continue;
+        };
+        if !known_ids.contains(&id) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Reconcile host resources against DB state on startup: reclaim the TAP devices
-/// and API/vsock sockets of VMs that are no longer running, and remove orphaned
-/// rootfs clone directories. Scoped to this daemon's own state and data dir, so a
+/// and API/vsock sockets of VMs that are no longer running, remove orphaned
+/// rootfs clone directories, and remove runtime files of VMs that no longer
+/// have a record. Scoped to this daemon's own state and data dir, so a
 /// co-located daemon's resources are never touched.
 ///
 /// Runs after `mark_stale_vms_stopped`, so at this point nothing this daemon
@@ -336,6 +384,7 @@ async fn reconcile_host_resources(
     };
     let known_names: std::collections::HashSet<&str> =
         vms.iter().map(|v| v.name.as_str()).collect();
+    let known_ids: std::collections::HashSet<uuid::Uuid> = vms.iter().map(|v| v.id).collect();
 
     #[cfg(feature = "linux-net")]
     let mut taps = 0usize;
@@ -360,21 +409,24 @@ async fn reconcile_host_resources(
     }
 
     let dirs = remove_orphan_clone_dirs(&storage.vms_dir(), &known_names);
+    let orphan_files = remove_orphan_runtime_files(runtime_dir, &known_ids);
 
     #[cfg(feature = "linux-net")]
-    if taps + socks + dirs > 0 {
+    if taps + socks + dirs + orphan_files > 0 {
         tracing::info!(
             taps,
             socks,
             dirs,
+            orphan_files,
             "reconciled leaked host resources from a prior run"
         );
     }
     #[cfg(not(feature = "linux-net"))]
-    if socks + dirs > 0 {
+    if socks + dirs + orphan_files > 0 {
         tracing::info!(
             socks,
             dirs,
+            orphan_files,
             "reconciled leaked host resources from a prior run"
         );
     }

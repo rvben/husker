@@ -7187,6 +7187,67 @@ mod tests {
         );
     }
 
+    /// Every runtime file of a VM without a record goes, whatever backend wrote
+    /// it; a known VM's files, files not named after a VM, and directories stay.
+    #[test]
+    fn remove_orphan_runtime_files_removes_only_files_of_unknown_vm_ids() {
+        let run = temp_test_dir("orphan-runtime-files").join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let known = uuid::Uuid::new_v4();
+        let orphan = uuid::Uuid::new_v4();
+        let touch = |name: String| std::fs::write(run.join(name), b"x").unwrap();
+        touch(format!("{known}.sock"));
+        touch(format!("{known}.serial.log"));
+        let orphan_files = [
+            format!("{orphan}.sock"),
+            format!("{orphan}.vsock"),
+            format!("{orphan}.vsock_52"),
+            format!("{orphan}.boot.log"),
+            format!("{orphan}.serial.log"),
+            format!("{orphan}.userdata.log"),
+            format!("{orphan}.qmp"),
+            format!("{orphan}.pid"),
+            format!("{orphan}.OVMF_VARS.fd"),
+            format!("{orphan}-fs0.sock"),
+        ];
+        for name in &orphan_files {
+            touch(name.clone());
+        }
+        touch("husker.lock".into());
+        touch("not-a-uuid-at-all-but-thirty-six-ch.sock".into());
+        std::fs::create_dir(run.join(format!("{orphan}.d"))).unwrap();
+
+        let known_ids = std::collections::HashSet::from([known]);
+        let removed = remove_orphan_runtime_files(&run, &known_ids);
+
+        assert_eq!(removed, orphan_files.len());
+        for name in &orphan_files {
+            assert!(!run.join(name).exists(), "{name} must be removed");
+        }
+        assert!(run.join(format!("{known}.sock")).exists());
+        assert!(run.join(format!("{known}.serial.log")).exists());
+        assert!(run.join("husker.lock").exists(), "non-VM files stay");
+        assert!(
+            run.join("not-a-uuid-at-all-but-thirty-six-ch.sock")
+                .exists(),
+            "a 36-character prefix that is not a UUID is not a VM id"
+        );
+        assert!(
+            run.join(format!("{orphan}.d")).is_dir(),
+            "directories are never removed"
+        );
+    }
+
+    #[test]
+    fn runtime_file_vm_id_requires_a_separator_after_the_uuid() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(runtime_file_vm_id(&format!("{id}.sock")), Some(id));
+        assert_eq!(runtime_file_vm_id(&format!("{id}-fs1.sock")), Some(id));
+        assert_eq!(runtime_file_vm_id(&id.to_string()), None);
+        assert_eq!(runtime_file_vm_id(&format!("{id}x.sock")), None);
+        assert_eq!(runtime_file_vm_id("short.sock"), None);
+    }
+
     #[cfg(feature = "linux-net")]
     #[test]
     fn env_override_dns_servers_comma_separated() {
