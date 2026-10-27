@@ -34,10 +34,10 @@ Cutover is transactional: the current binary and stopped SQLite state are saved
 before an atomic install. A failed start, health check, capability check, service
 restart, or error-level startup log restores both snapshots automatically.
 
-The unit must deliver its stop signal to the daemon alone (KillMode=mixed, as in
-contrib/husker.service) so the daemon can drain its guests before it exits. A unit
-that would signal every guest together with the daemon is refused before anything
-is stopped.
+The unit must deliver its stop signal to the daemon alone and still kill whatever
+the daemon leaves behind (KillMode=mixed, as in contrib/husker.service), so the
+daemon can drain its guests before it exits and no guest outlives the unit. A unit
+with any other KillMode is refused before anything is stopped.
 
 Environment overrides:
   HUSKER_DEPLOY_HOST          SSH destination (alternative to --host)
@@ -369,19 +369,29 @@ prepare_remote_runtime() {
     require_command systemctl
 }
 
-# The stop in the cutover is what the daemon's guest drain protects. With the
-# default KillMode=control-group systemd signals every guest process together
-# with the daemon, so the guests die before they can flush and whatever they
-# had not synced is lost. `mixed` and `process` deliver the stop signal to the
-# daemon alone, which then stops its guests itself; contrib/husker.service uses
-# `mixed` so that systemd still reaps anything the daemon leaves behind.
+# The stop in the cutover is what the daemon's guest drain protects, and only
+# KillMode=mixed both lets the drain run and leaves nothing behind. With the
+# default control-group systemd signals every guest process together with the
+# daemon, so the guests die before they can flush and whatever they had not
+# synced is lost. With `process` the daemon alone is signalled, but a guest that
+# outlives the drain keeps running, unmanaged, after the unit has stopped.
+# contrib/husker.service uses `mixed`: the daemon alone receives the stop
+# signal and drains its guests, and systemd kills whatever is still left once
+# the daemon has exited.
 require_drain_capable_unit() {
-    local kill_mode
+    local kill_mode remedy
     kill_mode="$(systemctl show "$SERVICE" -p KillMode --value)"
+    remedy="set KillMode=mixed in the unit (see contrib/husker.service), run systemctl daemon-reload, and deploy again"
     case "$kill_mode" in
-        mixed | process) ;;
+        mixed) ;;
+        control-group)
+            fail "$SERVICE stops with KillMode=control-group, which signals every guest together with the daemon; $remedy"
+            ;;
+        process)
+            fail "$SERVICE stops with KillMode=process, which leaves a guest that outlives the drain running after the unit has stopped; $remedy"
+            ;;
         *)
-            fail "$SERVICE stops with KillMode=${kill_mode:-unset}, which signals every guest together with the daemon; set KillMode=mixed in the unit (see contrib/husker.service), run systemctl daemon-reload, and deploy again"
+            fail "$SERVICE stops with KillMode=${kill_mode:-unset}, which is not the drain-capable KillMode=mixed; $remedy"
             ;;
     esac
 }

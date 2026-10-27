@@ -162,42 +162,55 @@ curl --fail --silent "$HEALTH_URL" >/dev/null || fail "disposable baseline did n
 LIVE_PID_BEFORE="$(systemctl show husker.service -p MainPID --value 2>/dev/null || printf '0')"
 LIVE_PID_BEFORE="${LIVE_PID_BEFORE:-0}"
 
+# Run the cutover while the disposable unit reports KillMode=$1 and require it
+# to be refused before the service is stopped, leaving the binary, the state
+# and the running process untouched and creating no rollback snapshot.
+expect_cutover_refused_for_kill_mode() {
+    local mode="$1"
+    [[ "$(systemctl show "$UNIT" -p KillMode --value)" == "$mode" ]] ||
+        fail "disposable unit does not report KillMode=${mode}"
+    log "cutover against a unit with KillMode=${mode} must be refused before the stop"
+    if env \
+        HUSKER_DEPLOY_HEALTH_ATTEMPTS=2 \
+        HUSKER_DEPLOY_AGENT_LOG_ATTEMPTS=1 \
+        HUSKER_DEPLOY_STABILITY_SECONDS=0 \
+        bash "$DEPLOY_SCRIPT" \
+            --remote-cutover \
+            --commit "$COMMIT" \
+            --artifact "$ARTIFACT" \
+            --service "$UNIT" \
+            --health-url "$HEALTH_URL" \
+            --install-path "$INSTALL_PATH" \
+            --state-db "$STATE_DB" \
+            --backup-root "$BACKUP_ROOT" >"$REFUSAL_LOG" 2>&1; then
+        fail "cutover against a unit with KillMode=${mode} unexpectedly proceeded"
+    fi
+    sed -n '1,40p' "$REFUSAL_LOG"
+    grep -Fq "KillMode=${mode}" "$REFUSAL_LOG" ||
+        fail "the refusal does not name the unit's KillMode"
+    systemctl is-active --quiet "$UNIT" || fail "the refusal stopped the disposable service"
+    [[ "$(systemctl show "$UNIT" -p MainPID --value)" == "$BASELINE_PID" ]] ||
+        fail "the refusal restarted the disposable service"
+    [[ "$(sha256sum "$INSTALL_PATH" | awk '{print $1}')" == "$ORIGINAL_BINARY_SHA" ]] ||
+        fail "the refusal changed the installed binary"
+    [[ "$(sha256sum "$STATE_DB" | awk '{print $1}')" == "$ORIGINAL_MAIN_SHA" ]] ||
+        fail "the refusal changed the state database"
+    [[ ! -e "$BACKUP_ROOT" ]] || fail "the refusal created a rollback snapshot"
+    log "cutover refused KillMode=${mode} before stopping the unit, leaving binary, state and process untouched"
+}
+
 # The disposable unit starts with systemd's default KillMode=control-group, the
-# mode that signals every guest together with the daemon. The cutover must
-# refuse it before the service is stopped, leaving the binary, the state and
-# the running process untouched and creating no rollback snapshot.
+# mode that signals every guest together with the daemon.
 BASELINE_PID="$(systemctl show "$UNIT" -p MainPID --value)"
 [[ "$BASELINE_PID" =~ ^[1-9][0-9]*$ ]] || fail "disposable baseline service has no main PID"
-[[ "$(systemctl show "$UNIT" -p KillMode --value)" == "control-group" ]] ||
-    fail "disposable unit does not start with the default KillMode"
-log "cutover against a unit with KillMode=control-group must be refused before the stop"
-if env \
-    HUSKER_DEPLOY_HEALTH_ATTEMPTS=2 \
-    HUSKER_DEPLOY_AGENT_LOG_ATTEMPTS=1 \
-    HUSKER_DEPLOY_STABILITY_SECONDS=0 \
-    bash "$DEPLOY_SCRIPT" \
-        --remote-cutover \
-        --commit "$COMMIT" \
-        --artifact "$ARTIFACT" \
-        --service "$UNIT" \
-        --health-url "$HEALTH_URL" \
-        --install-path "$INSTALL_PATH" \
-        --state-db "$STATE_DB" \
-        --backup-root "$BACKUP_ROOT" >"$REFUSAL_LOG" 2>&1; then
-    fail "cutover against a unit with KillMode=control-group unexpectedly proceeded"
-fi
-sed -n '1,40p' "$REFUSAL_LOG"
-grep -Fq 'KillMode=control-group' "$REFUSAL_LOG" ||
-    fail "the refusal does not name the unit's KillMode"
-systemctl is-active --quiet "$UNIT" || fail "the refusal stopped the disposable service"
-[[ "$(systemctl show "$UNIT" -p MainPID --value)" == "$BASELINE_PID" ]] ||
-    fail "the refusal restarted the disposable service"
-[[ "$(sha256sum "$INSTALL_PATH" | awk '{print $1}')" == "$ORIGINAL_BINARY_SHA" ]] ||
-    fail "the refusal changed the installed binary"
-[[ "$(sha256sum "$STATE_DB" | awk '{print $1}')" == "$ORIGINAL_MAIN_SHA" ]] ||
-    fail "the refusal changed the state database"
-[[ ! -e "$BACKUP_ROOT" ]] || fail "the refusal created a rollback snapshot"
-log "cutover refused the unit before stopping it, leaving binary, state and process untouched"
+expect_cutover_refused_for_kill_mode control-group
+
+# `process` signals the daemon alone but leaves a guest that outlives the drain
+# running after the unit has stopped, so it is refused too. systemd takes the
+# last assignment of a key, so the modes are appended in turn.
+printf 'KillMode=process\n' >>"$UNIT_FILE"
+systemctl daemon-reload
+expect_cutover_refused_for_kill_mode process
 
 printf 'KillMode=mixed\n' >>"$UNIT_FILE"
 systemctl daemon-reload
