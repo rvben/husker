@@ -56,7 +56,7 @@ pub struct VmPage {
 
 pub use agent_client::{AgentConnection, AgentError, ExecResult, ExecStreamEvent, ShellEvent};
 pub use diagnostics::{DRAIN_STOP_TIMEOUT, DrainReport};
-pub use guest_shutdown::{GUEST_EXIT_TIMEOUT, GUEST_SHUTDOWN_REQUEST_TIMEOUT};
+pub use guest_shutdown::{GUEST_EXIT_TIMEOUT, GUEST_FLUSH_TIMEOUT, GUEST_SHUTDOWN_CONNECT_TIMEOUT};
 #[cfg(feature = "linux-net")]
 pub use oci_materializer::{
     LocalOciImageMaterializer, MaterializedOciImage, OciImageMaterializer, OciMaterializationError,

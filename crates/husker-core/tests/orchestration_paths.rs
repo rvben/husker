@@ -1564,12 +1564,14 @@ async fn core_with_vm(
 }
 
 /// A guest agent stand-in for the shutdown request. It records the power
-/// action the host asks for, acknowledges it as planned, and once the host
-/// closes the connection ends the mock VM the way a real guest would, unless
-/// `exits` is false (a guest that acknowledges and then hangs).
+/// action the host asks for, acknowledges it as planned after `flush` (the
+/// time the guest's sync takes), and once the host closes the connection ends
+/// the mock VM the way a real guest would, unless `exits` is false (a guest
+/// that acknowledges and then hangs).
 async fn spawn_shutdown_responder(
     mock: MockVmm,
     vm_id: Uuid,
+    flush: std::time::Duration,
     exits: bool,
 ) -> (
     tempfile::TempDir,
@@ -1590,6 +1592,8 @@ async fn spawn_shutdown_responder(
                 panic!("the shutdown responder only answers Shutdown, got {request:?}");
             };
             seen.lock().unwrap().push(power);
+            // The real agent syncs the guest's storage before it answers.
+            tokio::time::sleep(flush).await;
             write_message(&mut stream, &AgentResponse::ShuttingDown { power })
                 .await
                 .unwrap();
@@ -1620,7 +1624,7 @@ async fn stop_asks_the_guest_for_the_power_action_its_backend_exits_on() {
         let (_tmp, core, vm_id) =
             core_with_vm(&mock, "vm-guest-stop", backend, VmState::Running).await;
         let (_agent_dir, socket, requested) =
-            spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+            spawn_shutdown_responder(mock.clone(), vm_id, std::time::Duration::ZERO, true).await;
         mock.set_agent_socket(Some(socket)).await;
 
         tokio::time::timeout(
@@ -1654,7 +1658,8 @@ async fn stop_resumes_a_paused_guest_so_it_can_end_itself() {
         VmState::Paused,
     )
     .await;
-    let (_agent_dir, socket, requested) = spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+    let (_agent_dir, socket, requested) =
+        spawn_shutdown_responder(mock.clone(), vm_id, std::time::Duration::ZERO, true).await;
     mock.set_agent_socket(Some(socket)).await;
 
     tokio::time::timeout(
@@ -1723,7 +1728,7 @@ async fn stop_proceeds_from_the_host_when_the_guest_is_unreachable() {
     let started = tokio::time::Instant::now();
     core.stop_vm("vm-no-agent").await.unwrap();
 
-    assert!(started.elapsed() < husker_core::GUEST_SHUTDOWN_REQUEST_TIMEOUT);
+    assert!(started.elapsed() < husker_core::GUEST_SHUTDOWN_CONNECT_TIMEOUT);
     assert_eq!(
         mock.states_seen_by_stop().await,
         vec![Some(VmState::Running)]
@@ -1747,7 +1752,7 @@ async fn stop_gives_up_on_a_guest_that_acknowledges_but_never_exits() {
     )
     .await;
     let (_agent_dir, socket, requested) =
-        spawn_shutdown_responder(mock.clone(), vm_id, false).await;
+        spawn_shutdown_responder(mock.clone(), vm_id, std::time::Duration::ZERO, false).await;
     mock.set_agent_socket(Some(socket)).await;
 
     let started = tokio::time::Instant::now();
@@ -1760,7 +1765,8 @@ async fn stop_gives_up_on_a_guest_that_acknowledges_but_never_exits() {
     );
     assert!(
         started.elapsed()
-            < husker_core::GUEST_EXIT_TIMEOUT + husker_core::GUEST_SHUTDOWN_REQUEST_TIMEOUT
+            < husker_core::GUEST_EXIT_TIMEOUT + husker_core::GUEST_SHUTDOWN_CONNECT_TIMEOUT,
+        "an immediate acknowledgement must not add a wait of its own"
     );
     assert_eq!(
         mock.states_seen_by_stop().await,
@@ -1768,6 +1774,92 @@ async fn stop_gives_up_on_a_guest_that_acknowledges_but_never_exits() {
     );
     assert_eq!(
         core.get_vm("vm-ack-hang").unwrap().state,
+        VmLifecycleState::Stopped
+    );
+}
+
+/// The agent acknowledges only after the guest's sync, so a guest with a lot
+/// of dirty data answers late. It gets the whole flush bound, well past the
+/// time the host allows for merely reaching an agent, and the backend stop
+/// still finds it already gone.
+#[tokio::test(start_paused = true)]
+async fn stop_waits_for_a_guest_whose_flush_outlasts_the_connect_bound() {
+    let flush = husker_core::GUEST_SHUTDOWN_CONNECT_TIMEOUT * 3;
+    assert!(
+        flush < husker_core::GUEST_FLUSH_TIMEOUT,
+        "the slow flush under test must still be within the flush bound"
+    );
+    let mock = MockVmm::new();
+    let (_tmp, core, vm_id) = core_with_vm(
+        &mock,
+        "vm-slow-flush",
+        BackendKind::Firecracker,
+        VmState::Running,
+    )
+    .await;
+    let (_agent_dir, socket, requested) =
+        spawn_shutdown_responder(mock.clone(), vm_id, flush, true).await;
+    mock.set_agent_socket(Some(socket)).await;
+
+    let started = tokio::time::Instant::now();
+    core.stop_vm("vm-slow-flush").await.unwrap();
+
+    assert_eq!(*requested.lock().unwrap(), vec![GuestPowerAction::Reboot]);
+    assert!(
+        started.elapsed() >= flush,
+        "the host must wait for the guest's flush before it does anything else"
+    );
+    assert!(started.elapsed() < flush + husker_core::GUEST_EXIT_TIMEOUT);
+    assert_eq!(
+        mock.states_seen_by_stop().await,
+        vec![Some(VmState::Stopped)],
+        "the backend stop must run only after the slowly flushing guest ended itself"
+    );
+    assert_eq!(
+        core.get_vm("vm-slow-flush").unwrap().state,
+        VmLifecycleState::Stopped
+    );
+}
+
+/// A guest whose agent takes the request but never acknowledges it holds the
+/// stop for the flush bound and no longer; the backend then stops it.
+#[tokio::test(start_paused = true)]
+async fn stop_gives_up_on_a_guest_that_never_finishes_flushing() {
+    let mock = MockVmm::new();
+    let (_tmp, core, vm_id) = core_with_vm(
+        &mock,
+        "vm-endless-flush",
+        BackendKind::Firecracker,
+        VmState::Running,
+    )
+    .await;
+    let (_agent_dir, socket, requested) = spawn_shutdown_responder(
+        mock.clone(),
+        vm_id,
+        husker_core::GUEST_FLUSH_TIMEOUT * 4,
+        true,
+    )
+    .await;
+    mock.set_agent_socket(Some(socket)).await;
+
+    let started = tokio::time::Instant::now();
+    core.stop_vm("vm-endless-flush").await.unwrap();
+
+    assert_eq!(*requested.lock().unwrap(), vec![GuestPowerAction::Reboot]);
+    assert!(
+        started.elapsed() >= husker_core::GUEST_FLUSH_TIMEOUT,
+        "the guest gets the whole flush bound before the host takes over"
+    );
+    assert!(
+        started.elapsed() < husker_core::GUEST_FLUSH_TIMEOUT + husker_core::GUEST_EXIT_TIMEOUT,
+        "a guest that never acknowledged gets no exit wait"
+    );
+    assert_eq!(
+        mock.states_seen_by_stop().await,
+        vec![Some(VmState::Running)]
+    );
+    assert_eq!(
+        core.get_vm("vm-endless-flush").unwrap().state,
         VmLifecycleState::Stopped
     );
 }
@@ -1782,7 +1874,8 @@ async fn destroy_asks_a_live_guest_to_end_itself_first() {
         VmState::Running,
     )
     .await;
-    let (_agent_dir, socket, requested) = spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+    let (_agent_dir, socket, requested) =
+        spawn_shutdown_responder(mock.clone(), vm_id, std::time::Duration::ZERO, true).await;
     mock.set_agent_socket(Some(socket)).await;
 
     tokio::time::timeout(
@@ -1810,7 +1903,8 @@ async fn drain_asks_live_guests_to_end_themselves_first() {
         VmState::Running,
     )
     .await;
-    let (_agent_dir, socket, requested) = spawn_shutdown_responder(mock.clone(), vm_id, true).await;
+    let (_agent_dir, socket, requested) =
+        spawn_shutdown_responder(mock.clone(), vm_id, std::time::Duration::ZERO, true).await;
     mock.set_agent_socket(Some(socket)).await;
 
     let drained = tokio::time::timeout(std::time::Duration::from_secs(5), core.drain_vms())

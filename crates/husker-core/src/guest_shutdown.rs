@@ -16,14 +16,19 @@
 use std::time::Duration;
 
 use husker_agent_proto::{AGENT_VSOCK_PORT, GuestPowerAction};
-use husker_vmm::{VmState, guest_power_action};
+use husker_vmm::{GUEST_SHUTDOWN_GRACE, VmState, guest_power_action};
 
 use super::*;
 
-/// Bound on reaching the agent and receiving its acknowledgement. The
-/// acknowledgement arrives after the guest's `sync`, so this also bounds the
-/// flush; a guest stuck inside it is stopped by the backend instead.
-pub const GUEST_SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound on reaching the guest agent. A guest without an agent, or one whose
+/// agent is not listening, is stopped by the backend after this.
+pub const GUEST_SHUTDOWN_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound on the guest's acknowledgement once its agent is reached. The agent
+/// acknowledges only after its `sync`, so this is the time a guest gets to
+/// make its storage durable; a guest still inside a longer flush is stopped
+/// by the backend regardless and loses what it had not written back yet.
+pub const GUEST_FLUSH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Longest to wait for the VM process to exit once the guest acknowledged a
 /// reboot or power-off. A guest reboot exits Firecracker within milliseconds;
@@ -31,6 +36,19 @@ pub const GUEST_SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const GUEST_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const GUEST_EXIT_POLL: Duration = Duration::from_millis(25);
+
+// A stop that runs every budget here to its end, followed by the backend's own
+// grace for a guest that acknowledged and then stayed up, must still finish
+// within the per-VM drain bound: a stop the drain cuts off leaves the guest to
+// be swept by the service manager instead of stopped by the backend.
+const _: () = assert!(
+    GUEST_SHUTDOWN_CONNECT_TIMEOUT.as_secs()
+        + GUEST_FLUSH_TIMEOUT.as_secs()
+        + GUEST_EXIT_TIMEOUT.as_secs()
+        + GUEST_SHUTDOWN_GRACE.as_secs()
+        <= DRAIN_STOP_TIMEOUT.as_secs(),
+    "the guest shutdown budgets plus the backend grace exceed the per-VM drain bound"
+);
 
 impl<B: VmmBackend> HuskerCore<B> {
     /// Ask `record`'s guest to flush its storage and end itself, then wait for
@@ -48,9 +66,29 @@ impl<B: VmmBackend> HuskerCore<B> {
             return;
         }
 
+        let connected = tokio::time::timeout(
+            GUEST_SHUTDOWN_CONNECT_TIMEOUT,
+            self.vmm.vsock_connect(record.id, AGENT_VSOCK_PORT),
+        )
+        .await;
+        let stream = match connected {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                debug!(%name, %error, "guest agent is unreachable; stopping from the host");
+                return;
+            }
+            Err(_) => {
+                debug!(
+                    %name,
+                    timeout_secs = GUEST_SHUTDOWN_CONNECT_TIMEOUT.as_secs(),
+                    "guest agent did not accept a connection in time; stopping from the host"
+                );
+                return;
+            }
+        };
+
         let requested = guest_power_action(record.vmm);
-        let asked = tokio::time::timeout(GUEST_SHUTDOWN_REQUEST_TIMEOUT, async {
-            let stream = self.vmm.vsock_connect(record.id, AGENT_VSOCK_PORT).await?;
+        let asked = tokio::time::timeout(GUEST_FLUSH_TIMEOUT, async {
             let mut connection = AgentConnection::new(stream);
             let planned = connection.shutdown(requested).await?;
             // Closing the connection tells the agent its acknowledgement was
@@ -66,10 +104,10 @@ impl<B: VmmBackend> HuskerCore<B> {
                 return;
             }
             Err(_) => {
-                debug!(
+                warn!(
                     %name,
-                    timeout_secs = GUEST_SHUTDOWN_REQUEST_TIMEOUT.as_secs(),
-                    "guest agent did not acknowledge the shutdown in time; stopping from the host"
+                    timeout_secs = GUEST_FLUSH_TIMEOUT.as_secs(),
+                    "guest did not finish flushing its storage in time; stopping from the host"
                 );
                 return;
             }

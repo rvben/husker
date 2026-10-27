@@ -36,6 +36,8 @@ use uuid::Uuid;
 
 pub use husker_types::{BackendKind, BootKind, InvalidBackendKind, InvalidBootKind};
 
+pub use guest_stop::GUEST_SHUTDOWN_GRACE;
+
 /// Kernel parameters that suppress probes for legacy hardware no direct-kernel
 /// guest can have.
 ///

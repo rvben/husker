@@ -16,7 +16,9 @@ use uuid::Uuid;
 use crate::VmmError;
 
 /// How long a guest gets to act on a shutdown request before it is forced off.
-pub(crate) const GUEST_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Public so that the host-side stop budgets built on top of a backend stop
+/// can account for it.
+pub const GUEST_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Interval between liveness checks while a guest shuts down. A backend's probe
 /// takes its instance lock only for the check itself, so every other VM's
