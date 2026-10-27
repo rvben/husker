@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.54](https://github.com/rvben/husker/compare/v0.4.53...v0.4.54) - 2026-10-27
+
+### Fixed
+
+- **release**: sign the macOS archive binary after the wheel build ([fed9622](https://github.com/rvben/husker/commit/fed9622e51ab8100c89399235f83c8162240196a))
+
 ## [0.4.53](https://github.com/rvben/husker/compare/v0.4.52...v0.4.53) - 2026-10-27
 
 ### Breaking Changes
