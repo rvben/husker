@@ -51,6 +51,7 @@ ARTIFACT="${DRILL_ROOT}/candidate/husker"
 STATE_DB="${DRILL_ROOT}/state/husker.db"
 BACKUP_ROOT="${DRILL_ROOT}/backups"
 SERVER_SCRIPT="${DRILL_ROOT}/server.py"
+REFUSAL_LOG="${DRILL_ROOT}/refusal.log"
 DEPLOY_LOG="${DRILL_ROOT}/deploy.log"
 mkdir -p "$(dirname "$INSTALL_PATH")" "$(dirname "$ARTIFACT")" "$(dirname "$STATE_DB")"
 
@@ -160,6 +161,49 @@ curl --fail --silent "$HEALTH_URL" >/dev/null || fail "disposable baseline did n
 
 LIVE_PID_BEFORE="$(systemctl show husker.service -p MainPID --value 2>/dev/null || printf '0')"
 LIVE_PID_BEFORE="${LIVE_PID_BEFORE:-0}"
+
+# The disposable unit starts with systemd's default KillMode=control-group, the
+# mode that signals every guest together with the daemon. The cutover must
+# refuse it before the service is stopped, leaving the binary, the state and
+# the running process untouched and creating no rollback snapshot.
+BASELINE_PID="$(systemctl show "$UNIT" -p MainPID --value)"
+[[ "$BASELINE_PID" =~ ^[1-9][0-9]*$ ]] || fail "disposable baseline service has no main PID"
+[[ "$(systemctl show "$UNIT" -p KillMode --value)" == "control-group" ]] ||
+    fail "disposable unit does not start with the default KillMode"
+log "cutover against a unit with KillMode=control-group must be refused before the stop"
+if env \
+    HUSKER_DEPLOY_HEALTH_ATTEMPTS=2 \
+    HUSKER_DEPLOY_AGENT_LOG_ATTEMPTS=1 \
+    HUSKER_DEPLOY_STABILITY_SECONDS=0 \
+    bash "$DEPLOY_SCRIPT" \
+        --remote-cutover \
+        --commit "$COMMIT" \
+        --artifact "$ARTIFACT" \
+        --service "$UNIT" \
+        --health-url "$HEALTH_URL" \
+        --install-path "$INSTALL_PATH" \
+        --state-db "$STATE_DB" \
+        --backup-root "$BACKUP_ROOT" >"$REFUSAL_LOG" 2>&1; then
+    fail "cutover against a unit with KillMode=control-group unexpectedly proceeded"
+fi
+sed -n '1,40p' "$REFUSAL_LOG"
+grep -Fq 'KillMode=control-group' "$REFUSAL_LOG" ||
+    fail "the refusal does not name the unit's KillMode"
+systemctl is-active --quiet "$UNIT" || fail "the refusal stopped the disposable service"
+[[ "$(systemctl show "$UNIT" -p MainPID --value)" == "$BASELINE_PID" ]] ||
+    fail "the refusal restarted the disposable service"
+[[ "$(sha256sum "$INSTALL_PATH" | awk '{print $1}')" == "$ORIGINAL_BINARY_SHA" ]] ||
+    fail "the refusal changed the installed binary"
+[[ "$(sha256sum "$STATE_DB" | awk '{print $1}')" == "$ORIGINAL_MAIN_SHA" ]] ||
+    fail "the refusal changed the state database"
+[[ ! -e "$BACKUP_ROOT" ]] || fail "the refusal created a rollback snapshot"
+log "cutover refused the unit before stopping it, leaving binary, state and process untouched"
+
+printf 'KillMode=mixed\n' >>"$UNIT_FILE"
+systemctl daemon-reload
+[[ "$(systemctl show "$UNIT" -p KillMode --value)" == "mixed" ]] ||
+    fail "the reloaded disposable unit does not report KillMode=mixed"
+
 log "forcing post-install health failure against disposable unit $UNIT"
 if env \
     HUSKER_DEPLOY_HEALTH_ATTEMPTS=2 \

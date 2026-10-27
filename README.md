@@ -398,7 +398,7 @@ make update-rootfs                  # Inject agent into rootfs image
 
 ### Systemd
 
-A systemd unit file is provided at `contrib/husker.service`.
+A systemd unit file is provided at `contrib/husker.service`. Keep its `KillMode=mixed`: with systemd's default `control-group` mode every guest is signalled together with the daemon on stop, so guests die before the daemon can drain them, and `scripts/deploy-linux.sh` refuses to stop such a unit.
 
 ## Contributing
 

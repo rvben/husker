@@ -34,6 +34,11 @@ Cutover is transactional: the current binary and stopped SQLite state are saved
 before an atomic install. A failed start, health check, capability check, service
 restart, or error-level startup log restores both snapshots automatically.
 
+The unit must deliver its stop signal to the daemon alone (KillMode=mixed, as in
+contrib/husker.service) so the daemon can drain its guests before it exits. A unit
+that would signal every guest together with the daemon is refused before anything
+is stopped.
+
 Environment overrides:
   HUSKER_DEPLOY_HOST          SSH destination (alternative to --host)
   HUSKER_DEPLOY_SERVICE       systemd unit name (default: husker)
@@ -364,6 +369,23 @@ prepare_remote_runtime() {
     require_command systemctl
 }
 
+# The stop in the cutover is what the daemon's guest drain protects. With the
+# default KillMode=control-group systemd signals every guest process together
+# with the daemon, so the guests die before they can flush and whatever they
+# had not synced is lost. `mixed` and `process` deliver the stop signal to the
+# daemon alone, which then stops its guests itself; contrib/husker.service uses
+# `mixed` so that systemd still reaps anything the daemon leaves behind.
+require_drain_capable_unit() {
+    local kill_mode
+    kill_mode="$(systemctl show "$SERVICE" -p KillMode --value)"
+    case "$kill_mode" in
+        mixed | process) ;;
+        *)
+            fail "$SERVICE stops with KillMode=${kill_mode:-unset}, which signals every guest together with the daemon; set KillMode=mixed in the unit (see contrib/husker.service), run systemctl daemon-reload, and deploy again"
+            ;;
+    esac
+}
+
 cutover_artifact() {
     local artifact="$1"
     local short artifact_hash installed_hash version
@@ -393,6 +415,8 @@ cutover_artifact() {
         log "commit $COMMIT is already installed and healthy ($artifact_hash)"
         return 0
     fi
+
+    require_drain_capable_unit
 
     local backup_dir next_path manifest
     install -d -m 0700 "$BACKUP_ROOT"
