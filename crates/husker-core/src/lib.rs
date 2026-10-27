@@ -1913,6 +1913,18 @@ fn merge_egress_hosts(existing: &str, entries: &[(String, Ipv4Addr)]) -> String 
     output
 }
 
+/// Where a mounted rootfs takes the `systemd-resolved` mask, if it runs
+/// systemd at all. The unit directory is the sign of systemd; a rootfs
+/// without it (Alpine, a busybox initramfs) has no resolver that would rewrite
+/// `/etc/resolv.conf` on boot, so there is nothing to mask.
+#[cfg(any(feature = "linux-net", test))]
+fn systemd_resolved_mask_path(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let unit_dir = root.join("etc/systemd/system");
+    unit_dir
+        .is_dir()
+        .then(|| unit_dir.join("systemd-resolved.service"))
+}
+
 /// Mount a rootfs image, pin its DNS and hostname egress decisions, and unmount.
 #[cfg(feature = "linux-net")]
 async fn inject_network_config(
@@ -1969,14 +1981,20 @@ async fn inject_network_config(
     }
     .await;
 
-    // Mask systemd-resolved so it doesn't recreate the symlink on boot
-    let resolved_link = mount_dir
-        .path()
-        .join("etc/systemd/system/systemd-resolved.service");
-    if !resolved_link.exists()
-        && let Err(e) = tokio::fs::symlink("/dev/null", &resolved_link).await
-    {
-        warn!(path = %resolved_link.display(), error = %e, "failed to mask systemd-resolved");
+    // Mask systemd-resolved so it does not recreate the symlink on boot. A
+    // rootfs without systemd has nothing to mask, which is not a failure.
+    match systemd_resolved_mask_path(mount_dir.path()) {
+        Some(resolved_link) => {
+            if !resolved_link.exists()
+                && let Err(e) = tokio::fs::symlink("/dev/null", &resolved_link).await
+            {
+                warn!(path = %resolved_link.display(), error = %e, "failed to mask systemd-resolved");
+            }
+        }
+        None => debug!(
+            rootfs = %rootfs.display(),
+            "rootfs has no systemd unit directory; no systemd-resolved mask needed"
+        ),
     }
 
     // Always unmount, even if write failed
@@ -4475,11 +4493,60 @@ mod tests {
     #[cfg(all(feature = "linux-net", unix))]
     use std::sync::OnceLock;
 
+    /// The mask goes exactly where a systemd rootfs keeps its unit overrides,
+    /// and nowhere on a rootfs that has no unit directory: an Alpine or
+    /// busybox image has no systemd-resolved to keep from rewriting
+    /// `/etc/resolv.conf`, so "nothing to mask" is the correct answer there,
+    /// not a failed mask.
+    #[test]
+    fn the_resolved_mask_belongs_only_to_a_rootfs_with_systemd() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            systemd_resolved_mask_path(root.path()),
+            None,
+            "a rootfs without /etc has nothing to mask"
+        );
+
+        std::fs::create_dir_all(root.path().join("etc")).unwrap();
+        assert_eq!(
+            systemd_resolved_mask_path(root.path()),
+            None,
+            "a rootfs with /etc but no systemd unit directory has nothing to mask"
+        );
+
+        std::fs::create_dir_all(root.path().join("etc/systemd/system")).unwrap();
+        assert_eq!(
+            systemd_resolved_mask_path(root.path()),
+            Some(
+                root.path()
+                    .join("etc/systemd/system/systemd-resolved.service")
+            ),
+            "a systemd rootfs takes the mask in its unit directory"
+        );
+    }
+
+    /// A plain file at the unit directory's path is not a unit directory, and
+    /// a symlink into it cannot be created, so the helper reports no systemd
+    /// rather than handing out a path the mask would then fail on.
+    #[test]
+    fn a_file_where_the_unit_directory_should_be_is_not_systemd() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc/systemd")).unwrap();
+        std::fs::write(root.path().join("etc/systemd/system"), b"not a directory").unwrap();
+        assert_eq!(systemd_resolved_mask_path(root.path()), None);
+    }
+
     #[cfg(all(feature = "linux-net", unix))]
     const FAKE_MOUNT_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 mount_dir="$4"
 if [ "${HUSKER_FAKE_SKIP_ETC_DIR:-0}" = "1" ]; then
+  exit "${HUSKER_FAKE_MOUNT_EXIT:-0}"
+fi
+if [ "${HUSKER_FAKE_NO_SYSTEMD:-0}" = "1" ]; then
+  mkdir -p "$mount_dir/etc"
+  printf '127.0.0.1 localhost\n' > "$mount_dir/etc/hosts"
+  printf 'nameserver 192.0.2.53\n' > "$mount_dir/etc/resolv.conf"
   exit "${HUSKER_FAKE_MOUNT_EXIT:-0}"
 fi
 mkdir -p "$mount_dir/etc/systemd/system"
@@ -4711,6 +4778,49 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
         let mask_target = std::fs::read_to_string(mask_capture).unwrap();
         assert_eq!(mask_target.trim(), "/dev/null");
+    }
+
+    /// An Alpine-style rootfs has `/etc` but no systemd unit directory. The
+    /// nameservers are written as on any rootfs and the mask is skipped: no
+    /// symlink is attempted where its parent does not exist and the injection
+    /// succeeds without a failed-mask warning.
+    #[cfg(all(feature = "linux-net", unix))]
+    #[tokio::test]
+    async fn inject_resolv_conf_on_a_rootfs_without_systemd_writes_nameservers_and_masks_nothing() {
+        let _guard = env_test_lock().lock().await;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        write_executable_script(&bin_dir.path().join("mount"), FAKE_MOUNT_SCRIPT);
+        write_executable_script(&bin_dir.path().join("umount"), FAKE_UMOUNT_SCRIPT);
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = rootfs_dir.path().join("rootfs.img");
+        std::fs::write(&rootfs, b"fake-rootfs").unwrap();
+
+        let capture_dir = tempfile::tempdir().unwrap();
+        let resolv_capture = capture_dir.path().join("resolv.conf.capture");
+        let mask_capture = capture_dir.path().join("resolved-mask.capture");
+
+        let mut path = OsString::from(bin_dir.path().as_os_str());
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+
+        let _path_guard = ScopedEnvVar::set("PATH", &path);
+        let _mount_exit = ScopedEnvVar::set("HUSKER_FAKE_MOUNT_EXIT", "0");
+        let _umount_exit = ScopedEnvVar::set("HUSKER_FAKE_UMOUNT_EXIT", "0");
+        let _no_systemd = ScopedEnvVar::set("HUSKER_FAKE_NO_SYSTEMD", "1");
+        let _capture_guard = ScopedEnvVar::set("HUSKER_FAKE_CAPTURE_FILE", &resolv_capture);
+        let _mask_guard = ScopedEnvVar::set("HUSKER_FAKE_MASK_CAPTURE_FILE", &mask_capture);
+
+        let servers = vec!["1.1.1.1".to_string()];
+        inject_resolv_conf(&rootfs, &servers).await.unwrap();
+
+        let resolv_contents = std::fs::read_to_string(resolv_capture).unwrap();
+        assert_eq!(resolv_contents, "nameserver 1.1.1.1\n");
+        assert!(
+            !mask_capture.exists(),
+            "no systemd-resolved mask belongs on a rootfs without systemd"
+        );
     }
 
     #[cfg(all(feature = "linux-net", unix))]
