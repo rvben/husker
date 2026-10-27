@@ -162,13 +162,12 @@ jobs:
         if: runner.os == 'Linux'
         run: maturin build --release --target ${{ matrix.target }} --compatibility manylinux_2_28 --zig --out "$DIST_DIR"
 
-      - name: Build binary (macOS, no-default-features + codesign)
+      # The binary is signed when it is packaged, not here: the wheel build
+      # below writes the same target path and would replace a signed binary
+      # with a freshly linked, unsigned one.
+      - name: Build binary (macOS, no-default-features)
         if: runner.os == 'macOS'
-        run: |
-          cargo build --release --no-default-features --target ${{ matrix.target }} --package husker
-          codesign --entitlements husker.entitlements --force --sign - \
-            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/husker"
-          codesign -d --entitlements :- "$CARGO_TARGET_DIR/${{ matrix.target }}/release/husker"
+        run: cargo build --release --no-default-features --target ${{ matrix.target }} --package husker
 
       - name: Build wheel (macOS, no-default-features)
         if: runner.os == 'macOS'
@@ -188,6 +187,11 @@ jobs:
             exit 1
           fi
           codesign --entitlements husker.entitlements --force --sign - "$BIN"
+          ENTITLEMENTS=$(codesign -d --entitlements - --xml "$BIN" 2>/dev/null)
+          if [[ "$ENTITLEMENTS" != *com.apple.security.virtualization* ]]; then
+            echo "error: wheel husker lacks the virtualization entitlement" >&2
+            exit 1
+          fi
           EXTRACT_DIR=$(find "$WHEEL_EXTRACT_DIR" -maxdepth 1 -mindepth 1 -type d | head -1)
           rm "$WHEEL"
           wheel pack "$EXTRACT_DIR" --dest-dir "$DIST_DIR"
@@ -228,6 +232,15 @@ jobs:
           mkdir -p "$RELEASE_PACKAGE"
           cp "$CARGO_TARGET_DIR/${{ matrix.target }}/release/husker" "$RELEASE_PACKAGE/husker"
           if [[ "${{ runner.os }}" == "macOS" ]]; then
+            # Apple Virtualization.framework refuses to start a VM from a
+            # binary without this entitlement, so sign the packaged copy and
+            # refuse to publish one that does not carry it.
+            codesign --entitlements husker.entitlements --force --sign - "$RELEASE_PACKAGE/husker"
+            ENTITLEMENTS=$(codesign -d --entitlements - --xml "$RELEASE_PACKAGE/husker" 2>/dev/null)
+            if [[ "$ENTITLEMENTS" != *com.apple.security.virtualization* ]]; then
+              echo "error: packaged husker lacks the virtualization entitlement" >&2
+              exit 1
+            fi
             cp husker.entitlements "$RELEASE_PACKAGE/"
           fi
 
