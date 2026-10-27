@@ -21,7 +21,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INITTAB="$SCRIPT_DIR/inittab"
 BUILD_SCRIPT="$SCRIPT_DIR/build-initramfs.sh"
-INITRAMFS_PATH="${HOME}/.local/share/husker/kernels/initramfs-virt.gz"
+# The built artifact follows build-initramfs.sh's naming for the same ARCH.
+case "${ARCH:-aarch64}" in
+    aarch64) INITRAMFS_PATH="${HOME}/.local/share/husker/kernels/initramfs-virt.gz" ;;
+    x86_64) INITRAMFS_PATH="${HOME}/.local/share/husker/kernels/initramfs-x86_64-virt.gz" ;;
+    *) echo "ERROR: unsupported ARCH ${ARCH} (expected aarch64 or x86_64)" >&2; exit 1 ;;
+esac
 
 ERRORS=0
 TESTS=0
@@ -196,7 +201,7 @@ if [ "${1:-}" = "--built" ]; then
         fail "initramfs not found at $INITRAMFS_PATH (run guest/build-initramfs.sh first)"
     else
         WORK_DIR=$(mktemp -d)
-        trap "rm -rf $WORK_DIR" EXIT
+        trap 'rm -rf "$WORK_DIR"' EXIT
 
         (cd "$WORK_DIR" && gzip -dc "$INITRAMFS_PATH" | cpio -i --quiet 2>/dev/null)
 

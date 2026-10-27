@@ -31,11 +31,11 @@ case "$ARCH" in
 esac
 
 APK_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ARCH}/"
-APK_NAME=$(curl -sL "$APK_URL" | grep -o "linux-virt-[0-9][^\"]*\.apk" | head -1)
+APK_NAME=$(curl -fsSL "$APK_URL" | grep -o "linux-virt-[0-9][^\"]*\.apk" | head -1)
 [ -z "$APK_NAME" ] && { echo "ERROR: linux-virt apk not found for $ARCH $ALPINE_VERSION" >&2; exit 1; }
 
 echo "Downloading $APK_NAME"
-curl -sL "${APK_URL}${APK_NAME}" -o "$WORK_DIR/linux-virt.apk"
+curl -fsSL "${APK_URL}${APK_NAME}" -o "$WORK_DIR/linux-virt.apk"
 
 mkdir -p "$WORK_DIR/apk"
 tar xzf "$WORK_DIR/linux-virt.apk" -C "$WORK_DIR/apk"

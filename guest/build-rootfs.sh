@@ -36,10 +36,10 @@ AGENT_BIN="$SCRIPT_DIR/target/${ARCH}-unknown-linux-musl/agent/husker-agent"
 
 # ── Fetch Alpine minirootfs tarball ──────────────────────────────────
 MINI_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ARCH}/"
-MINI_NAME=$(curl -sL "$MINI_URL" | grep -o "alpine-minirootfs-[0-9][^\"]*-${ARCH}\.tar\.gz" | head -1)
+MINI_NAME=$(curl -fsSL "$MINI_URL" | grep -o "alpine-minirootfs-[0-9][^\"]*-${ARCH}\.tar\.gz" | head -1)
 [ -z "$MINI_NAME" ] && { echo "ERROR: minirootfs tarball not found" >&2; exit 1; }
 echo "Downloading $MINI_NAME"
-curl -sL "${MINI_URL}${MINI_NAME}" -o "$WORK_DIR/minirootfs.tar.gz"
+curl -fsSL "${MINI_URL}${MINI_NAME}" -o "$WORK_DIR/minirootfs.tar.gz"
 
 # ── Populate an ext4 image via debugfs -f (no loop mount needed) ─────
 IMG="$WORK_DIR/rootfs.ext4"

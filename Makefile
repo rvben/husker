@@ -389,7 +389,7 @@ build-initramfs:
 # Build an uncompressed kernel Image extracted from Alpine's linux-virt apk.
 # ARCH defaults to aarch64 (for macOS VZ); pass x86_64 for Firecracker.
 build-kernel-image:
-	guest/build-kernel-image.sh $(ARCH)
+	guest/build-kernel-image.sh $(ARCH) $(ALPINE_VERSION)
 
 # Build baseline Alpine rootfs with husker-agent and inittab baked in.
 # ARCH=aarch64 builds for macOS VZ; ARCH=x86_64 for Firecracker.
@@ -399,11 +399,11 @@ ifeq ($(ARCH),x86_64)
 else
 	$(MAKE) build-agent-aarch64
 endif
-	guest/build-rootfs.sh $(ARCH)
+	guest/build-rootfs.sh $(ARCH) $(ALPINE_VERSION)
 
 # Validate initramfs/inittab consistency (module presence, load order, DHCP config)
 test-initramfs:
-	guest/test-initramfs.sh
+	ARCH=$(ARCH) guest/test-initramfs.sh
 
 # Build k3s-ready rootfs image (requires root, debootstrap)
 K3S_ROOTFS ?= k3s-rootfs.ext4

@@ -37,14 +37,14 @@ echo "Building initramfs for Alpine $ALPINE_VERSION ($ARCH)"
 APK_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ARCH}/"
 echo "Fetching package index from $APK_URL"
 
-APK_NAME=$(curl -sL "$APK_URL" | grep -o "linux-virt-[0-9][^\"]*\.apk" | head -1)
+APK_NAME=$(curl -fsSL "$APK_URL" | grep -o "linux-virt-[0-9][^\"]*\.apk" | head -1)
 if [ -z "$APK_NAME" ]; then
     echo "ERROR: could not find linux-virt package for Alpine $ALPINE_VERSION $ARCH" >&2
     exit 1
 fi
 
 echo "Downloading $APK_NAME"
-curl -sL "${APK_URL}${APK_NAME}" -o "$WORK_DIR/linux-virt.apk"
+curl -fsSL "${APK_URL}${APK_NAME}" -o "$WORK_DIR/linux-virt.apk"
 
 # ── Extract kernel modules ──────────────────────────────────────────
 
@@ -64,9 +64,13 @@ APK_MDIR="$WORK_DIR/apk/lib/modules/$KVER"
 # ── Download BusyBox static binary ──────────────────────────────────
 
 BUSYBOX_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ARCH}/"
-BB_NAME=$(curl -sL "$BUSYBOX_URL" | grep -o "busybox-static-[0-9][^\"]*\.apk" | head -1)
+BB_NAME=$(curl -fsSL "$BUSYBOX_URL" | grep -o "busybox-static-[0-9][^\"]*\.apk" | head -1)
+if [ -z "$BB_NAME" ]; then
+    echo "ERROR: busybox-static apk not found for $ARCH $ALPINE_VERSION" >&2
+    exit 1
+fi
 echo "Downloading BusyBox ($BB_NAME)"
-curl -sL "${BUSYBOX_URL}${BB_NAME}" -o "$WORK_DIR/busybox.apk"
+curl -fsSL "${BUSYBOX_URL}${BB_NAME}" -o "$WORK_DIR/busybox.apk"
 
 mkdir -p "$WORK_DIR/bb"
 tar xzf "$WORK_DIR/busybox.apk" -C "$WORK_DIR/bb"
