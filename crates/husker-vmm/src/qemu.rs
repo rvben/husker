@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::guest_stop::{GUEST_SHUTDOWN_GRACE, GuestExit, wait_for_process_exit_or_kill};
 #[cfg(target_os = "linux")]
 use crate::{BackendKind, CreatedVm};
 use crate::{MACOS_GUEST_UNSUPPORTED, VmConfig, VmInfo, VmState, VmmError};
@@ -33,6 +34,24 @@ pub(crate) struct QemuInstance {
     pub(crate) virtiofsd_socks: Vec<PathBuf>,
     /// Per-VM cgroup resource limits (no-op when the supervisor is disabled).
     pub(crate) cgroup: crate::cgroup::VmCgroup,
+}
+
+/// Record that `inst`'s QEMU process has exited: the VM is stopped, has no pid,
+/// and its cgroup is released.
+async fn settle_stopped(inst: &mut QemuInstance) {
+    inst.info.state = VmState::Stopped;
+    inst.info.pid = None;
+    inst.cgroup.remove().await;
+}
+
+/// Wait for a guest-triggered QEMU exit and force termination when the guest
+/// does not power down within the bound.
+async fn wait_for_exit_or_kill(
+    instances: &Mutex<HashMap<Uuid, QemuInstance>>,
+    id: Uuid,
+    grace: std::time::Duration,
+) -> Result<GuestExit, VmmError> {
+    wait_for_process_exit_or_kill(instances, id, grace, "qemu", |inst| &mut inst.process).await
 }
 
 /// Locate the virtiofsd binary: try `virtiofsd` on PATH, then well-known fallbacks.
@@ -458,26 +477,54 @@ impl QemuKvmBackend {
         Ok(info)
     }
 
-    /// Best-effort, asynchronous shutdown: sends an ACPI powerdown event and marks
-    /// the VM `Stopped`, but the QEMU process may still be winding down. Callers
-    /// must not assume the process has exited (mirrors the Firecracker backend).
+    /// Stop the VM: ask the guest to power down over QMP, wait up to the shared
+    /// grace period for the QEMU process to exit, and kill it otherwise. On
+    /// return the process is gone, so the caller may release the rootfs, TAP
+    /// device and cgroup at once. A guest that already ended itself (the agent
+    /// powered it off on the host's request) settles without a request.
     pub async fn stop(&self, id: Uuid) -> Result<(), VmmError> {
+        self.stop_within(id, GUEST_SHUTDOWN_GRACE).await
+    }
+
+    async fn stop_within(&self, id: Uuid, grace: std::time::Duration) -> Result<(), VmmError> {
         let qmp_path = {
-            let instances = self.instances.lock().await;
-            instances
-                .get(&id)
-                .ok_or(VmmError::VmNotFound(id))?
-                .qmp_path
-                .clone()
+            let mut instances = self.instances.lock().await;
+            let inst = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+            if matches!(inst.process.try_wait(), Ok(Some(_))) {
+                settle_stopped(inst).await;
+                return Ok(());
+            }
+            inst.qmp_path.clone()
         };
-        if let Ok(mut qmp) = crate::qmp::QmpClient::connect(&qmp_path).await {
-            let _ = qmp.system_powerdown().await;
+
+        // A guest that cannot be asked gets no grace: the process is killed at
+        // once rather than left holding its resources for the full period.
+        let grace = match Self::request_powerdown(&qmp_path).await {
+            Ok(()) => grace,
+            Err(error) => {
+                tracing::warn!(%id, %error, "guest shutdown request failed; force-stopping qemu");
+                std::time::Duration::ZERO
+            }
+        };
+        match wait_for_exit_or_kill(&self.instances, id, grace).await? {
+            GuestExit::Clean => {}
+            GuestExit::Forced => {
+                tracing::warn!(%id, "guest did not exit cleanly; force-killed qemu");
+            }
+            GuestExit::Gone => return Ok(()),
         }
+
         let mut instances = self.instances.lock().await;
         if let Some(inst) = instances.get_mut(&id) {
-            inst.info.state = VmState::Stopped;
+            settle_stopped(inst).await;
         }
         Ok(())
+    }
+
+    /// Send the guest an ACPI power-button event through the QMP socket.
+    async fn request_powerdown(qmp_path: &std::path::Path) -> Result<(), VmmError> {
+        let mut qmp = crate::qmp::QmpClient::connect(qmp_path).await?;
+        qmp.system_powerdown().await
     }
 
     pub async fn destroy(&self, id: Uuid) -> Result<(), VmmError> {
@@ -523,12 +570,7 @@ impl QemuKvmBackend {
         let inst = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
         if inst.info.state == VmState::Running || inst.info.state == VmState::Paused {
             match inst.process.try_wait() {
-                Ok(Some(_)) => {
-                    // Process exited: mark as stopped and reap the now-empty cgroup.
-                    inst.info.state = VmState::Stopped;
-                    inst.info.pid = None;
-                    inst.cgroup.remove().await;
-                }
+                Ok(Some(_)) => settle_stopped(inst).await,
                 Ok(None) => {}
                 Err(_) => {
                     // try_wait() failed: the process state is ambiguous (it may
@@ -904,6 +946,171 @@ mod tests {
         let info = be.info(id).await.unwrap();
         assert_eq!(info.state, VmState::Stopped);
         assert!(info.pid.is_none());
+    }
+
+    /// Track `process` as a running VM whose QMP socket is `qmp_path`.
+    async fn register_running_process(
+        be: &QemuKvmBackend,
+        dir: &std::path::Path,
+        process: tokio::process::Child,
+        qmp_path: PathBuf,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        be.instances.lock().await.insert(
+            id,
+            QemuInstance {
+                info: VmInfo {
+                    id,
+                    name: "stop".into(),
+                    state: VmState::Running,
+                    pid: process.id(),
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    vsock_cid: 3,
+                },
+                qmp_path,
+                pidfile_path: dir.join("stop.pid"),
+                serial_log_path: dir.join("stop.serial.log"),
+                boot_log_path: dir.join("stop.boot.log"),
+                process,
+                balloon: false,
+                virtiofsds: vec![],
+                virtiofsd_socks: vec![],
+                cgroup: noop_cgroup(),
+            },
+        );
+        id
+    }
+
+    async fn process_has_exited(be: &QemuKvmBackend, id: Uuid) -> bool {
+        be.instances
+            .lock()
+            .await
+            .get_mut(&id)
+            .expect("the instance stays tracked after a stop")
+            .process
+            .try_wait()
+            .unwrap()
+            .is_some()
+    }
+
+    /// Serve a QMP session on `path` that completes the handshake and accepts
+    /// every command, counting `system_powerdown` requests. The "guest" behind
+    /// it never acts on them.
+    fn serve_fake_qmp(path: &std::path::Path) -> Arc<std::sync::atomic::AtomicUsize> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let powerdowns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&powerdowns);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            writer
+                .write_all(b"{\"QMP\":{\"version\":{}}}\n")
+                .await
+                .unwrap();
+            let mut lines = BufReader::new(reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("system_powerdown") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                if writer.write_all(b"{\"return\":{}}\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        powerdowns
+    }
+
+    /// A guest that already ended itself gets no powerdown request: the QMP
+    /// socket sees no connection, and the stop settles the instance at once.
+    #[tokio::test]
+    async fn stop_of_an_exited_guest_sends_no_shutdown_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = test_backend("qemu-system-x86_64", dir.path());
+        let mut process = tokio::process::Command::new("true").spawn().unwrap();
+        process.wait().await.unwrap();
+        let qmp_path = dir.path().join("exited.qmp");
+        let qmp_socket = tokio::net::UnixListener::bind(&qmp_path).unwrap();
+        let id = register_running_process(&be, dir.path(), process, qmp_path).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), be.stop(id))
+            .await
+            .expect("an exited guest needs no grace period")
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), qmp_socket.accept())
+                .await
+                .is_err(),
+            "stop connected to the QMP socket of an exited guest"
+        );
+        let info = be.info(id).await.unwrap();
+        assert_eq!(info.state, VmState::Stopped);
+        assert!(info.pid.is_none());
+    }
+
+    /// The regression guard for a stop that returned while QEMU still ran: a
+    /// guest that accepts the powerdown request but never acts on it is killed
+    /// once the grace period elapses, and only then is the VM recorded stopped.
+    #[tokio::test]
+    async fn stop_kills_a_guest_that_ignores_the_powerdown_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = test_backend("qemu-system-x86_64", dir.path());
+        let qmp_path = dir.path().join("ignores.qmp");
+        let powerdowns = serve_fake_qmp(&qmp_path);
+        let process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let id = register_running_process(&be, dir.path(), process, qmp_path).await;
+
+        let grace = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        be.stop_within(id, grace).await.unwrap();
+
+        assert!(
+            started.elapsed() >= grace,
+            "the kill must not precede the grace period"
+        );
+        assert_eq!(
+            powerdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the guest is asked to power down before it is forced"
+        );
+        assert!(
+            process_has_exited(&be, id).await,
+            "stop returned while the qemu process was still running"
+        );
+        let info = be.info(id).await.unwrap();
+        assert_eq!(info.state, VmState::Stopped);
+        assert!(info.pid.is_none());
+    }
+
+    /// Without a reachable QMP socket the guest cannot be asked, so the process
+    /// is killed at once instead of holding its resources for the full grace.
+    #[tokio::test]
+    async fn stop_without_a_reachable_qmp_socket_kills_the_process_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = test_backend("qemu-system-x86_64", dir.path());
+        let process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let id = register_running_process(&be, dir.path(), process, dir.path().join("missing.qmp"))
+            .await;
+
+        let started = std::time::Instant::now();
+        be.stop(id).await.unwrap();
+
+        assert!(
+            started.elapsed() < GUEST_SHUTDOWN_GRACE,
+            "an unreachable guest must not be granted the grace period"
+        );
+        assert!(process_has_exited(&be, id).await);
+        assert_eq!(be.info(id).await.unwrap().state, VmState::Stopped);
     }
 
     #[tokio::test]

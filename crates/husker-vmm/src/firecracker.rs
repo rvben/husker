@@ -10,6 +10,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::guest_stop::{GUEST_SHUTDOWN_GRACE, GuestExit, wait_for_process_exit_or_kill};
 use crate::{
     BackendKind, CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState,
     VmmBackend, VmmError,
@@ -123,24 +124,6 @@ pub struct FirecrackerBackend {
 /// give each fork its own vsock socket so concurrent forks of one snapshot do
 /// not collide on the host UDS. The later of the two requirements wins.
 const FORK_MIN_FIRECRACKER: (u32, u32, u32) = (1, 16, 0);
-const GUEST_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-/// Interval between exit checks while a guest shuts down. Each check locks the
-/// instance map only for the check itself, so every other VM's operations keep
-/// flowing during the grace period.
-const GUEST_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
-
-/// How a `stop_vm` wait for the Firecracker process ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GuestExit {
-    /// Firecracker exited on its own after the shutdown request.
-    Clean,
-    /// The grace period elapsed, or the process state could not be read, and
-    /// the process was killed.
-    Forced,
-    /// The instance left the map during the wait; a concurrent destroy owns
-    /// the process now.
-    Gone,
-}
 
 /// Record that `instance`'s Firecracker process has exited: the VM is stopped,
 /// has no pid, and its cgroup is released.
@@ -154,46 +137,15 @@ async fn settle_stopped(instance: &mut FcInstance) {
 /// guest does not shut down within the bound. A successful `stop_vm` must mean
 /// the process no longer owns its TAP/rootfs/vsock resources; merely accepting
 /// `SendCtrlAltDel` is not sufficient for callers that immediately clean them.
-///
-/// The instance map is locked per exit check, never across the whole grace,
-/// because the map guards every VM: a stop that held it for the full grace
-/// would stall creates, execs and stops of unrelated VMs.
 async fn wait_for_exit_or_kill(
     instances: &Mutex<HashMap<Uuid, FcInstance>>,
     id: Uuid,
     grace: std::time::Duration,
 ) -> Result<GuestExit, VmmError> {
-    let deadline = tokio::time::Instant::now() + grace;
-    loop {
-        {
-            let mut instances = instances.lock().await;
-            let Some(instance) = instances.get_mut(&id) else {
-                return Ok(GuestExit::Gone);
-            };
-            match instance.process.try_wait() {
-                Ok(Some(_)) => return Ok(GuestExit::Clean),
-                Ok(None) => {}
-                Err(wait_error) => {
-                    instance.process.kill().await.map_err(|kill_error| {
-                        VmmError::ProcessError(format!(
-                            "wait for firecracker exit: {wait_error}; force kill also failed: {kill_error}"
-                        ))
-                    })?;
-                    return Ok(GuestExit::Forced);
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                instance.process.kill().await.map_err(|error| {
-                    VmmError::ProcessError(format!(
-                        "firecracker did not exit within {}s and force kill failed: {error}",
-                        grace.as_secs_f64()
-                    ))
-                })?;
-                return Ok(GuestExit::Forced);
-            }
-        }
-        tokio::time::sleep(GUEST_EXIT_POLL).await;
-    }
+    wait_for_process_exit_or_kill(instances, id, grace, "firecracker", |instance| {
+        &mut instance.process
+    })
+    .await
 }
 
 /// Parse Firecracker's `--version` output into `(major, minor, patch)`. The

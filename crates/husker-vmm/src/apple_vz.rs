@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::fd_stream::FdStream;
+use crate::guest_stop::{GUEST_SHUTDOWN_GRACE, GuestExit, wait_for_guest_exit};
 use crate::{BackendKind, CreatedVm, VmConfig, VmInfo, VmState, VmmBackend, VmmError};
 
 // ── Send/Sync wrappers ──────────────────────────────────────────────────
@@ -459,6 +460,29 @@ pub(crate) async fn dispatch_sync_fallible<T: Send + 'static>(
     dispatch_sync_result(queue, f).await?
 }
 
+/// Read the live state of `vm` on its serial dispatch queue.
+async fn live_vz_state(
+    queue: &DispatchRetained<DispatchQueue>,
+    vm: &QueueConfined<Retained<VZVirtualMachine>>,
+) -> Result<VZVirtualMachineState, VmmError> {
+    let vm = QueueConfined(vm.0.clone());
+    dispatch_sync_result(queue.clone(), move || -> VZVirtualMachineState {
+        let _capture_whole = &vm;
+        // Safety: Called on the VM's serial dispatch queue.
+        unsafe { vm.0.state() }
+    })
+    .await
+}
+
+/// Whether a VZ state means the guest no longer executes: it stopped, or the
+/// framework hit an internal error and abandoned it.
+fn vz_has_ended(state: VZVirtualMachineState) -> bool {
+    matches!(
+        state,
+        VZVirtualMachineState::Stopped | VZVirtualMachineState::Error
+    )
+}
+
 /// Dispatch a VZ completion-handler operation on a queue and await the result.
 ///
 /// The closure calling the VZ method executes synchronously on the dispatch queue.
@@ -590,32 +614,30 @@ impl VmmBackend for AppleVzBackend {
         Ok(CreatedVm::new(info, selection))
     }
 
-    /// Best-effort, asynchronous shutdown: requests a guest stop and marks the VM
-    /// `Stopped`, but the VZVirtualMachine may still be winding down. Callers must
-    /// not assume it has exited (mirrors the QEMU and Firecracker backends;
-    /// `destroy_vm` force-stops).
+    /// Stop the VM: send the guest an ACPI power-button request, wait up to the
+    /// shared grace period for the VZVirtualMachine to stop, and force it off
+    /// otherwise. On return the Virtualization.framework helper no longer holds
+    /// the rootfs or serves the vsock device, so the caller may release them at
+    /// once. A guest that already ended itself (the agent powered it off on the
+    /// host's request) is recorded as stopped without a request.
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        let (vm, live_vm, queue) = {
+        let (vm, queue) = {
             let instances = self.instances.lock().await;
             let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
-            // A guest already seen to have ended (the agent powered it off on
-            // the host's request and `vm_info` recorded it) has nothing to stop.
             if inst.info.state == VmState::Stopped {
                 return Ok(());
             }
-            (
-                QueueConfined(inst.vm.0.clone()),
-                QueueConfined(inst.vm.0.clone()),
-                inst.queue.clone(),
-            )
+            (QueueConfined(inst.vm.0.clone()), inst.queue.clone())
         };
 
-        // Send ACPI power button (graceful shutdown)
+        let request_vm = QueueConfined(vm.0.clone());
         let requested = dispatch_sync_fallible(queue.clone(), move || -> Result<(), VmmError> {
-            let _capture_whole = &vm;
+            let _capture_whole = &request_vm;
             // Safety: Called on the VM's serial dispatch queue via dispatch_sync_fallible.
             unsafe {
-                vm.0.requestStopWithError()
+                request_vm
+                    .0
+                    .requestStopWithError()
                     .map_err(|e| VmmError::ApiError(format!("requestStop: {e}")))
             }
         })
@@ -623,24 +645,47 @@ impl VmmBackend for AppleVzBackend {
         if let Err(error) = requested {
             // VZ refuses the request for a VM that is not running. When the
             // guest ended itself between the state check above and the request,
-            // that refusal is the outcome the stop wanted, not a failure.
-            let live_state = dispatch_sync_result(queue, move || -> VZVirtualMachineState {
-                let _capture_whole = &live_vm;
-                // Safety: Called on the VM's serial dispatch queue.
-                unsafe { live_vm.0.state() }
-            })
-            .await?;
+            // that refusal is the outcome the stop wanted; the wait below then
+            // observes the stopped state at once.
             if !matches!(
-                live_state,
+                live_vz_state(&queue, &vm).await?,
                 VZVirtualMachineState::Stopped | VZVirtualMachineState::Stopping
             ) {
                 return Err(error);
             }
         }
 
+        let exit = wait_for_guest_exit(
+            GUEST_SHUTDOWN_GRACE,
+            || async {
+                let ended = vz_has_ended(live_vz_state(&queue, &vm).await?);
+                Ok(ended.then_some(GuestExit::Clean))
+            },
+            || async {
+                match dispatch_vz_op(queue.clone(), QueueConfined(vm.0.clone()), VzOp::Stop).await {
+                    Ok(()) => Ok(GuestExit::Forced),
+                    // The force stop is refused for a VM that ended meanwhile.
+                    Err(_) if vz_has_ended(live_vz_state(&queue, &vm).await?) => {
+                        Ok(GuestExit::Clean)
+                    }
+                    Err(error) => Err(error),
+                }
+            },
+        )
+        .await?;
+        if exit == GuestExit::Forced {
+            tracing::warn!(%id, "guest did not stop within the grace period; force-stopped the virtual machine");
+        }
+
+        // A VM that hit an internal VZ error while stopping is failed, not
+        // stopped; everything else that ended is stopped.
+        let settled = match live_vz_state(&queue, &vm).await? {
+            VZVirtualMachineState::Error => VmState::Failed,
+            _ => VmState::Stopped,
+        };
         let mut instances = self.instances.lock().await;
         if let Some(inst) = instances.get_mut(&id) {
-            inst.info.state = VmState::Stopped;
+            inst.info.state = settled;
         }
         Ok(())
     }
@@ -678,12 +723,7 @@ impl VmmBackend for AppleVzBackend {
             return Ok(info);
         };
 
-        let live_state = dispatch_sync_result(queue, move || -> VZVirtualMachineState {
-            let _capture_whole = &vm;
-            // Safety: Called on the VM's serial dispatch queue.
-            unsafe { vm.0.state() }
-        })
-        .await?;
+        let live_state = live_vz_state(&queue, &vm).await?;
 
         // Map the live VZ state to our VmState. Only act when the live state
         // indicates the guest has stopped; all other transitions (Starting,

@@ -1,6 +1,7 @@
 //! VMM abstraction and backend-neutral types for Firecracker, Apple VZ, and QEMU/KVM.
 
 pub mod firecracker;
+pub(crate) mod guest_stop;
 pub mod vsock;
 
 #[cfg(unix)]
@@ -588,7 +589,11 @@ pub trait VmmBackend: Send + Sync {
         self.select_backend(BackendRequirements::from_config(config))
     }
 
-    /// Stop a running VM gracefully.
+    /// Stop a VM: ask the guest to shut down, wait up to the shared grace
+    /// period for it to end, and force it off otherwise. On return the guest no
+    /// longer runs and holds none of its host resources (rootfs, TAP device,
+    /// vsock), so the caller may release them at once. A guest that already
+    /// ended itself is recorded as stopped without a request.
     fn stop_vm(&self, id: Uuid) -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
 
     /// Force-kill a VM.
