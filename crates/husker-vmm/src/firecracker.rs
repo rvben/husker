@@ -142,6 +142,14 @@ enum GuestExit {
     Gone,
 }
 
+/// Record that `instance`'s Firecracker process has exited: the VM is stopped,
+/// has no pid, and its cgroup is released.
+async fn settle_stopped(instance: &mut FcInstance) {
+    instance.info.state = VmState::Stopped;
+    instance.info.pid = None;
+    instance.cgroup.remove().await;
+}
+
 /// Wait for a guest-triggered Firecracker exit and force termination when the
 /// guest does not shut down within the bound. A successful `stop_vm` must mean
 /// the process no longer owns its TAP/rootfs/vsock resources; merely accepting
@@ -674,10 +682,16 @@ impl VmmBackend for FirecrackerBackend {
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        // Extract what we need, then drop the lock before making the API call
+        // Extract what we need, then drop the lock before making the API call.
+        // A guest that has already ended itself (the agent rebooted it on the
+        // host's request) has no API to call and nothing to wait for.
         let socket_path = {
-            let instances = self.instances.lock().await;
-            let instance = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
+            let mut instances = self.instances.lock().await;
+            let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+            if matches!(instance.process.try_wait(), Ok(Some(_))) {
+                settle_stopped(instance).await;
+                return Ok(());
+            }
             instance.socket_path.clone()
         };
 
@@ -707,9 +721,7 @@ impl VmmBackend for FirecrackerBackend {
 
         let mut instances = self.instances.lock().await;
         if let Some(instance) = instances.get_mut(&id) {
-            instance.info.state = VmState::Stopped;
-            instance.info.pid = None;
-            instance.cgroup.remove().await;
+            settle_stopped(instance).await;
         }
         Ok(())
     }
@@ -1628,6 +1640,34 @@ mod tests {
             .try_wait()
             .unwrap()
             .is_some()
+    }
+
+    /// A guest that already ended itself gets no shutdown request: the API
+    /// socket sees no connection, and the stop settles the instance at once.
+    #[tokio::test]
+    async fn stop_of_an_exited_guest_sends_no_shutdown_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend("firecracker", dir.path());
+        let mut process = tokio::process::Command::new("true").spawn().unwrap();
+        process.wait().await.unwrap();
+        let id = register_running_process(&backend, dir.path(), process).await;
+        let api_socket =
+            tokio::net::UnixListener::bind(dir.path().join(format!("{id}.sock"))).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), backend.stop_vm(id))
+            .await
+            .expect("an exited guest needs no grace period")
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), api_socket.accept())
+                .await
+                .is_err(),
+            "stop_vm connected to the API socket of an exited guest"
+        );
+        let info = backend.vm_info(id).await.unwrap();
+        assert_eq!(info.state, VmState::Stopped);
+        assert!(info.pid.is_none());
     }
 
     #[tokio::test]

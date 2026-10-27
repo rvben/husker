@@ -595,14 +595,23 @@ impl VmmBackend for AppleVzBackend {
     /// not assume it has exited (mirrors the QEMU and Firecracker backends;
     /// `destroy_vm` force-stops).
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        let (vm, queue) = {
+        let (vm, live_vm, queue) = {
             let instances = self.instances.lock().await;
             let inst = instances.get(&id).ok_or(VmmError::VmNotFound(id))?;
-            (QueueConfined(inst.vm.0.clone()), inst.queue.clone())
+            // A guest already seen to have ended (the agent powered it off on
+            // the host's request and `vm_info` recorded it) has nothing to stop.
+            if inst.info.state == VmState::Stopped {
+                return Ok(());
+            }
+            (
+                QueueConfined(inst.vm.0.clone()),
+                QueueConfined(inst.vm.0.clone()),
+                inst.queue.clone(),
+            )
         };
 
         // Send ACPI power button (graceful shutdown)
-        dispatch_sync_fallible(queue, move || -> Result<(), VmmError> {
+        let requested = dispatch_sync_fallible(queue.clone(), move || -> Result<(), VmmError> {
             let _capture_whole = &vm;
             // Safety: Called on the VM's serial dispatch queue via dispatch_sync_fallible.
             unsafe {
@@ -610,7 +619,24 @@ impl VmmBackend for AppleVzBackend {
                     .map_err(|e| VmmError::ApiError(format!("requestStop: {e}")))
             }
         })
-        .await?;
+        .await;
+        if let Err(error) = requested {
+            // VZ refuses the request for a VM that is not running. When the
+            // guest ended itself between the state check above and the request,
+            // that refusal is the outcome the stop wanted, not a failure.
+            let live_state = dispatch_sync_result(queue, move || -> VZVirtualMachineState {
+                let _capture_whole = &live_vm;
+                // Safety: Called on the VM's serial dispatch queue.
+                unsafe { live_vm.0.state() }
+            })
+            .await?;
+            if !matches!(
+                live_state,
+                VZVirtualMachineState::Stopped | VZVirtualMachineState::Stopping
+            ) {
+                return Err(error);
+            }
+        }
 
         let mut instances = self.instances.lock().await;
         if let Some(inst) = instances.get_mut(&id) {
