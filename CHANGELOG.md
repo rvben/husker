@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased](https://github.com/rvben/husker/compare/v0.4.52...HEAD)
+## [0.4.53](https://github.com/rvben/husker/compare/v0.4.52...v0.4.53) - 2026-10-27
 
 ### Breaking Changes
 
@@ -21,6 +21,84 @@ All notable changes to this project are documented in this file.
 - **cli**: `husker schema` declares each command's `effects` explicitly (read-only, idempotent or non-idempotent) instead of deriving them from the command name; `exec`, `job`, `session start`, `prompt`, `dev new`, `port-forward add`, `snapshot restore`, `secret rotate` and `shell` are non-idempotent, and `session list`, `session get` and `events` are no longer marked mutating ([4ddd400](https://github.com/rvben/husker/commit/4ddd400d32e007ee4aea83f62b7899350b2fa96d)).
 - **cli**: `--config`, `--api-url` and `--api-token` are global flags and parse after the subcommand, as `husker schema` already advertised ([0c47891](https://github.com/rvben/husker/commit/0c4789102ef239fe6291305cfb42b09338a01b87)).
 - **sdk**: `exec(..., check=True)` raises `CommandFailed` instead of `HuskerError` with kind `exec_failed`, and `iter_file` raises `FileChanged` instead of `Conflict` with kind `file_changed` ([746c3f7](https://github.com/rvben/husker/commit/746c3f7a2ccc6d93629dd1160a6e740afcf31e64)).
+
+### Added
+
+- **cli**: expose --connect-timeout on cp and shell ([7075184](https://github.com/rvben/husker/commit/70751841ac19ffd3830f4ea4d710639ae9bb1cca))
+- **macos**: run macOS guests on Apple Silicon ([0444cea](https://github.com/rvben/husker/commit/0444cea33ca649e899b9fcbea0a41495ab479b4d))
+
+### Fixed
+
+- **api**: document every exec status in the OpenAPI schema ([0b8f6af](https://github.com/rvben/husker/commit/0b8f6afd1a11480f6aa7b81ea6f836149719008f))
+- **ci**: build before the chaos restart drill and require a free port ([9a3b563](https://github.com/rvben/husker/commit/9a3b563f39e688a042e9ba3e9b670f6d55e85b90))
+- **guest**: pass the Alpine version to every image build and fail on HTTP errors ([7fe972f](https://github.com/rvben/husker/commit/7fe972ffdec57f6051472c760c1faac82b25880c))
+- **guest**: build the k3s rootfs for the host architecture and fail on a failed package install ([4cabc3a](https://github.com/rvben/husker/commit/4cabc3a7d87cf877784bb40121a6f42c8d92e063))
+- **scripts**: refuse to deploy over a unit whose KillMode is not mixed ([73426f0](https://github.com/rvben/husker/commit/73426f0f0162e92e2d6036f2081b02bd7a0761dc))
+- **contrib**: raise the unit stop timeout above the sequential drain phases ([dd78e48](https://github.com/rvben/husker/commit/dd78e48990c2a6edaa5fed035da2bd6a6cfdcc6f))
+- **core**: give a guest its own flush bound before the host stops it ([0db0f5d](https://github.com/rvben/husker/commit/0db0f5da6392d0ffd7455043020646cf6250a188))
+- **agent**: restore a writable root when the guest power action fails ([baf183e](https://github.com/rvben/husker/commit/baf183e4b8f750635515d8b7082f14755edfd219))
+- **scripts**: refuse to stop a unit that kills guests together with the daemon ([538ac2c](https://github.com/rvben/husker/commit/538ac2cfc3c6da481947b81dd7b62cfc970cd5a2))
+- **net**: skip the bridge netfilter switch when br_netfilter is not loaded ([d4ce947](https://github.com/rvben/husker/commit/d4ce9472121f2c07574d597991626cc7cf84f760))
+- **agent**: remount the guest root read-only before ending the kernel ([948135b](https://github.com/rvben/husker/commit/948135bfe7bf50bb8f77210327b56fe0c9004bca))
+- **api**: give the guest PTY a default size when the client reports zero ([4817a13](https://github.com/rvben/husker/commit/4817a1350acc0d2d347162cca062a936fa1ba29f))
+- **agent**: name the program when a shell or exec fails to start ([189bf48](https://github.com/rvben/husker/commit/189bf4889fecb66b32afeefcfb68977a10c9bc4a))
+- **core**: skip the systemd-resolved mask on a rootfs without systemd ([b9c5e53](https://github.com/rvben/husker/commit/b9c5e53559dc8c87a1621fa1affe0823984e96df))
+- **daemon**: remove runtime files of VMs without a record at startup ([d36ac22](https://github.com/rvben/husker/commit/d36ac221c6e4fe031615ec123a73e0c473232758))
+- **storage**: find e2fsprogs in Homebrew's keg-only install on macOS ([10a9adc](https://github.com/rvben/husker/commit/10a9adca255ced7c58ae770159ac957f16fd4b22))
+- **vmm**: wait for the guest to end before recording a stop on QEMU and Apple VZ ([c23cca4](https://github.com/rvben/husker/commit/c23cca4e0b3c65ff5709f78441446f724e2dfb4b))
+- **contrib**: signal only the daemon on unit stop so guests drain cleanly ([c10a3ec](https://github.com/rvben/husker/commit/c10a3ec9b293f66fe10c366280a86381c4cab24c))
+- **core**: ask the guest to flush and end itself before stopping or destroying it ([078980b](https://github.com/rvben/husker/commit/078980be8f6a069136859e024d493bd31503e85f))
+- **vmm**: settle a guest that already ended itself without a grace period ([a82cbd3](https://github.com/rvben/husker/commit/a82cbd3e85d3913fb4502b1c645f0d56827074f2))
+- **cli**: log diagnostics to stderr so JSON output stays one document ([8844928](https://github.com/rvben/husker/commit/884492800278e95aac2c655af6d80d2f34b5f6ec))
+- **api**: fail a service response whose instance count cannot be read ([acdffec](https://github.com/rvben/husker/commit/acdffec2eeca37b1435fbf0b9c5f71ac52b06984))
+- **cli**: exit quietly when stdout's reader goes away ([2cf487f](https://github.com/rvben/husker/commit/2cf487f0f56a30f234c5beb85dc098401823ad44))
+- **core**: never reclaim a creation lease that names a committed VM ([f7dc22f](https://github.com/rvben/husker/commit/f7dc22f23319d62034ccaec72dd79ac8675d122d))
+- **cli**: accept a catalog image name as a profile rootfs in config check ([d1b8f6b](https://github.com/rvben/husker/commit/d1b8f6be22c4eb8a6b348270f1803a48aee0b93f))
+- **cli**: build both config check renderings from one report ([7e6f0f4](https://github.com/rvben/husker/commit/7e6f0f4498401873025a2f52ca71b2d731fa00ab))
+- **cli**: choose lifecycle hints from the daemon's refusal, not its message ([4ae2d06](https://github.com/rvben/husker/commit/4ae2d061dd56d0751a135902a3827f50e9e8a9c8))
+- **api**: end every streamed exec session with a close frame ([1374b04](https://github.com/rvben/husker/commit/1374b049700b21f42bdd6663e37bac69bc7d67fa))
+- **oci**: bound image imports and stop echoing registry error bodies ([ce85656](https://github.com/rvben/husker/commit/ce856566c13037d3ebacb3a84b8a8d6da31431f3))
+- **core**: accept an agent-reported guest IP only on a host link it does not own ([5e43f4d](https://github.com/rvben/husker/commit/5e43f4d5c1c54952e7f16570f00d89c00af8d2db))
+- **api**: match exec denylist entries by program, not by exact string ([c44bfaf](https://github.com/rvben/husker/commit/c44bfaf665d67803648802d3be9e41e2529d36b4))
+- **net**: scope port-forward DNAT to traffic entering from outside the bridge ([dd8fbf0](https://github.com/rvben/husker/commit/dd8fbf088e6a7d2045f36fd413a49312f9b665b3))
+- **daemon**: log each failed service instance with its error ([f42f72e](https://github.com/rvben/husker/commit/f42f72eed567267e73c52a97985e47d146fbf204))
+- **state**: refuse a database written by a newer husker ([6b541a5](https://github.com/rvben/husker/commit/6b541a575aaf83ecdef365aabc5c164e223bd090))
+- **agent**: answer a request the guest cannot decode instead of closing ([388b16e](https://github.com/rvben/husker/commit/388b16e970f1c938cbaf5b88acc90f6a7ea33e43))
+- **core**: limit stranded-fork rootfs recovery to backends that can fork ([7b8d70f](https://github.com/rvben/husker/commit/7b8d70fb010288ceb06e6a877ae26e338e4047f1))
+- **agent**: keep a restarted session supervised when its predecessor finishes ([69788a0](https://github.com/rvben/husker/commit/69788a0d0eeed33c7a4f8bd2c8196cbf669cef8d))
+- **core**: apply the resource name rules to macOS image names ([03d4e41](https://github.com/rvben/husker/commit/03d4e41e6c31e9086d765f5e5b32215d253d41f0))
+- **cli**: accept the backend aliases the daemon accepts for --vmm ([b0ebe51](https://github.com/rvben/husker/commit/b0ebe5147b3f2977e0cf38d2a59e627caa37b812))
+- **state**: switch a fresh database to WAL before the pool connects ([c4af71f](https://github.com/rvben/husker/commit/c4af71f8f017ad323614e405f265b898797477d4))
+- **core**: refuse a --vmm request the running backend cannot honour ([347e709](https://github.com/rvben/husker/commit/347e7094e7b60863099576d3e63028e883e16512))
+- **core**: refuse host mounts the macOS build cannot attach ([9b58d79](https://github.com/rvben/husker/commit/9b58d7974ee260941049f9e1c2e82ac2294fd498))
+- **cli**: publish the conflict exit code for vm_not_running ([99d4686](https://github.com/rvben/husker/commit/99d468697184479f469e8b86989e802cdec77d5a))
+- **api**: wait for the guest agent on every route that talks to it ([461e15b](https://github.com/rvben/husker/commit/461e15bba5ffa0d106b6afa3ea2885e58414f7a9))
+- **cli**: make image pulls atomic, durable and bounded in time ([60aabc9](https://github.com/rvben/husker/commit/60aabc973e673c7b991947db7198432d13b34696))
+- **core**: drain VMs concurrently with a per-VM stop timeout on shutdown ([b1aa0e9](https://github.com/rvben/husker/commit/b1aa0e96cb46ab70bcdd486dc95256de5f73d1f2))
+- **vmm**: keep the instance map free while a Firecracker guest shuts down ([3529c14](https://github.com/rvben/husker/commit/3529c14c685bf03ec2f001707750b9c3389d963f))
+- **cli**: carry the CLI's own hints in the envelope hint field and show them in text mode ([84741eb](https://github.com/rvben/husker/commit/84741ebd67a2bc79fe8d86f78fdac556912be126))
+- **cli**: derive the timeout flag help from the defaults the daemon applies ([391fb38](https://github.com/rvben/husker/commit/391fb386460d9b99a3a7cbed144ede0be1592671))
+- **api**: answer rejected requests with the error envelope ([1135e5b](https://github.com/rvben/husker/commit/1135e5b15f7fac311af0c657b24e2d6b38cd1a3d))
+- **cli**: reject unknown names in list --fields ([36f8923](https://github.com/rvben/husker/commit/36f8923fb75012bcf2f265cc00f4487c56bac952))
+- **api**: type boot_mode, userdata_status and image kind as enums in the OpenAPI contract ([c9282ed](https://github.com/rvben/husker/commit/c9282ed656605fb843f2e3f63a93f7c793714b60))
+- **api**: document every logs query parameter in the OpenAPI contract ([8edab0e](https://github.com/rvben/husker/commit/8edab0efe243885c04ec2e1909916adc15494e80))
+- **api**: refuse blank bearer tokens at daemon start ([517855c](https://github.com/rvben/husker/commit/517855cdb2fe1f78d7f00c315f582ec48e9ecf8c))
+- **api**: stop oversized guest file reads at the policy limit ([fe9c9ae](https://github.com/rvben/husker/commit/fe9c9ae21aad714084cfdf4d9a892f9e9914bc0d))
+- **core**: refuse append-mode writes to a guest that would truncate them ([e1d4703](https://github.com/rvben/husker/commit/e1d4703437462450f0c423b8bcd70846fa185fd6))
+- **api**: apply the exec command policy to interactive shells ([8d85c1b](https://github.com/rvben/husker/commit/8d85c1ba476c2b49e300d73affe515425d507de1))
+- **storage**: reject cloud images that reference other host files ([2a418c9](https://github.com/rvben/husker/commit/2a418c9f5652a4aac62fa8ce256107f92a6562b8))
+- **core**: finish VM creation and fork even when the client disconnects ([39e172e](https://github.com/rvben/husker/commit/39e172e291577789ca15c4d09a35e36f11fdc060))
+- **core**: keep the daemon starting when one VM's host resources cannot be restored ([69cee51](https://github.com/rvben/husker/commit/69cee51f2c6cc88ddc4b406846f3ea466148b490))
+- **oci**: reject whiteouts that resolve outside the rootfs through a symlink ([cfd037f](https://github.com/rvben/husker/commit/cfd037f041c3ed1977d9ea6c4933282b235c0659))
+- **config**: cascade HUSKER_DATA_DIR over a data_dir set in the config file ([70e51f2](https://github.com/rvben/husker/commit/70e51f2a93e47c16e13d04bdce80e33e70b077cf))
+- **cli**: pull the rootfs to the configured path ([9d63402](https://github.com/rvben/husker/commit/9d6340278620fa8652cc80659e8a087f40e14dad))
+- **deps**: upgrade tokio past the AsyncFd I/O-safety advisory ([efad7c8](https://github.com/rvben/husker/commit/efad7c89e5bde788c4ea1bb2d4bce4e7641cc0f3))
+- **security**: upgrade vulnerable decoder and API dependencies ([037cfc8](https://github.com/rvben/husker/commit/037cfc84bc246a7d638e3b6c2de055b7cc7c36e6))
+
+### Performance
+
+- **vmm**: await the cgroup exit grace instead of blocking the worker ([a541edb](https://github.com/rvben/husker/commit/a541edb5b713274f043d0fa12204091bc6978a16))
+- **state**: fsync the WAL at checkpoints instead of on every commit ([8e759ab](https://github.com/rvben/husker/commit/8e759ab5ba10f4feed4d308318a9f9897b546de5))
 
 ## [0.4.52](https://github.com/rvben/husker/compare/v0.4.51...v0.4.52) - 2026-10-05
 
