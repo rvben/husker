@@ -182,11 +182,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             // Fill daemon defaults for any path the client omitted. A remote client
             // sends only the paths the user explicitly specified; the daemon fills the
             // rest from its own configured defaults so the paths are valid on the
-            // daemon host, not the client host.
-            if req.kernel_path.is_none() {
+            // daemon host, not the client host. Which side supplied a path decides
+            // how a missing file is reported: the request's own path is its
+            // mistake, a missing default is the daemon host's.
+            let kernel_from_default = req.kernel_path.is_none();
+            let rootfs_from_default = req.rootfs_path.is_none();
+            if kernel_from_default {
                 req.kernel_path = self.default_kernel.clone();
             }
-            if req.rootfs_path.is_none() {
+            if rootfs_from_default {
                 req.rootfs_path = self.default_rootfs.clone();
             }
             // Resolve a catalog image name or an OCI/Docker reference in the rootfs
@@ -196,22 +200,26 @@ impl<B: VmmBackend> HuskerCore<B> {
             if let Some(rootfs) = req.rootfs_path.take() {
                 req.rootfs_path = Some(self.resolve_rootfs_arg(&rootfs).await?);
             }
-            let kernel = req.kernel_path.as_deref().ok_or_else(|| {
-                CoreError::InvalidArgument(
-                    "no kernel specified and the daemon has no default kernel; \
-                     pass --kernel, or run `husker images pull` on the daemon host"
-                        .into(),
-                )
+            let kernel = req
+                .kernel_path
+                .as_deref()
+                .ok_or(CoreError::NoDefaultImage(BootImage::Kernel))?;
+            let rootfs = req
+                .rootfs_path
+                .as_deref()
+                .ok_or(CoreError::NoDefaultImage(BootImage::Rootfs))?;
+            husker_storage::validate_kernel(kernel).map_err(|error| match error {
+                husker_storage::StorageError::KernelNotFound(path) => {
+                    boot_image_missing(BootImage::Kernel, path, kernel_from_default)
+                }
+                other => other.into(),
             })?;
-            let rootfs = req.rootfs_path.as_deref().ok_or_else(|| {
-                CoreError::InvalidArgument(
-                    "no rootfs specified and the daemon has no default rootfs; \
-                     pass a rootfs path, or run `husker images pull` on the daemon host"
-                        .into(),
-                )
+            husker_storage::validate_rootfs(rootfs).map_err(|error| match error {
+                husker_storage::StorageError::RootfsNotFound(path) => {
+                    boot_image_missing(BootImage::Rootfs, path, rootfs_from_default)
+                }
+                other => other.into(),
             })?;
-            husker_storage::validate_kernel(kernel)?;
-            husker_storage::validate_rootfs(rootfs)?;
         }
 
         let mut resources = AllocatedResources::default();
@@ -1664,5 +1672,17 @@ fn backend_selection_error(error: husker_vmm::VmmError) -> CoreError {
     match error {
         husker_vmm::VmmError::InvalidConfig(message) => CoreError::InvalidArgument(message),
         other => CoreError::Vmm(other),
+    }
+}
+
+/// The error for a boot image path that does not exist on the daemon host. A
+/// path the request named is the request's mistake; a path the daemon filled
+/// from its default is a gap on the daemon host and is reported as such, with
+/// the path so the operator knows what to provide.
+fn boot_image_missing(image: BootImage, path: PathBuf, from_default: bool) -> CoreError {
+    if from_default {
+        CoreError::DefaultImageMissing { image, path }
+    } else {
+        CoreError::InvalidArgument(format!("{image} not found: {}", path.display()))
     }
 }

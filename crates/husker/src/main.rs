@@ -730,7 +730,7 @@ fn build_vm_request_body(
     output: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
     let built =
-        crate::vm_creation::build_vm_request(name, args, profile, profiles, origins, config, true)?;
+        crate::vm_creation::build_vm_request(name, args, profile, profiles, origins, config)?;
     for diagnostic in &built.diagnostics {
         diagnostic.report(output);
     }

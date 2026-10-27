@@ -115,6 +115,14 @@ pub enum CoreError {
     SecretCrypto(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// The request left a boot image to the daemon and the daemon has no
+    /// default configured for it.
+    #[error("no {0} specified and the daemon has no default {0}")]
+    NoDefaultImage(BootImage),
+    /// The request left a boot image to the daemon and the configured default
+    /// is not on the daemon host.
+    #[error("no {image} specified and the daemon's default {image} does not exist: {}", path.display())]
+    DefaultImageMissing { image: BootImage, path: PathBuf },
     #[error("host port {0} is already in use")]
     PortForwardConflict(u16),
     #[error(
@@ -140,6 +148,35 @@ pub enum CoreError {
     State(#[from] husker_state::StateError),
     #[error("agent error: {0}")]
     Agent(#[from] AgentError),
+}
+
+/// A boot image a direct-boot VM needs. A request names it explicitly or
+/// leaves it to the daemon, which fills it from its configured default: the
+/// file then lives on the daemon host, so the daemon is the side that can say
+/// whether it exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootImage {
+    Kernel,
+    Rootfs,
+}
+
+impl BootImage {
+    /// How a request names this image explicitly, for remedies.
+    pub const fn request_form(self) -> &'static str {
+        match self {
+            Self::Kernel => "--kernel",
+            Self::Rootfs => "a rootfs path or image name",
+        }
+    }
+}
+
+impl std::fmt::Display for BootImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Kernel => "kernel",
+            Self::Rootfs => "rootfs",
+        })
+    }
 }
 
 /// A named VM preset as exposed by the daemon via its API.
@@ -6401,39 +6438,130 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         );
     }
 
-    /// A create request with no kernel/rootfs and NO daemon defaults must return
-    /// a clear InvalidArgument error — not a panic or a misleading message.
+    /// A create request with no kernel/rootfs and NO daemon defaults is refused
+    /// for the image the daemon cannot supply, before anything is allocated.
     #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
-    async fn missing_kernel_without_defaults_returns_invalid_argument() {
+    async fn a_request_without_a_kernel_needs_a_daemon_default() {
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         let core = Arc::new(make_vz_core(state, tmp.path()));
 
         let req = CreateVmRequest {
             name: "test-no-defaults".into(),
-            kernel_path: None,
-            rootfs_path: None,
-            initrd_path: None,
-            cloud_image: None,
-            vcpu_count: None,
-            mem_size_mib: None,
-            userdata: None,
-            env: vec![],
-            vmm: None,
-            disk_size: None,
-            ssh_authorized_keys: vec![],
-            balloon: false,
-            volume: None,
-            network: None,
-            mounts: vec![],
             ..Default::default()
         };
 
         let err = core.create_vm_record(req, None, true).await.unwrap_err();
         assert!(
-            matches!(err, CoreError::InvalidArgument(ref msg) if msg.contains("no kernel specified")),
-            "expected InvalidArgument with 'no kernel specified', got: {err:?}"
+            matches!(err, CoreError::NoDefaultImage(BootImage::Kernel)),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "no kernel specified and the daemon has no default kernel"
+        );
+    }
+
+    /// A configured default whose file is gone is reported as the daemon
+    /// host's gap, naming the path the operator has to provide. The rootfs is
+    /// checked once the kernel is in place, so each image gets its own report.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn a_missing_default_image_names_the_daemon_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let missing_kernel = tmp.path().join("kernels/vmlinux");
+        let missing_rootfs = tmp.path().join("images/rootfs.ext4");
+        let core = Arc::new(make_vz_core(state, tmp.path()).with_default_images(
+            Some(missing_kernel.clone()),
+            Some(missing_rootfs.clone()),
+            None,
+        ));
+
+        let req = CreateVmRequest {
+            name: "test-missing-defaults".into(),
+            ..Default::default()
+        };
+        let err = core.create_vm_record(req, None, true).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                CoreError::DefaultImageMissing { image: BootImage::Kernel, path } if *path == missing_kernel
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no kernel specified and the daemon's default kernel does not exist: {}",
+                missing_kernel.display()
+            )
+        );
+
+        // With the kernel named explicitly, the rootfs default is what is missing.
+        let kernel_path = tmp.path().join("Image");
+        let mut kernel_stub = vec![0u8; 64];
+        kernel_stub[56..60].copy_from_slice(&[0x41, 0x52, 0x4d, 0x64]);
+        std::fs::write(&kernel_path, &kernel_stub).unwrap();
+        let req = CreateVmRequest {
+            name: "test-missing-rootfs-default".into(),
+            kernel_path: Some(kernel_path),
+            ..Default::default()
+        };
+        let err = core.create_vm_record(req, None, true).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                CoreError::DefaultImageMissing { image: BootImage::Rootfs, path } if *path == missing_rootfs
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// A path the request named itself is the request's mistake, not a gap in
+    /// the daemon's defaults: an invalid argument that names the path, with no
+    /// advice about fetching images.
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn a_missing_image_the_request_named_is_an_invalid_argument() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let kernel_path = tmp.path().join("Image");
+        let mut kernel_stub = vec![0u8; 64];
+        kernel_stub[56..60].copy_from_slice(&[0x41, 0x52, 0x4d, 0x64]);
+        std::fs::write(&kernel_path, &kernel_stub).unwrap();
+        let rootfs_path = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs_path, b"rootfs").unwrap();
+        let core = Arc::new(make_vz_core(state, tmp.path()).with_default_images(
+            Some(kernel_path.clone()),
+            Some(rootfs_path),
+            None,
+        ));
+
+        let wrong_kernel = tmp.path().join("nope/vmlinux");
+        let req = CreateVmRequest {
+            name: "test-wrong-kernel".into(),
+            kernel_path: Some(wrong_kernel.clone()),
+            ..Default::default()
+        };
+        let err = core.create_vm_record(req, None, true).await.unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidArgument(message) if *message == format!("kernel not found: {}", wrong_kernel.display())),
+            "got: {err:?}"
+        );
+
+        let wrong_rootfs = tmp.path().join("nope/rootfs.ext4");
+        let req = CreateVmRequest {
+            name: "test-wrong-rootfs".into(),
+            kernel_path: Some(kernel_path),
+            rootfs_path: Some(wrong_rootfs.clone()),
+            ..Default::default()
+        };
+        let err = core.create_vm_record(req, None, true).await.unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidArgument(message) if *message == format!("rootfs not found: {}", wrong_rootfs.display())),
+            "got: {err:?}"
         );
     }
 

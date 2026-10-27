@@ -1203,8 +1203,10 @@ mod tests {
         assert!(json["error"].as_str().unwrap().contains("not found"));
     }
 
+    /// A kernel path the request named itself and that does not exist is the
+    /// request's mistake, not a daemon fault.
     #[tokio::test]
-    async fn create_vm_bad_kernel() {
+    async fn create_vm_with_a_missing_named_kernel_is_refused_as_invalid() {
         let app = router(test_core());
         let body = serde_json::json!({
             "name": "test-vm",
@@ -1222,8 +1224,13 @@ mod tests {
             .unwrap();
         let status = response.status();
         let json = response_json(response).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(json["error"].as_str().unwrap().contains("kernel"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["kind"], "invalid_argument", "{json}");
+        assert_eq!(
+            json["message"],
+            "invalid argument: kernel not found: /nonexistent/vmlinux"
+        );
+        assert!(json.get("hint").is_none(), "no daemon-side remedy: {json}");
     }
 
     #[tokio::test]
@@ -2510,6 +2517,52 @@ mod tests {
             hint.contains("husker destroy job-dd1980c6"),
             "the hint names the VM that must go: {hint}"
         );
+    }
+
+    /// A boot image the request left to the daemon is fetched on the daemon
+    /// host, so the remedy says where to run `husker images pull` and how to
+    /// name the image in the request instead.
+    #[test]
+    fn a_boot_image_the_daemon_cannot_supply_says_where_to_fetch_it() {
+        use husker_core::BootImage;
+
+        let (status, body) = map_error(CoreError::DefaultImageMissing {
+            image: BootImage::Rootfs,
+            path: "/var/lib/husker/images/rootfs.ext4".into(),
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.kind, "invalid_argument");
+        assert_eq!(
+            body.message,
+            "no rootfs specified and the daemon's default rootfs does not exist: \
+             /var/lib/husker/images/rootfs.ext4"
+        );
+        assert_eq!(
+            body.hint.as_deref(),
+            Some(
+                "run `husker images pull` on the daemon host, or pass a rootfs path or image name"
+            )
+        );
+
+        let (status, body) = map_error(CoreError::NoDefaultImage(BootImage::Kernel));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.kind, "invalid_argument");
+        assert_eq!(
+            body.message,
+            "no kernel specified and the daemon has no default kernel"
+        );
+        assert_eq!(
+            body.hint.as_deref(),
+            Some("run `husker images pull` on the daemon host, or pass --kernel")
+        );
+
+        // A path the request named is the request's own mistake: no remedy
+        // about the daemon's defaults applies.
+        let (status, body) = map_error(CoreError::InvalidArgument(
+            "kernel not found: /home/me/vmlinux".into(),
+        ));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.hint, None);
     }
 
     #[test]

@@ -932,8 +932,10 @@ async fn create_vm_rejects_duplicate_running_name_before_validation() {
     assert!(matches!(err, CoreError::VmAlreadyExists(ref name) if name == "dup-vm"));
 }
 
+/// A request that names a kernel path which does not exist is refused as an
+/// invalid argument naming that path, before any resource is allocated.
 #[tokio::test]
-async fn create_vm_missing_kernel_returns_storage_error() {
+async fn create_vm_missing_named_kernel_is_an_invalid_argument() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("run");
     let data_dir = tmp.path().join("data");
@@ -967,11 +969,14 @@ async fn create_vm_missing_kernel_returns_storage_error() {
             ..Default::default()
         })
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+    let expected = format!(
+        "kernel not found: {}",
+        tmp.path().join("missing-kernel").display()
+    );
     assert!(
-        err.contains("kernel not found"),
-        "unexpected create_vm error: {err}"
+        matches!(&err, CoreError::InvalidArgument(message) if *message == expected),
+        "unexpected create_vm error: {err:?}"
     );
 }
 
@@ -3481,8 +3486,8 @@ async fn export_image_rejects_symlink_destination() {
 async fn create_vm_accepts_safe_names() {
     let tmp = tempfile::tempdir().unwrap();
     let core = make_core(&tmp);
-    // Safe names should not be rejected on validation; they will fail later on
-    // missing kernel/rootfs but with a different error than InvalidArgument.
+    // A safe name passes validation and the request fails on its missing
+    // kernel instead, so the refusal names the kernel and never the name.
     for name in &["my-vm", "vm_01", "v.1.2", "abc", "a", &"a".repeat(64)] {
         let err = core
             .create_vm(CreateVmRequest {
@@ -3507,8 +3512,11 @@ async fn create_vm_accepts_safe_names() {
             .await
             .unwrap_err();
         assert!(
-            !matches!(err, CoreError::InvalidArgument(_)),
-            "safe name {name:?} should not be rejected as InvalidArgument; got {err:?}"
+            matches!(
+                &err,
+                CoreError::InvalidArgument(message) if message == "kernel not found: /missing-kernel"
+            ),
+            "safe name {name:?} must fail on the missing kernel, not on the name; got {err:?}"
         );
     }
 }

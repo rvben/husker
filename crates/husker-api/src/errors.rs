@@ -81,7 +81,9 @@ pub(crate) fn map_error(err: CoreError) -> Failure {
             (StatusCode::NOT_FOUND, "snapshot_not_found", err.to_string())
         }
         CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state", err.to_string()),
-        CoreError::InvalidArgument(_) => {
+        CoreError::InvalidArgument(_)
+        | CoreError::NoDefaultImage(_)
+        | CoreError::DefaultImageMissing { .. } => {
             (StatusCode::BAD_REQUEST, "invalid_argument", err.to_string())
         }
         CoreError::PortForwardConflict(_) => (StatusCode::CONFLICT, "port_in_use", err.to_string()),
@@ -270,6 +272,14 @@ fn hint_for(err: &CoreError) -> Option<String> {
              repair it and restart the daemon, or choose another VM name"
                 .into(),
         ),
+        // The daemon fills a boot image the request left out from its own
+        // default, so the file is fetched on the daemon host, not the client's.
+        CoreError::NoDefaultImage(image) | CoreError::DefaultImageMissing { image, .. } => {
+            Some(format!(
+                "run `husker images pull` on the daemon host, or pass {}",
+                image.request_form()
+            ))
+        }
         _ => None,
     }
 }

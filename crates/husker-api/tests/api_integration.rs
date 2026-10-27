@@ -1029,8 +1029,10 @@ async fn create_vm_missing_name_returns_422() {
 
 // ── POST /vms with Bad Kernel Path ───────────────────────────────────
 
+/// A kernel path the request named and that does not exist on the daemon
+/// host is the request's mistake: 400 with the path, no daemon-side remedy.
 #[tokio::test]
-async fn create_vm_bad_kernel_returns_500_with_error() {
+async fn create_vm_bad_kernel_returns_400_invalid_argument() {
     let app = router(test_core());
     let body = serde_json::json!({
         "name": "test-vm",
@@ -1047,13 +1049,12 @@ async fn create_vm_bad_kernel_returns_500_with_error() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let json = response_json(response).await;
-    let error = json["error"].as_str().expect("should have error field");
-    assert!(
-        error.contains("kernel"),
-        "error should mention kernel, got: {error}"
+    let json = rejected(response, StatusCode::BAD_REQUEST, "invalid_argument").await;
+    assert_eq!(
+        json["message"],
+        "invalid argument: kernel not found: /nonexistent/vmlinux"
     );
+    assert!(json.get("hint").is_none(), "no daemon-side remedy: {json}");
 }
 
 // ── Stop/Destroy/Exec on Nonexistent VM ──────────────────────────────

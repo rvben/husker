@@ -518,6 +518,88 @@ async fn a_daemon_400_kind_the_cli_does_not_list_is_still_invalid_usage() {
     assert!(output.stdout.is_empty());
 }
 
+/// A boot image the request left out is the daemon's to supply, so a missing
+/// default is the daemon's refusal: its message names the path on its host
+/// and its hint says where to fetch it. The CLI passes both through once and
+/// adds no guess of its own from the client's data directory, which this
+/// fixture leaves empty.
+#[tokio::test]
+async fn a_default_image_the_daemon_lacks_is_reported_once_from_the_daemon() {
+    let fixture = Fixture::start(|method, target| {
+        if method == "POST" && target == "/v1/vms" {
+            (
+                StatusCode::BAD_REQUEST,
+                concat!(
+                    r#"{"kind":"invalid_argument","#,
+                    r#""message":"no rootfs specified and the daemon's default rootfs does not exist: /var/lib/husker/images/rootfs.ext4","#,
+                    r#""hint":"run `husker images pull` on the daemon host, or pass a rootfs path or image name"}"#
+                )
+                .into(),
+            )
+        } else {
+            no_route(method, target)
+        }
+    })
+    .await;
+    let output = fixture
+        .husker(&["--output", "json", "run", "--name", "vm"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    let error = &envelope(&output)["error"];
+    assert_eq!(error["kind"], "invalid_usage", "{stderr}");
+    assert_eq!(
+        error["message"],
+        "no rootfs specified and the daemon's default rootfs does not exist: \
+         /var/lib/husker/images/rootfs.ext4",
+        "{stderr}"
+    );
+    assert_eq!(
+        error["hint"],
+        "run `husker images pull` on the daemon host, or pass a rootfs path or image name",
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("husker images pull").count(),
+        1,
+        "the remedy appears once, in the daemon's words: {stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+/// A daemon that has its default images creates the VM whether or not the
+/// client machine has them: the client's empty data directory earns no
+/// warning about images it never needed.
+#[tokio::test]
+async fn a_client_without_the_daemons_images_runs_a_vm_without_a_warning() {
+    let fixture = Fixture::start(|method, target| {
+        if method == "POST" && target == "/v1/vms" {
+            (
+                StatusCode::CREATED,
+                r#"{"id":"3b1f0b2e-9c0a-4a7e-9f1e-2d4c6a8b0e12","name":"vm","state":"running"}"#
+                    .into(),
+            )
+        } else {
+            no_route(method, target)
+        }
+    })
+    .await;
+    let output = fixture
+        .husker(&["--output", "json", "run", "--name", "vm"])
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["status"], "ok", "{document}");
+    assert_eq!(document["action"], "run", "{document}");
+    assert_eq!(document["vm"]["name"], "vm", "{document}");
+    assert!(
+        !stderr.contains("images pull"),
+        "no remedy for a problem the daemon did not report: {stderr}"
+    );
+    assert_no_envelope(&output);
+}
+
 /// A VM name already taken gets the way to free it. The CLI recognises that
 /// refusal by its kind: another conflict whose message happens to say
 /// "already exists" is not it.

@@ -61,8 +61,6 @@ pub(crate) enum VmCreationDiagnostic {
         rootfs: Option<PathBuf>,
         initrd: Option<PathBuf>,
     },
-    MissingDefaultKernel(PathBuf),
-    MissingDefaultRootfs(PathBuf),
 }
 
 impl VmCreationDiagnostic {
@@ -91,16 +89,6 @@ impl VmCreationDiagnostic {
                     display(initrd)
                 );
             }
-            Self::MissingDefaultKernel(path) => eprintln!(
-                "Default kernel not found at {}.\n\
-                 Run `husker images pull` to fetch it, or pass --kernel explicitly.",
-                path.display()
-            ),
-            Self::MissingDefaultRootfs(path) => eprintln!(
-                "Default rootfs not found at {}.\n\
-                 Run `husker images pull` to fetch it, or pass a rootfs path explicitly.",
-                path.display()
-            ),
             Self::CloudImage(_) | Self::MacOsImage(_) | Self::DirectBoot { .. } => {}
         }
     }
@@ -223,7 +211,6 @@ pub(crate) async fn plan_vm_creation(
         &profiles,
         &origins,
         config,
-        local_target,
     )?;
 
     if let Some(userdata_path) = intent.userdata {
@@ -298,7 +285,6 @@ pub(crate) fn build_vm_request(
     profiles: &HashMap<String, Profile>,
     origins: &HashMap<String, ProfileOrigin>,
     config: &Config,
-    local_target: bool,
 ) -> Result<BuiltVmRequest> {
     let cli_had_rootfs = args.rootfs.is_some();
 
@@ -425,21 +411,10 @@ pub(crate) fn build_vm_request(
         let kernel = args.kernel;
         let initrd = args.initrd;
 
-        // A remote daemon owns its defaults. Inspecting the client's filesystem
-        // in that case produces a false warning and leaks target resolution back
-        // into request construction.
-        if local_target {
-            if kernel.is_none() && !config.default_kernel.exists() {
-                diagnostics.push(VmCreationDiagnostic::MissingDefaultKernel(
-                    config.default_kernel.clone(),
-                ));
-            }
-            if rootfs.is_none() && !config.default_rootfs.exists() {
-                diagnostics.push(VmCreationDiagnostic::MissingDefaultRootfs(
-                    config.default_rootfs.clone(),
-                ));
-            }
-        }
+        // A boot image the request leaves out is the daemon's to supply from
+        // its own host, so whether the default exists is the daemon's verdict,
+        // carried back in its error; the client's filesystem says nothing
+        // about it, not even for a daemon on the same machine.
         diagnostics.push(VmCreationDiagnostic::DirectBoot {
             kernel: kernel.clone(),
             rootfs: rootfs.clone(),
@@ -647,8 +622,11 @@ mod tests {
         );
     }
 
+    /// The daemon fills a boot image the request leaves out and reports a
+    /// missing default itself, so the client's own default paths, present or
+    /// not, add nothing to the request or its diagnostics.
     #[test]
-    fn remote_target_does_not_inspect_local_daemon_defaults() {
+    fn missing_client_side_defaults_leave_the_boot_images_to_the_daemon() {
         let config = Config {
             default_kernel: "/definitely/missing/kernel".into(),
             default_rootfs: "/definitely/missing/rootfs".into(),
@@ -661,7 +639,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &config,
-            false,
         )
         .unwrap();
         assert_eq!(
@@ -672,6 +649,8 @@ mod tests {
                 initrd: None
             }]
         );
+        assert_eq!(built.body.kernel_path, None);
+        assert_eq!(built.body.rootfs_path, None);
     }
 
     #[test]
@@ -705,7 +684,6 @@ mod tests {
             &profiles,
             &HashMap::new(),
             &config,
-            false,
         )
         .unwrap();
         let body = built.body;
@@ -731,7 +709,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &Config::default(),
-            true,
         )
         .unwrap_err();
         assert_eq!(
