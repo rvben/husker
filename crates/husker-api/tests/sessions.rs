@@ -432,6 +432,67 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn submissions_replay_one_process_and_reject_changes_or_removed_ids() {
+    let f = Fixture::new().await;
+    let counter = f._temp.path().join("counter");
+    let body = json!({"idempotency_key": "fleet-lease-1", "command": "sh", "args": ["-c", format!("printf x >> '{}'; sleep 0.1", counter.display())], "timeout_secs": 5});
+    let (a, b) = tokio::join!(
+        f.request("POST", "/v1/vms/dev/session-submissions", body.clone()),
+        f.request("POST", "/v1/vms/dev/session-submissions", body.clone())
+    );
+    assert_eq!(a.0, StatusCode::CREATED, "{}", a.1);
+    assert_eq!(b.0, StatusCode::CREATED, "{}", b.1);
+    assert_eq!(a.1["id"], b.1["id"]);
+    let id = a.1["id"].as_str().unwrap();
+    f.finished(id).await;
+    assert_eq!(tokio::fs::read(counter).await.unwrap(), b"x");
+    let mut changed = body.clone();
+    changed["timeout_secs"] = json!(4);
+    let (status, error) = f
+        .request("POST", "/v1/vms/dev/session-submissions", changed)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["kind"], "session_replay_conflict");
+    assert_eq!(
+        f.request("DELETE", &format!("/v1/vms/dev/sessions/{id}"), Value::Null)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        f.request("POST", "/v1/vms/dev/session-submissions", body)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn submissions_refuse_protocol_v6_guests_before_starting_any_command() {
+    let f = Fixture::build(FixtureOptions {
+        legacy_guest: Some(LegacyGuest {
+            protocol_version: 6,
+            exec: LegacyExec::Ran {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        }),
+        ..FixtureOptions::default()
+    })
+    .await;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/v1/vms/dev/session-submissions",
+            json!({"idempotency_key": "fleet-lease-1", "command": "true"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["kind"], "guest_capability_missing");
+}
+
+#[tokio::test]
 async fn detached_session_reconnect_logs_cancel_and_remove() {
     let f = Fixture::new().await;
     let (status, info) = f.request("POST", "/v1/vms/dev/sessions", json!({
@@ -580,6 +641,7 @@ async fn session_and_tunnel_routes_require_auth() {
     let app = router_with_auth(f.core.clone(), f.policy.clone(), test_token());
     for (method, path) in [
         ("POST", "/v1/vms/dev/sessions"),
+        ("POST", "/v1/vms/dev/session-submissions"),
         ("GET", "/v1/vms/dev/sessions"),
         ("GET", "/v1/vms/dev/sessions/id/events"),
         ("POST", "/v1/vms/dev/sessions/id/cancel"),

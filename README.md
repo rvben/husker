@@ -412,3 +412,22 @@ See [`LICENSE`](LICENSE).
 
 Vership owns versioning, changelog generation, release commits, and tags. See
 [the release runbook](docs/releases.md) for the verified workflow and recovery policy.
+
+## Session submission pilot
+
+`POST /v1/vms/{name}/session-submissions` accepts the usual exec fields plus a
+non-secret `idempotency_key`. It requires a matching protocol v7 guest agent and
+returns the same session for identical submissions in the same VM generation.
+Changed resolved command/environment/timeout values and removed sessions are
+conflicts. Policy or injected-secret changes can therefore invalidate a replay;
+use the original effective specification, or inspect the existing session.
+
+The guest durably publishes a v1 specification hash and status before spawning.
+An accepted command interrupted before spawn is reported interrupted rather than
+executed again. Its environment and arguments are not stored in the receipt.
+Removed submission IDs retain bounded receipts until VM destruction. The 1024
+receipt budget blocks new replay acceptances, while cleanup and ordinary sessions
+remain available. This endpoint is intended for disposable VMs: do not upgrade or
+downgrade the agent in place while retaining a replay ledger. Rebuild the image
+and replace the VM instead. The older `/sessions` endpoint retains its existing
+start/remove semantics.

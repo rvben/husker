@@ -1,6 +1,7 @@
 //! Detached guest sessions and authenticated TCP transport for local previews.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -12,6 +13,7 @@ use husker_agent_proto::{AgentErrorCode, SessionEventsResponse, SessionInfo, Ses
 use husker_core::{AgentError, HuskerCore};
 use husker_vmm::VmmBackend;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utoipa::OpenApi;
 
@@ -19,6 +21,18 @@ use crate::errors::{Failure, error_response_with_hint, map_error};
 use crate::extract::{Json, Path, Query, WebSocketUpgrade};
 use crate::handlers::agent_connection;
 use crate::{ApiPolicy, ErrorResponse, ExecRequest, SharedCore};
+
+type MonitorKey = (uuid::Uuid, String);
+fn monitors() -> &'static Mutex<HashSet<MonitorKey>> {
+    static MONITORS: OnceLock<Mutex<HashSet<MonitorKey>>> = OnceLock::new();
+    MONITORS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+struct MonitorRegistration(MonitorKey);
+impl Drop for MonitorRegistration {
+    fn drop(&mut self) {
+        monitors().lock().unwrap().remove(&self.0);
+    }
+}
 
 /// The REST answer for a session or preview request the guest side could not
 /// serve. Classified refusals map by their code; a refusal without one is a
@@ -74,6 +88,11 @@ fn session_error(error: AgentError) -> Failure {
                 "session_conflict",
                 "retry; the daemon generates a fresh id for every start",
             ),
+            AgentErrorCode::SessionReplayConflict => (
+                StatusCode::CONFLICT,
+                "session_replay_conflict",
+                "reuse the original specification; a removed submission requires a new key",
+            ),
             AgentErrorCode::TunnelConnectFailed => (
                 StatusCode::BAD_GATEWAY,
                 "preview_unreachable",
@@ -116,7 +135,7 @@ pub(crate) async fn start<B: VmmBackend + 'static>(
     // Acceptance transfers the whole start/monitor handoff to the daemon.
     // A cancelled HTTP future must not orphan a successfully detached guest
     // command without its host idle guard.
-    tokio::spawn(start_owned(core, policy, name, request))
+    tokio::spawn(start_owned(core, policy, name, request, None))
         .await
         .map_err(|error| {
             (
@@ -130,11 +149,60 @@ pub(crate) async fn start<B: VmmBackend + 'static>(
         })?
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(crate) struct SessionSubmission {
+    idempotency_key: String,
+    #[serde(flatten)]
+    exec: ExecRequest,
+}
+
+#[utoipa::path(post, path = "/v1/vms/{name}/session-submissions", tag = "sessions",
+    params(("name" = String, Path)), request_body = SessionSubmission,
+    responses((status = 201, body = SessionInfo, description = "Durably accepted or replayed session"),
+        (status = 409, body = ErrorResponse, description = "Changed or removed submission"),
+        (status = 501, body = ErrorResponse, description = "Guest protocol v7 required")))]
+pub(crate) async fn submit<B: VmmBackend + 'static>(
+    State(core): State<SharedCore<B>>,
+    State(policy): State<Arc<ApiPolicy>>,
+    Path(name): Path<String>,
+    Json(request): Json<SessionSubmission>,
+) -> Result<(StatusCode, Json<SessionInfo>), Failure> {
+    if request.idempotency_key.is_empty() || request.idempotency_key.len() > 128 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            error_response_with_hint(
+                "invalid_idempotency_key",
+                "key must contain 1–128 UTF-8 bytes",
+                "use a non-secret stable command key",
+            ),
+        ));
+    }
+    tokio::spawn(start_owned(
+        core,
+        policy,
+        name,
+        request.exec,
+        Some(request.idempotency_key),
+    ))
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_response_with_hint(
+                "session_start_failed",
+                "submission task failed",
+                "retry the identical submission",
+            ),
+        )
+    })?
+}
+
 async fn start_owned<B: VmmBackend + 'static>(
     core: SharedCore<B>,
     policy: Arc<ApiPolicy>,
     name: String,
     request: ExecRequest,
+    key: Option<String>,
 ) -> Result<(StatusCode, Json<SessionInfo>), Failure> {
     let env = crate::handlers::resolve_exec_environment(core.as_ref(), &request, &policy)
         .map_err(|e| *e)?;
@@ -142,20 +210,53 @@ async fn start_owned<B: VmmBackend + 'static>(
         .timeout_secs
         .unwrap_or(policy.exec_timeout_secs)
         .clamp(1, policy.exec_timeout_max_secs.clamp(1, 86400));
+    let vm_id = core.get_vm(&name).map_err(map_error)?.id;
     let mut conn = agent_connection(&core, &name, request.connect_timeout_secs).await?;
-    let session = conn
-        .session_start(SessionStartRequest {
-            id: uuid::Uuid::new_v4().to_string(),
-            exec: husker_agent_proto::ExecRequest {
-                command: request.command,
-                args: request.args,
-                working_dir: request.working_dir,
-                env: env.into_iter().collect(),
-                timeout_secs: Some(timeout_secs),
-            },
-        })
-        .await
-        .map_err(session_error)?;
+    if core.get_vm(&name).map_err(map_error)?.id != vm_id {
+        return Err((
+            StatusCode::CONFLICT,
+            error_response_with_hint(
+                "vm_generation_changed",
+                "VM changed during submission",
+                "inspect ownership before retrying",
+            ),
+        ));
+    }
+    let id = key.as_ref().map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |key| {
+            let mut digest = Sha256::new();
+            digest.update(vm_id.as_bytes());
+            digest.update(key.as_bytes());
+            let mut bytes: [u8; 16] = digest.finalize()[..16].try_into().unwrap();
+            bytes[6] = (bytes[6] & 0x0f) | 0x80;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            uuid::Uuid::from_bytes(bytes).to_string()
+        },
+    );
+    let mut env: Vec<_> = env.into_iter().collect();
+    env.sort();
+    let submission = SessionStartRequest {
+        id,
+        exec: husker_agent_proto::ExecRequest {
+            command: request.command,
+            args: request.args,
+            working_dir: request.working_dir,
+            env,
+            timeout_secs: Some(timeout_secs),
+        },
+    };
+    let session = if key.is_some() {
+        conn.session_start_replay(submission).await
+    } else {
+        conn.session_start(submission).await
+    }
+    .map_err(session_error)?;
+    let monitor_key = (vm_id, session.id.clone());
+    if !monitors().lock().unwrap().insert(monitor_key.clone()) {
+        return Ok((StatusCode::CREATED, Json(session)));
+    }
+    let registration = MonitorRegistration(monitor_key);
     crate::metrics()
         .detached_sessions_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -168,6 +269,7 @@ async fn start_owned<B: VmmBackend + 'static>(
     let id = session.id.clone();
     let watcher_core = core.clone();
     tokio::spawn(async move {
+        let _registration = registration;
         let mut guard = Some(guard);
         let mut conn = Some(conn);
         let mut failed_since = None;
@@ -457,8 +559,9 @@ async fn relay<B: VmmBackend + 'static>(
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(start, list, get, events, cancel, remove, tunnel),
+    paths(start, submit, list, get, events, cancel, remove, tunnel),
     components(schemas(
+        SessionSubmission,
         SessionInfo,
         husker_agent_proto::SessionState,
         husker_agent_proto::SessionEvent,
@@ -513,6 +616,11 @@ mod tests {
                 rejected(AgentErrorCode::SessionIdExists),
                 StatusCode::CONFLICT,
                 "session_conflict",
+            ),
+            (
+                rejected(AgentErrorCode::SessionReplayConflict),
+                StatusCode::CONFLICT,
+                "session_replay_conflict",
             ),
             (
                 rejected(AgentErrorCode::TunnelConnectFailed),

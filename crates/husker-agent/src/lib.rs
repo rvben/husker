@@ -916,6 +916,12 @@ async fn handle_request_with_sessions(
                 .await
                 .map(AgentResponse::Session),
         ),
+        AgentRequest::SessionStartReplay(req) => Some(
+            sessions
+                .start_replay(req.clone(), limits.exec_timeout)
+                .await
+                .map(AgentResponse::Session),
+        ),
         AgentRequest::SessionGet { id } => Some(sessions.get(id).await.map(AgentResponse::Session)),
         AgentRequest::SessionList => Some(
             sessions
@@ -1140,6 +1146,7 @@ async fn handle_request_with_sessions(
         // decides what happens to the connection itself. ShellData and
         // ShellResize are only valid during an active shell session.
         AgentRequest::SessionStart(_)
+        | AgentRequest::SessionStartReplay(_)
         | AgentRequest::SessionGet { .. }
         | AgentRequest::SessionList
         | AgentRequest::SessionEvents { .. }

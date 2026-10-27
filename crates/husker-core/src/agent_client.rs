@@ -168,7 +168,11 @@ where
         request: AgentRequest,
     ) -> Result<AgentResponse, AgentError> {
         let reported = self.guest_info().await?.protocol_version;
-        let required = husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_SESSIONS;
+        let required = if matches!(request, AgentRequest::SessionStartReplay(_)) {
+            husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_SESSION_REPLAY
+        } else {
+            husker_agent_proto::MIN_PROTOCOL_VERSION_FOR_SESSIONS
+        };
         if reported < required {
             return Err(AgentError::SessionsUnsupported { reported, required });
         }
@@ -226,6 +230,19 @@ where
     ) -> Result<husker_agent_proto::SessionInfo, AgentError> {
         match self
             .session_request(AgentRequest::SessionStart(request))
+            .await?
+        {
+            AgentResponse::Session(info) => Ok(info),
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_start_replay(
+        &mut self,
+        request: husker_agent_proto::SessionStartRequest,
+    ) -> Result<husker_agent_proto::SessionInfo, AgentError> {
+        match self
+            .session_request(AgentRequest::SessionStartReplay(request))
             .await?
         {
             AgentResponse::Session(info) => Ok(info),

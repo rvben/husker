@@ -14,6 +14,8 @@ pub use sessions::*;
 pub enum AgentRequest {
     /// Start a detached command with durable, bounded output in the guest.
     SessionStart(SessionStartRequest),
+    /// Durable specification-checked replay, supported by protocol v7+.
+    SessionStartReplay(SessionStartRequest),
     SessionGet {
         id: String,
     },
@@ -339,6 +341,7 @@ pub enum AgentErrorCode {
     SessionRunning,
     /// A session with that id already exists.
     SessionIdExists,
+    SessionReplayConflict,
     /// Nothing on the guest accepted the tunnel's loopback connection.
     TunnelConnectFailed,
     /// The request could not be decoded as one this agent implements: a type
@@ -498,7 +501,9 @@ pub const AGENT_VSOCK_PORT: u32 = 52;
 /// v6 added [`GuestPowerAction`] to `Shutdown` and `ShuttingDown`. A v5 agent
 /// ignores the requested action and answers without one, which decodes as
 /// `Flush`, so a host needs no version check to stay correct against it.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
+/// Durable specification-checked replay uses a distinct request variant.
+pub const MIN_PROTOCOL_VERSION_FOR_SESSION_REPLAY: u32 = 7;
 
 /// Detached sessions and loopback TCP tunnels were added together in v5.
 pub const MIN_PROTOCOL_VERSION_FOR_SESSIONS: u32 = 5;
@@ -806,7 +811,7 @@ mod tests {
             }
             other => panic!("expected GuestInfo, got {other:?}"),
         }
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
         assert_eq!(MIN_PROTOCOL_VERSION_FOR_EXEC_STREAM, 4);
     }
 

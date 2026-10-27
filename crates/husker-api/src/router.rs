@@ -28,7 +28,9 @@ use crate::{
 };
 
 pub(crate) fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'static str> {
-    if *method == Method::POST && path.ends_with("/sessions") {
+    if *method == Method::POST
+        && (path.ends_with("/sessions") || path.ends_with("/session-submissions"))
+    {
         return Some("exec");
     }
     if *method == Method::GET && path.contains("/tunnel/") {
@@ -135,6 +137,10 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
         .route(
             "/v1/vms/{name}/sessions",
             get(crate::sessions::list::<B>).post(crate::sessions::start::<B>),
+        )
+        .route(
+            "/v1/vms/{name}/session-submissions",
+            post(crate::sessions::submit::<B>),
         )
         .route(
             "/v1/vms/{name}/sessions/{id}",

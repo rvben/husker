@@ -12,10 +12,12 @@ use husker_agent_proto::{
     AgentErrorCode, SessionEvent, SessionEventsResponse, SessionInfo, SessionStartRequest,
     SessionState, base64_encode,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
 const MAX_SESSIONS: usize = 128;
+const MAX_REPLAY_RECEIPTS: usize = 1024;
 const MAX_RUNNING: usize = 16;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: u64 = 4096;
@@ -69,6 +71,8 @@ pub enum SessionError {
     Running,
     #[error("session id already exists")]
     IdExists,
+    #[error("session replay conflict: specification changed, removed, or lacks a receipt")]
+    ReplayConflict,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -85,6 +89,7 @@ impl SessionError {
             }
             Self::Running => AgentErrorCode::SessionRunning,
             Self::IdExists => AgentErrorCode::SessionIdExists,
+            Self::ReplayConflict => AgentErrorCode::SessionReplayConflict,
             Self::Other(_) => return None,
         })
     }
@@ -233,7 +238,7 @@ impl SessionStore {
         };
         let mut sessions = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_dir() {
+            if entry.file_type().await?.is_dir() && entry.file_name() != ".removed" {
                 // A crash before initial status publication leaves only an
                 // empty log and temporary metadata. No worker starts until
                 // status is published. Recover these owned transaction scraps
@@ -277,13 +282,24 @@ impl SessionStore {
         // Dropping a client request cannot strand an active-map entry or kill a
         // child between spawn, durable status publication and worker handoff.
         let store = self.clone();
-        tokio::spawn(async move { store.start_owned(request, default_timeout).await }).await?
+        tokio::spawn(async move { store.start_owned(request, default_timeout, false).await })
+            .await?
+    }
+
+    pub(crate) async fn start_replay(
+        self: &Arc<Self>,
+        request: SessionStartRequest,
+        default_timeout: Duration,
+    ) -> Result<SessionInfo, SessionError> {
+        let store = self.clone();
+        tokio::spawn(async move { store.start_owned(request, default_timeout, true).await }).await?
     }
 
     async fn start_owned(
         self: &Arc<Self>,
         request: SessionStartRequest,
         default_timeout: Duration,
+        replay: bool,
     ) -> Result<SessionInfo, SessionError> {
         ensure!(
             request.exec.command.len() <= 4096,
@@ -291,12 +307,67 @@ impl SessionStore {
         );
         let _creation = self.creation.lock().await;
         let dir = self.directory(&request.id)?;
+        let sessions = self.list_entries().await?;
+        let specification = serde_json::to_vec(&(
+            &request.exec.command,
+            &request.exec.args,
+            &request.exec.working_dir,
+            &request.exec.env,
+            request
+                .exec
+                .timeout_secs
+                .unwrap_or(default_timeout.as_secs()),
+        ))?;
+        ensure!(
+            !replay || specification.len() <= 64 * 1024,
+            unclassified("session specification exceeds limit")
+        );
+        let digest = format!("v1:{}", hex::encode(Sha256::digest(&specification)));
+        if replay {
+            ensure!(
+                !tokio::fs::try_exists(self.root.join(".removed").join(&request.id)).await?,
+                SessionError::ReplayConflict
+            );
+            if tokio::fs::try_exists(&dir).await? {
+                let file = tokio::fs::File::open(dir.join("request.sha256"))
+                    .await
+                    .map_err(|_| SessionError::ReplayConflict)?;
+                let mut bytes = Vec::new();
+                file.take(69).read_to_end(&mut bytes).await?;
+                ensure!(bytes == digest.as_bytes(), SessionError::ReplayConflict);
+                return self.get(&request.id).await;
+            }
+            // Reserve receipt space at acceptance, so removing sessions always works.
+            let mut count = 0;
+            match tokio::fs::read_dir(self.root.join(".removed")).await {
+                Ok(mut entries) => {
+                    while entries.next_entry().await?.is_some() {
+                        count += 1;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            for session in &sessions {
+                if tokio::fs::try_exists(self.directory(&session.id)?.join("request.sha256"))
+                    .await?
+                {
+                    count += 1;
+                }
+            }
+            ensure!(
+                count < MAX_REPLAY_RECEIPTS,
+                unclassified(
+                    "replay receipt budget exhausted; destroy this VM before accepting more submissions"
+                )
+            );
+        }
         ensure!(
             self.active.lock().unwrap().len() < MAX_RUNNING,
             SessionError::TooManyRunning
         );
         ensure!(
-            self.list_entries().await?.len() < MAX_SESSIONS,
+            sessions.len() < MAX_SESSIONS,
             SessionError::RetentionLimitReached
         );
         tokio::fs::create_dir_all(&self.root).await?;
@@ -308,6 +379,7 @@ impl SessionStore {
                     anyhow::Error::new(error).context("creating the session directory"),
                 ),
             })?;
+        let mut accepted = false;
         let start: Result<SessionInfo, SessionError> = async {
             #[cfg(unix)]
             {
@@ -322,8 +394,13 @@ impl SessionStore {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             let log = tokio::fs::File::create(dir.join("events.jsonl")).await?;
-            let child = command.spawn().context("starting session command")?;
-            let group = ProcessGroup(child.id().context("session process has no id")? as i32);
+            let early_child = if replay { None } else { Some(command.spawn().context("starting session command")?) };
+            let early_group = early_child.as_ref().map(|child| child.id().context("session process has no id").map(|id| ProcessGroup(id as i32))).transpose()?;
+            if replay {
+                let mut receipt = tokio::fs::File::create(dir.join("request.sha256")).await?;
+                receipt.write_all(digest.as_bytes()).await?;
+                receipt.sync_all().await?;
+            }
             let info = SessionInfo {
                 id: request.id.clone(), command: request.exec.command.clone(),
                 state: SessionState::Running, created_at: now(), finished_at: None,
@@ -342,6 +419,33 @@ impl SessionStore {
                 self.release(&info.id, sequence);
                 return Err(error);
             }
+            if replay {
+                // Once status is published, recovery must never execute this ID again.
+                accepted = true;
+                if let Err(error) = async {
+                    tokio::fs::File::open(&self.root).await?.sync_all().await?;
+                    if let Some(parent) = self.root.parent() {
+                        tokio::fs::File::open(parent).await?.sync_all().await?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                }.await {
+                    self.release(&info.id, sequence);
+                    return Err(error.into());
+                }
+            }
+            let child = match early_child.map(Ok).unwrap_or_else(|| command.spawn()) {
+                Ok(child) => child,
+                Err(error) => {
+                    let mut failed = info.clone();
+                    failed.state = SessionState::Interrupted;
+                    failed.finished_at = Some(now());
+                    let saved = self.save(&failed).await;
+                    self.release(&info.id, sequence);
+                    saved?;
+                    return Err(anyhow::Error::new(error).context("starting accepted session command").into());
+                }
+            };
+            let group = match early_group { Some(group) => group, None => ProcessGroup(child.id().context("session process has no id")? as i32) };
             let store = self.clone();
             let mut outcome = info.clone();
             tokio::spawn(async move {
@@ -357,7 +461,7 @@ impl SessionStore {
             });
             Ok(info)
         }.await;
-        if start.is_err() {
+        if start.is_err() && !accepted {
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
         start
@@ -381,6 +485,15 @@ impl SessionStore {
         let _creation = self.creation.lock().await;
         let info = self.get(id).await?;
         ensure!(info.state != SessionState::Running, SessionError::Running);
+        if tokio::fs::try_exists(self.directory(id)?.join("request.sha256")).await? {
+            let tombstones = self.root.join(".removed");
+            tokio::fs::create_dir_all(&tombstones).await?;
+            let mut receipt = tokio::fs::File::create(tombstones.join(id)).await?;
+            receipt.write_all(b"removed").await?;
+            receipt.sync_all().await?;
+            tokio::fs::File::open(tombstones).await?.sync_all().await?;
+            tokio::fs::File::open(&self.root).await?.sync_all().await?;
+        }
         tokio::fs::remove_dir_all(self.directory(id)?).await?;
         Ok(())
     }
@@ -574,6 +687,136 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn durable_replay_runs_once_and_rejects_changed_or_removed_specifications() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let counter = temp.path().join("counter");
+        let req = request(&format!("printf x >> '{}'; sleep 0.1", counter.display()));
+        let (a, b) = tokio::join!(
+            store.start_replay(req.clone(), TIMEOUT),
+            store.start_replay(req.clone(), TIMEOUT)
+        );
+        assert_eq!(a.unwrap().id, b.unwrap().id);
+        assert_eq!(finished(&store).await.state, SessionState::Completed);
+        let reopened = SessionStore::new(temp.path().join("sessions"));
+        assert_eq!(
+            reopened
+                .start_replay(req.clone(), TIMEOUT)
+                .await
+                .unwrap()
+                .state,
+            SessionState::Completed
+        );
+        assert_eq!(tokio::fs::read(counter).await.unwrap(), b"x");
+        let mut changed = req.clone();
+        changed.exec.env.push(("SECRET".into(), "not-saved".into()));
+        assert!(matches!(
+            reopened.start_replay(changed, TIMEOUT).await,
+            Err(SessionError::ReplayConflict)
+        ));
+        reopened.remove(ID).await.unwrap();
+        assert!(reopened.list().await.unwrap().is_empty());
+        assert!(matches!(
+            reopened.start_replay(req, TIMEOUT).await,
+            Err(SessionError::ReplayConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_but_unspawned_replay_recovers_as_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().into());
+        let req = request("printf must-not-execute");
+        let dir = temp.path().join(ID);
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let digest = format!(
+            "v1:{}",
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&(
+                    &req.exec.command,
+                    &req.exec.args,
+                    &req.exec.working_dir,
+                    &req.exec.env,
+                    req.exec.timeout_secs.unwrap_or(TIMEOUT.as_secs())
+                ))
+                .unwrap()
+            ))
+        );
+        tokio::fs::write(dir.join("request.sha256"), digest)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("events.jsonl"), b"")
+            .await
+            .unwrap();
+        store
+            .save(&SessionInfo {
+                id: ID.into(),
+                command: "sh".into(),
+                state: SessionState::Running,
+                created_at: now(),
+                finished_at: None,
+                exit_code: None,
+                output_truncated: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.start_replay(req, TIMEOUT).await.unwrap().state,
+            SessionState::Interrupted
+        );
+        assert!(store.events(ID, 0).await.unwrap().events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_budget_blocks_new_acceptance_without_blocking_removal_or_legacy_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let removed = store.root.join(".removed");
+        tokio::fs::create_dir_all(&removed).await.unwrap();
+        for n in 0..MAX_REPLAY_RECEIPTS - 1 {
+            tokio::fs::write(removed.join(format!("old-{n}")), b"removed")
+                .await
+                .unwrap();
+        }
+        store.start_replay(request("true"), TIMEOUT).await.unwrap();
+        finished(&store).await;
+        store.remove(ID).await.unwrap();
+        assert!(store.list().await.unwrap().is_empty());
+        let mut second = request("true");
+        second.id = "22345678-1234-1234-1234-123456789abc".into();
+        assert!(
+            store
+                .start_replay(second.clone(), TIMEOUT)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("budget exhausted")
+        );
+        assert!(store.start(second, TIMEOUT).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn replay_specification_limit_does_not_change_legacy_session_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().into());
+        let mut req = request("true");
+        req.exec
+            .env
+            .push(("TEST_PAYLOAD".into(), "x".repeat(70 * 1024)));
+        store.start(req.clone(), TIMEOUT).await.unwrap();
+        assert_eq!(finished(&store).await.state, SessionState::Completed);
+        store.remove(ID).await.unwrap();
+        assert!(
+            store
+                .start_replay(req, TIMEOUT)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("specification exceeds limit")
+        );
     }
 
     #[tokio::test]

@@ -1083,10 +1083,12 @@ name = "husker-agent"
 version = "0.4.54"
 dependencies = [
  "anyhow",
+ "hex",
  "husker-agent-proto",
  "if-addrs",
  "libc",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1127,6 +1129,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "tokio",

@@ -69,6 +69,21 @@ async fn fetch_openapi() -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn openapi_advertises_durable_session_submissions() {
+    let document = fetch_openapi().await;
+    assert!(
+        document
+            .pointer("/paths/~1v1~1vms~1{name}~1session-submissions/post")
+            .is_some()
+    );
+    assert!(
+        document
+            .pointer("/components/schemas/SessionSubmission")
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn openapi_contains_critical_paths() {
     let doc = fetch_openapi().await;
     let paths = doc["paths"].as_object().expect("paths must be an object");
