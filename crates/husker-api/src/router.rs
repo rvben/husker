@@ -322,9 +322,12 @@ pub async fn serve_with_auth<B: VmmBackend + 'static>(
 }
 
 /// How long to wait for in-flight connections to drain after a shutdown signal
-/// before forcing the server to stop. Kept below the caller's VM-drain budget and
-/// systemd's default `TimeoutStopSec` so shutdown stays bounded end to end.
-const GRACEFUL_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+/// before forcing the server to stop. This is the first of the daemon's three
+/// sequential stop phases (connection grace, worker grace, VM drain); the
+/// shipped `contrib/husker.service` sets `TimeoutStopSec` above their sum, and
+/// a test in the daemon crate holds it there, so the service manager never
+/// kills the daemon while its guests are still draining.
+pub const GRACEFUL_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 /// Minimal router exposing ONLY `GET /v1/metrics`. Served on a separate bind
 /// (`metrics_listen`) so Prometheus can scrape while the full API - exec, shell,

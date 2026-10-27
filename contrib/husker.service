@@ -9,9 +9,15 @@ ExecStart=/usr/local/bin/husker daemon
 Restart=on-failure
 RestartSec=5
 
-# Bound shutdown. The daemon drains in-flight connections (~20s) then drains VMs
-# (~30s); this ceiling keeps a wedged client from stranding the stop indefinitely.
-TimeoutStopSec=60
+# Bound shutdown. The daemon stops in three phases, one after another: it gives
+# in-flight API connections up to 20s to close, its background workers up to 5s
+# to finish, then drains the guests, up to 45s (every guest is stopped
+# concurrently under a 30s bound, plus the state bookkeeping around it). That is
+# 70s in the worst case; this ceiling sits above it so systemd never SIGKILLs
+# the daemon while guests are still flushing, yet a wedged stop cannot strand
+# the unit indefinitely. A test in crates/husker holds this value above the
+# daemon's constants.
+TimeoutStopSec=90
 
 # Signal only the daemon on stop. The default KillMode=control-group delivers
 # the SIGTERM to every Firecracker/QEMU process in the unit at the same instant,

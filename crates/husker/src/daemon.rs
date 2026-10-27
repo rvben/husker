@@ -1679,6 +1679,35 @@ mod runtime_tests {
         assert_eq!(*events.lock().unwrap(), ["worker aborted", "VMs drained"]);
     }
 
+    /// The daemon stops in three sequential phases: the API server's connection
+    /// grace, the worker grace, then the VM drain. systemd must not SIGKILL the
+    /// daemon before the last phase can finish, or the guests still draining are
+    /// swept with it; the shipped unit's `TimeoutStopSec` has to cover the sum.
+    #[test]
+    fn shipped_unit_outlasts_the_sequential_stop_phases() {
+        let unit_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contrib/husker.service");
+        let unit = std::fs::read_to_string(unit_path).expect("read contrib/husker.service");
+        let timeout_stop = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("TimeoutStopSec="))
+            .expect("contrib/husker.service sets TimeoutStopSec");
+        let timeout_stop: u64 = timeout_stop
+            .trim()
+            .parse()
+            .expect("TimeoutStopSec is a plain number of seconds");
+        let timeout_stop = std::time::Duration::from_secs(timeout_stop);
+
+        let phases =
+            husker_api::GRACEFUL_SHUTDOWN_GRACE + RuntimeWorkers::SHUTDOWN_GRACE + DRAIN_DEADLINE;
+
+        assert!(
+            timeout_stop > phases,
+            "TimeoutStopSec={}s does not outlast the daemon's sequential stop phases ({}s)",
+            timeout_stop.as_secs(),
+            phases.as_secs()
+        );
+    }
+
     #[cfg(feature = "linux-net")]
     #[tokio::test]
     async fn linux_cleanup_attempts_both_steps_and_preserves_runtime_error() {
