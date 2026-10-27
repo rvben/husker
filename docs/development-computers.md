@@ -5,7 +5,8 @@ reconnect to their logs, and preview an application through the selected daemon.
 The native CLI works with HTTP, HTTPS, and SSH contexts. A Mac can drive a Linux
 Firecracker host without exposing its daemon port.
 
-This workflow requires the updated daemon **and guest agent protocol v5**.
+This workflow requires the updated daemon **and guest agent protocol v5 or
+newer** (the current agent speaks v6).
 Rebuild prepared images after upgrading the guest agent; updating the host binary
 alone does not update an existing guest disk. Earlier guest agents receive an
 explicit capability error for sessions and tunnels.
@@ -187,7 +188,7 @@ establish a local forward explicitly and pass its HTTP origin to `Client`.
 
 | Capability | Linux / Firecracker | Linux / QEMU | macOS / Apple VZ |
 | --- | --- | --- | --- |
-| Development image, sessions, private previews | Available with guest agent v5 | Available with guest agent v5 | Available with guest agent v5 |
+| Development image, sessions, private previews | Available with guest agent v5+ | Available with guest agent v5+ | Available with guest agent v5+ |
 | Full-state suspend/resume | Available | Unsupported | Unsupported |
 | Warm fork and pools | Available | Unsupported | Unsupported |
 | Fork disk isolation | Own rootfs clone; attached volumes refused | — | — |
@@ -198,7 +199,7 @@ can coexist. Persisted egress restrictions are validated before allocation and
 installed while the fork's TAP is disconnected; a failure rolls back without
 network exposure. An explicitly persisted empty policy stays deny-all.
 
-Forks require guest agent v5 and a **bound VMGenID kernel driver**. The microVM
+Forks require guest agent v5 or newer and a **bound VMGenID kernel driver**. The microVM
 kernel build enables `CONFIG_VIRT_DRIVERS=y` and `CONFIG_VMGENID=y`, and rejects a
 configuration that drops VMGenID. Rebuild existing kernels as well as guest images
 before using the stricter fork path. Firecracker emits a new generation identifier

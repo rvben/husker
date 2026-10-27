@@ -63,6 +63,8 @@ a genuinely empty fleet:
 
 ### VM details
 
+The `vm` object carries every VM field; this example shows two of them.
+
 ```json
 {
   "status": "ok",
@@ -92,6 +94,41 @@ a genuinely empty fleet:
 A command that exits nonzero has the same shape with `status: "error"` and
 its code in `result.exit_code`, and `husker` exits with that code.
 
+### Job
+
+`job` reports the guest command's result at the top level rather than under
+`result`, and passes its exit code through the same way:
+
+```json
+{
+  "status": "ok",
+  "action": "job",
+  "vm": "job-1a2b3c4d",
+  "exit_code": 0,
+  "stdout": "hello\n",
+  "stderr": ""
+}
+```
+
+### Version
+
+```json
+{
+  "status": "ok",
+  "action": "version",
+  "client_version": "0.4.53",
+  "daemon": {
+    "version": "0.4.53",
+    "vms_total": 3,
+    "vms_running": 1
+  }
+}
+```
+
+`daemon` is `null` when no daemon answered. `vms_total` and `vms_running` are
+`null` when the daemon answered but could not read its state store, so a
+consumer can tell an unknown fleet size from an empty fleet.
+
 ## Errors
 
 Structured errors are a single JSON line on stderr:
@@ -119,6 +156,13 @@ reported as `invalid_usage` (exit 2), exactly like a flag the parser refuses;
 404 is `not_found`, 409 `conflict`, 401 and 403 `permission_denied`, and
 anything else `error`. The daemon's message and hint are preserved in every
 case.
+
+Two kinds do not come from a daemon status. `timeout` (exit 1) reports an
+operation that did not finish within its deadline: `wait`, `job`, `run --dns`,
+a preview handshake, or a command the daemon ended at its run timeout.
+`confirmation_declined` (exit 6) reports a `[y/N]` prompt answered with
+anything but yes, so a script can tell a declined destructive command from one
+that ran.
 
 ## Stability policy
 

@@ -610,15 +610,17 @@ mod tests {
             .collect();
         assert_eq!(
             examples.len(),
-            4,
+            6,
             "keep the documented examples intentional"
         );
 
         validate_output("list", &examples[0]).unwrap();
         validate_output("info", &examples[1]).unwrap();
         validate_output("exec", &examples[2]).unwrap();
-        assert_eq!(examples[3]["error"]["kind"], "not_found");
-        assert!(examples[3]["error"]["message"].is_string());
+        validate_output("job", &examples[3]).unwrap();
+        validate_output("version", &examples[4]).unwrap();
+        assert_eq!(examples[5]["error"]["kind"], "not_found");
+        assert!(examples[5]["error"]["message"].is_string());
     }
 
     #[test]
