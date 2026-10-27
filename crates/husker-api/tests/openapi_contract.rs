@@ -158,13 +158,19 @@ async fn openapi_lists_every_logs_query_parameter() {
     );
 }
 
-/// The session and preview routes answer refusals from the guest agent with
-/// their own statuses; a consumer branching on them must find each one in
-/// the contract, not just the success case.
+/// The exec, session and preview routes answer policy refusals, timeouts and
+/// refusals from the guest agent with their own statuses; a consumer
+/// branching on them must find each one in the contract, not just the
+/// success case.
 #[tokio::test]
-async fn openapi_documents_every_session_error_status() {
+async fn openapi_documents_every_exec_and_session_error_status() {
     let doc = fetch_openapi().await;
-    let expectations: [(&str, &str, &[&str]); 7] = [
+    let expectations: [(&str, &str, &[&str]); 8] = [
+        (
+            "/v1/vms/{name}/exec",
+            "post",
+            &["200", "403", "404", "408", "409", "503"],
+        ),
         (
             "/v1/vms/{name}/sessions",
             "post",

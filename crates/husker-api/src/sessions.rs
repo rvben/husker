@@ -101,7 +101,7 @@ fn session_error(error: AgentError) -> Failure {
     params(("name" = String, Path)), request_body = ExecRequest,
     responses((status = 201, body = SessionInfo, description = "Detached command started"),
         (status = 403, body = ErrorResponse, description = "Execution policy denied"),
-        (status = 404, body = ErrorResponse, description = "VM not found"),
+        (status = 404, body = ErrorResponse, description = "VM or referenced secret not found"),
         (status = 409, body = ErrorResponse, description = "Session retention limit reached; remove finished sessions"),
         (status = 429, body = ErrorResponse, description = "Too many running sessions"),
         (status = 501, body = ErrorResponse, description = "Guest agent predates sessions"),

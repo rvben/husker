@@ -1452,7 +1452,10 @@ pub(crate) async fn destroy_vm<B: VmmBackend + 'static>(
     request_body = ExecRequest,
     responses(
         (status = 200, description = "Command executed", body = ExecResponse),
-        (status = 404, description = "VM not found", body = ErrorResponse),
+        (status = 403, description = "Execution policy denied the command or an environment key", body = ErrorResponse),
+        (status = 404, description = "VM or referenced secret not found", body = ErrorResponse),
+        (status = 408, description = "The agent did not report an exit within the run timeout plus its grace", body = ErrorResponse),
+        (status = 409, description = "VM is not running", body = ErrorResponse),
         (status = 503, description = "Agent not ready", body = ErrorResponse)
     )
 )]
