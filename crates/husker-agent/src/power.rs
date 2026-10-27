@@ -7,7 +7,7 @@
 //! through the vsock listeners, which serve a real guest; the Unix-socket
 //! listener, the embedder entry point and every test run with
 //! [`NoPowerControl`], so no code path a host test can reach ever flushes,
-//! unmounts or reboots the machine the test runs on.
+//! unmounts, remounts or reboots the machine the test runs on.
 
 use husker_agent_proto::GuestPowerAction;
 
@@ -39,8 +39,8 @@ impl PowerControl for NoPowerControl {
     fn apply(&self, _action: GuestPowerAction) {}
 }
 
-/// The kernel of a real guest: `sync(2)`, `umount2(2)` and `reboot(2)` on
-/// Linux, `sync(2)` and the system `shutdown` utility on macOS.
+/// The kernel of a real guest: `sync(2)`, `umount2(2)`, `mount(2)` and
+/// `reboot(2)` on Linux, `sync(2)` and the system `shutdown` utility on macOS.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct KernelPowerControl;
 
@@ -102,6 +102,15 @@ fn flush_guest_storage() {
 /// Ask the kernel to end the guest. `reboot(2)` with `RB_AUTOBOOT` or
 /// `RB_POWER_OFF` acts immediately and without unmounting, which is why the
 /// pages were flushed first; it returns only on failure, with errno set.
+///
+/// Between the flush and the reboot the root filesystem is remounted
+/// read-only. Ending the kernel without that leaves ext4's `needs_recovery`
+/// flag set on the rootfs clone, so every later reader (the next boot, or the
+/// host's e2fsprogs before it edits or commits the clone) first replays a
+/// journal that holds nothing. The remount commits the journal and clears the
+/// flag, leaving the clone clean. It is best effort: a guest with files still
+/// open for writing (a systemd guest's journald, a running session) answers
+/// `EBUSY`, and the stop proceeds exactly as before.
 #[cfg(target_os = "linux")]
 fn end_guest(action: GuestPowerAction) -> std::io::Result<()> {
     let command = match action {
@@ -109,10 +118,24 @@ fn end_guest(action: GuestPowerAction) -> std::io::Result<()> {
         GuestPowerAction::Reboot => libc::RB_AUTOBOOT,
         GuestPowerAction::PowerOff => libc::RB_POWER_OFF,
     };
-    // SAFETY: sync() and reboot() take no pointers; reboot does not return on
-    // success.
+    // SAFETY: sync() takes no pointers; `mount` reads only the root path,
+    // held for the call, and `MS_REMOUNT` neither reads the source nor the
+    // filesystem type nor the data pointer, which may all be null; reboot()
+    // takes no pointers and does not return on success.
     unsafe {
         libc::sync();
+        let root = c"/";
+        if libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        ) < 0
+        {
+            let error = std::io::Error::last_os_error();
+            tracing::debug!("root filesystem stays writable until the kernel ends: {error}");
+        }
         if libc::reboot(command) < 0 {
             return Err(std::io::Error::last_os_error());
         }
