@@ -103,6 +103,11 @@
   either way; the default case carries a `hint` that names `husker images
   pull`. Daemons before 0.4.53 answered a missing named image with 500
   `storage_error`, as if the daemon rather than the request were at fault.
+- `GET /v1/health` reports `vms` as `{total, running}`, or `null` when the
+  state store cannot answer; `husker version --output json` passes that
+  through as `null` `vms_total` and `vms_running` in its `daemon` block.
+  Daemons before 0.4.53 reported zero total and zero running for that case,
+  indistinguishable from an empty fleet.
 
 ## Deprecation workflow
 
