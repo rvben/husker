@@ -194,6 +194,7 @@ async fn create_vm_missing_binary() {
     let backend = test_backend("/nonexistent/firecracker", dir.path());
 
     let config = VmConfig {
+        requested_id: None,
         name: "test".into(),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -209,6 +210,7 @@ async fn create_vm_missing_binary() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: Vec::new(),
     };
 
@@ -233,6 +235,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
     let backend = test_backend("/nonexistent/firecracker", &runtime_dir);
 
     let config = VmConfig {
+        requested_id: None,
         name: "orphan-test".into(),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -248,6 +251,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: Vec::new(),
     };
 
@@ -275,31 +279,17 @@ async fn create_vm_failure_cleans_up_serial_log() {
     );
 }
 
-/// Verify that the serial log file is cleaned up when create_vm fails
-/// due to a Firecracker API error (e.g., invalid kernel path).
+/// Failed configuration retains a real child and artifacts for confirmed
+/// destruction; a cleanup failure keeps that owner available for retry.
 #[tokio::test]
-async fn create_vm_api_failure_cleans_up_serial_log() {
+async fn create_vm_api_failure_retains_child_and_files_until_confirmed_destroy() {
     let (dir, socket_path) = spawn_error_fc().await;
-
-    // Create a shell script that simulates a firecracker binary:
-    // it creates the socket (by copying the mock one) and then waits.
-    // Instead, we use a trick: pre-create the API socket pointing to
-    // the mock FC, and use `true` as the binary (exits immediately).
-    // The backend will find the socket (mock one), then the API call
-    // will fail with a 400 error from the mock.
 
     let runtime_dir = dir.path().join("run");
     std::fs::create_dir_all(&runtime_dir).unwrap();
 
-    // The mock FC server is listening on `socket_path`. We need the
-    // backend to use that socket. We can create a symlink in runtime_dir
-    // with the expected name pattern: `{uuid}.sock`.
-    // But we don't know the UUID. Instead, we'll verify that NO serial
-    // log files remain after failure, regardless of path.
-
-    // For this test, we test at a higher level: use a script that creates
-    // the expected socket path. Since we can't easily predict the UUID,
-    // we'll create a wrapper script.
+    // The wrapper exposes the rejecting mock API and execs a harmless sleeper,
+    // so the tracked process has no unowned shell child.
     let wrapper_script = dir.path().join("fake-fc.sh");
     std::fs::write(
         &wrapper_script,
@@ -316,7 +306,7 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
              # Symlink the mock FC socket to the expected path\n\
              ln -sf {} \"$SOCK\"\n\
              # Keep running until killed\n\
-             sleep 60\n",
+             exec sleep 60\n",
             socket_path.display()
         ),
     )
@@ -329,7 +319,9 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
 
     let backend = test_backend(&wrapper_script, &runtime_dir);
 
+    let id = uuid::Uuid::new_v4();
     let config = VmConfig {
+        requested_id: Some(id),
         name: "api-fail-test".into(),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -345,6 +337,7 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: Vec::new(),
     };
 
@@ -364,20 +357,184 @@ async fn create_vm_api_failure_cleans_up_serial_log() {
         "ProcessError must contain original API error details, got: {err}"
     );
 
-    // No .serial.log files should remain
-    let serial_logs: Vec<_> = std::fs::read_dir(&runtime_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .file_name()
+    let info = backend.vm_info(id).await.unwrap();
+    assert_eq!(info.state, husker_vmm::VmState::Failed);
+    assert!(info.pid.is_some());
+    assert!(runtime_dir.join(format!("{id}.serial.log")).exists());
+    assert!(runtime_dir.join(format!("{id}.boot.log")).exists());
+
+    // Destruction must retain ownership if a runtime path cannot be removed.
+    let obstructed = runtime_dir.join(format!("{id}.vsock"));
+    std::fs::create_dir(&obstructed).unwrap();
+    assert!(backend.destroy_vm(id).await.is_err());
+    assert!(backend.vm_info(id).await.is_ok());
+    assert!(runtime_dir.join(format!("{id}.serial.log")).exists());
+    std::fs::remove_dir(&obstructed).unwrap();
+    backend.destroy_vm(id).await.unwrap();
+    assert!(matches!(
+        backend.vm_info(id).await,
+        Err(VmmError::VmNotFound(_))
+    ));
+    assert!(std::fs::read_dir(&runtime_dir).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn cancelled_boot_retains_spawned_child_for_confirmed_destroy() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("run");
+    let wrapper = dir.path().join("sleeper.sh");
+    std::fs::write(&wrapper, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = Arc::new(test_backend(&wrapper, &runtime_dir));
+    let id = uuid::Uuid::new_v4();
+    let config = VmConfig {
+        requested_id: Some(id),
+        name: "cancelled-boot".into(),
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        kernel_path: "/tmp/vmlinux".into(),
+        rootfs_path: "/tmp/rootfs.ext4".into(),
+        kernel_args: None,
+        initrd_path: None,
+        vsock_cid: 3,
+        tap_device: None,
+        guest_mac: None,
+        vmm: None,
+        boot: husker_vmm::BootMode::DirectKernel,
+        seed_path: None,
+        balloon: false,
+        volume_path: None,
+        network_disabled: false,
+        host_shares: Vec::new(),
+    };
+    let worker_backend = backend.clone();
+    let creation = tokio::spawn(async move {
+        worker_backend
+            .create_vm(
+                worker_backend.select_backend_for_config(&config).unwrap(),
+                config,
+            )
+            .await
+    });
+    let owned = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Ok(info) = backend.vm_info(id).await {
+                break info;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(owned.state, husker_vmm::VmState::Creating);
+    assert!(owned.pid.is_some());
+    creation.abort();
+    assert!(creation.await.unwrap_err().is_cancelled());
+    assert_eq!(backend.vm_info(id).await.unwrap().pid, owned.pid);
+    assert!(runtime_dir.join(format!("{id}.serial.log")).exists());
+    backend.destroy_vm(id).await.unwrap();
+    assert!(matches!(
+        backend.vm_info(id).await,
+        Err(VmmError::VmNotFound(_))
+    ));
+    assert!(std::fs::read_dir(&runtime_dir).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn restore_failure_and_cancellation_retain_child_until_cleanup_retry() {
+    use husker_vmm::{RestoreTarget, SnapshotPaths, VmState};
+    use std::os::unix::fs::PermissionsExt;
+    for cancel in [false, true] {
+        let (_mock_dir, mock_socket) = spawn_error_fc().await;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("run");
+        let wrapper = dir.path().join("restore-sleeper.sh");
+        let expose_api = if cancel {
+            String::new()
+        } else {
+            format!(
+                "while [ $# -gt 0 ]; do\ncase \"$1\" in\n--api-sock) socket=\"$2\"; shift 2;;\n*) shift;;\nesac\ndone\nln -s '{}' \"$socket\"\n",
+                mock_socket.display()
+            )
+        };
+        std::fs::write(&wrapper, format!("#!/bin/sh\n{expose_api}exec sleep 60\n")).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend = Arc::new(test_backend(&wrapper, &runtime));
+        let id = uuid::Uuid::new_v4();
+        let worker = backend.clone();
+        let snapshot = SnapshotPaths::in_dir(dir.path().join("snapshot"));
+        let restore = tokio::spawn(async move {
+            worker
+                .restore_vm(
+                    &snapshot,
+                    RestoreTarget::Resume {
+                        id,
+                        name: "restore-ownership".into(),
+                        vcpu_count: 1,
+                        mem_size_mib: 128,
+                        vsock_cid: 3,
+                    },
+                )
+                .await
+        });
+        if cancel {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Ok(info) = backend.vm_info(id).await {
+                        assert_eq!(info.state, VmState::Creating);
+                        assert!(info.pid.is_some());
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            restore.abort();
+            assert!(restore.await.unwrap_err().is_cancelled());
+        } else {
+            let error = tokio::time::timeout(std::time::Duration::from_secs(3), restore)
+                .await
                 .unwrap()
-                .to_string_lossy()
-                .ends_with(".serial.log")
-        })
-        .collect();
-    assert!(
-        serial_logs.is_empty(),
-        "serial log files should be cleaned up on API failure, found: {serial_logs:?}"
-    );
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("API error"));
+            assert_eq!(backend.vm_info(id).await.unwrap().state, VmState::Failed);
+        }
+        let owned = backend.vm_info(id).await.unwrap();
+        assert!(owned.pid.is_some());
+        // A second restore must not overwrite this child or truncate its logs.
+        let serial = runtime.join(format!("{id}.serial.log"));
+        std::fs::write(&serial, b"retained diagnostics").unwrap();
+        assert!(
+            backend
+                .restore_vm(
+                    &SnapshotPaths::in_dir(dir.path().join("other")),
+                    RestoreTarget::Resume {
+                        id,
+                        name: "duplicate".into(),
+                        vcpu_count: 1,
+                        mem_size_mib: 128,
+                        vsock_cid: 4,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&serial).unwrap(), b"retained diagnostics");
+        assert_eq!(backend.vm_info(id).await.unwrap().pid, owned.pid);
+        let obstruction = runtime.join(format!("{id}.vsock"));
+        std::fs::create_dir(&obstruction).unwrap();
+        assert!(backend.destroy_vm(id).await.is_err());
+        assert!(backend.vm_info(id).await.is_ok());
+        assert!(serial.exists());
+        std::fs::remove_dir(&obstruction).unwrap();
+        backend.destroy_vm(id).await.unwrap();
+        assert!(matches!(
+            backend.vm_info(id).await,
+            Err(VmmError::VmNotFound(_))
+        ));
+        assert!(std::fs::read_dir(&runtime).unwrap().next().is_none());
+    }
 }

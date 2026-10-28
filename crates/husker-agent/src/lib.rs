@@ -1,7 +1,10 @@
 //! Guest-side agent handlers for exec, file transfer, and interactive shell services.
 
+pub mod job_process;
+pub mod job_runner;
 mod pty;
 mod sessions;
+pub mod transport;
 pub use sessions::SessionStore;
 mod power;
 pub use power::{NoPowerControl, PowerControl};

@@ -71,10 +71,17 @@ fn serve_connection<S>(
 async fn listen_unix(path: &str, limits: crate::AgentLimits) -> Result<()> {
     info!("listening on Unix socket: {path}");
     let listener = tokio::net::UnixListener::bind(path).context("binding Unix socket")?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let allowed_uid = unsafe { libc::geteuid() };
     let power: std::sync::Arc<dyn crate::PowerControl> = std::sync::Arc::new(crate::NoPowerControl);
 
     loop {
         let (stream, _) = listener.accept().await?;
+        if let Err(error) = crate::transport::authorize_unix_peer(&stream, allowed_uid) {
+            warn!(%error, "rejecting unauthorized Unix agent peer");
+            continue;
+        }
         serve_connection(stream, limits, power.clone());
     }
 }
@@ -114,6 +121,10 @@ async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        if !crate::transport::authorized_vsock_cid(addr.cid()) {
+            warn!("rejecting non-host vsock peer CID {}", addr.cid());
+            continue;
+        }
         info!("vsock connection from CID {}", addr.cid());
         serve_connection(stream, limits, power.clone());
     }
@@ -167,12 +178,14 @@ async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
 
     loop {
         let mut ready = listener.readable().await?;
-        // Safety: accept(2) on our listening socket; peer address not needed.
+        let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        let mut peer_len = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+        // Safety: accept(2) writes into a valid sockaddr_vm of the supplied size.
         let fd = unsafe {
             libc::accept(
                 listener.get_ref().as_raw_fd(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                (&raw mut peer).cast(),
+                &mut peer_len,
             )
         };
         if fd < 0 {
@@ -193,6 +206,13 @@ async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
         drop(ready);
         // Safety: `fd` is a freshly accepted, owned stream socket.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        if peer_len as usize != std::mem::size_of::<libc::sockaddr_vm>()
+            || i32::from(peer.svm_family) != libc::AF_VSOCK
+            || !crate::transport::authorized_vsock_cid(peer.svm_cid)
+        {
+            warn!("rejecting unauthorized vsock peer");
+            continue;
+        }
         if let Err(e) = configure_transport_fd(owned.as_raw_fd()) {
             warn!("vsock connection setup failed: {e}");
             continue;

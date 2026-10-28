@@ -314,46 +314,45 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(reconciled)
     }
 
-    /// Recover source rootfs disks left stranded by a fork that crashed mid-load
-    /// on a prior daemon run. Such a fork leaves the source's `rootfs.ext4` as a
-    /// stale symlink to the fork clone, with the real disk in a
-    /// `rootfs.ext4.fork-src-bak` backup. Restore each one before any resume can
-    /// open the stale symlink and boot the source against the wrong disk. Run at
-    /// daemon startup. Returns the number recovered.
-    ///
-    /// Only VMs on a backend that can fork are examined: the backup is a fork
-    /// artifact, and the recovery replaces the rootfs with it, so a stray file
-    /// of that name beside another backend's disk must not be consumed.
-    pub fn recover_stranded_fork_rootfs(&self) -> usize {
+    /// Inspect source rootfs backups stranded by an interrupted fork. Startup
+    /// cannot infer that a former fork has stopped opening the alias merely from
+    /// the absence of a registered instance. Preserve both paths for reconciliation.
+    pub fn inspect_stranded_fork_rootfs(&self) -> usize {
         let vms = match self.state.list_vms() {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "failed to list VMs for stranded-fork rootfs recovery");
+                warn!(error = %e, "failed to inspect stranded fork sources");
                 return 0;
             }
         };
-        let mut recovered = 0;
+        let mut stranded = 0;
         for vm in vms {
-            if !husker_vmm::Capabilities::for_backend_kind(vm.vmm).fork {
-                continue;
-            }
-            let rootfs = self.storage.vm_dir(&vm.name).join("rootfs.ext4");
-            match husker_vmm::firecracker::recover_aliased_rootfs(&rootfs) {
-                Ok(true) => {
-                    warn!(vm = %vm.name, "recovered source rootfs stranded by an interrupted fork");
-                    recovered += 1;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(vm = %vm.name, error = %e, "failed to recover stranded fork source rootfs")
-                }
+            if let Err(error) = self.require_reconciled_fork_source(&vm) {
+                warn!(vm = %vm.name, %error, "preserving stranded fork source until prior holder termination is confirmed");
+                stranded += 1;
             }
         }
-        recovered
+        stranded
+    }
+
+    pub(crate) fn require_reconciled_fork_source(
+        &self,
+        record: &VmRecord,
+    ) -> Result<(), CoreError> {
+        let backup = self
+            .storage
+            .vm_dir(&record.name)
+            .join("rootfs.ext4.fork-src-bak");
+        match std::fs::symlink_metadata(&backup) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Io(format!("inspect fork source backup: {e}"))),
+            Ok(_) => Err(CoreError::Io("fork source reconciliation pending; prior holder termination and source restoration must be confirmed".into())),
+        }
     }
 
     /// Restore a suspended VM in place (same id/IP/CID/MAC).
     async fn restore_from_suspend(&self, record: &VmRecord) -> Result<(), CoreError> {
+        self.require_reconciled_fork_source(record)?;
         let slot = self.suspend_slot_dir(record.id);
         let paths = SnapshotPaths::in_dir(&slot);
 
@@ -430,6 +429,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // source's rootfs aliased to a clone during `/snapshot/load`.
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        self.require_reconciled_fork_source(&record)?;
         self.ensure_vm_is_not_pool_template(&record)?;
         // Only a "suspended" restore removed DNAT and installed resume
         // listeners (see `suspend_vm_locked`); a "paused" VM never touched

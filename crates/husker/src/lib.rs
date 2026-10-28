@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(all(test, unix))]
+#[path = "../agent_staging.rs"]
+mod agent_staging;
 pub mod archive;
+
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 pub mod firecracker;
 pub mod http;

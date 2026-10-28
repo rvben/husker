@@ -441,10 +441,10 @@ impl VmmBackend for FailingVmm {
         if let Some(gate) = &self.create_gate {
             gate.notified().await;
         }
-        if self.should_fail("create") {
+        if self.should_fail("create_without_identity") {
             return Err(VmmError::ApiError("injected create failure".into()));
         }
-        let id = Uuid::new_v4();
+        let id = config.requested_id.unwrap_or_else(Uuid::new_v4);
         let info = VmInfo {
             id,
             name: config.name,
@@ -455,6 +455,11 @@ impl VmmBackend for FailingVmm {
             vsock_cid: config.vsock_cid,
         };
         self.vms.lock().await.insert(id, info.clone());
+        // Retain the reserved allocation so rollback can positively destroy it.
+        if self.should_fail("create") {
+            return Err(VmmError::ApiError("injected create failure".into()));
+        }
+
         Ok(CreatedVm::new(info, selection))
     }
 
@@ -474,7 +479,9 @@ impl VmmBackend for FailingVmm {
         if self.should_fail("destroy") {
             return Err(VmmError::ApiError("injected destroy failure".into()));
         }
-        self.vms.lock().await.remove(&id);
+        if self.vms.lock().await.remove(&id).is_none() {
+            return Err(VmmError::VmNotFound(id));
+        }
         Ok(())
     }
 
@@ -1530,7 +1537,10 @@ async fn restart_recovers_host_resources_that_rollback_could_not_delete() {
         .create_vm(create_request("interrupted", &kernel, &rootfs))
         .await
         .unwrap_err();
-    assert!(matches!(error, CoreError::Network(_)), "got {error:?}");
+    assert!(matches!(error, CoreError::Io(_)), "got {error:?}");
+    assert!(error.to_string().contains("rollback remains pending"));
+    assert!(error.to_string().contains("injected attach failure"));
+    assert!(error.to_string().contains("injected TAP cleanup failure"));
     assert!(network.has_tap("husker3").await);
     drop(core);
 
@@ -1709,6 +1719,147 @@ async fn recovery_attempts_all_cleanup_and_retains_the_lease_on_failure() {
         .unwrap();
     assert_eq!(created.vsock_cid, 3);
     assert_eq!(created.guest_ip.as_deref(), Some("172.20.0.2"));
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn restart_preserves_factory_creation_lease_until_positive_allocation_abort() {
+    use husker_state::jobs::{CollectionState, JobState};
+    let tmp = tempfile::tempdir().unwrap();
+    let state_path = tmp.path().join("factory-state.db");
+    let store = husker_state::StateStore::open(&state_path).unwrap();
+    let deadline = chrono::Utc::now() + chrono::Duration::minutes(10);
+    let job = store
+        .accept_job(
+            "uncertain-creation",
+            "{\"version\":1}",
+            deadline,
+            deadline + chrono::Duration::days(1),
+        )
+        .unwrap()
+        .0;
+    let claimed = store.claim_job_vm(job.id).unwrap();
+    let name = claimed.vm_name.unwrap();
+    let vm_id = Uuid::new_v4();
+    store.bind_job_vm(job.id, vm_id, &name).unwrap();
+    store
+        .finish_job(
+            job.id,
+            JobState::InfrastructureFailed,
+            CollectionState::Failed,
+            "{\"version\":1}",
+        )
+        .unwrap();
+    let lease = store
+        .begin_host_resource_lease_for_vm(&name, vm_id)
+        .unwrap();
+    let network = Arc::new(TestHostNetwork::default());
+    let core = fresh_linux_core_with_state(tmp.path(), store, network);
+    let directory = tmp.path().join("vms").join(&name);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("rootfs.ext4"), b"uncertain owned disk").unwrap();
+
+    assert_eq!(
+        core.recover_host_resource_leases().await.unwrap().recovered,
+        0
+    );
+    let inspected = husker_state::StateStore::open(&state_path).unwrap();
+    assert_eq!(
+        inspected.list_host_resource_leases().unwrap()[0].id,
+        lease.id
+    );
+    assert_eq!(
+        std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+        b"uncertain owned disk"
+    );
+    assert_ne!(inspected.allocate_cid().unwrap(), lease.vsock_cid);
+
+    // This fixture never entered a VMM. A positive pre-entry abort is the
+    // authority to reclaim its host-only allocation, not the missing VM row.
+    inspected
+        .record_job_leased_prebackend_abort(job.id, vm_id, lease.id)
+        .unwrap();
+    assert_eq!(
+        core.recover_host_resource_leases().await.unwrap().recovered,
+        1
+    );
+    assert!(!directory.exists());
+    assert!(inspected.list_host_resource_leases().unwrap().is_empty());
+    assert_eq!(inspected.allocate_cid().unwrap(), lease.vsock_cid);
+    assert!(
+        inspected.get_job(job.id).unwrap().cleanup_pending,
+        "host lease recovery does not confirm all job cleanup"
+    );
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn creation_lease_recovery_preserves_a_vm_record_and_its_disk_with_the_same_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
+    let state_path = tmp.path().join("replacement-state.db");
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::new(TestHostNetwork::default()),
+    );
+    let record = core
+        .create_vm(create_request("replacement-owner", &kernel, &rootfs))
+        .await
+        .unwrap();
+    let inspected = husker_state::StateStore::open(&state_path).unwrap();
+    let lease = inspected.begin_host_resource_lease(&record.name).unwrap();
+    let disk = tmp.path().join("vms/replacement-owner/rootfs.ext4");
+    let before = std::fs::read(&disk).unwrap();
+    assert_eq!(
+        core.recover_host_resource_leases().await.unwrap().recovered,
+        0
+    );
+    assert_eq!(core.get_vm(&record.name).unwrap().id, record.id);
+    assert_eq!(std::fs::read(&disk).unwrap(), before);
+    assert_eq!(
+        inspected.list_host_resource_leases().unwrap()[0].id,
+        lease.id
+    );
+    assert_ne!(inspected.allocate_cid().unwrap(), lease.vsock_cid);
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
+async fn restart_preserves_entered_generic_lease_until_durable_destruction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_path = tmp.path().join("entered-state.db");
+    let store = husker_state::StateStore::open(&state_path).unwrap();
+    let lease = store.begin_host_resource_lease("entered-generic").unwrap();
+    let vm_id = Uuid::new_v4();
+    store
+        .enter_host_resource_lease_backend(lease.id, vm_id)
+        .unwrap();
+    let core = fresh_linux_core_with_state(tmp.path(), store, Arc::new(TestHostNetwork::default()));
+    let directory = tmp.path().join("vms/entered-generic");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("rootfs.ext4"), b"keep until proof").unwrap();
+    assert_eq!(
+        core.recover_host_resource_leases().await.unwrap().recovered,
+        0
+    );
+    assert_eq!(
+        std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+        b"keep until proof"
+    );
+    let inspected = husker_state::StateStore::open(&state_path).unwrap();
+    assert!(inspected.release_host_resource_lease(lease.id).is_err());
+    assert_ne!(inspected.allocate_cid().unwrap(), lease.vsock_cid);
+    // A receipt, rather than absence of the VM row, authorizes cleanup.
+    inspected
+        .record_host_resource_lease_destruction(lease.id, vm_id)
+        .unwrap();
+    assert_eq!(
+        core.recover_host_resource_leases().await.unwrap().recovered,
+        1
+    );
+    assert!(!directory.exists());
+    assert_eq!(inspected.allocate_cid().unwrap(), lease.vsock_cid);
 }
 
 #[cfg(feature = "linux-net")]
@@ -1920,29 +2071,32 @@ async fn reclaim_cleanup_failure_keeps_the_vm_resource_fields_for_retry() {
 
 #[cfg(not(feature = "linux-net"))]
 #[tokio::test]
-async fn create_failure_rolls_back_and_leaves_no_vm_record() {
-    // FailingVmm fails create AFTER the core has allocated resources (CID, vm_dir,
-    // vm_id). The AllocatedResources rollback must unwind them so no partial VM
-    // record is left behind.
+async fn create_failure_without_identity_preserves_disk_and_reports_pending_rollback() {
+    // The backend returns an error without an identity after allocation entry.
+    // A missing VM record cannot authorize destruction of its backing files.
     let tmp = tempfile::tempdir().unwrap();
     let (kernel, rootfs) = boot_fixture(tmp.path());
 
-    let core = fresh_core(tmp.path(), &["create"]);
+    let core = fresh_core(tmp.path(), &["create_without_identity"]);
     let err = core
         .create_vm(create_request("doomed", &kernel, &rootfs))
         .await
         .unwrap_err();
     assert!(
-        matches!(err, CoreError::Vmm(VmmError::ApiError(_))),
-        "expected the injected vmm create failure, got {err:?}"
+        matches!(err, CoreError::Io(_)),
+        "expected an unresolved rollback, got {err:?}"
     );
+    assert!(err.to_string().contains("injected create failure"));
+    assert!(err.to_string().contains("rollback remains pending"));
+    assert!(err.to_string().contains("not found"));
+    assert!(tmp.path().join("vms/doomed/rootfs.ext4").is_file());
     assert!(
         core.list_vms().unwrap().is_empty(),
-        "a failed create must roll back its VM record, not leak it"
+        "the backend never returned a VM to commit"
     );
     assert!(
         core.get_vm("doomed").is_err(),
-        "the rolled-back VM must not be looked up"
+        "a VM row must not be invented to hide the uncertain outcome"
     );
 }
 

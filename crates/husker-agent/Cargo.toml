@@ -1,6 +1,7 @@
 [package]
 name = "husker-agent"
 description = "Guest agent binary for husker microVMs"
+default-run = "husker-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +14,14 @@ path = "src/lib.rs"
 name = "husker-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "husker-job-runner"
+path = "src/job_runner_main.rs"
+
 [dependencies]
+sha2 = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
 husker-agent-proto = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -21,8 +29,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
+serde = { workspace = true }
 libc = "0.2"
 if-addrs = { workspace = true }
 

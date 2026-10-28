@@ -57,6 +57,7 @@ mod dto;
 mod errors;
 mod extract;
 mod handlers;
+mod jobs;
 mod router;
 mod sessions;
 
@@ -88,6 +89,9 @@ use std::sync::atomic::Ordering;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ApiPolicy {
+    /// Opt-in factory execution; retained evidence remains inspectable when disabled.
+    #[serde(default)]
+    pub factory_jobs_enabled: bool,
     pub max_request_bytes: usize,
     pub max_file_read_bytes: usize,
     pub max_file_write_bytes: usize,
@@ -113,6 +117,7 @@ pub struct ApiPolicy {
 impl Default for ApiPolicy {
     fn default() -> Self {
         Self {
+            factory_jobs_enabled: false,
             max_request_bytes: 2 * 1024 * 1024,
             max_file_read_bytes: 1024 * 1024,
             max_file_write_bytes: 1024 * 1024,
@@ -2269,6 +2274,10 @@ mod tests {
 
     #[test]
     fn rate_limited_route_classification() {
+        assert_eq!(
+            is_rate_limited_route(&Method::POST, "/v1/vms/vm/session-submissions"),
+            Some("exec")
+        );
         assert_eq!(
             is_rate_limited_route(&Method::POST, "/v1/vms/test/exec"),
             Some("exec")

@@ -1,6 +1,11 @@
 //! SQLite-backed persistent state store for VM records, CID allocation, port
 //! forwards, host groups, and services.
 
+mod boot_epoch;
+mod connection;
+mod durable;
+pub mod jobs;
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -15,7 +20,7 @@ pub use husker_types::{BackendKind, BootKind, ImageKind, NetworkMode, UserdataSt
 
 /// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
 /// every call site that used the old `MutexGuard<Connection>` is unchanged.
-type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
+type PooledConn = r2d2::PooledConnection<connection::StateManager>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -316,6 +321,10 @@ pub struct HostResourceLease {
     pub tap_device: Option<String>,
     pub guest_ip: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub vm_id: Option<Uuid>,
+    pub backend_entered: bool,
+    pub vm_destroyed: bool,
+    pub allocation_aborted: bool,
 }
 
 /// Persistent host group record.
@@ -439,7 +448,7 @@ pub struct VolumeRecord {
 /// while an in-memory store uses a single connection so its ephemeral database
 /// persists across checkouts.
 pub struct StateStore {
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: r2d2::Pool<connection::StateManager>,
 }
 
 /// Apply an idempotent `ALTER TABLE ... ADD COLUMN` migration.
@@ -784,6 +793,37 @@ const MIGRATIONS: &[(u32, &str)] = &[
              SELECT RAISE(ABORT, 'unknown VM boot kind');
          END;",
     ),
+    (16, jobs::SCHEMA),
+    (17, jobs::ARTIFACT_SCHEMA),
+    (18, jobs::OWNERSHIP_SCHEMA),
+    (19, jobs::DESTRUCTION_SCHEMA),
+    (20, jobs::ALLOCATION_ABORT_SCHEMA),
+    (21, "ALTER TABLE host_resource_leases ADD COLUMN vm_id TEXT;
+          ALTER TABLE host_resource_leases ADD COLUMN backend_entered INTEGER NOT NULL DEFAULT 1 CHECK(backend_entered IN (0,1));
+          ALTER TABLE host_resource_leases ADD COLUMN vm_destroyed INTEGER NOT NULL DEFAULT 0 CHECK(vm_destroyed IN (0,1));
+          CREATE TRIGGER creation_lease_identity_is_immutable
+          BEFORE UPDATE OF vm_id,backend_entered,vm_destroyed,vm_name,vsock_cid,tap_device,guest_ip ON host_resource_leases
+          WHEN (OLD.backend_entered=1 AND (NEW.vm_id IS NOT OLD.vm_id OR NEW.backend_entered<>1
+            OR NEW.vm_name IS NOT OLD.vm_name OR NEW.vsock_cid IS NOT OLD.vsock_cid
+            OR NEW.tap_device IS NOT OLD.tap_device OR NEW.guest_ip IS NOT OLD.guest_ip))
+            OR (OLD.vm_destroyed=1 AND NEW.vm_destroyed<>1)
+            OR (NEW.vm_destroyed=1 AND (NEW.backend_entered<>1 OR NEW.vm_id IS NULL))
+          BEGIN SELECT RAISE(ABORT, 'invalid creation lease identity transition'); END;
+          CREATE TRIGGER creation_lease_release_requires_proof
+          BEFORE DELETE ON host_resource_leases
+          WHEN OLD.backend_entered=1 AND OLD.vm_destroyed=0
+            AND NOT EXISTS(SELECT 1 FROM vms WHERE id=OLD.vm_id AND name=OLD.vm_name AND vsock_cid=OLD.vsock_cid)
+          BEGIN SELECT RAISE(ABORT, 'creation lease destruction is unconfirmed'); END;"),
+    (22, "ALTER TABLE host_resource_leases ADD COLUMN allocation_aborted INTEGER NOT NULL DEFAULT 0 CHECK(allocation_aborted IN (0,1));
+          CREATE TRIGGER creation_lease_planned_identity_is_immutable
+          BEFORE UPDATE OF vm_id,backend_entered,allocation_aborted,vm_name,vsock_cid,tap_device,guest_ip ON host_resource_leases
+          WHEN (OLD.vm_id IS NOT NULL AND NEW.vm_id IS NOT OLD.vm_id)
+            OR (OLD.allocation_aborted=1 AND (NEW.allocation_aborted<>1 OR NEW.backend_entered<>0
+                OR NEW.vm_name IS NOT OLD.vm_name OR NEW.vsock_cid IS NOT OLD.vsock_cid
+                OR NEW.tap_device IS NOT OLD.tap_device OR NEW.guest_ip IS NOT OLD.guest_ip))
+            OR (NEW.allocation_aborted=1 AND (NEW.backend_entered<>0 OR NEW.vm_id IS NULL))
+          BEGIN SELECT RAISE(ABORT, 'invalid planned creation lease transition'); END;"),
+    (23, boot_epoch::SCHEMA),
 ];
 
 /// The newest schema version this build knows: the last migration's number.
@@ -976,12 +1016,8 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// timeout lets a writer wait for the write lock instead of failing under
 /// contention. foreign_keys is enforced per-connection.
 ///
-/// synchronous=NORMAL fsyncs the WAL at checkpoints instead of on every
-/// commit. Every state call runs on a tokio worker, so a per-commit fsync
-/// stalls the executor for the disk's flush latency. In WAL mode the database
-/// stays consistent across any crash under NORMAL; only a power loss or kernel
-/// panic can roll back the newest commits, which the daemon tolerates because
-/// no VM survives the host and every VM row is reconciled at startup.
+/// Ordinary state writes use NORMAL synchronization. Ownership and job receipts
+/// borrow a FULL connection with `lock_durable`, restoring NORMAL on return.
 fn init_connection(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(LOCK_WAIT)?;
     conn.execute_batch(
@@ -1032,9 +1068,10 @@ impl StateStore {
             // SQLite connections are local and don't go stale like a network DB,
             // so skip the per-checkout test query.
             .test_on_check_out(false)
-            .build(manager)?;
+            .build(connection::StateManager(manager))?;
         let store = Self { pool };
         store.migrate()?;
+        store.observe_legacy_lease_boots()?;
         Ok(store)
     }
 
@@ -1051,14 +1088,19 @@ impl StateStore {
         let pool = r2d2::Pool::builder()
             .max_size(1)
             .test_on_check_out(false)
-            .build(manager)?;
+            .build(connection::StateManager(manager))?;
         let store = Self { pool };
         store.migrate()?;
+        store.observe_legacy_lease_boots()?;
         Ok(store)
     }
 
     fn lock(&self) -> Result<PooledConn, StateError> {
         Ok(self.pool.get()?)
+    }
+
+    fn lock_durable(&self) -> Result<durable::DurableConn, StateError> {
+        durable::DurableConn::new(self.lock()?)
     }
 
     fn migrate(&self) -> Result<(), StateError> {
@@ -2391,7 +2433,25 @@ impl StateStore {
         &self,
         vm_name: &str,
     ) -> Result<HostResourceLease, StateError> {
-        let mut conn = self.lock()?;
+        self.begin_host_resource_lease_inner(vm_name, None)
+    }
+
+    /// Reserve the planned generation atomically with its CID, before storage
+    /// work. Entering the backend later cannot change this identity.
+    pub fn begin_host_resource_lease_for_vm(
+        &self,
+        vm_name: &str,
+        vm_id: Uuid,
+    ) -> Result<HostResourceLease, StateError> {
+        self.begin_host_resource_lease_inner(vm_name, Some(vm_id))
+    }
+
+    fn begin_host_resource_lease_inner(
+        &self,
+        vm_name: &str,
+        vm_id: Option<Uuid>,
+    ) -> Result<HostResourceLease, StateError> {
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let freed: Option<u32> = tx
@@ -2424,16 +2484,21 @@ impl StateStore {
             tap_device: None,
             guest_ip: None,
             created_at: Utc::now(),
+            vm_id,
+            backend_entered: false,
+            vm_destroyed: false,
+            allocation_aborted: false,
         };
         let inserted = tx.execute(
             "INSERT INTO host_resource_leases
-                (id, vm_name, vsock_cid, tap_device, guest_ip, created_at)
-             VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+                (id, vm_name, vsock_cid, tap_device, guest_ip, created_at, backend_entered, vm_id)
+             VALUES (?1, ?2, ?3, NULL, NULL, ?4, 0, ?5)",
             params![
                 lease.id.to_string(),
                 lease.vm_name,
                 lease.vsock_cid,
                 lease.created_at.to_rfc3339(),
+                lease.vm_id.map(|id| id.to_string()),
             ],
         );
         if let Err(error) = inserted {
@@ -2449,6 +2514,7 @@ impl StateStore {
                 other => StateError::Database(other),
             });
         }
+        boot_epoch::observe_on(&tx, lease.id)?;
         tx.commit()?;
         debug!(
             cid = lease.vsock_cid,
@@ -2462,7 +2528,7 @@ impl StateStore {
     pub fn list_host_resource_leases(&self) -> Result<Vec<HostResourceLease>, StateError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, vm_name, vsock_cid, tap_device, guest_ip, created_at
+            "SELECT id, vm_name, vsock_cid, tap_device, guest_ip, created_at, vm_id, backend_entered, vm_destroyed, allocation_aborted
              FROM host_resource_leases ORDER BY created_at, id",
         )?;
         let leases = stmt
@@ -2476,10 +2542,67 @@ impl StateStore {
                     tap_device: row.get(3)?,
                     guest_ip: row.get(4)?,
                     created_at: parse_datetime(&created_at)?,
+                    vm_id: row
+                        .get::<_, Option<String>>(6)?
+                        .map(|id| parse_uuid(&id))
+                        .transpose()?,
+                    backend_entered: row.get(7)?,
+                    vm_destroyed: row.get(8)?,
+                    allocation_aborted: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(leases)
+    }
+
+    pub fn get_host_resource_lease(&self, id: Uuid) -> Result<HostResourceLease, StateError> {
+        let conn = self.lock()?;
+        conn.query_row("SELECT id, vm_name, vsock_cid, tap_device, guest_ip, created_at, vm_id, backend_entered, vm_destroyed, allocation_aborted FROM host_resource_leases WHERE id=?1",
+            [id.to_string()], |row| Ok(HostResourceLease {
+                id: parse_uuid(&row.get::<_, String>(0)?)?,
+                vm_name: row.get(1)?, vsock_cid: row.get(2)?,
+                tap_device: row.get(3)?, guest_ip: row.get(4)?,
+                created_at: parse_datetime(&row.get::<_, String>(5)?)?,
+                vm_id: row.get::<_, Option<String>>(6)?.map(|id| parse_uuid(&id)).transpose()?,
+                backend_entered: row.get(7)?, vm_destroyed: row.get(8)?, allocation_aborted: row.get(9)?,
+            })).optional()?.ok_or(StateError::HostResourceLeaseNotFound(id))
+    }
+
+    /// Commit the exact backend identity before entering allocation. An already
+    /// entered or legacy uncertain lease cannot authorize a new attempt.
+    pub fn enter_host_resource_lease_backend(
+        &self,
+        id: Uuid,
+        vm_id: Uuid,
+    ) -> Result<(), StateError> {
+        let mut conn = self.lock_durable()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM host_resource_leases WHERE id=?1 AND backend_entered=0 AND (vm_id IS NULL OR vm_id=?2) AND vm_destroyed=0 AND allocation_aborted=0)",
+            params![id.to_string(),vm_id.to_string()], |row| row.get(0))?;
+        if !eligible || vm_id.is_nil() {
+            return Err(StateError::HostResourceLeaseMismatch(id));
+        }
+        boot_epoch::prepare_entry_on(&tx, id, boot_epoch::current())?;
+        if tx.execute("UPDATE host_resource_leases SET vm_id=?2,backend_entered=1 WHERE id=?1 AND backend_entered=0 AND (vm_id IS NULL OR vm_id=?2) AND vm_destroyed=0 AND allocation_aborted=0",
+            params![id.to_string(), vm_id.to_string()])? != 1 {
+            return Err(StateError::HostResourceLeaseMismatch(id));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist positive backend destruction before storage or identity cleanup.
+    pub fn record_host_resource_lease_destruction(
+        &self,
+        id: Uuid,
+        vm_id: Uuid,
+    ) -> Result<(), StateError> {
+        let conn = self.lock_durable()?;
+        if conn.execute("UPDATE host_resource_leases SET vm_destroyed=1 WHERE id=?1 AND vm_id=?2 AND backend_entered=1",
+            params![id.to_string(), vm_id.to_string()])? != 1 {
+            return Err(StateError::HostResourceLeaseMismatch(id));
+        }
+        Ok(())
     }
 
     /// Persist the network identity a lease will create before touching the
@@ -2490,7 +2613,7 @@ impl StateStore {
         tap_device: Option<&str>,
         guest_ip: Option<&str>,
     ) -> Result<(), StateError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         let updated = conn.execute(
             "UPDATE host_resource_leases SET tap_device = ?2, guest_ip = ?3 WHERE id = ?1",
             params![id.to_string(), tap_device, guest_ip],
@@ -2523,11 +2646,11 @@ impl StateStore {
         if expiration.is_some_and(|value| value.vm_id != record.id) {
             return Err(StateError::VmExpirationMismatch(record.id));
         }
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let lease = tx
             .query_row(
-                "SELECT id, vm_name, vsock_cid, tap_device, guest_ip, created_at
+                "SELECT id, vm_name, vsock_cid, tap_device, guest_ip, created_at, vm_id, backend_entered, vm_destroyed, allocation_aborted
                  FROM host_resource_leases WHERE id = ?1",
                 params![lease_id.to_string()],
                 |row| {
@@ -2540,12 +2663,17 @@ impl StateStore {
                         tap_device: row.get(3)?,
                         guest_ip: row.get(4)?,
                         created_at: parse_datetime(&created_at)?,
+                        vm_id: row.get::<_, Option<String>>(6)?.map(|id| parse_uuid(&id)).transpose()?,
+                        backend_entered: row.get(7)?, vm_destroyed: row.get(8)?, allocation_aborted: row.get(9)?,
                     })
                 },
             )
             .optional()?
             .ok_or(StateError::HostResourceLeaseNotFound(lease_id))?;
-        if lease.vm_name != record.name
+        if !lease.backend_entered
+            || lease.vm_destroyed
+            || lease.vm_id != Some(record.id)
+            || lease.vm_name != record.name
             || lease.vsock_cid != record.vsock_cid
             || lease.tap_device != record.tap_device
             || lease.guest_ip != record.guest_ip
@@ -2567,16 +2695,19 @@ impl StateStore {
 
     /// Release a creation lease and return its CID to the allocator atomically.
     pub fn release_host_resource_lease(&self, id: Uuid) -> Result<(), StateError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let cid: Option<u32> = tx
+        let ownership: Option<(u32, bool, bool)> = tx
             .query_row(
-                "SELECT vsock_cid FROM host_resource_leases WHERE id = ?1",
+                "SELECT vsock_cid,backend_entered,vm_destroyed FROM host_resource_leases WHERE id = ?1",
                 params![id.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some(cid) = cid {
+        if let Some((cid, entered, destroyed)) = ownership {
+            if entered && !destroyed && !boot_epoch::confirmed_on(&tx, id)? {
+                return Err(StateError::HostResourceLeaseMismatch(id));
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO freed_cids (cid) VALUES (?1)",
                 params![cid],
@@ -3746,10 +3877,7 @@ mod tests {
             let synchronous: i64 = conn
                 .query_row("PRAGMA synchronous", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(
-                synchronous, 1,
-                "synchronous must be NORMAL (1), not FULL (2)"
-            );
+            assert_eq!(synchronous, 1, "ordinary connections must use NORMAL (1)");
         }
     }
 
@@ -3923,6 +4051,76 @@ mod tests {
     }
 
     #[test]
+    fn entered_creation_lease_keeps_its_generation_and_cid_until_durable_destruction() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lease.db");
+        let store = StateStore::open(&path).unwrap();
+        let lease = store.begin_host_resource_lease("entered").unwrap();
+        let vm_id = Uuid::new_v4();
+        store
+            .enter_host_resource_lease_backend(lease.id, vm_id)
+            .unwrap();
+        assert!(
+            store
+                .enter_host_resource_lease_backend(lease.id, vm_id)
+                .is_err()
+        );
+        assert!(
+            store
+                .record_host_resource_lease_destruction(lease.id, Uuid::new_v4())
+                .is_err()
+        );
+        assert!(store.release_host_resource_lease(lease.id).is_err());
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        let retained = store.list_host_resource_leases().unwrap().remove(0);
+        assert_eq!(retained.vm_id, Some(vm_id));
+        assert!(retained.backend_entered && !retained.vm_destroyed);
+        assert_ne!(store.allocate_cid().unwrap(), lease.vsock_cid);
+        store
+            .record_host_resource_lease_destruction(lease.id, vm_id)
+            .unwrap();
+        store
+            .record_host_resource_lease_destruction(lease.id, vm_id)
+            .unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert!(store.list_host_resource_leases().unwrap()[0].vm_destroyed);
+        store.release_host_resource_lease(lease.id).unwrap();
+        assert_eq!(store.allocate_cid().unwrap(), lease.vsock_cid);
+    }
+
+    #[test]
+    fn migration_21_preserves_legacy_creation_leases_as_uncertain() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.db");
+        drop(StateStore::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER creation_lease_release_requires_proof;
+        DROP TRIGGER creation_lease_cannot_reenter_after_reboot;
+        DROP TABLE creation_lease_boot_epochs;
+        DROP TRIGGER creation_lease_planned_identity_is_immutable;
+            ALTER TABLE host_resource_leases DROP COLUMN allocation_aborted;
+            DROP TRIGGER creation_lease_identity_is_immutable;
+            ALTER TABLE host_resource_leases DROP COLUMN vm_destroyed;
+            ALTER TABLE host_resource_leases DROP COLUMN backend_entered;
+            ALTER TABLE host_resource_leases DROP COLUMN vm_id;
+            INSERT INTO host_resource_leases VALUES ('00000000-0000-0000-0000-000000000001','legacy',3,NULL,NULL,'2026-10-07T00:00:00Z');
+            PRAGMA user_version=20;").unwrap();
+        drop(conn);
+        let store = StateStore::open(&path).unwrap();
+        let lease = store.list_host_resource_leases().unwrap().remove(0);
+        assert!(lease.backend_entered && !lease.vm_destroyed);
+        assert_eq!(lease.vm_id, None);
+        assert!(store.release_host_resource_lease(lease.id).is_err());
+        assert!(
+            store
+                .enter_host_resource_lease_backend(lease.id, Uuid::new_v4())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn committing_a_vm_atomically_transfers_its_host_resource_lease() {
         let store = StateStore::open_memory().unwrap();
         let lease = store.begin_host_resource_lease("committed-vm").unwrap();
@@ -3934,6 +4132,9 @@ mod tests {
         vm.tap_device = Some("husker3".into());
         vm.guest_ip = Some("172.20.0.2".into());
 
+        store
+            .enter_host_resource_lease_backend(lease.id, vm.id)
+            .unwrap();
         store
             .commit_vm_from_host_resource_lease(&vm, lease.id)
             .unwrap();
@@ -6357,5 +6558,278 @@ mod tests {
             version, 2,
             "a failed migration does not advance the version"
         );
+    }
+}
+
+#[cfg(test)]
+mod job_database_durability_tests {
+    use super::*;
+
+    /// Limit every already-open connection in this disposable file-backed pool.
+    /// SQLite's pager, not an injected SQL trigger, must return SQLITE_FULL.
+    fn page_limit(store: &StateStore, limit: u32) {
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let connection = store.lock().unwrap();
+            let actual: u32 = connection
+                .query_row(&format!("PRAGMA max_page_count={limit}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(actual, limit);
+            held.push(connection);
+        }
+    }
+
+    fn assert_sqlite_full(error: jobs::JournalError) {
+        let jobs::JournalError::Database(rusqlite::Error::SqliteFailure(code, _)) = error else {
+            panic!("expected the pager's SQLITE_FULL, received {error:?}");
+        };
+        assert_eq!(code.code, rusqlite::ErrorCode::DiskFull);
+        assert_eq!(code.extended_code, 13);
+    }
+
+    #[test]
+    fn database_full_preserves_factory_receipts_and_retries_after_capacity_repair() {
+        use jobs::{CollectionState, JobEvent, JobState};
+        use sha2::{Digest, Sha256};
+        for page_size in [512, 4096] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("full.sqlite");
+            // Seed a legal page size before opening the actual production pool.
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch(&format!("PRAGMA page_size={page_size}; VACUUM;"))
+                .unwrap();
+            drop(seed);
+            let store = StateStore::open(&path).unwrap();
+            let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+            let retention = deadline + chrono::Duration::hours(1);
+            let (job, fresh) = store
+                .accept_job("owned", "{}", deadline, retention)
+                .unwrap();
+            assert!(fresh);
+            let name = store.claim_job_vm(job.id).unwrap().vm_name.unwrap();
+            let vm_id = Uuid::new_v4();
+            store.bind_job_vm(job.id, vm_id, &name).unwrap();
+            let lease = store
+                .begin_host_resource_lease_for_vm(&name, vm_id)
+                .unwrap();
+            store
+                .enter_host_resource_lease_backend(lease.id, vm_id)
+                .unwrap();
+            let lease = store.get_host_resource_lease(lease.id).unwrap();
+            store.mark_job_running(job.id).unwrap();
+            store
+                .append_job_events(
+                    job.id,
+                    &[JobEvent {
+                        sequence: 1,
+                        stream: "stdout".into(),
+                        data: b"committed prefix".to_vec(),
+                    }],
+                    false,
+                )
+                .unwrap();
+            let staged = r#"{"receipt":"committed guest"}"#;
+            store.stage_job_manifest(job.id, staged).unwrap();
+            let original_artifact = b"committed artifact";
+            let original_digest =
+                format!("sha256:{}", hex::encode(Sha256::digest(original_artifact)));
+            store
+                .retain_job_artifact(
+                    job.id,
+                    0,
+                    "results/original",
+                    &original_digest,
+                    original_artifact,
+                )
+                .unwrap();
+            let stage_job = store
+                .accept_job("stage-owner", "{}", deadline, retention)
+                .unwrap()
+                .0;
+            let stage_name = store.claim_job_vm(stage_job.id).unwrap().vm_name.unwrap();
+            store
+                .bind_job_vm(stage_job.id, Uuid::new_v4(), &stage_name)
+                .unwrap();
+            store.mark_job_running(stage_job.id).unwrap();
+            let pages: u32 = {
+                let connection = store.lock().unwrap();
+                assert_eq!(
+                    connection
+                        .query_row("PRAGMA page_size", [], |row| row.get::<_, u32>(0))
+                        .unwrap(),
+                    page_size
+                );
+                connection
+                    .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+                    .unwrap();
+                assert_eq!(
+                    connection
+                        .query_row("PRAGMA freelist_count", [], |row| row.get::<_, u32>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    connection
+                        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "wal"
+                );
+                connection
+                    .query_row("PRAGMA page_count", [], |row| row.get(0))
+                    .unwrap()
+            };
+            page_limit(&store, pages);
+            let before = store.get_job(job.id).unwrap();
+            let large = serde_json::json!({"payload": "x".repeat(60_000)}).to_string();
+            assert_sqlite_full(
+                store
+                    .accept_job("failed-acceptance", &large, deadline, retention)
+                    .unwrap_err(),
+            );
+            assert!(matches!(
+                store.find_job_submission(
+                    "failed-acceptance",
+                    &format!("sha256:{}", hex::encode(Sha256::digest(large.as_bytes())))
+                ),
+                Err(jobs::JournalError::SubmissionNotFound)
+            ));
+            let replay = store
+                .accept_job("owned", "{}", deadline, retention)
+                .unwrap();
+            assert!(!replay.1);
+            assert_eq!(replay.0.id, job.id);
+            assert_sqlite_full(store.stage_job_manifest(stage_job.id, &large).unwrap_err());
+            assert!(store.get_job(stage_job.id).unwrap().manifest.is_none());
+            assert_sqlite_full(
+                store
+                    .append_job_events(
+                        job.id,
+                        &[
+                            JobEvent {
+                                sequence: 2,
+                                stream: "stdout".into(),
+                                data: b"must roll back with batch".to_vec(),
+                            },
+                            JobEvent {
+                                sequence: 3,
+                                stream: "stderr".into(),
+                                data: vec![b'x'; jobs::MAX_EVENT_BYTES],
+                            },
+                        ],
+                        false,
+                    )
+                    .unwrap_err(),
+            );
+            let bytes = vec![b'x'; 60_000];
+            let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+            assert_sqlite_full(
+                store
+                    .retain_job_artifact(job.id, 1, "results/next", &digest, &bytes)
+                    .unwrap_err(),
+            );
+            let failure = serde_json::json!({"host_error": "x".repeat(
+            if page_size == 512 { 512 } else { 32_000 })})
+            .to_string();
+            assert_sqlite_full(
+                store
+                    .finish_job_failure(job.id, JobState::Unknown, &failure)
+                    .unwrap_err(),
+            );
+            let after = store.get_job(job.id).unwrap();
+            assert_eq!(after.state, JobState::Running);
+            assert_eq!(after.collection, CollectionState::Pending);
+            assert_eq!(after.manifest, before.manifest);
+            assert_eq!(after.capture_cursor, before.capture_cursor);
+            assert_eq!(after.retained_bytes, before.retained_bytes);
+            assert_eq!(after.vm_id, Some(vm_id));
+            assert!(after.cleanup_pending && !after.vm_destroyed && !after.vm_allocation_aborted);
+            assert_eq!(store.get_host_resource_lease(lease.id).unwrap(), lease);
+            assert_eq!(store.job_events(job.id, 0).unwrap().events.len(), 1);
+            assert_eq!(
+                store.job_events(job.id, 0).unwrap().events[0].data,
+                b"committed prefix"
+            );
+            assert_eq!(store.job_artifacts(job.id).unwrap().len(), 1);
+            assert_eq!(store.job_artifact(job.id, 0).unwrap(), original_artifact);
+            assert!(store.job_artifact(job.id, 1).is_err());
+            // All pooled connections must remain outside any abandoned transaction.
+            let mut held = Vec::new();
+            for _ in 0..8 {
+                let connection = store.lock().unwrap();
+                assert!(connection.is_autocommit());
+                held.push(connection);
+            }
+            drop(held);
+            // One MiB of extra private database capacity, independent of page size.
+            page_limit(&store, pages + 1024 * 1024 / page_size);
+            let accepted = store
+                .accept_job("failed-acceptance", &large, deadline, retention)
+                .unwrap();
+            assert!(accepted.1);
+            store.stage_job_manifest(stage_job.id, &large).unwrap();
+            store
+                .append_job_events(
+                    job.id,
+                    &[JobEvent {
+                        sequence: 2,
+                        stream: "stdout".into(),
+                        data: b"after repair".to_vec(),
+                    }],
+                    false,
+                )
+                .unwrap();
+            store
+                .retain_job_artifact(job.id, 1, "results/next", &digest, &bytes)
+                .unwrap();
+            let sealed = store
+                .finish_job_failure(job.id, JobState::Unknown, &failure)
+                .unwrap();
+            assert_eq!(sealed.collection, CollectionState::Failed);
+            let manifest: serde_json::Value =
+                serde_json::from_str(sealed.manifest.as_deref().unwrap()).unwrap();
+            assert_eq!(manifest["guest_result"]["receipt"], "committed guest");
+            let replay = store
+                .accept_job("owned", "{}", deadline, retention)
+                .unwrap();
+            assert_eq!(replay.0.state, JobState::Unknown);
+            assert!(!replay.1);
+            drop(store);
+            let reopened = StateStore::open(&path).unwrap();
+            assert_eq!(reopened.get_job(job.id).unwrap().manifest, sealed.manifest);
+            assert_eq!(reopened.get_job(job.id).unwrap().state, JobState::Unknown);
+            assert_eq!(reopened.job_events(job.id, 0).unwrap().events.len(), 2);
+            assert_eq!(reopened.job_artifact(job.id, 1).unwrap(), bytes);
+            assert_eq!(reopened.get_host_resource_lease(lease.id).unwrap(), lease);
+            assert!(reopened.get_job(job.id).unwrap().cleanup_pending);
+            let connection = reopened.lock().unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            // This fault is bounded to the private database; it does not fill a host
+            // filesystem or exercise a live VM, physical WAL quota or orphan cleanup.
+        }
+    }
+
+    #[test]
+    fn durable_receipts_use_full_synchronous_on_every_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&temp.path().join("durable.sqlite")).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let connection = store.lock_durable().unwrap();
+            let synchronous: u32 = connection
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                synchronous, 2,
+                "each connection must use SQLite FULL durability"
+            );
+            held.push(connection);
+        }
     }
 }

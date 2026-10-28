@@ -77,7 +77,7 @@ pub(crate) async fn wait_for_process_exit_or_kill<I>(
     id: Uuid,
     grace: Duration,
     hypervisor: &str,
-    process: impl Fn(&mut I) -> &mut tokio::process::Child,
+    process: impl Fn(&mut I) -> Option<&mut tokio::process::Child>,
 ) -> Result<GuestExit, VmmError> {
     let process = &process;
     wait_for_guest_exit(
@@ -85,7 +85,10 @@ pub(crate) async fn wait_for_process_exit_or_kill<I>(
         || async move {
             let mut instances = instances.lock().await;
             match instances.get_mut(&id) {
-                Some(instance) => probe_process(process(instance), hypervisor).await,
+                Some(instance) => {
+                    let process = process(instance).ok_or_else(|| VmmError::ProcessError(format!("{hypervisor} allocation has no confirmed child handle")))?;
+                    probe_process(process, hypervisor).await
+                },
                 None => Ok(Some(GuestExit::Gone)),
             }
         },
@@ -93,7 +96,7 @@ pub(crate) async fn wait_for_process_exit_or_kill<I>(
             let mut instances = instances.lock().await;
             match instances.get_mut(&id) {
                 Some(instance) => {
-                    process(instance).kill().await.map_err(|error| {
+                    process(instance).ok_or_else(|| VmmError::ProcessError(format!("{hypervisor} allocation has no confirmed child handle")))?.kill().await.map_err(|error| {
                         VmmError::ProcessError(format!(
                             "{hypervisor} did not exit within {}s and force kill failed: {error}",
                             grace.as_secs_f64()

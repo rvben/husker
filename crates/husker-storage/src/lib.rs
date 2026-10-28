@@ -35,6 +35,32 @@ pub enum StorageError {
 
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Read-only available bytes for this account on an opened directory's
+/// filesystem. This is neither a quota nor a reservation against other writers.
+#[cfg(unix)]
+pub fn available_directory_bytes(path: &Path) -> Result<u64, StorageError> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "storage path is not a directory",
+        )
+        .into());
+    }
+    let mut statistics = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // Safety: valid owned fd and writable statvfs buffer, initialized on success.
+    if unsafe { libc::fstatvfs(directory.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let statistics = unsafe { statistics.assume_init() };
+    u64::try_from(u128::from(statistics.f_bavail) * u128::from(statistics.f_frsize))
+        .map_err(|_| std::io::Error::other("available storage byte count overflow").into())
+}
+
 /// Everything needed to turn a catalog rootfs into a bootable private VM disk.
 #[derive(Debug, Clone, Copy)]
 pub struct RootDiskRequest<'a> {
@@ -42,7 +68,7 @@ pub struct RootDiskRequest<'a> {
     pub destination: &'a Path,
     pub size_bytes: Option<u64>,
     /// Empty when this daemon build has no embedded agent. In that case the
-    /// cloned image is left unchanged.
+    /// cloned image contents are left unchanged; the private disk is writable.
     pub guest_agent: &'a [u8],
 }
 
@@ -92,9 +118,23 @@ pub trait StorageDriver: Send + Sync {
         request: RootDiskRequest<'a>,
     ) -> StorageFuture<'a, Result<Option<AgentRefresh>, StorageError>> {
         Box::pin(async move {
+            match std::fs::symlink_metadata(request.destination) {
+                Ok(_) => {
+                    return Err(StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "private root disk destination must be new",
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
             self.clone_rootfs(request.source, request.destination)
                 .await?;
             let prepared = async {
+                // A prepared image is sealed read-only. Cloning retains its
+                // permissions, but only the fresh VM disk must be writable.
+                // Do not change generic clone/export behavior or the source.
+                make_private_root_disk_writable(request.source, request.destination)?;
                 if let Some(size) = request.size_bytes {
                     grow_rootfs_ext4(request.destination, size).await?;
                 }
@@ -209,6 +249,38 @@ impl StorageDriver for LocalStorageDriver {
 
 pub fn default_storage_driver() -> Arc<dyn StorageDriver> {
     Arc::new(LocalStorageDriver)
+}
+
+#[cfg(unix)]
+fn make_private_root_disk_writable(source: &Path, path: &Path) -> Result<(), StorageError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let source_metadata = std::fs::metadata(source)?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || (metadata.dev(), metadata.ino()) == (source_metadata.dev(), source_metadata.ino())
+    {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private root disk must be an owned regular file with one link",
+        )));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_private_root_disk_writable(_source: &Path, _path: &Path) -> Result<(), StorageError> {
+    Err(StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private writable root disks require Unix permissions",
+    )))
 }
 
 /// Manages rootfs images and kernel files.
@@ -1370,6 +1442,47 @@ pub fn validate_volume(path: &Path) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn available_storage_observation_requires_an_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(available_directory_bytes(temp.path()).is_ok());
+        let missing = temp.path().join("missing");
+        assert!(available_directory_bytes(&missing).is_err());
+        assert!(!missing.exists());
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"unchanged").unwrap();
+        assert!(available_directory_bytes(&file).is_err());
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+        assert!(available_directory_bytes(&link).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_disk_preparation_rejects_source_alias_hardlink_symlink_and_fifo() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("sealed");
+        std::fs::write(&source, b"sealed").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(make_private_root_disk_writable(&source, &source).is_err());
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(make_private_root_disk_writable(&source, &link).is_err());
+        let hardlink = temp.path().join("hardlink");
+        std::fs::hard_link(&source, &hardlink).unwrap();
+        assert!(make_private_root_disk_writable(&source, &hardlink).is_err());
+        let fifo = temp.path().join("fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(make_private_root_disk_writable(&source, &fifo).is_err());
+        assert_eq!(std::fs::metadata(&source).unwrap().mode() & 0o777, 0o400);
+        assert_eq!(std::fs::read(&source).unwrap(), b"sealed");
+    }
 
     #[test]
     fn validate_kernel_missing_file() {

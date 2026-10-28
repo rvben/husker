@@ -360,15 +360,52 @@ pub(crate) fn remove_orphan_runtime_files(
     removed
 }
 
+/// Keep interrupted creation addresses reserved before new work can allocate.
+/// A lease address outside the selected subnet must be reconciled explicitly;
+/// silently skipping it would discard durable ownership.
+#[cfg(feature = "linux-net")]
+fn reserve_creation_lease_addresses(
+    state: &husker_state::StateStore,
+    allocator: &husker_net::IpAllocator,
+) -> Result<usize> {
+    let leases = state
+        .list_host_resource_leases()
+        .context("reading creation lease IP ownership")?;
+    let mut owned_addresses: std::collections::HashSet<std::net::Ipv4Addr> = state
+        .list_vms()
+        .context("reading VM IP ownership before lease reservation")?
+        .into_iter()
+        .filter_map(|vm| vm.guest_ip.and_then(|address| address.parse().ok()))
+        .collect();
+    let mut reserved = 0;
+    for lease in leases {
+        if let Some(address) = lease.guest_ip {
+            let address = address
+                .parse::<std::net::Ipv4Addr>()
+                .context("creation lease has an invalid guest IP")?;
+            if !owned_addresses.insert(address) {
+                anyhow::bail!(
+                    "creation lease address has another durable owner; reconciliation required"
+                );
+            }
+            allocator
+                .reserve(address)
+                .context("creation lease address cannot be reserved in the configured subnet")?;
+            reserved += 1;
+        }
+    }
+    Ok(reserved)
+}
+
 /// Reconcile host resources against DB state on startup: reclaim the TAP devices
 /// and API/vsock sockets of VMs that are no longer running, remove orphaned
 /// rootfs clone directories, and remove runtime files of VMs that no longer
 /// have a record. Scoped to this daemon's own state and data dir, so a
 /// co-located daemon's resources are never touched.
 ///
-/// Runs after `mark_stale_vms_stopped`, so at this point nothing this daemon
-/// manages is running. Suspended VMs are skipped: they intentionally preserve
-/// their TAP, IP, and rootfs so `resume` can restore the same identity in place.
+/// Runs after `mark_stale_vms_stopped`. A stopped record is not destruction
+/// proof for factory jobs or interrupted creations; their ownership is preserved
+/// for explicit recovery. Suspended VMs keep their TAP, IP, and rootfs for resume.
 async fn reconcile_host_resources(
     state: &husker_state::StateStore,
     storage: &husker_storage::StorageConfig,
@@ -382,14 +419,44 @@ async fn reconcile_host_resources(
             return;
         }
     };
-    let known_names: std::collections::HashSet<&str> =
-        vms.iter().map(|v| v.name.as_str()).collect();
-    let known_ids: std::collections::HashSet<uuid::Uuid> = vms.iter().map(|v| v.id).collect();
+    let leases = match state.list_host_resource_leases() {
+        Ok(leases) => leases,
+        Err(error) => {
+            tracing::warn!(%error, "host reconcile: preserving files because creation ownership cannot be read");
+            return;
+        }
+    };
+    let jobs = match state.recoverable_jobs() {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::warn!(%error, "host reconcile: preserving files because factory ownership cannot be read");
+            return;
+        }
+    };
+    let known_names: std::collections::HashSet<&str> = vms
+        .iter()
+        .map(|v| v.name.as_str())
+        .chain(leases.iter().map(|lease| lease.vm_name.as_str()))
+        .chain(jobs.iter().filter_map(|job| job.vm_name.as_deref()))
+        .collect();
+    let factory_generations: std::collections::HashSet<_> =
+        jobs.iter().filter_map(|job| job.vm_id).collect();
+    let known_ids: std::collections::HashSet<uuid::Uuid> = vms
+        .iter()
+        .map(|v| v.id)
+        .chain(leases.iter().filter_map(|lease| lease.vm_id))
+        .chain(factory_generations.iter().copied())
+        .collect();
 
     #[cfg(feature = "linux-net")]
     let mut taps = 0usize;
     let mut socks = 0usize;
     for vm in &vms {
+        // Generic stale-resource cleanup is not a factory destruction receipt.
+        // Its exact-generation worker must confirm destruction first.
+        if factory_generations.contains(&vm.id) {
+            continue;
+        }
         // Suspended VMs keep their TAP/sockets/rootfs for resume; leave them.
         if vm.state == husker_core::VmLifecycleState::Suspended {
             continue;
@@ -438,6 +505,18 @@ pub(crate) async fn start_daemon(
     auth: DaemonAuth,
 ) -> Result<()> {
     tracing::info!("starting husker daemon");
+    if let Some(worker) = &config.apple_vz_worker {
+        worker.validate()?;
+        #[cfg(not(all(not(feature = "linux-net"), target_os = "macos")))]
+        anyhow::bail!(
+            "apple_vz_worker requires macOS with linux-net disabled; refusing backend fallback"
+        );
+    }
+    if let Some(budget) = &config.factory_resource_budget {
+        budget.validate().context("factory resource budget")?;
+    } else if config.factory_jobs_enabled {
+        anyhow::bail!("factory_jobs_enabled requires an explicit factory_resource_budget");
+    }
 
     // Resolve firecracker_bin to an absolute path before handing it to the
     // VMM backend. Auto-installed Firecracker lands at `{data_dir}/bin/firecracker`
@@ -460,6 +539,28 @@ pub(crate) async fn start_daemon(
         data_dir: config.data_dir.clone(),
         state_dir: config.effective_state_dir(),
     };
+
+    // Pin and validate routing before creating state/runtime directories. This
+    // only reads the reviewed executable; it launches no child or native VM.
+    #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
+    let vz_worker_backend = config
+        .apple_vz_worker
+        .as_ref()
+        .map(|worker| {
+            let executable = husker_vmm::vz_worker_owner::WorkerExecutable::new(
+                worker.executable.clone(),
+                worker.validate()?,
+            )?;
+            let backend = husker_vmm::apple_vz_worker::AppleVzWorkerBackend::new(
+                storage.runtime_dir(),
+                executable.clone(),
+                worker.lifetime_secs,
+            )?;
+            executable.verify_virtualization_entitlement()?;
+            Ok::<_, anyhow::Error>(backend)
+        })
+        .transpose()
+        .context("preparing apple_vz_worker backend")?;
 
     // Mount guard: when data_dir is a dedicated storage mount, refuse to start
     // (and create nothing under it) until the loopback is actually mounted.
@@ -569,6 +670,14 @@ pub(crate) async fn start_daemon(
             }
         }
 
+        let leased_addresses = reserve_creation_lease_addresses(&state, &ip_allocator)?;
+        if leased_addresses > 0 {
+            tracing::info!(
+                leased_addresses,
+                "seeded IP allocator from interrupted creations"
+            );
+        }
+
         // Clean up any stale bridge from a previous run
         let _ = host_network.delete_bridge(&config.bridge_name).await;
 
@@ -654,6 +763,7 @@ pub(crate) async fn start_daemon(
                     .with_embedded_agent(husker::EMBEDDED_AGENT)
                     .with_storage_volume(config.storage_volume)
                     .with_resource_limits(config.resource_limits)
+                    .with_factory_resource_budget(config.factory_resource_budget)
                     .with_host_interface(uplink.effective.clone())
                     .with_uefi_firmware(config.ovmf_code.clone(), config.ovmf_vars.clone())
                     .with_lan_bridge(config.lan_bridge.clone())
@@ -700,6 +810,7 @@ pub(crate) async fn start_daemon(
                     .with_host_network(host_network.clone())
                     .with_storage_volume(config.storage_volume)
                     .with_resource_limits(config.resource_limits)
+                    .with_factory_resource_budget(config.factory_resource_budget)
                     .with_host_interface(uplink.effective.clone())
                     .with_default_images(
                         Some(config.default_kernel.clone()),
@@ -724,30 +835,13 @@ pub(crate) async fn start_daemon(
 
     #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
     {
-        let runtime_config = DaemonRuntimeConfig::from_config(&config, auth, listen);
-        let vmm = husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
-
-        let core = Arc::new(
-            husker_core::HuskerCore::new(vmm, state, storage, runtime_dir.clone())
-                .with_embedded_agent(husker::EMBEDDED_AGENT)
-                .with_storage_volume(config.storage_volume)
-                .with_resource_limits(config.resource_limits)
-                .with_default_images(
-                    Some(config.default_kernel.clone()),
-                    Some(config.default_rootfs.clone()),
-                    config.default_initrd.clone(),
-                )
-                .with_default_resources(config.default_memory, config.default_cpus)
-                .with_profiles(
-                    config
-                        .profiles
-                        .iter()
-                        .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
-                        .collect(),
-                ),
-        );
-
-        run_daemon_runtime(core, runtime_config).await
+        match vz_worker_backend {
+            Some(vmm) => run_mac_daemon(config, auth, listen, state, storage, vmm).await,
+            None => {
+                let vmm = husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir);
+                run_mac_daemon(config, auth, listen, state, storage, vmm).await
+            }
+        }
     }
 
     #[cfg(all(not(feature = "linux-net"), not(target_os = "macos")))]
@@ -767,6 +861,7 @@ pub(crate) async fn start_daemon(
                 .with_embedded_agent(husker::EMBEDDED_AGENT)
                 .with_storage_volume(config.storage_volume)
                 .with_resource_limits(config.resource_limits)
+                .with_factory_resource_budget(config.factory_resource_budget)
                 .with_default_images(
                     Some(config.default_kernel.clone()),
                     Some(config.default_rootfs.clone()),
@@ -786,19 +881,52 @@ pub(crate) async fn start_daemon(
     }
 }
 
+#[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
+async fn run_mac_daemon<B: husker_vmm::VmmBackend + 'static>(
+    config: Config,
+    auth: DaemonAuth,
+    listen: SocketAddr,
+    state: husker_state::StateStore,
+    storage: husker_storage::StorageConfig,
+    vmm: B,
+) -> Result<()> {
+    let runtime_config = DaemonRuntimeConfig::from_config(&config, auth, listen);
+    let runtime_dir = storage.runtime_dir();
+    let core = Arc::new(
+        husker_core::HuskerCore::new(vmm, state, storage, runtime_dir)
+            .with_embedded_agent(husker::EMBEDDED_AGENT)
+            .with_storage_volume(config.storage_volume)
+            .with_resource_limits(config.resource_limits)
+            .with_factory_resource_budget(config.factory_resource_budget)
+            .with_default_images(
+                Some(config.default_kernel.clone()),
+                Some(config.default_rootfs.clone()),
+                config.default_initrd.clone(),
+            )
+            .with_default_resources(config.default_memory, config.default_cpus)
+            .with_profiles(
+                config
+                    .profiles
+                    .iter()
+                    .map(|(k, v)| (k.clone(), profile_to_daemon(v)))
+                    .collect(),
+            ),
+    );
+    run_daemon_runtime(core, runtime_config).await
+}
+
 /// Run an initial service reconcile for all services, then create the ordinal index.
 /// Always run on daemon startup (independent of the periodic-loop setting).
 async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
     core: &Arc<husker_core::HuskerCore<B>>,
 ) {
-    // Recover any source rootfs left stranded by a fork that crashed mid-load,
-    // BEFORE the suspend reconcile (which can leave VMs resumable): a later
-    // resume must not open a stale symlink to a fork clone.
-    let recovered_disks = core.recover_stranded_fork_rootfs();
-    if recovered_disks > 0 {
-        tracing::info!(
-            recovered_disks,
-            "recovered source rootfs disks stranded by interrupted forks"
+    // Preserve ambiguous disk aliases: an absent backend instance is not proof
+    // that a prior fork has finished opening its snapshot's embedded disk path.
+    let stranded_disks = core.inspect_stranded_fork_rootfs();
+    if stranded_disks > 0 {
+        tracing::warn!(
+            stranded_disks,
+            "fork source reconciliation pending; resume and source deletion remain blocked"
         );
     }
     // Recover any VM interrupted mid-suspend on the previous run, so a VM whose
@@ -875,6 +1003,7 @@ impl DaemonRuntimeConfig {
             listen,
             api_token: auth.api_token,
             api_policy: husker_api::ApiPolicy {
+                factory_jobs_enabled: config.factory_jobs_enabled,
                 max_request_bytes: config.api_max_request_bytes,
                 max_file_read_bytes: config.api_max_file_read_bytes,
                 max_file_write_bytes: config.api_max_file_write_bytes,
@@ -1118,28 +1247,28 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
     core: Arc<husker_core::HuskerCore<B>>,
     config: DaemonRuntimeConfig,
 ) -> Result<()> {
+    let interrupted = core
+        .recover_factory_jobs_after_restart()
+        .context("recovering factory job outcomes before ingress")?;
+    if interrupted > 0 {
+        tracing::warn!(
+            interrupted,
+            "factory jobs interrupted by restart; no execution resumed"
+        );
+    }
+    let recovery = core
+        .recover_host_resource_leases()
+        .await
+        .context("recovering interrupted VM host resources")?;
+    if recovery.failed > 0 {
+        tracing::warn!(failed = recovery.failed, "creation resources remain owned");
+    }
     run_initial_service_reconcile(&core).await;
 
     // Only a daemon that owns host networking has leases, suspended VM
     // networks and port-forward rules to recover.
     #[cfg(feature = "linux-net")]
     {
-        let recovery = core
-            .recover_host_resource_leases()
-            .await
-            .context("recovering interrupted VM host resources")?;
-        if recovery.recovered > 0 {
-            tracing::info!(
-                recovered = recovery.recovered,
-                "recovered interrupted VM creations"
-            );
-        }
-        if recovery.failed > 0 {
-            tracing::warn!(
-                failed = recovery.failed,
-                "interrupted VM creations still hold host resources; their leases are retried at the next start"
-            );
-        }
         let networks = core
             .restore_suspended_vm_networks()
             .await
@@ -1184,6 +1313,10 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
         Arc::clone(&core),
         workers.shutdown_signal(),
     )));
+    workers.supervise(Some(spawn_factory_cleanup_loop(
+        Arc::clone(&core),
+        workers.shutdown_signal(),
+    )));
     workers.supervise(Some(spawn_expiration_loop(
         Arc::clone(&core),
         workers.shutdown_signal(),
@@ -1220,6 +1353,27 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
     };
     let drain = async {
         core.quiesce_shutdown_ingress();
+        match core
+            .shutdown_factory_jobs(std::time::Duration::from_secs(15))
+            .await
+        {
+            Ok(report) => {
+                tracing::info!(
+                    joined = report.workers_joined,
+                    pending = report.workers_pending,
+                    cleanup_pending = report.cleanup_pending,
+                    "factory shutdown ownership report"
+                );
+                if report.workers_pending > 0 {
+                    tracing::warn!(
+                        "factory allocation or cleanup remains unresolved at shutdown; durable ownership retained"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "factory shutdown outcome could not be persisted")
+            }
+        }
         drain_vms_on_shutdown(&core).await;
         #[cfg(feature = "linux-net")]
         {
@@ -1354,6 +1508,38 @@ fn spawn_idle_policy_loop<B: husker_vmm::VmmBackend + 'static>(
     })
 }
 
+/// Retry terminal factory ownership and expire only cleanup-confirmed evidence.
+fn spawn_factory_cleanup_loop<B: husker_vmm::VmmBackend + 'static>(
+    core: Arc<husker_core::HuskerCore<B>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                () = wait_for_runtime_shutdown(&mut shutdown) => break,
+                _ = ticker.tick() => {
+                    match core.factory_cleanup_tick().await {
+                        Ok(report) if report.attempted > 0 || report.expired_evidence > 0 || report.outcomes_reconciled > 0 || report.outcome_publication_pending > 0 || report.allocation_aborts_confirmed > 0 || report.allocation_aborts_pending > 0 => {
+                            tracing::info!(attempted = report.attempted, confirmed = report.confirmed,
+                                pending = report.pending, expired_evidence = report.expired_evidence,
+                                outcomes_reconciled = report.outcomes_reconciled,
+                                outcome_publication_pending = report.outcome_publication_pending,
+                                allocation_aborts_confirmed = report.allocation_aborts_confirmed,
+                                allocation_aborts_pending = report.allocation_aborts_pending,
+                                "factory cleanup reconciliation");
+                        }
+                        Ok(_) => (),
+                        Err(error) => tracing::warn!(%error, "factory cleanup journal unavailable"),
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Spawn the hard-lifetime reaper used by externally orchestrated ephemeral
 /// VMs. This runs in every daemon mode: unlike suspend-based idle policy,
 /// destroying an expired VM does not depend on Linux host networking.
@@ -1433,6 +1619,326 @@ async fn drain_vms_on_shutdown<B: husker_vmm::VmmBackend>(core: &husker_core::Hu
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_config_errors_prevent_startup_resource_creation_and_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        for sha256 in ["bad".into(), "ab".repeat(32)] {
+            let data_dir = temp.path().join("must-not-be-created");
+            let config = Config {
+                data_dir: data_dir.clone(),
+                apple_vz_worker: Some(crate::config::AppleVzWorkerConfig {
+                    executable: temp.path().join("missing-worker"),
+                    sha256,
+                    protocol_version: 1,
+                    lifetime_secs: 60,
+                }),
+                ..Config::default()
+            };
+            let error = start_daemon(
+                config,
+                "127.0.0.1:0".parse().unwrap(),
+                DaemonAuth {
+                    api_token: None,
+                    metrics_token: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("apple_vz_worker"));
+            assert!(!data_dir.exists());
+        }
+    }
+
+    #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
+    #[tokio::test]
+    async fn unsigned_worker_is_rejected_before_startup_creates_state() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let executable = temp.path().join("never-launched-fixture");
+        let bytes = b"#!/bin/sh\nexit 0\n";
+        std::fs::write(&executable, bytes).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data_dir = temp.path().join("state");
+        let config = Config {
+            data_dir: data_dir.clone(),
+            apple_vz_worker: Some(crate::config::AppleVzWorkerConfig {
+                executable,
+                sha256: hex::encode(Sha256::digest(bytes)),
+                protocol_version: 1,
+                lifetime_secs: 60,
+            }),
+            ..Config::default()
+        };
+        let error = start_daemon(
+            config,
+            "127.0.0.1:0".parse().unwrap(),
+            DaemonAuth {
+                api_token: None,
+                metrics_token: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("code signing"));
+        assert!(!data_dir.exists());
+    }
+
+    #[cfg(all(not(feature = "linux-net"), target_os = "macos"))]
+    #[tokio::test]
+    async fn worker_socket_path_is_rejected_before_startup_creates_state() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("never-launched-fixture");
+        let bytes = b"#!/bin/sh\nexit 0\n";
+        std::fs::write(&executable, bytes).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data_dir = temp.path().join("x".repeat(120));
+        let config = Config {
+            data_dir: data_dir.clone(),
+            apple_vz_worker: Some(crate::config::AppleVzWorkerConfig {
+                executable,
+                sha256: hex::encode(Sha256::digest(bytes)),
+                protocol_version: 1,
+                lifetime_secs: 60,
+            }),
+            ..Config::default()
+        };
+        let error = start_daemon(
+            config,
+            "127.0.0.1:0".parse().unwrap(),
+            DaemonAuth {
+                api_token: None,
+                metrics_token: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("socket path"));
+        assert!(!data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn factory_budget_errors_prevent_startup_resource_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        for invalid in [
+            None,
+            Some(husker_state::jobs::FactoryResourceBudget {
+                max_jobs: 0,
+                max_vcpus: 4,
+                max_memory_mib: 4096,
+                memory_overhead_mib: 128,
+                max_root_disk_bytes: 8 * 1024 * 1024 * 1024,
+                max_boot_storage_bytes: 20 * 1024 * 1024 * 1024,
+                min_free_storage_bytes: 16 * 1024 * 1024,
+            }),
+        ] {
+            let data_dir = temp.path().join("must-not-be-created");
+            let config = Config {
+                factory_jobs_enabled: true,
+                factory_resource_budget: invalid,
+                data_dir: data_dir.clone(),
+                ..Config::default()
+            };
+            let error = start_daemon(
+                config,
+                "127.0.0.1:0".parse().unwrap(),
+                DaemonAuth {
+                    api_token: None,
+                    metrics_token: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("factory_resource_budget")
+                    || error.to_string().contains("factory resource budget")
+            );
+            assert!(!data_dir.exists());
+        }
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn startup_reserves_uncertain_creation_addresses_before_new_allocations() {
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let lease = state
+            .begin_host_resource_lease("uncertain-address")
+            .unwrap();
+        state
+            .set_host_resource_lease_network(lease.id, Some("husker3"), Some("172.20.0.2"))
+            .unwrap();
+        state
+            .enter_host_resource_lease_backend(lease.id, uuid::Uuid::new_v4())
+            .unwrap();
+        let allocator = husker_net::IpAllocator::new("172.20.0.0".parse().unwrap(), 24);
+        assert_eq!(
+            reserve_creation_lease_addresses(&state, &allocator).unwrap(),
+            1
+        );
+        assert_eq!(
+            allocator.allocate().unwrap(),
+            "172.20.0.3".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(state.list_host_resource_leases().unwrap()[0].id, lease.id);
+        assert!(state.release_host_resource_lease(lease.id).is_err());
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn startup_rejects_invalid_or_incompatible_creation_addresses_without_releasing_ownership() {
+        for address in ["invalid", "10.1.2.3", "172.20.0.1"] {
+            let state = husker_state::StateStore::open_memory().unwrap();
+            let lease = state
+                .begin_host_resource_lease("incompatible-address")
+                .unwrap();
+            state
+                .set_host_resource_lease_network(lease.id, Some("husker3"), Some(address))
+                .unwrap();
+            let allocator = husker_net::IpAllocator::new("172.20.0.0".parse().unwrap(), 24);
+            assert!(reserve_creation_lease_addresses(&state, &allocator).is_err());
+            assert_eq!(state.list_host_resource_leases().unwrap()[0].id, lease.id);
+            assert_ne!(state.allocate_cid().unwrap(), lease.vsock_cid);
+        }
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[test]
+    fn startup_rejects_overlapping_creation_address_owners() {
+        let state = husker_state::StateStore::open_memory().unwrap();
+        for name in ["first-address-owner", "second-address-owner"] {
+            let lease = state.begin_host_resource_lease(name).unwrap();
+            state
+                .set_host_resource_lease_network(lease.id, None, Some("172.20.0.2"))
+                .unwrap();
+        }
+        let allocator = husker_net::IpAllocator::new("172.20.0.0".parse().unwrap(), 24);
+        let error = reserve_creation_lease_addresses(&state, &allocator).unwrap_err();
+        assert!(error.to_string().contains("another durable owner"));
+        assert_eq!(state.list_host_resource_leases().unwrap().len(), 2);
+        assert_eq!(state.allocate_cid().unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn generic_startup_reconcile_preserves_leases_and_pending_factory_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+        };
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let lease = state.begin_host_resource_lease("leased-creation").unwrap();
+        let current = std::time::SystemTime::now();
+        let deadline = (current + std::time::Duration::from_secs(300)).into();
+        let retention = (current + std::time::Duration::from_secs(86400)).into();
+        let mut jobs = Vec::new();
+        for key in ["no-vm-row", "has-vm-row"] {
+            let job = state
+                .accept_job(key, "{\"version\":1}", deadline, retention)
+                .unwrap()
+                .0;
+            let claimed = state.claim_job_vm(job.id).unwrap();
+            let name = claimed.vm_name.unwrap();
+            let vm_id = uuid::Uuid::new_v4();
+            state.bind_job_vm(job.id, vm_id, &name).unwrap();
+            state
+                .finish_job(
+                    job.id,
+                    husker_state::jobs::JobState::Unknown,
+                    husker_state::jobs::CollectionState::Failed,
+                    "{\"version\":1}",
+                )
+                .unwrap();
+            jobs.push((job.id, name, vm_id));
+        }
+        let (_, name, vm_id) = &jobs[1];
+        let now = std::time::SystemTime::now().into();
+        state
+            .insert_vm(&husker_state::VmRecord {
+                id: *vm_id,
+                name: name.clone(),
+                state: husker_state::VmLifecycleState::Stopped,
+                pid: None,
+                vcpu_count: 1,
+                mem_size_mib: 512,
+                vsock_cid: 999,
+                tap_device: None,
+                host_ip: None,
+                guest_ip: None,
+                kernel_path: "kernel".into(),
+                rootfs_path: "rootfs".into(),
+                created_at: now,
+                updated_at: now,
+                userdata: None,
+                userdata_status: None,
+                userdata_env: None,
+                service_id: None,
+                service_ordinal: None,
+                vmm: husker_core::BackendKind::AppleVz,
+                boot_mode: husker_core::BootKind::DirectKernel,
+                balloon: false,
+                volume: None,
+                network: husker_core::NetworkMode::Isolated,
+                egress_policy: None,
+                last_activity_at: now,
+                suspended_at: None,
+                idle_timeout_secs: None,
+                suspend_ttl_secs: None,
+                auto_resume: false,
+                forked_from: None,
+            })
+            .unwrap();
+        for name in [
+            lease.vm_name.as_str(),
+            jobs[0].1.as_str(),
+            jobs[1].1.as_str(),
+            "unowned-clone",
+        ] {
+            let directory = storage.vm_dir(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("rootfs.ext4"), b"owned bytes").unwrap();
+        }
+        for extension in ["sock", "vsock"] {
+            std::fs::write(
+                runtime.join(format!("{vm_id}.{extension}")),
+                b"owned runtime",
+            )
+            .unwrap();
+        }
+        reconcile_host_resources(
+            &state,
+            &storage,
+            &runtime,
+            #[cfg(feature = "linux-net")]
+            &husker_net::SystemHostNetwork,
+        )
+        .await;
+        for name in [
+            lease.vm_name.as_str(),
+            jobs[0].1.as_str(),
+            jobs[1].1.as_str(),
+        ] {
+            assert_eq!(
+                std::fs::read(storage.vm_dir(name).join("rootfs.ext4")).unwrap(),
+                b"owned bytes"
+            );
+        }
+        assert!(!storage.vm_dir("unowned-clone").exists());
+        for extension in ["sock", "vsock"] {
+            assert_eq!(
+                std::fs::read(runtime.join(format!("{vm_id}.{extension}"))).unwrap(),
+                b"owned runtime"
+            );
+        }
+        assert_eq!(state.list_host_resource_leases().unwrap()[0].id, lease.id);
+        for (job, _, _) in jobs {
+            assert!(state.get_job(job).unwrap().cleanup_pending);
+        }
+    }
 
     #[cfg(feature = "linux-net")]
     #[derive(Default)]

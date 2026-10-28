@@ -10,6 +10,7 @@ default = ["linux-net"]
 linux-net = ["husker-core/linux-net"]
 
 [dependencies]
+sha2 = { workspace = true }
 futures-util = { workspace = true }
 husker-core = { workspace = true, features = ["utoipa"] }
 husker-vmm = { workspace = true }
@@ -19,7 +20,6 @@ axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }

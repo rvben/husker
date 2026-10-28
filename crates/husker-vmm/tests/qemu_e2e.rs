@@ -59,6 +59,7 @@ async fn qemu_boots_and_vsock() {
     let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path(), disabled_cgroup());
 
     let config = husker_vmm::VmConfig {
+        requested_id: None,
         name: "e2e".into(),
         vcpu_count: 1,
         mem_size_mib: 512,
@@ -74,6 +75,7 @@ async fn qemu_boots_and_vsock() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: Vec::new(),
     };
     let info = backend
@@ -132,7 +134,9 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let backend = QemuKvmBackend::new(&fake, dir.path(), disabled_cgroup());
+    let id = uuid::Uuid::new_v4();
     let config = husker_vmm::VmConfig {
+        requested_id: Some(id),
         name: "e2e-broken".into(),
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -148,10 +152,15 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: Vec::new(),
     };
     let err = backend.create(config).await.expect_err("create must fail");
     let msg = err.to_string();
+    backend
+        .destroy(id)
+        .await
+        .expect("destroy retained failed boot");
     eprintln!("create error:\n{msg}");
     assert!(
         msg.contains("qemu boot log (tail)"),
@@ -187,6 +196,7 @@ async fn qemu_uefi_boots_cloud_image() {
 
     let backend = QemuKvmBackend::new("qemu-system-x86_64", dir.path(), disabled_cgroup());
     let config = husker_vmm::VmConfig {
+        requested_id: None,
         name: "uefi-e2e".into(),
         vcpu_count: 2,
         mem_size_mib: 1024,
@@ -205,6 +215,7 @@ async fn qemu_uefi_boots_cloud_image() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: Vec::new(),
     };
     let info = backend.create(config).await.expect("UEFI VM should boot");
@@ -261,6 +272,7 @@ async fn qemu_host_share_visible_in_guest() {
     let kernel_args =
         format!("console=ttyS0 init={agent_bin} husker.init=1 husker.share=fs0=/share");
     let config = husker_vmm::VmConfig {
+        requested_id: None,
         name: "e2e-share".into(),
         vcpu_count: 1,
         mem_size_mib: 512,
@@ -276,6 +288,7 @@ async fn qemu_host_share_visible_in_guest() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: vec![husker_vmm::HostShare {
             host: share_dir.path().to_path_buf(),
             guest: "/share".into(),
@@ -394,6 +407,7 @@ async fn qemu_host_share_via_initramfs() {
     // No `husker.init=1`: the rootfs runs its own init, so the initramfs `/init`
     // is what mounts the `husker.share=` virtiofs share before switch_root.
     let config = husker_vmm::VmConfig {
+        requested_id: None,
         name: "e2e-share-initrd".into(),
         vcpu_count: 1,
         mem_size_mib: 512,
@@ -409,6 +423,7 @@ async fn qemu_host_share_via_initramfs() {
         seed_path: None,
         balloon: false,
         volume_path: None,
+        network_disabled: false,
         host_shares: vec![husker_vmm::HostShare {
             host: share_dir.path().to_path_buf(),
             guest: "/share".into(),

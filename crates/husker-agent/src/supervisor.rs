@@ -532,6 +532,18 @@ fn install_term_handlers() {
 /// Supervise the agent: run it as a child (a re-exec of this binary, which is
 /// not PID 1 so it serves normally), restart it if it exits, and reap any
 /// re-parented orphans - PID 1's duty. Never returns.
+/// Factory init already established the required mounts. Enter only the
+/// existing orphan-reaping/restart loop, without OCI network/share/volume setup.
+/// Restarting the agent does not replay accepted session commands: its durable
+/// session store reports unfinished receipts as interrupted.
+pub fn run_factory() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        std::process::id() == 1 && unsafe { libc::geteuid() } == 0,
+        "factory supervisor requires guest root as PID 1"
+    );
+    supervise()
+}
+
 fn supervise() -> ! {
     install_term_handlers();
     let exe = std::env::current_exe()

@@ -855,6 +855,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_terminates_nested_process_group_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("child-survived");
+        let store = SessionStore::new(temp.path().join("sessions"));
+        store
+            .start(
+                request(&format!(
+                    r#"sh -c 'sleep 1; touch "{}"' & printf ready; wait"#,
+                    marker.display()
+                )),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while store.events(ID, 0).await.unwrap().events.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        store.cancel(ID).await.unwrap();
+        assert_eq!(finished(&store).await.state, SessionState::Cancelled);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "nested child survived process-group cancellation"
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_and_timeout_report_distinct_outcomes() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path().into());

@@ -199,6 +199,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: req.balloon,
             volume_path: None,
             host_shares: vec![],
+            requested_id: None,
+            network_disabled: false,
         };
 
         let created = self.vmm.create_vm(backend_selection, vm_config).await?;

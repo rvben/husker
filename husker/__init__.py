@@ -7,11 +7,11 @@ import time
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 __all__ = ["Client", "Sandbox", "Session", "SessionInfo", "Event", "EventPage",
-           "ExecResult", "HuskerError", "TransportError", "NotFound", "Conflict",
+           "Job", "JobSnapshot", "JobEventPage", "JobArtifact", "ExecResult", "HuskerError", "TransportError", "NotFound", "Conflict",
            "PolicyDenied", "Unauthorized", "CapabilityUnsupported", "CapacityExceeded",
            "CommandFailed", "FileChanged"]
 
@@ -141,7 +141,9 @@ class Client:
         self._token = token
         self._opener = build_opener(_NoRedirect())
 
-    def _request(self, method, path, body=None, *, timeout=None):
+    def _request(self, method, path, body=None, *, timeout=None, max_response_bytes=8 * 1024 * 1024):
+        if type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 16 * 1024 * 1024:
+            raise ValueError("response limit must be an integer between 1 and 16777216")
         headers = {"Accept": "application/json", "User-Agent": "husker-python-sdk"}
         if self._token:
             headers["Authorization"] = "Bearer " + self._token
@@ -151,11 +153,13 @@ class Client:
         request = Request(self.base_url + path, data=data, headers=headers, method=method)
         try:
             with self._opener.open(request, timeout=self.timeout if timeout is None else timeout) as response:
-                raw = response.read()
+                raw = response.read(max_response_bytes + 1)
+                if len(raw) > max_response_bytes:
+                    raise TransportError("Husker response exceeded the bounded read limit")
                 return json.loads(raw) if raw else None
         except HTTPError as error:
             with error:
-                raw = error.read()
+                raw = error.read(64 * 1024 + 1)
             try:
                 details = json.loads(raw)
                 if not isinstance(details, dict):
@@ -170,6 +174,37 @@ class Client:
             raise TransportError("unable to reach Husker daemon: %s" % error) from None
         except (ValueError, UnicodeError) as error:
             raise TransportError("invalid JSON response from Husker daemon") from error
+
+    def submit_job(self, submission, source_bundle, acceptance_bundle, *, retention_until):
+        """Submit immutable factory inputs; never automatically retry or fall back.
+
+        Journal the key and specification digest before this call. After a lost
+        response, use find_job for read-only reconciliation. Identical submission
+        replay is supported, but must never change the key or frozen request.
+        Bundles must be canonical archives produced by `husker bundle freeze`.
+        """
+        from .jobs import submit_job
+        return submit_job(self, submission, source_bundle, acceptance_bundle, retention_until)
+
+    def find_job(self, idempotency_key, specification_digest):
+        """Read-only lookup of a journaled submission after a lost receipt.
+
+        NotFound means no retained acceptance was found. This operation cannot
+        accept or execute work, and never falls back to a submission POST.
+        """
+        from .jobs import Job, JobSnapshot, _key, _digest
+        query = urlencode({"idempotency_key": _key(idempotency_key),
+                           "execution_specification_digest": _digest(specification_digest)})
+        snapshot = JobSnapshot._parse(self._request("GET", "/v1/job-submissions?" + query,
+            max_response_bytes=256 * 1024), expected_digest=specification_digest)
+        job = Job(self, snapshot.id, specification_digest=specification_digest)
+        job.receipt = snapshot
+        return job
+
+    def job(self, job_id, *, specification_digest=None):
+        """Reconnect a host-journal job UUID without starting any execution."""
+        from .jobs import Job
+        return Job(self, job_id, specification_digest=specification_digest)
 
     def create(self, name, *, image=None, **options):
         """Create a VM. Options use the HTTP API names, e.g. mem_size_mib."""
@@ -235,9 +270,21 @@ class Sandbox:
             raise CommandFailed(result)
         return result
 
-    def start(self, argv: Sequence[str], *, workdir=None, env=None, secrets=None, timeout_secs=3600):
-        info = self.client._request("POST", self._path + "/sessions",
-            _command(argv, workdir, env, secrets, timeout_secs))
+    def start(self, argv: Sequence[str], *, workdir=None, env=None, secrets=None,
+              timeout_secs=3600, idempotency_key=None):
+        """Start detached work; keyed retries require a v6 guest and updated daemon.
+
+        Journal the key before calling. Retry only the identical specification
+        against the same VM generation. Interrupted work is never restarted.
+        """
+        request = _command(argv, workdir, env, secrets, timeout_secs)
+        endpoint = "/sessions"
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key.encode("utf-8")) <= 128:
+                raise ValueError("idempotency_key must contain 1–128 UTF-8 bytes")
+            request["idempotency_key"] = idempotency_key
+            endpoint = "/session-submissions"
+        info = self.client._request("POST", self._path + endpoint, request)
         return Session(self, info["id"])
 
     def session(self, session_id):
@@ -373,3 +420,6 @@ class Session:
             if info.state != "running":
                 return info
             time.sleep(poll_interval if remaining is None else min(poll_interval, max(0, deadline - time.monotonic())))
+
+
+from .jobs import Job, JobSnapshot, JobEventPage, JobArtifact

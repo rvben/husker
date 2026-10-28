@@ -1178,6 +1178,7 @@ dependencies = [
  "husker-agent-proto",
  "if-addrs",
  "libc",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1186,6 +1187,7 @@ dependencies = [
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1315,16 +1317,20 @@ name = "husker-state"
 version = "0.4.54"
 dependencies = [
  "chrono",
+ "hex",
  "husker-types",
+ "libc",
  "log",
  "r2d2",
  "r2d2_sqlite",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 
@@ -1332,6 +1338,7 @@ dependencies = [
 name = "husker-storage"
 version = "0.4.54"
 dependencies = [
+ "libc",
  "reflink-copy",
  "serde",
  "serde_json",
@@ -1368,6 +1375,7 @@ dependencies = [
  "objc2-virtualization",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

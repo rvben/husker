@@ -1,6 +1,14 @@
 //! Core orchestration layer for VM lifecycle, agent connectivity, and recovery logic.
 
 pub mod agent_client;
+mod job_boot;
+pub mod job_collection;
+pub mod job_launch;
+pub mod job_worker;
+#[cfg(any(target_os = "linux", test))]
+mod orphan_process;
+use job_boot::PreparedBoot;
+pub mod job_spec;
 
 /// Userspace TCP port-forward proxy. Used on backends without host nftables
 /// (macOS/VZ) for regular forwards, and on Linux for the resume-listener
@@ -12,7 +20,6 @@ mod diagnostics;
 mod egress;
 mod fork;
 mod guest_shutdown;
-#[cfg(feature = "linux-net")]
 mod host_resources;
 mod idle;
 mod images;
@@ -837,12 +844,14 @@ struct AllocatedResources {
     #[cfg(feature = "linux-net")]
     guest_ip: Option<Ipv4Addr>,
     cid: Option<u32>,
-    #[cfg(feature = "linux-net")]
     host_resource_lease_id: Option<Uuid>,
     #[cfg(feature = "linux-net")]
     tap_name: Option<String>,
     vm_dir: Option<PathBuf>,
     vm_id: Option<Uuid>,
+    /// Set before entering the backend, including when it returns an error
+    /// before reporting a VM identity. Such an error is not cleanup proof.
+    backend_allocation_entered: bool,
 }
 
 /// Service ownership stamped onto an instance VM at creation time.
@@ -905,19 +914,13 @@ pub struct ReconcileOutcome {
     pub failed: Vec<(String, String)>,
 }
 
-/// SIGKILL a VM's recorded VMM process if it is still alive and still *this*
-/// VM's process.
-///
-/// Both backends embed the VM id in their argv (firecracker `--api-sock
-/// <runtime>/<id>.sock`; qemu `-qmp`/`-serial`/`-pidfile` `<runtime>/<id>.*`), so
-/// the id in the live `/proc/<pid>/cmdline` confirms the pid is this VM's VMM and
-/// not an unrelated process that recycled it. A dead or recycled pid is never
-/// touched. Linux-only (uses /proc + signals). Returns whether a process was
-/// killed.
+/// Reap only a same-UID recognized VMM with the exact UUID-named socket or
+/// pidfile argument. A pidfd is opened before identity inspection and used for
+/// signalling/exit confirmation, so PID reuse cannot redirect the signal.
+/// Unsupported pidfds, inspection errors and unconfirmed exit return false.
 #[cfg(target_os = "linux")]
 fn reap_vmm_if_orphaned(id: Uuid, pid: u32) -> bool {
-    let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    cmdline.contains(&id.to_string()) && unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0
+    orphan_process::reap(id, pid)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -931,8 +934,10 @@ fn reap_vmm_if_orphaned(_id: Uuid, _pid: u32) -> bool {
 /// them stopped). Both Firecracker and QEMU are foreground children that survive
 /// an uncleaned daemon exit (`kill_on_drop` only fires on a graceful drop and
 /// there is no death signal), so each is SIGKILLed via [`reap_vmm_if_orphaned`],
-/// which only touches a pid whose live cmdline still names this VM. Must run
-/// BEFORE mark_stale_vms_stopped. Returns the number reaped.
+/// which requires a recognized executable and exact generation argument. Also
+/// scans pending job generations whose VM row was never committed. Must run
+/// BEFORE mark_stale_vms_stopped. Returns confirmed process exits, not a complete
+/// factory storage/cgroup cleanup receipt.
 #[cfg(target_os = "linux")]
 pub fn reap_orphaned_vmms(state: &husker_state::StateStore) -> usize {
     let vms = match state.list_vms() {
@@ -951,6 +956,34 @@ pub fn reap_orphaned_vmms(state: &husker_state::StateStore) -> usize {
         if reap_vmm_if_orphaned(vm.id, pid) {
             reaped += 1;
             warn!(pid, vm = %vm.name, "reaped orphaned VMM process from a prior daemon");
+        }
+    }
+    // Preparing jobs persist their intended generation before the VM row.
+    // Scan only bounded pending job identities; do not infer cleanup from absence.
+    if let Ok(jobs) = state.recoverable_jobs() {
+        let ids: std::collections::HashSet<_> = jobs
+            .into_iter()
+            .filter(|job| job.cleanup_pending && !job.vm_destroyed)
+            .filter_map(|job| job.vm_id)
+            .collect();
+        if !ids.is_empty()
+            && let Ok(entries) = std::fs::read_dir("/proc")
+        {
+            for entry in entries.take(65536).flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if let Some(id) = orphan_process::pending_match(pid, &ids)
+                    && reap_vmm_if_orphaned(id, pid)
+                {
+                    reaped += 1;
+                    warn!(pid,vm_id=%id,"reaped journal-owned orphan VMM before VM-row persistence");
+                }
+            }
         }
     }
     reaped
@@ -1014,9 +1047,29 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Every background userdata execution owned by this core. Lifecycle
     /// operations cancel and join the matching job before mutating its VM.
     userdata_jobs: Arc<agent_ops::UserdataJobs>,
+    /// Bounds detached factory workers, including cancelled allocations still joining.
+    factory_worker_slots: Arc<tokio::sync::Semaphore>,
+    factory_resource_budget: Option<husker_state::jobs::FactoryResourceBudget>,
+    factory_cleanup_cursor: std::sync::atomic::AtomicUsize,
+    factory_admission: parking_lot::Mutex<bool>,
+    factory_shutdown_lock: tokio::sync::Mutex<()>,
+    factory_workers:
+        parking_lot::Mutex<std::collections::HashMap<Uuid, tokio::task::JoinHandle<()>>>,
+    /// Positive backend destruction awaiting durable factory receipts. Entries
+    /// bind VM UUID to (job UUID, optional lease UUID); never reconstructed
+    /// from absence. Successful creation transfers its lease to the VM row.
+    factory_destroyed_allocations:
+        parking_lot::Mutex<std::collections::HashMap<Uuid, (Uuid, Option<Uuid>)>>,
+    /// Confirmed generic allocation destruction awaiting its durable lease receipt.
+    destroyed_creation_leases: parking_lot::Mutex<std::collections::HashMap<Uuid, Uuid>>,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks:
         parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Factory lifecycle locks span allocation and cleanup. Weak entries are
+    /// pruned on access so completed jobs do not accumulate lock-map entries.
+    job_lifecycle_locks: parking_lot::Mutex<
+        std::collections::HashMap<Uuid, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
     /// Per-image-name locks serialize catalog publication and make a repeated
     /// commit idempotent without allowing two VMs to race on the same path.
     image_name_locks:
@@ -1208,7 +1261,16 @@ impl<B: VmmBackend> HuskerCore<B> {
             profiles: std::collections::HashMap::new(),
             runtime_dir,
             userdata_jobs: Arc::new(agent_ops::UserdataJobs::default()),
+            factory_worker_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+            factory_resource_budget: None,
+            factory_cleanup_cursor: std::sync::atomic::AtomicUsize::new(0),
+            factory_admission: parking_lot::Mutex::new(true),
+            factory_shutdown_lock: tokio::sync::Mutex::new(()),
+            factory_workers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            factory_destroyed_allocations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            destroyed_creation_leases: parking_lot::Mutex::new(std::collections::HashMap::new()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            job_lifecycle_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -1254,7 +1316,16 @@ impl<B: VmmBackend> HuskerCore<B> {
             profiles: std::collections::HashMap::new(),
             runtime_dir,
             userdata_jobs: Arc::new(agent_ops::UserdataJobs::default()),
+            factory_worker_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+            factory_resource_budget: None,
+            factory_cleanup_cursor: std::sync::atomic::AtomicUsize::new(0),
+            factory_admission: parking_lot::Mutex::new(true),
+            factory_shutdown_lock: tokio::sync::Mutex::new(()),
+            factory_workers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            factory_destroyed_allocations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            destroyed_creation_leases: parking_lot::Mutex::new(std::collections::HashMap::new()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            job_lifecycle_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -1313,6 +1384,14 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// by diagnostics so the cgroup readiness check is shown only when relevant.
     pub fn with_resource_limits(mut self, resource_limits: bool) -> Self {
         self.resource_limits = resource_limits;
+        self
+    }
+
+    pub fn with_factory_resource_budget(
+        mut self,
+        budget: Option<husker_state::jobs::FactoryResourceBudget>,
+    ) -> Self {
+        self.factory_resource_budget = budget;
         self
     }
 
@@ -1473,6 +1552,17 @@ impl<B: VmmBackend> HuskerCore<B> {
         map.entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    fn job_lifecycle_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.job_lifecycle_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(id, Arc::downgrade(&lock));
+        lock
     }
 
     fn image_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -2995,6 +3085,7 @@ mod tests {
                 AutoResumeMockVmm {
                     fail_vsock_connect: false,
                     backend_kind: husker_vmm::BackendKind::Firecracker,
+                    connect_attempts: std::sync::atomic::AtomicUsize::new(0),
                 },
                 husker_state::StateStore::open_memory().unwrap(),
                 husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -3020,6 +3111,7 @@ mod tests {
             AutoResumeMockVmm {
                 fail_vsock_connect: false,
                 backend_kind: husker_vmm::BackendKind::Qemu,
+                connect_attempts: std::sync::atomic::AtomicUsize::new(0),
             },
             husker_state::StateStore::open_memory().unwrap(),
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -3315,6 +3407,7 @@ mod tests {
     struct AutoResumeMockVmm {
         fail_vsock_connect: bool,
         backend_kind: husker_vmm::BackendKind,
+        connect_attempts: std::sync::atomic::AtomicUsize,
     }
 
     #[cfg(feature = "linux-net")]
@@ -3405,6 +3498,8 @@ mod tests {
             id: Uuid,
             _port: u32,
         ) -> Result<Self::VsockStream, husker_vmm::VmmError> {
+            self.connect_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.fail_vsock_connect {
                 return Err(husker_vmm::VmmError::VmNotFound(id));
             }
@@ -3437,6 +3532,7 @@ mod tests {
             AutoResumeMockVmm {
                 fail_vsock_connect,
                 backend_kind: husker_vmm::BackendKind::Firecracker,
+                connect_attempts: std::sync::atomic::AtomicUsize::new(0),
             },
             husker_state::StateStore::open_memory().unwrap(),
             husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
@@ -3450,6 +3546,117 @@ mod tests {
         )
         .with_host_network(Arc::new(SuccessfulHostNetwork));
         (core, tmp)
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn creation_lease_recovery_keeps_ip_until_database_release_commits() {
+        let (mut core, temp) = resume_mock_core(false).await;
+        let path = temp.path().join("lease-recovery.db");
+        core.state = husker_state::StateStore::open(&path).unwrap();
+        let lease = core.state.begin_host_resource_lease("ip-owner").unwrap();
+        let address: Ipv4Addr = "172.20.0.2".parse().unwrap();
+        core.state
+            .set_host_resource_lease_network(lease.id, None, Some(&address.to_string()))
+            .unwrap();
+        let vm_id = Uuid::new_v4();
+        core.state
+            .enter_host_resource_lease_backend(lease.id, vm_id)
+            .unwrap();
+        core.ip_allocator.reserve(address).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER injected_lease_release_failure BEFORE DELETE ON host_resource_leases BEGIN SELECT RAISE(ABORT, 'injected lease release failure'); END;").unwrap();
+        assert!(matches!(
+            core.recover_host_resource_leases().await,
+            Err(CoreError::State(_))
+        ));
+        assert_eq!(
+            core.state.get_host_resource_lease(lease.id).unwrap().vm_id,
+            Some(vm_id)
+        );
+        assert_ne!(core.ip_allocator.allocate().unwrap(), address);
+        assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+        conn.execute_batch("DROP TRIGGER injected_lease_release_failure;")
+            .unwrap();
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap().recovered,
+            1
+        );
+        assert_eq!(core.ip_allocator.allocate().unwrap(), address);
+        assert_eq!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+        assert!(core.state.list_host_resource_leases().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn creation_lease_recovery_preserves_an_address_owned_by_another_vm() {
+        let (core, _temp) = resume_mock_core(false).await;
+        let address: Ipv4Addr = "172.20.0.2".parse().unwrap();
+        let mut vm = sample_vm_record("other-address-owner");
+        vm.guest_ip = Some(address.to_string());
+        core.state.insert_vm(&vm).unwrap();
+        let lease = core
+            .state
+            .begin_host_resource_lease("conflicting-creation")
+            .unwrap();
+        core.state
+            .set_host_resource_lease_network(lease.id, None, Some(&address.to_string()))
+            .unwrap();
+        core.ip_allocator.reserve(address).unwrap();
+        let directory = core.storage.vm_dir(&lease.vm_name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("rootfs.ext4"), b"conflicting disk").unwrap();
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap().recovered,
+            0
+        );
+        assert_eq!(
+            core.state.get_vm(vm.id).unwrap().guest_ip,
+            Some(address.to_string())
+        );
+        assert_eq!(
+            std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+            b"conflicting disk"
+        );
+        assert_eq!(
+            core.state
+                .get_host_resource_lease(lease.id)
+                .unwrap()
+                .vsock_cid,
+            lease.vsock_cid
+        );
+        assert_ne!(core.ip_allocator.allocate().unwrap(), address);
+        assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn creation_lease_recovery_preserves_overlapping_lease_address_owners() {
+        let (core, _temp) = resume_mock_core(false).await;
+        let address: Ipv4Addr = "172.20.0.2".parse().unwrap();
+        for name in ["first-lease-owner", "second-lease-owner"] {
+            let lease = core.state.begin_host_resource_lease(name).unwrap();
+            core.state
+                .set_host_resource_lease_network(lease.id, None, Some(&address.to_string()))
+                .unwrap();
+            let directory = core.storage.vm_dir(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("rootfs.ext4"), b"overlapping lease disk").unwrap();
+        }
+        core.ip_allocator.reserve(address).unwrap();
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap().recovered,
+            0
+        );
+        assert_eq!(core.state.list_host_resource_leases().unwrap().len(), 2);
+        for name in ["first-lease-owner", "second-lease-owner"] {
+            assert_eq!(
+                std::fs::read(core.storage.vm_dir(name).join("rootfs.ext4")).unwrap(),
+                b"overlapping lease disk"
+            );
+        }
+        assert_ne!(core.ip_allocator.allocate().unwrap(), address);
+        assert_eq!(core.state.allocate_cid().unwrap(), 5);
     }
 
     /// Write a valid suspend slot (manifest + vmstate + memory) for `id` under
@@ -3998,6 +4205,55 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn factory_launch_waits_for_guest_bind_within_the_original_deadline() {
+        let (core, _tmp) = resume_mock_core(true).await;
+        let rec = sample_vm_record("factory-boot-wait");
+        core.state.insert_vm(&rec).unwrap();
+        let deadline =
+            chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 4, 0).unwrap();
+        let job = core
+            .state
+            .accept_job(
+                "factory-boot-wait",
+                "{}",
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap()
+            .0;
+        core.state.bind_job_vm(job.id, rec.id, &rec.name).unwrap();
+        let inputs = husker_agent_proto::frozen_bundle::FrozenBundle::from_files(
+            std::collections::BTreeMap::from([(
+                "sentinel".into(),
+                husker_agent_proto::frozen_bundle::BundleFile {
+                    data: b"never staged before guest readiness".to_vec(),
+                    executable: false,
+                },
+            )]),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = core
+            .launch_prepared_job(job.id, &inputs, &inputs)
+            .await
+            .unwrap_err();
+        assert!(
+            core.vmm
+                .connect_attempts
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 1
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert!(error.to_string().contains("agent not ready"));
+        let retained = core.state.get_job(job.id).unwrap();
+        assert_eq!(retained.state, husker_state::jobs::JobState::Preparing);
+        assert!(retained.cleanup_pending);
+        assert!(!retained.vm_destroyed);
+        assert_eq!(core.active_session_count(rec.id), 0);
+    }
+
     /// Block until `/proc/<pid>/cmdline` is observable, so the test never reads a
     /// just-forked child before it has finished `exec`-ing the shell.
     #[cfg(target_os = "linux")]
@@ -4024,9 +4280,14 @@ mod tests {
         // blocks on the piped stdin without forking, so the shell's own cmdline
         // carries the id (no child to orphan).
         let id = Uuid::new_v4();
-        let mut victim = Command::new("/bin/sh")
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("firecracker");
+        std::fs::copy("/bin/sh", &binary).unwrap();
+        let mut victim = Command::new(&binary)
             .arg("-c")
-            .arg(format!("read _x # {id}"))
+            .arg("read _x")
+            .arg("--api-sock")
+            .arg(format!("/run/{id}.sock"))
             .stdin(Stdio::piped())
             .spawn()
             .expect("spawn victim");
@@ -5940,7 +6201,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     /// cloud-image path touches disk or starts a VM.
     #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
-    async fn non_nat_modes_are_rejected_on_apple_vz() {
+    async fn bridged_mode_is_rejected_on_apple_vz() {
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         let storage = husker_storage::StorageConfig {
@@ -5955,7 +6216,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             runtime_dir,
         ));
 
-        for (index, mode) in ["bridged", "none"].into_iter().enumerate() {
+        for (index, mode) in ["bridged"].into_iter().enumerate() {
             // cloud_image skips the host-kernel validation. The topology guard
             // fires before the deliberately nonexistent image is inspected.
             let req = CreateVmRequest {
@@ -6001,6 +6262,695 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             storage,
             runtime_dir,
         )
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn rollback_preserves_backing_files_and_cid_without_positive_vmm_destruction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        let cid = core.state.allocate_cid().unwrap();
+        let directory = tmp.path().join("owned-disk");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("rootfs"), b"still owned").unwrap();
+        // No VM is created: an unknown generation must not authorize deleting
+        // files or recycling its CID. Apple VZ returns VmNotFound directly.
+        let error = core
+            .rollback_create(AllocatedResources {
+                vm_id: Some(Uuid::new_v4()),
+                vm_dir: Some(directory.clone()),
+                cid: Some(cid),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::Vmm(husker_vmm::VmmError::VmNotFound(_))
+        ));
+        assert_eq!(
+            std::fs::read(directory.join("rootfs")).unwrap(),
+            b"still owned"
+        );
+        assert_ne!(core.state.allocate_cid().unwrap(), cid);
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn macos_restart_recovers_safe_leases_and_preserves_uncertain_disk_and_cid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = husker_state::StateStore::open(&path).unwrap();
+        let pre_entry = store.begin_host_resource_lease("pre-entry").unwrap();
+        let uncertain = store.begin_host_resource_lease("uncertain-entry").unwrap();
+        let confirmed = store.begin_host_resource_lease("confirmed-entry").unwrap();
+        let uncertain_id = Uuid::new_v4();
+        store
+            .enter_host_resource_lease_backend(uncertain.id, uncertain_id)
+            .unwrap();
+        let confirmed_id = Uuid::new_v4();
+        store
+            .enter_host_resource_lease_backend(confirmed.id, confirmed_id)
+            .unwrap();
+        store
+            .record_host_resource_lease_destruction(confirmed.id, confirmed_id)
+            .unwrap();
+        drop(store);
+        let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
+        for lease in [&pre_entry, &uncertain, &confirmed] {
+            let directory = core.storage.vm_dir(&lease.vm_name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("rootfs.ext4"), b"owned disk").unwrap();
+        }
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap().recovered,
+            2
+        );
+        let retained = core.state.list_host_resource_leases().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, uncertain.id);
+        assert_eq!(retained[0].vm_id, Some(uncertain_id));
+        assert_eq!(
+            std::fs::read(core.storage.vm_dir(&uncertain.vm_name).join("rootfs.ext4")).unwrap(),
+            b"owned disk"
+        );
+        assert!(!core.storage.vm_dir(&pre_entry.vm_name).exists());
+        assert!(!core.storage.vm_dir(&confirmed.vm_name).exists());
+        assert_eq!(core.state.allocate_cid().unwrap(), pre_entry.vsock_cid);
+        assert_eq!(core.state.allocate_cid().unwrap(), confirmed.vsock_cid);
+        drop(core);
+        let restarted = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
+        assert_eq!(
+            restarted
+                .recover_host_resource_leases()
+                .await
+                .unwrap()
+                .recovered,
+            0
+        );
+        assert_ne!(restarted.state.allocate_cid().unwrap(), uncertain.vsock_cid);
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn restart_fences_only_exact_unentered_factory_leases_then_cleans_partial_storage() {
+        use husker_state::jobs::JobState;
+        for scenario in [
+            "planned",
+            "entered",
+            "foreign",
+            "unbound",
+            "vm-conflict",
+            "foreign-aborted",
+            "unbound-aborted",
+            "duplicate",
+            "duplicate-aborted",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("restart.sqlite");
+            let store = husker_state::StateStore::open(&path).unwrap();
+            let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+            let job = store
+                .accept_job(
+                    scenario,
+                    "{}",
+                    deadline,
+                    deadline + chrono::Duration::hours(1),
+                )
+                .unwrap()
+                .0;
+            let name = store.claim_job_vm(job.id).unwrap().vm_name.unwrap();
+            let id = Uuid::new_v4();
+            store.bind_job_vm(job.id, id, &name).unwrap();
+            let lease = if scenario.starts_with("unbound") {
+                store.begin_host_resource_lease(&name).unwrap()
+            } else {
+                store
+                    .begin_host_resource_lease_for_vm(
+                        &name,
+                        if scenario.starts_with("foreign") {
+                            Uuid::new_v4()
+                        } else {
+                            id
+                        },
+                    )
+                    .unwrap()
+            };
+            if scenario == "entered" {
+                store
+                    .enter_host_resource_lease_backend(lease.id, id)
+                    .unwrap();
+            }
+            if scenario.ends_with("aborted") {
+                store.record_job_vm_allocation_abort(job.id, id).unwrap();
+            }
+            if scenario.starts_with("duplicate") {
+                store
+                    .begin_host_resource_lease_for_vm("another-generation-owner", id)
+                    .unwrap();
+            }
+            if scenario == "vm-conflict" {
+                let mut vm = running_nat_vm(&name);
+                vm.id = id;
+                store.insert_vm(&vm).unwrap();
+            }
+            drop(store);
+            let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
+            let directory = core.storage.vm_dir(&name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("rootfs.ext4"), b"partial owned disk").unwrap();
+            assert_eq!(core.recover_factory_jobs_after_restart().unwrap(), 1);
+            assert_eq!(core.recover_factory_jobs_after_restart().unwrap(), 0);
+            let recovered = core.state.get_job(job.id).unwrap();
+            assert_eq!(recovered.state, JobState::Unknown);
+            assert!(!recovered.vm_destroyed && recovered.cleanup_pending);
+            assert_eq!(
+                recovered.vm_allocation_aborted,
+                scenario == "planned" || scenario.ends_with("aborted")
+            );
+            if scenario == "planned" {
+                assert!(
+                    core.state
+                        .get_host_resource_lease(lease.id)
+                        .unwrap()
+                        .allocation_aborted
+                );
+                assert!(
+                    core.state
+                        .enter_host_resource_lease_backend(lease.id, id)
+                        .is_err()
+                );
+                assert_eq!(
+                    core.recover_host_resource_leases().await.unwrap().recovered,
+                    1
+                );
+                assert_eq!(core.factory_cleanup_tick().await.unwrap().confirmed, 1);
+                let job = core.state.get_job(job.id).unwrap();
+                assert!(!job.cleanup_pending && !job.vm_destroyed);
+                assert!(!directory.exists());
+                assert_eq!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+            } else {
+                assert_eq!(
+                    core.recover_host_resource_leases().await.unwrap().recovered,
+                    0
+                );
+                assert_eq!(
+                    std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+                    b"partial owned disk"
+                );
+                assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn restart_abort_commit_failure_retains_ownership_and_retries_without_reexecution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("restart.sqlite");
+        let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let job = core
+            .state
+            .accept_job(
+                "retry",
+                "{}",
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap()
+            .0;
+        let name = core.state.claim_job_vm(job.id).unwrap().vm_name.unwrap();
+        let id = Uuid::new_v4();
+        core.state.bind_job_vm(job.id, id, &name).unwrap();
+        let lease = core
+            .state
+            .begin_host_resource_lease_for_vm(&name, id)
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER injected_restart_abort_failure BEFORE UPDATE OF vm_allocation_aborted ON execution_jobs BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(core.recover_factory_jobs_after_restart().is_err());
+        assert!(!core.state.get_job(job.id).unwrap().vm_allocation_aborted);
+        assert!(
+            !core
+                .state
+                .get_host_resource_lease(lease.id)
+                .unwrap()
+                .allocation_aborted
+        );
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap().recovered,
+            0
+        );
+        assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+        conn.execute_batch("DROP TRIGGER injected_restart_abort_failure;")
+            .unwrap();
+        assert_eq!(core.recover_factory_jobs_after_restart().unwrap(), 0);
+        assert!(core.state.get_job(job.id).unwrap().vm_allocation_aborted);
+        assert!(core.state.mark_job_running(job.id).is_err());
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn restart_recovery_refuses_to_fence_while_a_worker_is_owned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let job = core
+            .state
+            .accept_job(
+                "live-owner",
+                "{}",
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap()
+            .0;
+        let name = core.state.claim_job_vm(job.id).unwrap().vm_name.unwrap();
+        let id = Uuid::new_v4();
+        core.state.bind_job_vm(job.id, id, &name).unwrap();
+        let lease = core
+            .state
+            .begin_host_resource_lease_for_vm(&name, id)
+            .unwrap();
+        core.factory_workers
+            .lock()
+            .insert(job.id, tokio::spawn(std::future::pending::<()>()));
+        assert!(core.recover_factory_jobs_after_restart().is_err());
+        assert_eq!(
+            core.state.get_job(job.id).unwrap().state,
+            husker_state::jobs::JobState::Preparing
+        );
+        assert!(
+            !core
+                .state
+                .get_host_resource_lease(lease.id)
+                .unwrap()
+                .allocation_aborted
+        );
+        let handle = core.factory_workers.lock().remove(&job.id).unwrap();
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        let shutdown = core.factory_shutdown_lock.lock().await;
+        assert!(core.factory_workers.lock().is_empty());
+        assert!(core.recover_factory_jobs_after_restart().is_err());
+        assert!(!core.state.get_job(job.id).unwrap().vm_allocation_aborted);
+        drop(shutdown);
+        assert_eq!(core.recover_factory_jobs_after_restart().unwrap(), 1);
+        assert!(core.state.get_job(job.id).unwrap().vm_allocation_aborted);
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn factory_tick_retries_terminal_publication_and_never_confirms_absent_vm_destruction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("worker-publication.sqlite");
+        let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let job = core
+            .state
+            .accept_job(
+                "unpublished",
+                "{}",
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap()
+            .0;
+        let name = format!("job-{}", job.id);
+        let vm_id = Uuid::new_v4();
+        core.state.bind_job_vm(job.id, vm_id, &name).unwrap();
+        core.state.mark_job_running(job.id).unwrap();
+        core.factory_workers
+            .lock()
+            .insert(job.id, tokio::spawn(async {}));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !core.factory_workers.lock()[&job.id].is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TRIGGER block_outcome BEFORE UPDATE OF state ON execution_jobs BEGIN SELECT RAISE(ABORT, 'synthetic journal write failure'); END;").unwrap();
+        let blocked = core.factory_cleanup_tick().await.unwrap();
+        assert_eq!(blocked.outcome_publication_pending, 1);
+        assert_eq!(blocked.outcomes_reconciled, 0);
+        assert!(core.factory_workers.lock().contains_key(&job.id));
+        connection
+            .execute_batch("DROP TRIGGER block_outcome;")
+            .unwrap();
+        let report = core.factory_cleanup_tick().await.unwrap();
+        assert_eq!(report.outcomes_reconciled, 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.confirmed, 0);
+        assert_eq!(report.pending, 1);
+        assert!(core.factory_workers.lock()[&job.id].is_finished());
+        let job = core.state.get_job(job.id).unwrap();
+        assert_eq!(job.state, husker_state::jobs::JobState::Unknown);
+        assert!(job.cleanup_pending);
+        assert!(!job.vm_destroyed);
+        assert_eq!(job.vm_id, Some(vm_id));
+        assert_eq!(
+            core.factory_cleanup_tick()
+                .await
+                .unwrap()
+                .outcomes_reconciled,
+            0
+        );
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn factory_tick_retries_abort_then_releases_fixture_storage_and_cid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abort-retry.sqlite");
+        // Backend object only: no VM or guest is created in this fixture.
+        let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let job = core
+            .state
+            .accept_job(
+                "abort-cleanup",
+                "{}",
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap()
+            .0;
+        let name = core.state.claim_job_vm(job.id).unwrap().vm_name.unwrap();
+        let vm_id = Uuid::new_v4();
+        core.state.bind_job_vm(job.id, vm_id, &name).unwrap();
+        let lease = core
+            .state
+            .begin_host_resource_lease_for_vm(&name, vm_id)
+            .unwrap();
+        let directory = core.storage.vm_dir(&name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("rootfs.ext4"), b"partial fixture disk").unwrap();
+        core.factory_workers
+            .lock()
+            .insert(job.id, tokio::spawn(async {}));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !core.factory_workers.lock()[&job.id].is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TRIGGER block_abort BEFORE UPDATE OF vm_allocation_aborted ON execution_jobs BEGIN SELECT RAISE(ABORT, 'synthetic abort write failure'); END;").unwrap();
+        let blocked = core.factory_cleanup_tick().await.unwrap();
+        assert_eq!(blocked.outcomes_reconciled, 1);
+        assert_eq!(blocked.allocation_aborts_pending, 1);
+        assert_eq!(blocked.allocation_aborts_confirmed, 0);
+        assert_eq!(blocked.confirmed, 0);
+        assert_eq!(blocked.pending, 1);
+        assert!(!core.state.get_job(job.id).unwrap().vm_allocation_aborted);
+        assert!(
+            !core
+                .state
+                .get_host_resource_lease(lease.id)
+                .unwrap()
+                .allocation_aborted
+        );
+        assert!(core.factory_workers.lock()[&job.id].is_finished());
+        assert!(directory.exists());
+        assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+        connection
+            .execute_batch("DROP TRIGGER block_abort;")
+            .unwrap();
+        let repaired = core.factory_cleanup_tick().await.unwrap();
+        assert_eq!(repaired.outcomes_reconciled, 0);
+        assert_eq!(repaired.allocation_aborts_confirmed, 1);
+        assert_eq!(repaired.allocation_aborts_pending, 0);
+        assert_eq!(repaired.confirmed, 1);
+        assert_eq!(repaired.pending, 0);
+        let receipt = core.state.get_job(job.id).unwrap();
+        assert_eq!(receipt.state, husker_state::jobs::JobState::Unknown);
+        assert!(receipt.vm_allocation_aborted);
+        assert!(!receipt.vm_destroyed && !receipt.cleanup_pending);
+        assert!(core.state.list_host_resource_leases().unwrap().is_empty());
+        assert!(!directory.exists());
+        assert_eq!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+        assert_eq!(
+            core.factory_cleanup_tick()
+                .await
+                .unwrap()
+                .allocation_aborts_confirmed,
+            0
+        );
+        assert!(core.factory_workers.lock().is_empty());
+        let replay = core
+            .state
+            .accept_job(
+                "abort-cleanup",
+                "{}",
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        assert!(!replay.1);
+        assert_eq!(replay.0.id, job.id);
+        assert_eq!(replay.0.state, receipt.state);
+        assert!(core.factory_workers.lock().is_empty());
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn macos_lease_recovery_rejects_unsupported_network_ownership_before_removing_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        let lease = core
+            .state
+            .begin_host_resource_lease("foreign-network")
+            .unwrap();
+        core.state
+            .set_host_resource_lease_network(lease.id, Some("husker3"), Some("172.20.0.2"))
+            .unwrap();
+        let directory = core.storage.vm_dir(&lease.vm_name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("rootfs.ext4"), b"preserve").unwrap();
+        core.state.begin_host_resource_lease("healthy").unwrap();
+        let recovery = core.recover_host_resource_leases().await.unwrap();
+        assert_eq!(recovery.failed, 1);
+        assert_eq!(recovery.recovered, 1);
+        assert_eq!(
+            std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(
+            core.state.list_host_resource_leases().unwrap()[0].id,
+            lease.id
+        );
+        assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn macos_lease_recovery_retains_identity_after_filesystem_failure_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        let lease = core
+            .state
+            .begin_host_resource_lease("retry-cleanup")
+            .unwrap();
+        let directory = core.storage.vm_dir(&lease.vm_name);
+        std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        std::fs::write(&directory, b"unexpected file").unwrap();
+        assert_eq!(core.recover_host_resource_leases().await.unwrap().failed, 1);
+        assert_eq!(std::fs::read(&directory).unwrap(), b"unexpected file");
+        assert_eq!(
+            core.state.list_host_resource_leases().unwrap()[0].id,
+            lease.id
+        );
+        assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap().recovered,
+            1
+        );
+        assert!(!directory.exists());
+        assert!(core.state.list_host_resource_leases().unwrap().is_empty());
+        assert_eq!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn macos_lease_recovery_preserves_replacement_vm_disk_and_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        let lease = core.state.begin_host_resource_lease("replacement").unwrap();
+        let mut vm = running_nat_vm(&lease.vm_name);
+        vm.vsock_cid = lease.vsock_cid + 100;
+        core.state.insert_vm(&vm).unwrap();
+        let directory = core.storage.vm_dir(&lease.vm_name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("rootfs.ext4"), b"replacement disk").unwrap();
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap().recovered,
+            0
+        );
+        assert_eq!(core.state.get_vm(vm.id).unwrap().name, vm.name);
+        assert_eq!(
+            std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+            b"replacement disk"
+        );
+        assert_eq!(
+            core.state.list_host_resource_leases().unwrap()[0].id,
+            lease.id
+        );
+        assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+    }
+
+    #[tokio::test]
+    async fn rollback_preserves_files_when_backend_entered_without_reporting_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(not(feature = "linux-net"))]
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        #[cfg(feature = "linux-net")]
+        let core = test_core().await;
+        #[cfg(feature = "linux-net")]
+        let lease = core
+            .state
+            .begin_host_resource_lease("uncertain-allocation")
+            .unwrap();
+        let directory = tmp.path().join("uncertain-disk");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("rootfs"), b"uncertain allocation").unwrap();
+        let error = core
+            .rollback_create(AllocatedResources {
+                backend_allocation_entered: true,
+                vm_dir: Some(directory.clone()),
+                #[cfg(feature = "linux-net")]
+                host_resource_lease_id: Some(lease.id),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("destruction is unconfirmed"));
+        assert_eq!(
+            std::fs::read(directory.join("rootfs")).unwrap(),
+            b"uncertain allocation"
+        );
+        #[cfg(feature = "linux-net")]
+        {
+            assert_eq!(
+                core.state.list_host_resource_leases().unwrap()[0].id,
+                lease.id
+            );
+            assert_ne!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+        }
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn rollback_preserves_cid_when_directory_removal_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        let cid = core.state.allocate_cid().unwrap();
+        let path = tmp.path().join("unexpected-file");
+        std::fs::write(&path, b"preserve").unwrap();
+        assert!(
+            core.rollback_create(AllocatedResources {
+                vm_id: None,
+                vm_dir: Some(path.clone()),
+                cid: Some(cid),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"preserve");
+        assert_ne!(core.state.allocate_cid().unwrap(), cid);
+    }
+
+    #[tokio::test]
+    async fn factory_cleanup_recovers_exact_leased_destruction_without_a_vm_row() {
+        for matching in [false, true] {
+            #[cfg(not(feature = "linux-net"))]
+            let tmp = tempfile::tempdir().unwrap();
+            #[cfg(not(feature = "linux-net"))]
+            let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+            #[cfg(feature = "linux-net")]
+            let core = test_core().await;
+            let deadline = chrono::Utc::now() + chrono::Duration::minutes(5);
+            let job = core
+                .state
+                .accept_job(
+                    "lease-recovery",
+                    "{\"version\":1}",
+                    deadline,
+                    deadline + chrono::Duration::days(1),
+                )
+                .unwrap()
+                .0;
+            let claimed = core.state.claim_job_vm(job.id).unwrap();
+            let name = claimed.vm_name.unwrap();
+            let vm_id = Uuid::new_v4();
+            core.state.bind_job_vm(job.id, vm_id, &name).unwrap();
+            core.state
+                .finish_job(
+                    job.id,
+                    husker_state::jobs::JobState::InfrastructureFailed,
+                    husker_state::jobs::CollectionState::Failed,
+                    "{\"version\":1}",
+                )
+                .unwrap();
+            let lease = core.state.begin_host_resource_lease(&name).unwrap();
+            let leased_id = if matching { vm_id } else { Uuid::new_v4() };
+            core.state
+                .enter_host_resource_lease_backend(lease.id, leased_id)
+                .unwrap();
+            core.state
+                .record_host_resource_lease_destruction(lease.id, leased_id)
+                .unwrap();
+            let directory = core.storage.vm_dir(&name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("rootfs.ext4"), b"leased disk").unwrap();
+            let result = core.cleanup_job_vm(job.id).await;
+            let recovered = core.state.get_job(job.id).unwrap();
+            if matching {
+                result.unwrap();
+                assert!(recovered.vm_destroyed && !recovered.cleanup_pending);
+                assert!(core.state.list_host_resource_leases().unwrap().is_empty());
+                assert_eq!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
+                assert!(!directory.exists());
+            } else {
+                assert!(result.is_err());
+                assert!(!recovered.vm_destroyed && recovered.cleanup_pending);
+                assert_eq!(
+                    std::fs::read(directory.join("rootfs.ext4")).unwrap(),
+                    b"leased disk"
+                );
+                assert_eq!(
+                    core.state.list_host_resource_leases().unwrap()[0].id,
+                    lease.id
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
+    async fn rollback_releases_cid_after_pre_vmm_files_are_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
+        let cid = core.state.allocate_cid().unwrap();
+        let directory = tmp.path().join("partial-disk");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("rootfs"), b"partial").unwrap();
+        core.rollback_create(AllocatedResources {
+            vm_id: None,
+            vm_dir: Some(directory.clone()),
+            cid: Some(cid),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(!directory.exists());
+        assert_eq!(core.state.allocate_cid().unwrap(), cid);
     }
 
     /// Helper: a running NAT VM record with a discovered guest IP, for the

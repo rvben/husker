@@ -1,6 +1,44 @@
 use super::*;
 
 impl<B: VmmBackend> HuskerCore<B> {
+    async fn create_leased_vm(
+        &self,
+        selection: husker_vmm::BackendSelection,
+        mut config: husker_vmm::VmConfig,
+        resources: &mut AllocatedResources,
+    ) -> Result<husker_vmm::CreatedVm, CoreError> {
+        let lease = resources
+            .host_resource_lease_id
+            .ok_or_else(|| CoreError::Io("VM creation has no durable resource lease".into()))?;
+        let id = self
+            .state
+            .get_host_resource_lease(lease)?
+            .vm_id
+            .ok_or_else(|| CoreError::Io("creation lease has no planned VM UUID".into()))?;
+        if config.requested_id.is_some_and(|requested| requested != id) {
+            return Err(CoreError::Io(
+                "requested UUID differs from planned creation lease".into(),
+            ));
+        }
+        config.requested_id = Some(id);
+        self.state.enter_host_resource_lease_backend(lease, id)?;
+        resources.vm_id = Some(id);
+        resources.backend_allocation_entered = true;
+        let created = self.vmm.create_vm(selection, config).await?;
+        if created.info.id != id {
+            // A contract-violating backend may own either identity. Preserve the
+            // lease/files instead of treating one destroyed ID as full cleanup.
+            resources.vm_id = None;
+            tracing::error!(planned_vm = %id, returned_vm = %created.info.id,
+                "backend returned a different leased VM UUID; both identities require reconciliation");
+            return Err(CoreError::Io(format!(
+                "backend returned VM {} instead of leased VM {id}",
+                created.info.id
+            )));
+        }
+        Ok(created)
+    }
+
     /// Create and boot a new VM.
     ///
     /// Allocates network, storage, and VMM resources. On failure, all
@@ -128,20 +166,28 @@ impl<B: VmmBackend> HuskerCore<B> {
         let core = Arc::clone(self);
         let name = req.name.clone();
         crate::run_to_completion("creation", &name, async move {
-            core.create_vm_record_inner(req, tags, replace_existing_stopped, expiration)
+            core.create_vm_record_inner(req, tags, replace_existing_stopped, expiration, None)
                 .await
         })
         .await
     }
 
-    async fn create_vm_record_inner(
+    pub(crate) async fn create_vm_record_inner(
         &self,
         mut req: CreateVmRequest,
         tags: Option<ServiceTag>,
         replace_existing_stopped: bool,
         expiration: Option<PendingVmExpiration>,
+        prepared_boot: Option<&PreparedBoot>,
     ) -> Result<VmRecord, CoreError> {
         validate_resource_name("vm", &req.name)?;
+        #[cfg(not(feature = "linux-net"))]
+        if validate_network_mode(req.network.as_deref())? == NetworkMode::Bridged {
+            return Err(CoreError::InvalidArgument(
+                "bridged networking is only supported on Linux".into(),
+            ));
+        }
+
         crate::validate_egress_network_contract(req.network.as_deref(), !req.egress.is_empty())?;
         #[cfg(feature = "linux-net")]
         let resolved_egress = crate::egress::resolve_egress_rules(&req.egress).await?;
@@ -187,17 +233,19 @@ impl<B: VmmBackend> HuskerCore<B> {
             // mistake, a missing default is the daemon host's.
             let kernel_from_default = req.kernel_path.is_none();
             let rootfs_from_default = req.rootfs_path.is_none();
-            if kernel_from_default {
+            if prepared_boot.is_none() && kernel_from_default {
                 req.kernel_path = self.default_kernel.clone();
             }
-            if rootfs_from_default {
+            if prepared_boot.is_none() && rootfs_from_default {
                 req.rootfs_path = self.default_rootfs.clone();
             }
             // Resolve a catalog image name or an OCI/Docker reference in the rootfs
             // argument to a real host path (auto-importing an OCI ref on first use),
             // so `husker run myimg` / `husker job python:3.12-alpine` work without
             // knowing the on-disk catalog layout.
-            if let Some(rootfs) = req.rootfs_path.take() {
+            if prepared_boot.is_none()
+                && let Some(rootfs) = req.rootfs_path.take()
+            {
                 req.rootfs_path = Some(self.resolve_rootfs_arg(&rootfs).await?);
             }
             let kernel = req
@@ -229,6 +277,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 &resolved_egress,
                 tags,
                 expiration.as_ref(),
+                prepared_boot,
                 &mut resources,
             )
             .await
@@ -240,7 +289,27 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             Err(e) => {
                 warn!(error = %e, "VM creation failed, rolling back");
-                self.rollback_create(resources).await;
+                if !resources.backend_allocation_entered
+                    && let (Some(boot), Some(lease)) =
+                        (prepared_boot, resources.host_resource_lease_id)
+                {
+                    let job = self
+                        .state
+                        .job_for_vm(boot.vm_id)
+                        .map_err(|error| CoreError::Io(error.to_string()))?
+                        .ok_or_else(|| {
+                            CoreError::Io("prepared creation lost its job owner".into())
+                        })?;
+                    self.state.record_job_leased_prebackend_abort(job.id, boot.vm_id, lease)
+                        .map_err(|error| CoreError::Io(format!(
+                            "VM creation failed ({e}); pre-backend abort remains unconfirmed: {error}"
+                        )))?;
+                }
+                if let Err(rollback) = self.rollback_create(resources).await {
+                    return Err(CoreError::Io(format!(
+                        "VM creation failed ({e}); rollback remains pending: {rollback}"
+                    )));
+                }
                 Err(e)
             }
         }
@@ -254,6 +323,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         resolved_egress: &[crate::egress::ResolvedEgressRule],
         tags: Option<ServiceTag>,
         expiration: Option<&PendingVmExpiration>,
+        prepared_boot: Option<&PreparedBoot>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
         if req.macos_image.is_some() {
@@ -317,7 +387,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             None
         };
 
-        let lease = self.state.begin_host_resource_lease(&req.name)?;
+        let planned_id = prepared_boot
+            .map(|boot| boot.vm_id)
+            .unwrap_or_else(Uuid::new_v4);
+        let lease = self
+            .state
+            .begin_host_resource_lease_for_vm(&req.name, planned_id)?;
         let cid = lease.vsock_cid;
         resources.cid = Some(cid);
         resources.host_resource_lease_id = Some(lease.id);
@@ -492,7 +567,11 @@ impl<B: VmmBackend> HuskerCore<B> {
                     source: rootfs,
                     destination: &vm_rootfs,
                     size_bytes: req.disk_size,
-                    guest_agent: self.embedded_agent,
+                    guest_agent: if prepared_boot.is_some() {
+                        &[]
+                    } else {
+                        self.embedded_agent
+                    },
                 })
                 .await
                 .map_err(crate::storage_preparation_error)?;
@@ -518,7 +597,10 @@ impl<B: VmmBackend> HuskerCore<B> {
                     .map(|host| (host.clone(), rule.destination))
             })
             .collect::<Vec<_>>();
-        if !is_cloud && (!self.dns_servers.is_empty() || !egress_hosts.is_empty()) {
+        if prepared_boot.is_none()
+            && !is_cloud
+            && (!self.dns_servers.is_empty() || !egress_hosts.is_empty())
+        {
             inject_network_config(&disk_path, &self.dns_servers, &egress_hosts).await?;
         }
 
@@ -552,7 +634,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // If the booting rootfs is a catalog image with a boot_init (an OCI image
         // imported by `import-oci`), boot it via the agent supervisor. Looked up
         // by the source rootfs path so it works however the image was referenced.
-        let boot_init = if is_cloud {
+        let boot_init = if prepared_boot.is_some() || is_cloud {
             None
         } else {
             self.state.list_images().ok().and_then(|imgs| {
@@ -565,14 +647,17 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Resolve initrd: prefer explicit path, then daemon default (if it exists on
         // the daemon host), then the conventional data-dir location as a last resort.
         // Resolved before kernel_args so the root= flag reflects the actual initrd state.
-        let initrd_path = req
-            .initrd_path
-            .clone()
-            .or_else(|| self.default_initrd.clone().filter(|p| p.exists()))
-            .or_else(|| {
-                let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
-                conventional.exists().then_some(conventional)
-            });
+        let initrd_path = if prepared_boot.is_some() {
+            req.initrd_path.clone()
+        } else {
+            req.initrd_path
+                .clone()
+                .or_else(|| self.default_initrd.clone().filter(|p| p.exists()))
+                .or_else(|| {
+                    let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
+                    conventional.exists().then_some(conventional)
+                })
+        };
 
         // Parse and validate host-mount specs. Each spec is validated for path
         // safety here; the API layer enforces the allowlist before forwarding.
@@ -605,6 +690,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         };
 
         let vm_config = husker_vmm::VmConfig {
+            requested_id: prepared_boot.map(|boot| boot.vm_id),
             name: req.name.clone(),
             vcpu_count: req
                 .vcpu_count
@@ -624,13 +710,21 @@ impl<B: VmmBackend> HuskerCore<B> {
             seed_path,
             balloon: req.balloon,
             volume_path,
+            network_disabled: network_mode == NetworkMode::Isolated,
             host_shares,
         };
 
-        let created = self.vmm.create_vm(backend_selection, vm_config).await?;
+        let created = self
+            .create_leased_vm(backend_selection, vm_config, resources)
+            .await?;
         let backend = created.backend();
         let info = created.info;
         resources.vm_id = Some(info.id);
+        if prepared_boot.is_some_and(|boot| boot.vm_id != info.id) {
+            return Err(CoreError::InvalidArgument(
+                "backend returned a different prepared VM UUID".into(),
+            ));
+        }
 
         let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
         let now = chrono::Utc::now();
@@ -715,23 +809,18 @@ impl<B: VmmBackend> HuskerCore<B> {
         _resolved_egress: &[crate::egress::ResolvedEgressRule],
         tags: Option<ServiceTag>,
         expiration: Option<&PendingVmExpiration>,
+        prepared_boot: Option<&PreparedBoot>,
         resources: &mut AllocatedResources,
     ) -> Result<VmRecord, CoreError> {
-        // Apple VZ always installs a NAT attachment. Reject every other mode
-        // before allocating resources so persistence never promises networking
-        // semantics the backend did not enforce.
+        // Apple VZ supports NAT or no virtual NIC. Reject unsupported modes
+        // before allocating resources; never degrade policy to NAT.
         let network_mode = validate_network_mode(req.network.as_deref())?;
 
         match network_mode {
-            NetworkMode::Nat => {}
+            NetworkMode::Nat | NetworkMode::Isolated => {}
             NetworkMode::Bridged => {
                 return Err(CoreError::InvalidArgument(
                     "bridged networking is only supported on Linux".into(),
-                ));
-            }
-            NetworkMode::Isolated => {
-                return Err(CoreError::InvalidArgument(
-                    "isolated networking (--net none) is only supported on Linux".into(),
                 ));
             }
         }
@@ -777,8 +866,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             backend_selection.backend(),
         )?;
 
-        let cid = self.state.allocate_cid()?;
+        let planned_id = prepared_boot
+            .map(|boot| boot.vm_id)
+            .unwrap_or_else(Uuid::new_v4);
+        let lease = self
+            .state
+            .begin_host_resource_lease_for_vm(&req.name, planned_id)?;
+        let cid = lease.vsock_cid;
         resources.cid = Some(cid);
+        resources.host_resource_lease_id = Some(lease.id);
 
         debug!(cid, "resources allocated");
 
@@ -900,6 +996,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             let record_rootfs_path = image_path.to_string_lossy().into_owned();
 
             let vm_config = husker_vmm::VmConfig {
+                requested_id: prepared_boot.map(|boot| boot.vm_id),
                 name: req.name.clone(),
                 vcpu_count: req
                     .vcpu_count
@@ -919,13 +1016,21 @@ impl<B: VmmBackend> HuskerCore<B> {
                 seed_path: Some(seed_path),
                 balloon: req.balloon,
                 volume_path: None,
+                network_disabled: network_mode == NetworkMode::Isolated,
                 host_shares: vec![],
             };
 
-            let created = self.vmm.create_vm(backend_selection, vm_config).await?;
+            let created = self
+                .create_leased_vm(backend_selection, vm_config, resources)
+                .await?;
             let backend = created.backend();
             let info = created.info;
             resources.vm_id = Some(info.id);
+            if prepared_boot.is_some_and(|boot| boot.vm_id != info.id) {
+                return Err(CoreError::InvalidArgument(
+                    "backend returned a different prepared VM UUID".into(),
+                ));
+            }
 
             let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
             let now = chrono::Utc::now();
@@ -973,7 +1078,11 @@ impl<B: VmmBackend> HuskerCore<B> {
                 expires_at: value.expires_at,
             });
             self.state
-                .insert_vm_with_expiration(&record, expiration.as_ref())
+                .commit_vm_from_host_resource_lease_with_expiration(
+                    &record,
+                    lease.id,
+                    expiration.as_ref(),
+                )
                 .map_err(map_vm_insert_error)?;
 
             return Ok(record);
@@ -997,7 +1106,11 @@ impl<B: VmmBackend> HuskerCore<B> {
                 source: rootfs,
                 destination: &vm_rootfs,
                 size_bytes: req.disk_size,
-                guest_agent: self.embedded_agent,
+                guest_agent: if prepared_boot.is_some() {
+                    &[]
+                } else {
+                    self.embedded_agent
+                },
             })
             .await
             .map_err(crate::storage_preparation_error)?;
@@ -1009,19 +1122,23 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         // Resolve initrd: prefer explicit path, then daemon default (if it exists on
         // the daemon host), then the conventional data-dir location as a last resort.
-        let initrd_path = req
-            .initrd_path
-            .clone()
-            .or_else(|| self.default_initrd.clone().filter(|p| p.exists()))
-            .or_else(|| {
-                let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
-                conventional.exists().then_some(conventional)
-            });
+        let initrd_path = if prepared_boot.is_some() {
+            req.initrd_path.clone()
+        } else {
+            req.initrd_path
+                .clone()
+                .or_else(|| self.default_initrd.clone().filter(|p| p.exists()))
+                .or_else(|| {
+                    let conventional = self.storage.data_dir.join("kernels/initramfs-virt.gz");
+                    conventional.exists().then_some(conventional)
+                })
+        };
 
         let kernel_str = kernel.to_string_lossy().into_owned();
         let rootfs_str = rootfs.to_string_lossy().into_owned();
         let volume_path = volume_attachment.as_ref().map(|(_, p)| p.clone());
         let vm_config = husker_vmm::VmConfig {
+            requested_id: prepared_boot.map(|boot| boot.vm_id),
             name: req.name.clone(),
             vcpu_count: req
                 .vcpu_count
@@ -1041,13 +1158,21 @@ impl<B: VmmBackend> HuskerCore<B> {
             seed_path: None,
             balloon: req.balloon,
             volume_path,
+            network_disabled: network_mode == NetworkMode::Isolated,
             host_shares: vec![],
         };
 
-        let created = self.vmm.create_vm(backend_selection, vm_config).await?;
+        let created = self
+            .create_leased_vm(backend_selection, vm_config, resources)
+            .await?;
         let backend = created.backend();
         let info = created.info;
         resources.vm_id = Some(info.id);
+        if prepared_boot.is_some_and(|boot| boot.vm_id != info.id) {
+            return Err(CoreError::InvalidArgument(
+                "backend returned a different prepared VM UUID".into(),
+            ));
+        }
 
         let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
         let now = chrono::Utc::now();
@@ -1095,73 +1220,97 @@ impl<B: VmmBackend> HuskerCore<B> {
             expires_at: value.expires_at,
         });
         self.state
-            .insert_vm_with_expiration(&record, expiration.as_ref())
+            .commit_vm_from_host_resource_lease_with_expiration(
+                &record,
+                lease.id,
+                expiration.as_ref(),
+            )
             .map_err(map_vm_insert_error)?;
 
         Ok(record)
     }
 
-    /// Roll back partially allocated resources in reverse order.
-    pub(crate) async fn rollback_create(&self, resources: AllocatedResources) {
-        #[cfg(feature = "linux-net")]
-        let mut host_cleanup_succeeded = true;
+    /// Roll back partially allocated resources in reverse order. Never remove
+    /// backing files or release an identity while a VMM may still own them.
+    /// Even VmNotFound is not positive evidence of destruction here.
+    pub(crate) async fn rollback_create(
+        &self,
+        resources: AllocatedResources,
+    ) -> Result<(), CoreError> {
+        if resources.backend_allocation_entered && resources.vm_id.is_none() {
+            return Err(CoreError::Io(
+                "backend allocation returned without a VM identity; destruction is unconfirmed"
+                    .into(),
+            ));
+        }
         if let Some(vm_id) = resources.vm_id {
             debug!(%vm_id, "rolling back: destroying VM");
-            if let Err(e) = self.vmm.destroy_vm(vm_id).await {
-                warn!(%vm_id, error = %e, "rollback: failed to destroy VM");
+            let factory_job = self
+                .state
+                .job_for_vm(vm_id)
+                .map_err(|error| CoreError::Io(error.to_string()))?;
+            if let Some(job) = factory_job {
+                let lease = resources.host_resource_lease_id.ok_or_else(|| {
+                    CoreError::Io("factory rollback has no creation lease".into())
+                })?;
+                self.destroy_factory_allocation(job.id, vm_id, Some(lease))
+                    .await?;
+            } else {
+                if let Some(lease) = resources.host_resource_lease_id {
+                    let lease = self.state.get_host_resource_lease(lease)?;
+                    if !lease.backend_entered || lease.vm_id != Some(vm_id) {
+                        return Err(CoreError::Io(
+                            "backend allocation has no matching entered lease".into(),
+                        ));
+                    }
+                    if !self
+                        .confirm_creation_lease_termination(&lease, None)
+                        .await?
+                    {
+                        return Err(CoreError::Io(format!(
+                            "backend allocation {vm_id} termination is unconfirmed (identity mismatch or VM not found)"
+                        )));
+                    }
+                } else {
+                    self.vmm.destroy_vm(vm_id).await?;
+                }
             }
         }
         if let Some(ref dir) = resources.vm_dir {
             debug!(dir = %dir.display(), "rolling back: removing VM directory");
-            if let Err(e) = tokio::fs::remove_dir_all(dir).await {
-                warn!(dir = %dir.display(), error = %e, "rollback: failed to remove VM directory");
+            if let Err(error) = tokio::fs::remove_dir_all(dir).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(CoreError::Io(format!(
+                    "rollback: remove VM directory {}: {error}",
+                    dir.display()
+                )));
             }
         }
         #[cfg(feature = "linux-net")]
         if let Some(ref tap) = resources.tap_name {
             debug!(tap, "rolling back: removing TAP");
-            if let Err(e) = self
-                .host_network
-                .remove_egress_policy(tap, &self.bridge_name)
-                .await
-            {
-                host_cleanup_succeeded = false;
-                warn!(tap, error = %e, "rollback: failed to remove egress policy");
-            }
-            if let Err(e) = self
-                .host_network
-                .remove_all_port_forwards(tap, &self.bridge_name)
-                .await
-            {
-                host_cleanup_succeeded = false;
-                warn!(tap, error = %e, "rollback: failed to remove port forwards");
-            }
-            if let Err(e) = self.host_network.delete_tap(tap).await {
-                host_cleanup_succeeded = false;
-                warn!(tap, error = %e, "rollback: failed to delete TAP device");
-            }
+            self.remove_tap_host_resources(tap).await?;
         }
         #[cfg(not(feature = "linux-net"))]
-        if let Some(cid) = resources.cid {
-            debug!(cid, "rolling back: releasing CID");
-            if let Err(e) = self.state.release_cid(cid) {
-                warn!(cid, error = %e, "rollback: failed to release CID");
-            }
-        }
-        #[cfg(feature = "linux-net")]
-        if host_cleanup_succeeded
-            && let Some(lease_id) = resources.host_resource_lease_id
-            && let Err(e) = self.state.release_host_resource_lease(lease_id)
+        if resources.host_resource_lease_id.is_none()
+            && let Some(cid) = resources.cid
         {
-            warn!(%lease_id, error = %e, "rollback: failed to release host-resource lease");
+            debug!(cid, "rolling back: releasing CID");
+            self.state.release_cid(cid)?;
+        }
+        if let Some(lease_id) = resources.host_resource_lease_id {
+            self.state.release_host_resource_lease(lease_id)?;
         }
         #[cfg(feature = "linux-net")]
-        if host_cleanup_succeeded && let Some(guest_ip) = resources.guest_ip {
+        if let Some(guest_ip) = resources.guest_ip {
             debug!(%guest_ip, "rolling back: releasing IP");
-            if let Err(e) = self.ip_allocator.release(guest_ip) {
-                warn!(%guest_ip, error = %e, "rollback: failed to release IP");
+            match self.ip_allocator.release(guest_ip) {
+                Ok(()) | Err(husker_net::NetError::NotAllocated(_)) => {}
+                Err(error) => return Err(error.into()),
             }
         }
+        Ok(())
     }
 
     /// Stop a running or paused VM.
@@ -1177,6 +1326,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // same per-name mutation lock used by those operations.
         let _stop_guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        self.require_reconciled_fork_source(&record)?;
         self.ensure_vm_is_not_pool_template(&record)?;
         match record.state {
             VmLifecycleState::Running | VmLifecycleState::Paused => {}
@@ -1378,6 +1528,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             Err(e) => return Err(e.into()),
         }
 
+        self.require_reconciled_fork_source(record)?;
         match self.state.get_pool_by_template_vm_id(record.id)? {
             Some(pool)
                 if owning_pool.is_some_and(|owner| {
@@ -1410,12 +1561,58 @@ impl<B: VmmBackend> HuskerCore<B> {
             self.shut_down_guest(record).await;
         }
 
-        match self.vmm.destroy_vm(record.id).await {
-            Ok(()) => {}
-            Err(husker_vmm::VmmError::VmNotFound(_)) => {
+        let factory_job = self
+            .state
+            .job_for_vm(record.id)
+            .map_err(|error| CoreError::InvalidArgument(error.to_string()))?;
+        let destruction = if let Some(job) = &factory_job {
+            if job.vm_destroyed {
+                Ok(())
+            } else {
+                let leases: Vec<_> = self
+                    .state
+                    .list_host_resource_leases()?
+                    .into_iter()
+                    .filter(|lease| lease.vm_id == Some(record.id) || lease.vm_name == name)
+                    .collect();
+                if leases.len() > 1 {
+                    return Err(CoreError::InvalidArgument(
+                        "factory destruction has conflicting creation lease owners".into(),
+                    ));
+                }
+                self.destroy_factory_allocation(
+                    job.id,
+                    record.id,
+                    leases.first().map(|lease| lease.id),
+                )
+                .await
+            }
+        } else {
+            self.vmm
+                .destroy_vm(record.id)
+                .await
+                .map_err(CoreError::from)
+        };
+        match destruction {
+            Ok(()) => {
+                self.state
+                    .record_job_vm_destruction(record.id)
+                    .map_err(|error| CoreError::InvalidArgument(error.to_string()))?;
+            }
+            Err(CoreError::Vmm(husker_vmm::VmmError::VmNotFound(_))) => {
+                if self
+                    .state
+                    .job_for_vm(record.id)
+                    .map_err(|error| CoreError::InvalidArgument(error.to_string()))?
+                    .is_some_and(|job| !job.vm_destroyed)
+                {
+                    return Err(CoreError::InvalidArgument(
+                        "factory VMM absence has no confirmed destruction receipt".into(),
+                    ));
+                }
                 debug!(%name, "VM not in VMM backend, cleaning up state only");
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
 
         // Clean up network resources. Port forwards live in two places:
@@ -1467,8 +1664,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.port_proxy.stop_all(record.id);
 
         let vm_dir = self.storage.vm_dir(&record.name);
-        if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
-            warn!(%name, dir = %vm_dir.display(), error = %e, "failed to remove VM directory during destroy");
+        if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "remove VM directory during destruction: {e}"
+            )));
         }
 
         let serial_log = self.runtime_dir.join(format!("{}.serial.log", record.id));

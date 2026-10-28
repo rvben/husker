@@ -6,6 +6,21 @@ fn main() -> Result<()> {
 
     info!("husker-agent starting");
 
+    // The factory image performs its strict offline mount setup in /sbin/init.
+    // Reuse only PID-1 child supervision: OCI networking, shares and volume
+    // discovery must never run on this path.
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.iter().any(|arg| arg == "--factory-supervisor") {
+        anyhow::ensure!(
+            arguments.len() == 1,
+            "factory supervisor accepts no extra arguments"
+        );
+        #[cfg(target_os = "linux")]
+        return husker_agent::supervisor::run_factory();
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("factory supervisor requires a Linux guest PID 1; refusing host execution");
+    }
+
     // Guest init/supervisor mode: when booted as PID 1 with the husker.init=1
     // marker (set by import-oci images), the agent becomes a minimal init - it
     // performs mounts/network/device setup and then supervises itself as a

@@ -233,6 +233,40 @@ impl VmCgroup {
         write_file(&dir.join("cgroup.procs"), &format!("{pid}\n"))
     }
 
+    /// Confirm removal before releasing ownership. Unlike Drop/best-effort
+    /// cleanup, failures retain the directory for a later destruction retry.
+    pub async fn remove_confirmed(&mut self) -> Result<(), CgroupError> {
+        let Some(dir) = self.dir.as_ref() else {
+            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            #[cfg(not(test))]
+            let result = std::fs::remove_dir(dir);
+            #[cfg(test)]
+            let result = std::fs::remove_dir_all(dir);
+            match result {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EBUSY | libc::ENOTEMPTY))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    write_file(&dir.join("cgroup.kill"), "1")?;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(source) => {
+                    return Err(CgroupError::Io {
+                        path: dir.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        self.dir = None;
+        Ok(())
+    }
+
     /// Kill the cgroup's members and remove it. A signalled member gets
     /// `MEMBER_EXIT_GRACE` to exit, awaited on the runtime clock so the worker
     /// running a stop or destroy stays free for other VMs.
@@ -409,5 +443,22 @@ mod tests {
             vm_cgroup_dir_name(id),
             "vm-00000000-0000-0000-0000-000000000000"
         );
+    }
+    #[tokio::test]
+    async fn confirmed_cleanup_preserves_failed_ownership_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cgroup");
+        std::fs::write(&path, b"invalid directory fixture").unwrap();
+        let mut group = VmCgroup {
+            dir: Some(path.clone()),
+        };
+        assert!(group.remove_confirmed().await.is_err());
+        assert_eq!(group.dir.as_ref(), Some(&path));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        group.remove_confirmed().await.unwrap();
+        assert!(group.dir.is_none());
+        assert!(!path.exists());
+        group.remove_confirmed().await.unwrap();
     }
 }
