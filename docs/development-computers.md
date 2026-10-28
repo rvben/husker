@@ -309,7 +309,7 @@ HUSKER_RUN_DEV_E2E=1 HUSKER_DEV_E2E_URL=http://127.0.0.1:7777 \
 
 The JSON result reports `fork_api_ms` and `first_guest_response_ms` separately
 for every clone. These include Husker orchestration and client/agent overhead;
-they are not raw VMM benchmarks. `HUSKER_DEV_E2E_FORKS` selects 1–8 clones (default
+they are not raw VMM benchmarks. `HUSKER_DEV_E2E_FORKS` selects 1 to 8 clones (default
 2). Ensure the test host can accommodate their configured 4 GiB / 2-vCPU limits
 and disk clones. Local proof-workload tests validate the harness only; real
 Firecracker, Ubuntu provisioning and kernel behavior require the live gate.
