@@ -23,6 +23,8 @@ pub(crate) struct QemuInstance {
     pub(crate) qmp_path: PathBuf,
     pub(crate) pidfile_path: PathBuf,
     pub(crate) serial_log_path: PathBuf,
+    /// Finished once the process is confirmed exited, keeping its final output.
+    pub(crate) serial_capture: Option<crate::serial_capture::SerialCapture>,
     pub(crate) boot_log_path: PathBuf,
     /// Absent while starting filesystem helpers or after a failed main spawn.
     pub(crate) process: Option<tokio::process::Child>,
@@ -44,6 +46,7 @@ async fn settle_stopped(inst: &mut QemuInstance) {
     inst.info.state = VmState::Stopped;
     inst.info.pid = None;
     inst.cgroup.remove().await;
+    crate::serial_capture::finish_child_capture(&mut inst.serial_capture).await;
 }
 
 /// Wait for a guest-triggered QEMU exit and force termination when the guest
@@ -162,9 +165,10 @@ impl QemuKvmBackend {
             config.name.clone(),
             "-qmp".into(),
             format!("unix:{},server,nowait", self.qmp_socket(id).display()),
-            // Guest serial console (ttyS0) -> file, so `husker logs` can read it.
+            // Guest serial console (ttyS0) -> stdout, drained by a bounded
+            // capture into the file `husker logs` reads.
             "-serial".into(),
-            format!("file:{}", self.serial_log(id).display()),
+            "stdio".into(),
             "-pidfile".into(),
             self.pidfile(id).to_string_lossy().into_owned(),
             "-device".into(),
@@ -361,6 +365,7 @@ impl QemuKvmBackend {
                 qmp_path: self.qmp_socket(id),
                 pidfile_path: self.pidfile(id),
                 serial_log_path: self.serial_log(id),
+                serial_capture: None,
                 boot_log_path: self.boot_log(id),
                 process: None,
                 balloon: config.balloon,
@@ -401,11 +406,8 @@ impl QemuKvmBackend {
             })?;
         }
         let boot_log_path = self.boot_log(id);
-        let log_out = std::fs::File::create(&boot_log_path)
+        let log_err = std::fs::File::create(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("create qemu log: {e}")))?;
-        let log_err = log_out
-            .try_clone()
-            .map_err(|e| VmmError::ProcessError(format!("clone qemu log handle: {e}")))?;
 
         for (n, share) in config.host_shares.iter().enumerate() {
             let sock = self.virtiofs_sock(id, n);
@@ -437,10 +439,13 @@ impl QemuKvmBackend {
 
         let mut instances = self.instances.lock().await;
         let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+        let (serial_output, serial_capture) =
+            crate::serial_capture::SerialCapture::for_child(&instance.serial_log_path)?;
+        instance.serial_capture = Some(serial_capture);
         let process = tokio::process::Command::new(&self.binary)
             .args(args)
             .stdin(std::process::Stdio::null())
-            .stdout(log_out)
+            .stdout(serial_output)
             .stderr(log_err)
             .kill_on_drop(true)
             .spawn()
@@ -539,6 +544,7 @@ impl QemuKvmBackend {
         if let Some(process) = &mut inst.process {
             crate::termination::terminate_child(process, "qemu").await?;
         }
+        crate::serial_capture::finish_child_capture(&mut inst.serial_capture).await;
         for vfd in &mut inst.virtiofsds {
             crate::termination::terminate_child(vfd, "virtiofsd").await?;
         }
@@ -546,12 +552,12 @@ impl QemuKvmBackend {
         for path in [
             inst.qmp_path.as_path(),
             inst.pidfile_path.as_path(),
-            inst.serial_log_path.as_path(),
             inst.boot_log_path.as_path(),
             ovmf_vars_copy.as_path(),
         ] {
             crate::termination::remove_runtime_file(path).await?;
         }
+        crate::serial_capture::remove_serial_log(&inst.serial_log_path).await?;
         for sock in &inst.virtiofsd_socks {
             crate::termination::remove_runtime_file(sock).await?;
         }
@@ -992,6 +998,7 @@ mod tests {
                 qmp_path: dir.path().join("x.qmp"),
                 pidfile_path: dir.path().join("x.pid"),
                 serial_log_path: dir.path().join("x.serial.log"),
+                serial_capture: None,
                 boot_log_path: dir.path().join("x.boot.log"),
                 process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,
@@ -1014,7 +1021,9 @@ mod tests {
         let qmp = dir.path().join("a.qmp");
         let pid = dir.path().join("a.pid");
         let serial = dir.path().join("a.serial.log");
-        for p in [&qmp, &pid, &serial] {
+        // Left by a compaction a crash interrupted.
+        let serial_staging = crate::serial_log::compaction_staging_path(&serial);
+        for p in [&qmp, &pid, &serial, &serial_staging] {
             tokio::fs::write(p, b"").await.unwrap();
         }
         be.instances.lock().await.insert(
@@ -1032,6 +1041,7 @@ mod tests {
                 qmp_path: qmp.clone(),
                 pidfile_path: pid.clone(),
                 serial_log_path: serial.clone(),
+                serial_capture: None,
                 boot_log_path: dir.path().join("a.boot.log"),
                 process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,
@@ -1062,6 +1072,7 @@ mod tests {
         be.destroy(id).await.unwrap();
         assert!(!be.instances.lock().await.contains_key(&id));
         assert!(!qmp.exists() && !pid.exists() && !serial.exists());
+        assert!(!serial_staging.exists());
     }
 
     #[tokio::test]
@@ -1085,6 +1096,7 @@ mod tests {
                 qmp_path: dir.path().join("d.qmp"),
                 pidfile_path: dir.path().join("d.pid"),
                 serial_log_path: dir.path().join("d.serial.log"),
+                serial_capture: None,
                 boot_log_path: dir.path().join("d.boot.log"),
                 process: Some(process),
                 balloon: false,
@@ -1122,6 +1134,7 @@ mod tests {
                 qmp_path,
                 pidfile_path: dir.join("stop.pid"),
                 serial_log_path: dir.join("stop.serial.log"),
+                serial_capture: None,
                 boot_log_path: dir.join("stop.boot.log"),
                 process: Some(process),
                 balloon: false,
@@ -1412,6 +1425,7 @@ mod tests {
                 qmp_path: dir.path().join("u.qmp"),
                 pidfile_path: dir.path().join("u.pid"),
                 serial_log_path: dir.path().join("u.serial.log"),
+                serial_capture: None,
                 boot_log_path: dir.path().join("u.boot.log"),
                 process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,
@@ -1520,6 +1534,7 @@ mod tests {
                 qmp_path: dir.path().join("nb.qmp"),
                 pidfile_path: dir.path().join("nb.pid"),
                 serial_log_path: dir.path().join("nb.serial.log"),
+                serial_capture: None,
                 boot_log_path: dir.path().join("nb.boot.log"),
                 process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,

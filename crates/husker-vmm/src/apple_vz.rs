@@ -839,7 +839,7 @@ impl VmmBackend for AppleVzBackend {
             if let Some(capture) = &mut instance.serial_capture {
                 capture.finish().await?;
             }
-            crate::termination::remove_runtime_file(&instance.serial_log_path).await?;
+            crate::serial_capture::remove_serial_log(&instance.serial_log_path).await?;
             drop(instance);
             return self.forget_stopped_instance(id, &owner).await;
         }
@@ -867,7 +867,7 @@ impl VmmBackend for AppleVzBackend {
         if let Some(capture) = &mut instance.serial_capture {
             capture.finish().await?;
         }
-        crate::termination::remove_runtime_file(&instance.serial_log_path).await?;
+        crate::serial_capture::remove_serial_log(&instance.serial_log_path).await?;
         instance.info.state = VmState::Stopped;
         drop(instance);
         self.forget_stopped_instance(id, &owner).await
@@ -1376,8 +1376,12 @@ mod tests {
             assert!(backend.destroy_vm(id).await.is_err());
             assert!(backend.instances.lock().await.contains_key(&id));
             std::fs::remove_dir(&path).unwrap();
+            // Left by a compaction a crash interrupted.
+            let staging = crate::serial_log::compaction_staging_path(&path);
+            std::fs::write(&staging, b"").unwrap();
             backend.destroy_vm(id).await.unwrap();
             assert!(!backend.instances.lock().await.contains_key(&id));
+            assert!(!staging.exists());
         }
     }
 

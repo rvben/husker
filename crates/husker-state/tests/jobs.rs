@@ -145,7 +145,7 @@ fn boot_storage_reservation_counts_two_disks_and_stays_owned_until_full_cleanup(
     budget.max_boot_storage_bytes = 2 * 1024 * 1024 * 1024
         + husker_types::factory_limits::KERNEL_BYTES
         + husker_types::factory_limits::INITRD_BYTES
-        + husker_types::factory_limits::SERIAL_BYTES;
+        + husker_types::factory_limits::SERIAL_STORAGE_BYTES;
     let first = budget_submit(&store, "boot-first", &budget).unwrap().0;
     let vm = Uuid::new_v4();
     store.bind_job_vm(first.id, vm, "boot-budget-vm").unwrap();
@@ -1412,7 +1412,7 @@ fn filesystem_pressure_is_atomic_and_replay_never_observes_storage() {
     let boot = 2 * 1024 * 1024 * 1024
         + husker_types::factory_limits::KERNEL_BYTES
         + husker_types::factory_limits::INITRD_BYTES
-        + husker_types::factory_limits::SERIAL_BYTES;
+        + husker_types::factory_limits::SERIAL_STORAGE_BYTES;
     let floor = budget.min_free_storage_bytes;
     for (storage, reason) in [
         (

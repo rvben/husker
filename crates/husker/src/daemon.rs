@@ -1316,10 +1316,6 @@ async fn run_daemon_runtime<B: husker_vmm::VmmBackend + 'static>(
         config.service_reconcile_interval,
         workers.shutdown_signal(),
     ));
-    workers.supervise(Some(spawn_log_rotation(
-        Arc::clone(&core),
-        workers.shutdown_signal(),
-    )));
     workers.supervise(Some(spawn_factory_cleanup_loop(
         Arc::clone(&core),
         workers.shutdown_signal(),
@@ -1564,29 +1560,6 @@ fn spawn_expiration_loop<B: husker_vmm::VmmBackend + 'static>(
                 biased;
                 () = wait_for_runtime_shutdown(&mut shutdown) => break,
                 _ = ticker.tick() => core.expiration_tick().await,
-            }
-        }
-    })
-}
-
-/// Spawn a background task that rotates oversized serial logs every hour.
-fn spawn_log_rotation<B: husker_vmm::VmmBackend + 'static>(
-    core: Arc<husker_core::HuskerCore<B>>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-        interval.tick().await; // first tick fires immediately, skip it
-        loop {
-            tokio::select! {
-                biased;
-                () = wait_for_runtime_shutdown(&mut shutdown) => break,
-                _ = interval.tick() => {
-                    let count = core.rotate_serial_logs().await;
-                    if count > 0 {
-                        tracing::info!(count, "rotated serial logs");
-                    }
-                }
             }
         }
     })

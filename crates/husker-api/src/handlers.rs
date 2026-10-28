@@ -2292,7 +2292,7 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
 
     // Error `code`s are part of the stable API contract: each source yields
     // a `{source}_log_*` prefix (e.g. `serial_log_not_found`, `boot_log_not_found`).
-    let metadata = tokio::fs::metadata(&log_path).await.map_err(|e| {
+    let log_error = |e: std::io::Error| {
         if e.kind() == std::io::ErrorKind::NotFound {
             (
                 StatusCode::NOT_FOUND,
@@ -2310,69 +2310,26 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
                 ),
             )
         }
-    })?;
+    };
 
-    let file_size = metadata.len();
     if follow {
         // Bounded preload: for follow mode never load more than 1 MiB.
-        let mut initial_content = if file_size > LOG_MAX_READ_BYTES {
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response(
-                        &format!("{log_label}_log_read_failed"),
-                        format!("reading {log_label} log: {e}"),
-                    ),
-                )
-            })?;
-            file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
+        let (mut follower, preload, truncated) =
+            husker_vmm::serial_log::SerialFollower::start(&log_path, LOG_MAX_READ_BYTES)
                 .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        error_response(
-                            &format!("{log_label}_log_seek_failed"),
-                            format!("seeking {log_label} log: {e}"),
-                        ),
-                    )
-                })?;
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response(
-                        &format!("{log_label}_log_read_failed"),
-                        format!("reading {log_label} log: {e}"),
-                    ),
-                )
-            })?;
-            format!(
-                "[... truncated, showing last 1 MiB ...]\n{}",
-                String::from_utf8_lossy(&buf)
-            )
+                .map_err(log_error)?;
+        let preload = String::from_utf8_lossy(&preload);
+        let mut initial_content = if truncated {
+            format!("[... truncated, showing last 1 MiB ...]\n{preload}")
         } else {
-            let bytes = tokio::fs::read(&log_path).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response(
-                        &format!("{log_label}_log_read_failed"),
-                        format!("reading {log_label} log: {e}"),
-                    ),
-                )
-            })?;
-            String::from_utf8_lossy(&bytes).into_owned()
+            preload.into_owned()
         };
         if let Some(n) = params.tail {
             initial_content = tail_lines(&initial_content, n);
         }
-
-        let mut offset = file_size;
         let initial = axum::body::Bytes::from(initial_content.into_bytes());
 
         let stream = async_stream::stream! {
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
             if !initial.is_empty() {
                 yield Ok::<axum::body::Bytes, std::io::Error>(initial);
             }
@@ -2380,47 +2337,17 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
                 interval.tick().await;
-                match tokio::fs::metadata(&log_path).await {
-                    Ok(meta) => {
-                        let len = meta.len();
-                        if len < offset {
-                            offset = 0;
-                            let notice = b"\n[... serial log rotated or truncated ...]\n".to_vec();
-                            yield Ok(axum::body::Bytes::from(notice));
-                        }
-                        if len > offset {
-                            match tokio::fs::File::open(&log_path).await {
-                                Ok(mut file) => {
-                                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-                                        yield Err(e);
-                                        break;
-                                    }
-                                    let mut buf = Vec::with_capacity((len - offset) as usize);
-                                    match file.read_to_end(&mut buf).await {
-                                        Ok(_) => {
-                                            offset += buf.len() as u64;
-                                            yield Ok(axum::body::Bytes::from(buf));
-                                        }
-                                        Err(e) => {
-                                            yield Err(e);
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                    break;
-                                }
-                                Err(e) => {
-                                    yield Err(e);
-                                    break;
-                                }
-                            }
+                match follower.poll(&log_path).await {
+                    Ok(Some(output)) => {
+                        if !output.is_empty() {
+                            yield Ok(axum::body::Bytes::from(output));
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(None) => break,
+                    Err(e) => {
+                        yield Err(e);
                         break;
                     }
-                    Err(_) => {}
                 }
             }
         };
@@ -2432,54 +2359,15 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
             .body(body)
             .expect("static response builder"))
     } else {
-        let truncated = file_size > LOG_MAX_READ_BYTES;
+        let mut file = tokio::fs::File::open(&log_path).await.map_err(log_error)?;
+        let (bytes, truncated) = read_log_tail(&mut file, LOG_MAX_READ_BYTES)
+            .await
+            .map_err(log_error)?;
+        let bytes = String::from_utf8_lossy(&bytes);
         let content = if truncated {
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let mut file = tokio::fs::File::open(&log_path).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response(
-                        &format!("{log_label}_log_read_failed"),
-                        format!("reading {log_label} log: {e}"),
-                    ),
-                )
-            })?;
-            file.seek(std::io::SeekFrom::Start(file_size - LOG_MAX_READ_BYTES))
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        error_response(
-                            &format!("{log_label}_log_seek_failed"),
-                            format!("seeking {log_label} log: {e}"),
-                        ),
-                    )
-                })?;
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response(
-                        &format!("{log_label}_log_read_failed"),
-                        format!("reading {log_label} log: {e}"),
-                    ),
-                )
-            })?;
-            format!(
-                "[... truncated, showing last 1 MiB ...]\n{}",
-                String::from_utf8_lossy(&buf)
-            )
+            format!("[... truncated, showing last 1 MiB ...]\n{bytes}")
         } else {
-            let bytes = tokio::fs::read(&log_path).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_response(
-                        &format!("{log_label}_log_read_failed"),
-                        format!("reading {log_label} log: {e}"),
-                    ),
-                )
-            })?;
-            String::from_utf8_lossy(&bytes).into_owned()
+            bytes.into_owned()
         };
 
         let output = if let Some(n) = params.tail {
@@ -2493,6 +2381,22 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
             .body(axum::body::Body::from(output))
             .expect("static response builder"))
     }
+}
+
+/// The last `max` bytes of an open log and whether older bytes were left out.
+/// The length comes from the open file rather than its path, because a serial
+/// log is compacted by renaming a shorter file over it: measuring the path and
+/// reading another inode would seek past the end and return nothing.
+pub(crate) async fn read_log_tail(
+    file: &mut tokio::fs::File,
+    max: u64,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let offset = file.metadata().await?.len().saturating_sub(max);
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut bytes = Vec::new();
+    file.take(max).read_to_end(&mut bytes).await?;
+    Ok((bytes, offset > 0))
 }
 
 /// Return the last `n` lines of `content`.

@@ -2459,6 +2459,31 @@ mod tests {
         );
     }
 
+    /// A compaction renames a shorter file over the log between a reader
+    /// opening it and reading it. The reader must return the tail of the file
+    /// it opened, not seek by the replacement's length or past its end.
+    #[tokio::test]
+    async fn log_tail_reads_the_opened_file_across_a_rename_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("vm.serial.log");
+        let original: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&log, &original).unwrap();
+        let mut file = tokio::fs::File::open(&log).await.unwrap();
+
+        let staging = dir.path().join("vm.serial.log.compact");
+        std::fs::write(&staging, b"short").unwrap();
+        std::fs::rename(&staging, &log).unwrap();
+
+        let (tail, truncated) = handlers::read_log_tail(&mut file, 1024).await.unwrap();
+        assert!(truncated);
+        assert_eq!(tail, original[original.len() - 1024..]);
+
+        let mut file = tokio::fs::File::open(&log).await.unwrap();
+        let (whole, truncated) = handlers::read_log_tail(&mut file, 1024).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(whole, b"short");
+    }
+
     // ── tail_lines unit tests ─────────────────────────────────────────
 
     #[test]

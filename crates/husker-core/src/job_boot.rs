@@ -406,11 +406,12 @@ impl<B: VmmBackend> HuskerCore<B> {
         // remaining generation-specific files without ever touching a replacement.
         let vm_directory = self.storage.vm_dir(name);
         remove_directory(&vm_directory).await?;
-        for file in [
-            self.vmm.serial_log_file(vm_id),
-            PathBuf::from(format!("{vm_id}.boot.log")),
+        let serial_log = self.runtime_dir.join(self.vmm.serial_log_file(vm_id));
+        for path in [
+            husker_vmm::serial_log::compaction_staging_path(&serial_log),
+            serial_log,
+            self.runtime_dir.join(format!("{vm_id}.boot.log")),
         ] {
-            let path = self.runtime_dir.join(file);
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => (),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -1020,9 +1021,24 @@ mod allocation_recovery_tests {
         assert!(core.state.list_host_resource_leases().unwrap().is_empty());
         assert_eq!(core.state.allocate_cid().unwrap(), lease.vsock_cid);
         terminal(&core, job.id);
+        let vm_id = lease.vm_id.unwrap();
+        let serial_log = core.runtime_dir.join(core.vmm.serial_log_file(vm_id));
+        let runtime_files = [
+            // Left by a compaction a crash interrupted.
+            husker_vmm::serial_log::compaction_staging_path(&serial_log),
+            core.runtime_dir.join(format!("{vm_id}.boot.log")),
+            serial_log,
+        ];
+        std::fs::create_dir_all(&core.runtime_dir).unwrap();
+        for file in &runtime_files {
+            std::fs::write(file, b"x").unwrap();
+        }
         core.cleanup_job_vm(job.id).await.unwrap();
         assert!(!core.state.get_job(job.id).unwrap().cleanup_pending);
         assert_eq!(core.vmm.aborts.load(Ordering::SeqCst), 1);
+        for file in &runtime_files {
+            assert!(!file.exists(), "{} survived cleanup", file.display());
+        }
     }
 
     #[tokio::test]

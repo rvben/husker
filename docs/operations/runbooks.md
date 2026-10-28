@@ -56,10 +56,16 @@
 - Symptom: `husker logs -f` stops unexpectedly.
 - Checks:
   - VM still running
-  - serial log rotation/truncation notices
+  - serial log truncation notices: each VM's serial log is capped at 8 MiB,
+    and on overflow the oldest output is dropped behind a
+    `[husker: earlier serial output discarded: N bytes]` marker counting every
+    byte dropped so far. A follow session continues across these compactions
+    and prints `[... N serial bytes discarded before they were shown ...]`
+    only when it fell behind, or `[... serial log restarted ...]` when the VM
+    booted again with a fresh log
 - Actions:
   - reconnect follow session
-  - inspect host disk pressure and rotation cadence
+  - inspect host disk pressure
 
 ## 7. VM lifecycle command appears stuck
 

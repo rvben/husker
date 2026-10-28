@@ -39,7 +39,7 @@ and retained evidence. Admission charges each job against it:
 | `max_vcpus` | Requested vCPUs |
 | `max_memory_mib` | Requested guest memory plus `memory_overhead_mib` |
 | `max_root_disk_bytes` | Requested root disk size |
-| `max_boot_storage_bytes` | Twice the root disk size, plus 256 MiB kernel, 512 MiB initrd and 8 MiB serial log bounds |
+| `max_boot_storage_bytes` | Twice the root disk size, plus 256 MiB kernel, 512 MiB initrd and 16 MiB serial log bounds (an 8 MiB log and the copy written while it is compacted) |
 
 Boot storage is charged in full even when the root copies start sparse or
 reflinked, because both can grow to their full size. Fresh admission also

@@ -3,8 +3,10 @@
 mod creation;
 pub mod firecracker;
 pub(crate) mod guest_stop;
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(unix)]
 mod serial_capture;
+#[cfg(unix)]
+pub mod serial_log;
 mod termination;
 pub mod vsock;
 

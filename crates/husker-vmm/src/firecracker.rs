@@ -22,6 +22,8 @@ struct FcInstance {
     vsock_path: PathBuf,
     boot_log_path: PathBuf,
     serial_log_path: PathBuf,
+    /// Finished once the process is confirmed exited, keeping its final output.
+    serial_capture: Option<crate::serial_capture::SerialCapture>,
     process: tokio::process::Child,
     /// Whether the balloon device was installed at boot.
     balloon: bool,
@@ -216,6 +218,7 @@ async fn settle_stopped(instance: &mut FcInstance) {
     instance.info.state = VmState::Stopped;
     instance.info.pid = None;
     instance.cgroup.remove().await;
+    crate::serial_capture::finish_child_capture(&mut instance.serial_capture).await;
 }
 
 /// Wait for a guest-triggered Firecracker exit and force termination when the
@@ -527,9 +530,10 @@ impl FirecrackerBackend {
         boot_log_path: &Path,
         vsock_path: &Path,
         serial_log_path: &Path,
-        serial_file: std::fs::File,
+        serial: (std::process::Stdio, crate::serial_capture::SerialCapture),
         stderr_file: std::fs::File,
     ) -> Result<VmInfo, VmmError> {
+        let (serial_output, serial_capture) = serial;
         // Create the per-VM cgroup before spawning so we can place the process
         // immediately after obtaining its pid, before InstanceStart.
         let vm_cgroup = self
@@ -548,7 +552,7 @@ impl FirecrackerBackend {
             .arg(boot_log_path)
             .arg("--level")
             .arg("Info")
-            .stdout(serial_file)
+            .stdout(serial_output)
             .stderr(stderr_file)
             .kill_on_drop(true)
             .spawn()
@@ -576,6 +580,7 @@ impl FirecrackerBackend {
                 vsock_path: vsock_path.to_owned(),
                 boot_log_path: boot_log_path.to_owned(),
                 serial_log_path: serial_log_path.to_owned(),
+                serial_capture: Some(serial_capture),
                 process,
                 fork_source: None,
                 balloon: config.balloon,
@@ -788,8 +793,7 @@ impl VmmBackend for FirecrackerBackend {
 
         // Firecracker writes guest serial console (ttyS0) to stdout.
         // Capture it to a file so `husker logs` can read it.
-        let serial_file = std::fs::File::create(&serial_log_path)
-            .map_err(|e| VmmError::ProcessError(format!("create serial log: {e}")))?;
+        let serial = crate::serial_capture::SerialCapture::for_child(&serial_log_path)?;
 
         // FC process stderr goes to the FC log file (separate from guest serial).
         let stderr_file = std::fs::OpenOptions::new()
@@ -808,7 +812,7 @@ impl VmmBackend for FirecrackerBackend {
                 &boot_log_path,
                 &vsock_path,
                 &serial_log_path,
-                serial_file,
+                serial,
                 stderr_file,
             )
             .await
@@ -823,6 +827,9 @@ impl VmmBackend for FirecrackerBackend {
                     instance.info.state = VmState::Failed;
                 } else {
                     // No child was spawned; these files have no live owner.
+                    let _ = std::fs::remove_file(crate::serial_log::compaction_staging_path(
+                        &serial_log_path,
+                    ));
                     let _ = std::fs::remove_file(&serial_log_path);
                     let _ = std::fs::remove_file(&boot_log_path);
                     let _ = std::fs::remove_file(&socket_path);
@@ -903,6 +910,7 @@ impl VmmBackend for FirecrackerBackend {
         let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
         tracing::debug!(%id, "destroying firecracker VM");
         crate::termination::terminate_child(&mut instance.process, "firecracker").await?;
+        crate::serial_capture::finish_child_capture(&mut instance.serial_capture).await;
         if let Some(source) = instance.fork_source.as_mut() {
             source.alias.undo()?;
         }
@@ -911,10 +919,10 @@ impl VmmBackend for FirecrackerBackend {
             &instance.socket_path,
             &instance.vsock_path,
             &instance.boot_log_path,
-            &instance.serial_log_path,
         ] {
             crate::termination::remove_runtime_file(path).await?;
         }
+        crate::serial_capture::remove_serial_log(&instance.serial_log_path).await?;
         instance.cgroup.remove_confirmed().await.map_err(|error| {
             VmmError::ProcessError(format!("confirm VMM cgroup cleanup: {error}"))
         })?;
@@ -1109,8 +1117,8 @@ impl VmmBackend for FirecrackerBackend {
         let _ = tokio::fs::remove_file(&socket_path).await;
         tokio::fs::write(&boot_log_path, b"").await?;
 
-        let serial_file = std::fs::File::create(&serial_log_path)
-            .map_err(|e| VmmError::ProcessError(format!("create serial log: {e}")))?;
+        let (serial_output, serial_capture) =
+            crate::serial_capture::SerialCapture::for_child(&serial_log_path)?;
         let stderr_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1132,7 +1140,7 @@ impl VmmBackend for FirecrackerBackend {
             .arg(&boot_log_path)
             .arg("--level")
             .arg("Info")
-            .stdout(serial_file)
+            .stdout(serial_output)
             .stderr(stderr_file)
             .kill_on_drop(true)
             .spawn()
@@ -1159,6 +1167,7 @@ impl VmmBackend for FirecrackerBackend {
                 vsock_path: vsock_path.clone(),
                 boot_log_path: boot_log_path.clone(),
                 serial_log_path: serial_log_path.clone(),
+                serial_capture: Some(serial_capture),
                 process,
                 fork_source,
                 balloon: false,
@@ -1938,6 +1947,7 @@ mod tests {
             vsock_path: dir.path().join("fake.vsock"),
             boot_log_path: dir.path().join("fake.boot.log"),
             serial_log_path: dir.path().join("fake.serial.log"),
+            serial_capture: None,
             process: tokio::process::Command::new("true").spawn().unwrap(),
             fork_source: None,
             balloon: false,
@@ -2063,12 +2073,15 @@ mod tests {
         let vsock_path = dir.path().join("test.vsock");
         let boot_log_path = dir.path().join("test.boot.log");
         let serial_log_path = dir.path().join("test.serial.log");
+        // Left by a compaction a crash interrupted.
+        let serial_staging = crate::serial_log::compaction_staging_path(&serial_log_path);
 
         // Create the files
         tokio::fs::write(&socket_path, b"").await.unwrap();
         tokio::fs::write(&vsock_path, b"").await.unwrap();
         tokio::fs::write(&boot_log_path, b"").await.unwrap();
         tokio::fs::write(&serial_log_path, b"").await.unwrap();
+        tokio::fs::write(&serial_staging, b"").await.unwrap();
 
         let instance = FcInstance {
             info: VmInfo {
@@ -2084,6 +2097,7 @@ mod tests {
             vsock_path: vsock_path.clone(),
             boot_log_path: boot_log_path.clone(),
             serial_log_path: serial_log_path.clone(),
+            serial_capture: None,
             process: tokio::process::Command::new("true").spawn().unwrap(),
             fork_source: None,
             balloon: false,
@@ -2109,6 +2123,7 @@ mod tests {
         assert!(!vsock_path.exists());
         assert!(!boot_log_path.exists());
         assert!(!serial_log_path.exists());
+        assert!(!serial_staging.exists());
     }
 
     #[tokio::test]
@@ -2134,6 +2149,7 @@ mod tests {
             vsock_path: dir.path().join("test.vsock"),
             boot_log_path: dir.path().join("test.boot.log"),
             serial_log_path: dir.path().join("test.serial.log"),
+            serial_capture: None,
             process,
             fork_source: None,
             balloon: false,
@@ -2170,6 +2186,7 @@ mod tests {
             vsock_path: dir.join(format!("{id}.vsock")),
             boot_log_path: dir.join(format!("{id}.boot.log")),
             serial_log_path: dir.join(format!("{id}.serial.log")),
+            serial_capture: None,
             process,
             fork_source: None,
             balloon: false,
@@ -2352,6 +2369,7 @@ mod tests {
             vsock_path: dir.path().join("nb.vsock"),
             boot_log_path: dir.path().join("nb.boot.log"),
             serial_log_path: dir.path().join("nb.serial.log"),
+            serial_capture: None,
             process: tokio::process::Command::new("true").spawn().unwrap(),
             fork_source: None,
             balloon: false,

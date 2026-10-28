@@ -84,10 +84,10 @@ impl FactoryResourceBudget {
             // The prepared immutable job copy and writable VM disk may allocate
             // independently even when initially sparse or reflinked. Charge the
             // optional initrd bound even when absent, including legacy receipts.
-            use husker_types::factory_limits::{INITRD_BYTES, KERNEL_BYTES, SERIAL_BYTES};
+            use husker_types::factory_limits::{INITRD_BYTES, KERNEL_BYTES, SERIAL_STORAGE_BYTES};
             boot_storage = disk
                 .checked_mul(2)
-                .and_then(|n| n.checked_add(KERNEL_BYTES + INITRD_BYTES + SERIAL_BYTES))
+                .and_then(|n| n.checked_add(KERNEL_BYTES + INITRD_BYTES + SERIAL_STORAGE_BYTES))
                 .and_then(|n| boot_storage.checked_add(n))
                 .ok_or(JournalError::Capacity("factory boot storage budget"))?;
             if cpus > self.max_vcpus {

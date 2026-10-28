@@ -1670,8 +1670,13 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.port_proxy.stop_all(record.id);
 
         let serial_log = self.runtime_dir.join(self.vmm.serial_log_file(record.id));
-        if let Err(e) = remove_file_best_effort(&serial_log).await {
-            warn!(%name, path = %serial_log.display(), error = %e, "failed to remove serial log during destroy");
+        for path in [
+            husker_vmm::serial_log::compaction_staging_path(&serial_log),
+            serial_log,
+        ] {
+            if let Err(e) = remove_file_best_effort(&path).await {
+                warn!(%name, path = %path.display(), error = %e, "failed to remove serial log during destroy");
+            }
         }
 
         // The userdata log is optional (only VMs with userdata have one), so

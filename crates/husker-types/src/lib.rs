@@ -8,6 +8,10 @@ pub mod factory_limits {
     pub const KERNEL_BYTES: u64 = 256 * 1024 * 1024;
     pub const INITRD_BYTES: u64 = 512 * 1024 * 1024;
     pub const SERIAL_BYTES: u64 = 8 * 1024 * 1024;
+    /// Peak host storage of one serial log. A compaction writes the retained
+    /// tail (at most half the cap plus a marker line) beside the full log
+    /// before renaming it over the log.
+    pub const SERIAL_STORAGE_BYTES: u64 = 2 * SERIAL_BYTES;
 }
 
 /// The concrete VMM implementation that owns a VM.

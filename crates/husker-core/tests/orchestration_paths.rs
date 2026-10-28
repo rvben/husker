@@ -787,6 +787,32 @@ async fn serial_log_path_follows_a_backend_that_nests_vm_runtime_files() {
 }
 
 #[tokio::test]
+async fn destroy_removes_the_serial_log_and_an_interrupted_compaction() {
+    let mock = MockVmm::new().with_serial_log_dir("worker");
+    let (tmp, core, vm_id) = core_with_vm(
+        &mock,
+        "vm-serial-cleanup",
+        BackendKind::Firecracker,
+        VmState::Stopped,
+    )
+    .await;
+    let log = core.serial_log_path("vm-serial-cleanup").unwrap();
+    let staging = husker_vmm::serial_log::compaction_staging_path(&log);
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, b"boot").unwrap();
+    std::fs::write(&staging, b"partial").unwrap();
+    // Another VM's log in the same directory is not this VM's to remove.
+    let other = log.with_file_name(format!("{}.serial.log", Uuid::new_v4()));
+    std::fs::write(&other, b"other").unwrap();
+
+    core.destroy_vm("vm-serial-cleanup").await.unwrap();
+
+    assert!(!log.exists() && !staging.exists());
+    assert!(other.exists());
+    assert!(log.starts_with(tmp.path().join("run").join(format!("worker-{vm_id}"))));
+}
+
+#[tokio::test]
 async fn serial_log_path_missing_vm_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("run");
@@ -1153,56 +1179,6 @@ async fn create_vm_replaces_stopped_vm_before_validation() {
         core.get_vm("replace-vm"),
         Err(CoreError::VmNotFound(_))
     ));
-}
-
-#[tokio::test]
-async fn rotate_serial_logs_rotates_only_large_serial_files() {
-    let tmp = tempfile::tempdir().unwrap();
-    let runtime_dir = tmp.path().join("run");
-    let data_dir = tmp.path().join("data");
-    std::fs::create_dir_all(&runtime_dir).unwrap();
-    std::fs::create_dir_all(&data_dir).unwrap();
-
-    let large_log = runtime_dir.join("large.serial.log");
-    let small_log = runtime_dir.join("small.serial.log");
-    let other = runtime_dir.join("notes.txt");
-
-    std::fs::write(&large_log, vec![b'a'; 11 * 1024 * 1024]).unwrap();
-    std::fs::write(&small_log, vec![b'b'; 1024]).unwrap();
-    std::fs::write(&other, b"hello").unwrap();
-
-    let core = build_core(
-        MockVmm::new(),
-        StateStore::open_memory().unwrap(),
-        &data_dir,
-        &runtime_dir,
-    );
-    let rotated = core.rotate_serial_logs().await;
-
-    assert_eq!(rotated, 1);
-    assert_eq!(std::fs::read(&small_log).unwrap().len(), 1024);
-    assert_eq!(std::fs::read(&other).unwrap(), b"hello");
-    let rotated_size = std::fs::metadata(&large_log).unwrap().len();
-    assert!(
-        (4 * 1024 * 1024..11 * 1024 * 1024).contains(&rotated_size),
-        "unexpected rotated size: {rotated_size}"
-    );
-}
-
-#[tokio::test]
-async fn rotate_serial_logs_missing_runtime_dir_returns_zero() {
-    let tmp = tempfile::tempdir().unwrap();
-    let runtime_dir = tmp.path().join("missing-run-dir");
-    let data_dir = tmp.path().join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
-
-    let core = build_core(
-        MockVmm::new(),
-        StateStore::open_memory().unwrap(),
-        &data_dir,
-        &runtime_dir,
-    );
-    assert_eq!(core.rotate_serial_logs().await, 0);
 }
 
 #[tokio::test]

@@ -1818,46 +1818,6 @@ fn validate_image_kind(value: Option<&str>) -> Result<ImageKind, CoreError> {
         })
 }
 
-/// Serial log files exceeding this size are eligible for rotation.
-const LOG_ROTATE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MiB
-
-/// How many bytes to keep when rotating a serial log.
-const LOG_ROTATE_KEEP: u64 = 5 * 1024 * 1024; // 5 MiB
-
-/// Truncate a log file, keeping only the last `keep_bytes`.
-///
-/// Uses the copy-truncate pattern: read tail, truncate, write back.
-/// Small data-loss window between read and truncate is acceptable
-/// for diagnostic serial console output.
-async fn rotate_log_file(path: &std::path::Path, keep_bytes: u64) -> std::io::Result<()> {
-    let file_len = tokio::fs::metadata(path).await?.len();
-    if file_len <= keep_bytes {
-        return Ok(());
-    }
-
-    // Read the tail and rewrite it with std::fs in a blocking task. `read_exact`
-    // into a sized buffer reads exactly `keep_bytes`; tokio's async `File` can
-    // short-read after a `seek` (its `read_to_end` then stops early and keeps
-    // fewer bytes than requested), so the synchronous path is deterministic.
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        let mut buf = vec![0u8; keep_bytes as usize];
-        let mut src = std::fs::File::open(&path)?;
-        src.seek(SeekFrom::Start(file_len - keep_bytes))?;
-        src.read_exact(&mut buf)?;
-        drop(src);
-        let mut dst = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
-        dst.write_all(&buf)?;
-        Ok(())
-    })
-    .await
-    .map_err(std::io::Error::other)?
-}
-
 /// Prepare a cloud-image boot disk: validate the base image and OVMF firmware exist,
 /// clone the base qcow2 into `dest_disk`, optionally grow it, and return the UEFI
 /// BootMode carrying the firmware paths. This is pure file I/O (no networking), so the
@@ -4957,52 +4917,6 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
                 }
             }
         }
-    }
-
-    #[tokio::test]
-    async fn rotate_log_file_truncates_oversized() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.serial.log");
-
-        // Write a 12 MiB file with a recognizable pattern at the end
-        let data: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        std::fs::write(&path, &data).unwrap();
-
-        rotate_log_file(&path, LOG_ROTATE_KEEP).await.unwrap();
-
-        let result = std::fs::read(&path).unwrap();
-        assert!(
-            result.len() as u64 == LOG_ROTATE_KEEP,
-            "expected {} bytes, got {}",
-            LOG_ROTATE_KEEP,
-            result.len()
-        );
-        // The kept portion should match the tail of the original data
-        let expected_tail = &data[data.len() - LOG_ROTATE_KEEP as usize..];
-        assert_eq!(&result, expected_tail);
-    }
-
-    #[tokio::test]
-    async fn rotate_log_file_skips_small_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("small.serial.log");
-
-        let data = vec![0u8; 1024]; // 1 KiB
-        std::fs::write(&path, &data).unwrap();
-
-        rotate_log_file(&path, LOG_ROTATE_KEEP).await.unwrap();
-
-        let result = std::fs::read(&path).unwrap();
-        assert_eq!(result.len(), 1024, "small file should not be modified");
-    }
-
-    #[tokio::test]
-    async fn rotate_log_file_nonexistent_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nonexistent.serial.log");
-
-        let result = rotate_log_file(&path, LOG_ROTATE_KEEP).await;
-        assert!(result.is_err());
     }
 
     #[cfg(feature = "linux-net")]
