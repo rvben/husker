@@ -4,9 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use flate2::read::GzDecoder;
 use futures_util::StreamExt;
-use tar::Archive;
 
 // `husker fork` overrides the host TAP name on `/snapshot/load` via the
 // `network_overrides` field, added in Firecracker 1.12.0 (PR #4731), so the
@@ -77,7 +75,12 @@ pub async fn install(data_dir: &Path) -> Result<PathBuf> {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        body.extend_from_slice(&chunk.context("reading response chunk")?);
+        let chunk = chunk.context("reading response chunk")?;
+        anyhow::ensure!(
+            body.len() as u64 + chunk.len() as u64 <= crate::archive::MAX_FIRECRACKER_ARCHIVE_BYTES,
+            "firecracker download exceeds its size limit"
+        );
+        body.extend_from_slice(&chunk);
     }
 
     // Verify the download against the pinned checksum BEFORE extracting and
@@ -102,37 +105,26 @@ pub async fn install(data_dir: &Path) -> Result<PathBuf> {
         ));
     }
 
-    // Build the expected entry name so it can be captured into the closure.
-    let target_name = binary_name();
-
-    // Extract on a blocking pool — tar+flate2 are synchronous.
+    let binary = crate::archive::firecracker_binary(body, binary_name()).await?;
+    // Publish only a completely validated executable. Replacing the directory
+    // entry never follows a pre-existing destination symlink.
+    let bin_dir_clone = bin_dir.clone();
     let dest_clone = dest.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let gz = GzDecoder::new(&body[..]);
-        let mut archive = Archive::new(gz);
-        for entry in archive.entries().context("iterating tar")? {
-            let mut entry = entry.context("reading tar entry")?;
-            let path = entry.path().context("entry path")?;
-            let is_match = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s == target_name)
-                .unwrap_or(false);
-            if !is_match {
-                continue;
-            }
-            entry
-                .unpack(&dest_clone)
-                .with_context(|| format!("unpacking to {}", dest_clone.display()))?;
-            let mut perms = std::fs::metadata(&dest_clone)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&dest_clone, perms)?;
-            return Ok(());
-        }
-        Err(anyhow!("{target_name} not found in {url}"))
+        use std::io::Write as _;
+        let mut staged = tempfile::NamedTempFile::new_in(bin_dir_clone)?;
+        staged.write_all(&binary)?;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        staged.as_file().sync_all()?;
+        staged
+            .persist(dest_clone)
+            .context("installing firecracker executable")?;
+        Ok(())
     })
     .await
-    .context("extraction task join")??;
+    .context("installation task join")??;
 
     Ok(dest)
 }

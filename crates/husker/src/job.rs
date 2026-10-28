@@ -742,7 +742,7 @@ async fn retrieve_outputs(
     };
 
     Ok(Retrieval {
-        files: extract_archive_over(&archive, cwd)?,
+        files: extract_archive_over(archive, cwd).await?,
         unmatched_out,
         unmatched_write_back,
         error: None,

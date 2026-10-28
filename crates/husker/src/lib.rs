@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+pub mod archive;
 #[cfg(all(target_os = "linux", feature = "linux-net"))]
 pub mod firecracker;
 pub mod http;
