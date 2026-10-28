@@ -18,7 +18,8 @@ export CARGO_TARGET_DIR
 # install is updated, e.g. to roll the new version out to your own hosts. Empty
 # by default, so a plain clone releases exactly as before; set it in Makefile.local.
 POST_RELEASE ?=
-HUSKER_DEV_HOST ?= ubuntu@husker-dev.am8.nl
+# SSH destination for deploy-husker-dev, e.g. user@host; set it in Makefile.local.
+HUSKER_DEV_HOST ?=
 
 all: lint test
 
@@ -152,9 +153,10 @@ check-deploy-script:
 	bash -n scripts/ci/deploy_rollback_drill.sh
 	@scripts/deploy-linux.sh --help >/dev/null
 
-# Deploy the current committed snapshot to the development daemon host. Override
-# HUSKER_DEV_HOST for another SSH destination with the same systemd layout.
+# Deploy the current committed snapshot to the development daemon host named by
+# HUSKER_DEV_HOST, an SSH destination with the expected systemd layout.
 deploy-husker-dev:
+	@test -n "$(HUSKER_DEV_HOST)" || { echo "deploy-husker-dev: set HUSKER_DEV_HOST (e.g. in Makefile.local) to the SSH destination" >&2; exit 2; }
 	scripts/deploy-linux.sh --host "$(HUSKER_DEV_HOST)"
 
 # Type check without building
