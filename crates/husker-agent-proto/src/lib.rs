@@ -7,6 +7,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod sessions;
 pub use sessions::*;
+pub mod frozen_bundle;
+pub mod job_result;
+pub mod job_spec;
 
 /// Messages sent from the host to the guest agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]

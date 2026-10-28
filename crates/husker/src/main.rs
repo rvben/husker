@@ -12,6 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+mod bundle;
 mod cli;
 mod cli_contract;
 mod config;
@@ -830,6 +831,13 @@ async fn run(cli: Cli) -> Result<()> {
     let output = resolve_command_format(raw_output, &command);
 
     // Context management is local-only; handle it before resolving a daemon URL.
+    if let Commands::Bundle { action } = command {
+        anyhow::ensure!(
+            api_url.is_none() && context.is_none(),
+            "bundle commands operate locally; omit --context and --api-url (and their environment variables)"
+        );
+        return bundle::run(action, output);
+    }
     if let Commands::Context { action } = command {
         return context_command(action, output);
     }
@@ -2148,6 +2156,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Context { .. } => {
             unreachable!("Context is handled before daemon-target resolution in run()")
         }
+        Commands::Bundle { .. } => unreachable!("bundle handled before daemon resolution"),
         Commands::Schema => unreachable!("schema handled before target resolution"),
         Commands::GuestAgent => unreachable!("guest-agent handled before target resolution"),
         Commands::Macos { .. } => unreachable!("macos handled before target connection"),
