@@ -84,6 +84,7 @@ struct PauseGate {
 struct MockVmm {
     inner: Arc<MockInner>,
     selection_backend: BackendKind,
+    serial_log_dir: Option<&'static str>,
 }
 
 impl MockVmm {
@@ -102,11 +103,19 @@ impl MockVmm {
                 last_config: Mutex::new(None),
             }),
             selection_backend: BackendKind::AppleVz,
+            serial_log_dir: None,
         }
     }
 
     fn with_selection_backend(mut self, backend_kind: BackendKind) -> Self {
         self.selection_backend = backend_kind;
+        self
+    }
+
+    /// Nest serial logs in a per-VM directory, as a backend whose VMs run in
+    /// their own runtime subdirectory does.
+    fn with_serial_log_dir(mut self, prefix: &'static str) -> Self {
+        self.serial_log_dir = Some(prefix);
         self
     }
 
@@ -188,7 +197,7 @@ impl VmmBackend for MockVmm {
         selection: husker_vmm::BackendSelection,
         config: VmConfig,
     ) -> Result<CreatedVm, VmmError> {
-        let id = Uuid::new_v4();
+        let id = config.requested_id.unwrap_or_else(Uuid::new_v4);
         let info = VmInfo {
             id,
             name: config.name.clone(),
@@ -319,6 +328,14 @@ impl VmmBackend for MockVmm {
 
     async fn set_balloon(&self, _id: Uuid, _amount_mib: u32) -> Result<(), VmmError> {
         Ok(())
+    }
+
+    fn serial_log_file(&self, id: Uuid) -> PathBuf {
+        let file = PathBuf::from(format!("{id}.serial.log"));
+        match self.serial_log_dir {
+            Some(prefix) => PathBuf::from(format!("{prefix}-{id}")).join(file),
+            None => file,
+        }
     }
 
     fn backend_kind(&self) -> &'static str {
@@ -730,6 +747,43 @@ async fn serial_log_path_uses_vm_id_filename() {
     let core = build_core(MockVmm::new(), state, &data_dir, &runtime_dir);
     let path = core.serial_log_path("vm-logs").unwrap();
     assert_eq!(path, runtime_dir.join(format!("{vm_id}.serial.log")));
+}
+
+#[tokio::test]
+async fn serial_log_path_follows_a_backend_that_nests_vm_runtime_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("run");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let state = StateStore::open_memory().unwrap();
+    let vm_id = Uuid::new_v4();
+    state
+        .insert_vm(&vm_record(
+            vm_id,
+            "vm-nested",
+            "running",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    let core = build_core(
+        MockVmm::new().with_serial_log_dir("worker"),
+        state,
+        &data_dir,
+        &runtime_dir,
+    );
+    assert_eq!(
+        core.serial_log_path("vm-nested").unwrap(),
+        runtime_dir
+            .join(format!("worker-{vm_id}"))
+            .join(format!("{vm_id}.serial.log"))
+    );
 }
 
 #[tokio::test]
@@ -3743,13 +3797,8 @@ async fn create_vm_persists_the_selected_backend() {
     // Daemon capability identity is deliberately different: persistence must
     // follow the per-create selection, not this coarse backend advertisement.
     assert_eq!(core.backend_kind(), "apple_vz");
-    // Isolated networking avoids host setup on Linux. The Apple path does not
-    // provision a host TAP and truthfully supports only its NAT attachment.
-    let network = if cfg!(feature = "linux-net") {
-        "none"
-    } else {
-        "nat"
-    };
+    // Offline topology is explicit on every backend, without a host TAP.
+    let network = "none";
     let created = core
         .create_vm(CreateVmRequest {
             name: "backend-authority".into(),
@@ -4177,6 +4226,8 @@ mod kernel_args_composition {
 
     #[derive(Default)]
     struct PreparingStorage {
+        forbid_refresh: bool,
+        fail_prepare: bool,
         clone_calls: std::sync::atomic::AtomicUsize,
         prepare_calls: std::sync::atomic::AtomicUsize,
     }
@@ -4207,6 +4258,9 @@ mod kernel_args_composition {
             'a,
             Result<Option<husker_storage::AgentRefresh>, husker_storage::StorageError>,
         > {
+            if self.forbid_refresh {
+                assert!(request.guest_agent.is_empty());
+            }
             self.prepare_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
@@ -4214,6 +4268,11 @@ mod kernel_args_composition {
                     tokio::fs::create_dir_all(parent).await?;
                 }
                 tokio::fs::write(request.destination, b"prepared-disk").await?;
+                if self.fail_prepare {
+                    return Err(husker_storage::StorageError::CommandFailed(
+                        "injected disk preparation failure".into(),
+                    ));
+                }
                 Ok(None)
             })
         }
@@ -4242,6 +4301,76 @@ mod kernel_args_composition {
             runtime_dir,
         ));
         (core, mock)
+    }
+
+    #[tokio::test]
+    async fn apple_creation_passes_explicit_offline_topology_and_persists_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("vmlinux");
+        std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
+        let rootfs = tmp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+        let (core, mock) = make_capturing_core(&tmp);
+        for (mode, expected) in [("none", true), ("nat", false)] {
+            let record = core
+                .create_ephemeral_vm(
+                    CreateVmRequest {
+                        name: format!("topology-{mode}"),
+                        kernel_path: Some(kernel.clone()),
+                        rootfs_path: Some(rootfs.clone()),
+                        network: Some(mode.into()),
+                        ..Default::default()
+                    },
+                    60,
+                    Some("synthetic-boundary-proof".into()),
+                )
+                .await
+                .unwrap();
+            let config = mock.last_config().await.unwrap();
+            assert_eq!(config.network_disabled, expected);
+            assert!(config.tap_device.is_none());
+            assert_eq!(
+                record.network,
+                if expected {
+                    NetworkMode::Isolated
+                } else {
+                    NetworkMode::Nat
+                }
+            );
+            assert_eq!(core.get_vm(&record.name).unwrap().network, record.network);
+            core.destroy_vm(&record.name).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn apple_rejects_filtered_and_bridged_policies_before_vmm_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, mock) = make_capturing_core(&tmp);
+        for network in ["bridged", "filtered"] {
+            let error = core
+                .create_vm(CreateVmRequest {
+                    name: format!("unsupported-{network}"),
+                    network: Some(network.into()),
+                    egress: if network == "filtered" {
+                        vec![husker_core::EgressRuleRequest {
+                            host: "example.invalid".into(),
+                            port: 443,
+                            protocol: "tcp".into(),
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidArgument(_)),
+                "{network}: {error:?}"
+            );
+            assert!(mock.last_config().await.is_none());
+            assert!(core.list_vms().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -4485,6 +4614,413 @@ mod kernel_args_composition {
             cfg.mem_size_mib, 512,
             "daemon default_memory=512 must be used when mem_size_mib is omitted"
         );
+    }
+    /// An authenticated kernel that the create path then rejects (here a
+    /// compressed image Apple VZ cannot boot) fails before any allocation, so
+    /// the job must carry an abort receipt and its cleanup must complete.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn prepared_job_rejected_before_allocation_records_abort_and_cleans_up() {
+        use husker_core::job_spec::JobSpec;
+        use husker_state::jobs::JobState;
+        use sha2::{Digest, Sha256};
+        let sha = |bytes: &[u8]| format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let runtime = tmp.path().join("run");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        let compressed = b"\x1f\x8b compressed kernel padded to a full header".repeat(2);
+        let kernel = tmp.path().join("kernel");
+        std::fs::write(&kernel, &compressed).unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::write(&rootfs, b"prepared rootfs").unwrap();
+        let path = data.join("state.sqlite");
+        let state = StateStore::open(&path).unwrap();
+        let image_id = Uuid::new_v4();
+        state
+            .insert_image(&ImageRecord {
+                id: image_id,
+                name: "prepared".into(),
+                source_path: rootfs.display().to_string(),
+                file_path: rootfs.display().to_string(),
+                format: "ext4".into(),
+                kind: ImageKind::Rootfs,
+                boot_init: None,
+                content_digest: Some(sha(b"prepared rootfs")),
+                parent_image: None,
+                size_bytes: 15,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "version":1, "image":{"catalog_id":image_id,"rootfs_digest":sha(b"prepared rootfs"),
+                "kernel_digest":sha(&compressed),"initrd_digest":null},
+            "source":{"digest":sha(b"source"),"size_bytes":1024},
+            "acceptance":{"digest":sha(b"acceptance"),"size_bytes":1024},
+            "commands":[{"argv":["true"],"timeout_secs":20}], "working_directory":"/workspace",
+            "environment":{},"uid":1000,"gid":1000,
+            "resources":{"vcpu_count":2,"mem_size_mib":256,"disk_size_bytes":1073741824,"pids_limit":32},
+            "network":{"mode":"none"}, "deadline":deadline,"artifacts":[],
+            "correlation":{"job":"fixture","stage":"baseline","round":1}
+        }))
+        .unwrap();
+        let (job, _) = state
+            .accept_job(
+                "rejected-kernel",
+                &spec.canonical_json().unwrap(),
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let mock = MockVmm::new();
+        let core = HuskerCore::new(
+            mock.clone(),
+            StateStore::open(&path).unwrap(),
+            StorageConfig {
+                data_dir: data.clone(),
+                state_dir: tmp.path().join("state"),
+            },
+            runtime,
+        )
+        .with_default_images(Some(kernel), None, None);
+        let error = core.create_reserved_job_vm(job.id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("kernel"),
+            "expected the kernel format rejection, got: {error}"
+        );
+        assert!(mock.last_config().await.is_none());
+        let failed = state.get_job(job.id).unwrap();
+        assert_eq!(failed.state, JobState::InfrastructureFailed);
+        assert!(failed.vm_allocation_aborted && !failed.vm_destroyed);
+        // The generation's lease is fenced, not released, until cleanup confirms.
+        let fenced = state.list_host_resource_leases().unwrap();
+        assert_eq!(fenced.len(), 1);
+        assert!(fenced[0].allocation_aborted && fenced[0].vm_id == failed.vm_id);
+        assert_eq!(core.factory_cleanup_tick().await.unwrap().confirmed, 1);
+        assert!(!state.get_job(job.id).unwrap().cleanup_pending);
+        assert!(state.list_host_resource_leases().unwrap().is_empty());
+        assert!(!data.join("job-inputs").join(job.id.to_string()).exists());
+    }
+    #[tokio::test]
+    async fn prepared_job_whose_lease_cannot_begin_stages_nothing_and_cleans_up() {
+        use husker_core::job_spec::JobSpec;
+        use husker_state::jobs::JobState;
+        use sha2::{Digest, Sha256};
+        let sha = |bytes: &[u8]| format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let runtime = tmp.path().join("run");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        let kernel_bytes = kernel_stub_bytes();
+        let kernel = tmp.path().join("kernel");
+        std::fs::write(&kernel, &kernel_bytes).unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::write(&rootfs, b"prepared rootfs").unwrap();
+        let path = data.join("state.sqlite");
+        let state = StateStore::open(&path).unwrap();
+        let image_id = Uuid::new_v4();
+        state
+            .insert_image(&ImageRecord {
+                id: image_id,
+                name: "prepared".into(),
+                source_path: rootfs.display().to_string(),
+                file_path: rootfs.display().to_string(),
+                format: "ext4".into(),
+                kind: ImageKind::Rootfs,
+                boot_init: None,
+                content_digest: Some(sha(b"prepared rootfs")),
+                parent_image: None,
+                size_bytes: 15,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "version":1, "image":{"catalog_id":image_id,"rootfs_digest":sha(b"prepared rootfs"),
+                "kernel_digest":sha(&kernel_bytes),"initrd_digest":null},
+            "source":{"digest":sha(b"source"),"size_bytes":1024},
+            "acceptance":{"digest":sha(b"acceptance"),"size_bytes":1024},
+            "commands":[{"argv":["true"],"timeout_secs":20}], "working_directory":"/workspace",
+            "environment":{},"uid":1000,"gid":1000,
+            "resources":{"vcpu_count":2,"mem_size_mib":256,"disk_size_bytes":1073741824,"pids_limit":32},
+            "network":{"mode":"none"}, "deadline":deadline,"artifacts":[],
+            "correlation":{"job":"fixture","stage":"baseline","round":1}
+        }))
+        .unwrap();
+        let (job, _) = state
+            .accept_job(
+                "lease-failure",
+                &spec.canonical_json().unwrap(),
+                deadline,
+                deadline + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let mock = MockVmm::new();
+        let core = HuskerCore::new(
+            mock.clone(),
+            StateStore::open(&path).unwrap(),
+            StorageConfig {
+                data_dir: data.clone(),
+                state_dir: tmp.path().join("state"),
+            },
+            runtime,
+        )
+        .with_default_images(Some(kernel), None, None);
+        // Validation passes; the UUID binding and its host resource lease are
+        // the first durable allocation, and their shared transaction fails.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER injected_lease_failure BEFORE INSERT ON host_resource_leases \
+                 BEGIN SELECT RAISE(ABORT, 'injected lease failure'); END;",
+            )
+            .unwrap();
+        let error = core.create_reserved_job_vm(job.id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("injected lease failure"),
+            "expected the lease failure, got: {error}"
+        );
+        assert!(mock.last_config().await.is_none());
+        // Nothing was bound and nothing staged: the claim allocated nothing.
+        let refused = state.get_job(job.id).unwrap();
+        assert_eq!(refused.vm_id, None);
+        assert!(refused.cleanup_pending && !refused.vm_allocation_aborted);
+        assert!(state.list_host_resource_leases().unwrap().is_empty());
+        assert!(!data.join("job-inputs").join(job.id.to_string()).exists());
+        // The worker seals the refusal; cleanup then releases the unbound claim.
+        state
+            .finish_job_failure(job.id, JobState::InfrastructureFailed, "{}")
+            .unwrap();
+        assert_eq!(core.factory_cleanup_tick().await.unwrap().confirmed, 1);
+        assert!(!state.get_job(job.id).unwrap().cleanup_pending);
+    }
+    #[tokio::test]
+    async fn prepared_job_boot_pins_private_inputs_omits_initrd_and_never_reallocates() {
+        use husker_core::job_spec::JobSpec;
+        use husker_state::jobs::JobState;
+        use sha2::{Digest, Sha256};
+        let sha = |bytes: &[u8]| format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
+        for (corrupt_kernel, fail_prepare) in [(false, false), (true, false), (false, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let runtime = tmp.path().join("run");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::create_dir(&runtime).unwrap();
+            let kernel = tmp.path().join("kernel");
+            std::fs::write(&kernel, kernel_stub_bytes()).unwrap();
+            let rootfs = tmp.path().join("rootfs");
+            std::fs::write(&rootfs, b"prepared rootfs").unwrap();
+            let initrd = tmp.path().join("default-initrd");
+            std::fs::write(&initrd, b"must not boot").unwrap();
+            let path = data.join("state.sqlite");
+            let state = StateStore::open(&path).unwrap();
+            let image_id = Uuid::new_v4();
+            let image = ImageRecord {
+                id: image_id,
+                name: "prepared".into(),
+                source_path: rootfs.display().to_string(),
+                file_path: rootfs.display().to_string(),
+                format: "ext4".into(),
+                kind: ImageKind::Rootfs,
+                boot_init: None,
+                content_digest: Some(sha(b"prepared rootfs")),
+                parent_image: None,
+                size_bytes: 15,
+                created_at: Utc::now(),
+            };
+            state.insert_image(&image).unwrap();
+            let deadline =
+                chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+            let spec: JobSpec = serde_json::from_value(serde_json::json!({
+                "version":1, "image":{"catalog_id":image_id,"rootfs_digest":sha(b"prepared rootfs"),
+                    "kernel_digest":sha(&kernel_stub_bytes()),"initrd_digest":null},
+                "source":{"digest":sha(b"source"),"size_bytes":1024},
+                "acceptance":{"digest":sha(b"acceptance"),"size_bytes":1024},
+                "commands":[{"argv":["true"],"timeout_secs":20}], "working_directory":"/workspace",
+                "environment":{},"uid":1000,"gid":1000,
+                "resources":{"vcpu_count":2,"mem_size_mib":256,"disk_size_bytes":1073741824,"pids_limit":32},
+                "network":{"mode":"none"}, "deadline":deadline,"artifacts":[],
+                "correlation":{"job":"fixture","stage":"baseline","round":1}
+            })).unwrap();
+            let (job, _) = state
+                .accept_job(
+                    "prepared",
+                    &spec.canonical_json().unwrap(),
+                    deadline,
+                    deadline + chrono::Duration::hours(1),
+                )
+                .unwrap();
+            if corrupt_kernel {
+                std::fs::write(&kernel, b"changed kernel").unwrap();
+            }
+            let mock = MockVmm::new();
+            let driver = Arc::new(PreparingStorage {
+                forbid_refresh: true,
+                fail_prepare,
+                ..Default::default()
+            });
+            let core = HuskerCore::new(
+                mock.clone(),
+                StateStore::open(&path).unwrap(),
+                StorageConfig {
+                    data_dir: data.clone(),
+                    state_dir: tmp.path().join("state"),
+                },
+                runtime.clone(),
+            )
+            .with_default_images(Some(kernel.clone()), None, Some(initrd))
+            .with_embedded_agent(b"must not refresh")
+            .with_storage_driver(driver.clone());
+            let core = Arc::new(core);
+            let result = if corrupt_kernel || fail_prepare {
+                core.create_reserved_job_vm(job.id).await
+            } else {
+                let gate = mock.block_next_create().await;
+                let creating_core = core.clone();
+                let creating =
+                    tokio::spawn(async move { creating_core.create_reserved_job_vm(job.id).await });
+                gate.entered.notified().await;
+                let pending = state.get_job(job.id).unwrap();
+                let intended = pending
+                    .vm_id
+                    .expect("generation must be durable before allocation returns");
+                assert_eq!(pending.state, JobState::Preparing);
+                assert!(state.get_vm(intended).is_err());
+                assert_eq!(
+                    mock.last_config().await.unwrap().requested_id,
+                    Some(intended)
+                );
+                gate.release.notify_one();
+                creating.await.unwrap()
+            };
+            if corrupt_kernel || fail_prepare {
+                assert!(result.is_err());
+                assert!(mock.last_config().await.is_none());
+                let failed = state.get_job(job.id).unwrap();
+                assert_eq!(failed.state, JobState::InfrastructureFailed);
+                assert!(failed.cleanup_pending);
+                assert!(failed.vm_allocation_aborted);
+                assert!(!failed.vm_destroyed);
+                assert!(failed.manifest.unwrap().contains(if corrupt_kernel {
+                    "digest mismatch"
+                } else {
+                    "injected disk preparation failure"
+                }));
+                if fail_prepare {
+                    assert_eq!(
+                        driver
+                            .prepare_calls
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        1
+                    );
+                    assert!(state.list_host_resource_leases().unwrap().is_empty());
+                    assert!(!data.join("vms").join(format!("job-{}", job.id)).exists());
+                }
+                let inputs = data.join("job-inputs").join(job.id.to_string());
+                std::fs::remove_dir_all(&inputs).unwrap();
+                std::fs::write(&inputs, b"nonallocation cleanup failure fixture").unwrap();
+                let blocked = core.factory_cleanup_tick().await.unwrap();
+                assert_eq!(blocked.confirmed, 0);
+                assert_eq!(blocked.pending, 1);
+                let reopened = StateStore::open(&path).unwrap().get_job(job.id).unwrap();
+                assert!(reopened.vm_allocation_aborted);
+                assert!(reopened.cleanup_pending);
+                assert!(!reopened.vm_destroyed);
+                std::fs::remove_file(&inputs).unwrap();
+                assert_eq!(core.factory_cleanup_tick().await.unwrap().confirmed, 1);
+                let cleaned = state.get_job(job.id).unwrap();
+                assert!(!cleaned.cleanup_pending);
+                assert!(cleaned.vm_allocation_aborted);
+                assert!(!cleaned.vm_destroyed);
+                assert!(mock.last_config().await.is_none());
+                assert!(!data.join("job-inputs").join(job.id.to_string()).exists());
+            } else {
+                let vm = result.unwrap();
+                assert!(!state.get_job(job.id).unwrap().vm_allocation_aborted);
+                let config = mock.last_config().await.unwrap();
+                assert!(config.network_disabled);
+                assert!(config.initrd_path.is_none());
+                assert!(config.host_shares.is_empty());
+                assert_eq!(config.vcpu_count, 2);
+                assert_eq!(config.mem_size_mib, 256);
+                assert_ne!(config.kernel_path, kernel);
+                std::fs::write(&kernel, b"later modification").unwrap();
+                assert_eq!(
+                    std::fs::read(&config.kernel_path).unwrap(),
+                    kernel_stub_bytes()
+                );
+                assert_eq!(state.get_job(job.id).unwrap().vm_id, Some(vm.id));
+                assert_eq!(
+                    state.get_vm_expiration(vm.id).unwrap().unwrap().expires_at,
+                    deadline
+                );
+                assert_eq!(
+                    driver
+                        .prepare_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                assert!(core.cleanup_job_vm(job.id).await.is_err());
+                state
+                    .finish_job(
+                        job.id,
+                        JobState::Interrupted,
+                        husker_state::jobs::CollectionState::Failed,
+                        "{}",
+                    )
+                    .unwrap();
+                let inputs = config.kernel_path.parent().unwrap().to_path_buf();
+                let backup = inputs.with_extension("backup");
+                std::fs::rename(&inputs, &backup).unwrap();
+                std::fs::write(&inputs, b"cleanup failure fixture").unwrap();
+                let retry = core.factory_cleanup_tick().await.unwrap();
+                assert_eq!(retry.attempted, 1);
+                assert_eq!(retry.confirmed, 0);
+                assert_eq!(retry.pending, 1);
+                let pending = state.get_job(job.id).unwrap();
+                assert!(pending.vm_destroyed);
+                assert!(pending.cleanup_pending);
+                assert!(state.get_vm(vm.id).is_err());
+                assert_eq!(pending.manifest.as_deref(), Some("{}"));
+                assert!(state.delete_job_evidence(job.id).is_err());
+                // A replacement generation must remain intact even with a
+                // durable destruction receipt for the original generation.
+                let mut replacement = vm.clone();
+                replacement.id = Uuid::new_v4();
+                state.insert_vm(&replacement).unwrap();
+                assert!(core.cleanup_job_vm(job.id).await.is_err());
+                assert_eq!(state.get_vm(replacement.id).unwrap().id, replacement.id);
+                state.delete_vm(replacement.id).unwrap();
+                std::fs::remove_file(&inputs).unwrap();
+                std::fs::rename(&backup, &inputs).unwrap();
+                let restarted = HuskerCore::new(
+                    MockVmm::new(),
+                    StateStore::open(&path).unwrap(),
+                    StorageConfig {
+                        data_dir: data.clone(),
+                        state_dir: tmp.path().join("state"),
+                    },
+                    runtime.clone(),
+                );
+                assert_eq!(restarted.recover_factory_jobs_after_restart().unwrap(), 0);
+                let retry = restarted.factory_cleanup_tick().await.unwrap();
+                assert_eq!(retry.attempted, 1);
+                assert_eq!(retry.confirmed, 1);
+                assert_eq!(retry.pending, 0);
+                assert_eq!(retry.expired_evidence, 0);
+                assert_eq!(
+                    state.get_job(job.id).unwrap().manifest.as_deref(),
+                    Some("{}")
+                );
+                assert!(!inputs.exists());
+                assert!(!state.get_job(job.id).unwrap().cleanup_pending);
+                restarted.cleanup_job_vm(job.id).await.unwrap();
+            }
+            assert!(core.create_reserved_job_vm(job.id).await.is_err());
+        }
     }
 }
 

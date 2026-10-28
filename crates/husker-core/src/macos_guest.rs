@@ -183,6 +183,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         };
         let boot_kind = boot.kind();
         let vm_config = husker_vmm::VmConfig {
+            requested_id: None,
             name: req.name.clone(),
             vcpu_count,
             mem_size_mib,
@@ -198,13 +199,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             seed_path: None,
             balloon: req.balloon,
             volume_path: None,
+            network_disabled: network_mode == NetworkMode::Isolated,
             host_shares: vec![],
         };
 
-        let created = self.vmm.create_vm(backend_selection, vm_config).await?;
+        let created = self
+            .create_leased_vm(backend_selection, vm_config, resources)
+            .await?;
         let backend = created.backend();
         let info = created.info;
-        resources.vm_id = Some(info.id);
 
         let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
         let now = chrono::Utc::now();
@@ -252,8 +255,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             owner: value.owner.clone(),
             expires_at: value.expires_at,
         });
+        let lease = resources
+            .host_resource_lease_id
+            .ok_or_else(|| CoreError::Io("VM creation has no durable resource lease".into()))?;
         self.state
-            .insert_vm_with_expiration(&record, expiration.as_ref())
+            .commit_vm_from_host_resource_lease_with_expiration(&record, lease, expiration.as_ref())
             .map_err(crate::vm_lifecycle::map_vm_insert_error)?;
         Ok(record)
     }

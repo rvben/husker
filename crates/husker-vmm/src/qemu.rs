@@ -24,11 +24,13 @@ pub(crate) struct QemuInstance {
     pub(crate) pidfile_path: PathBuf,
     pub(crate) serial_log_path: PathBuf,
     pub(crate) boot_log_path: PathBuf,
-    pub(crate) process: tokio::process::Child,
+    /// Absent while starting filesystem helpers or after a failed main spawn.
+    pub(crate) process: Option<tokio::process::Child>,
     /// Whether the balloon device was installed at boot.
     pub(crate) balloon: bool,
     /// One virtiofsd child per host share (parallel to `virtiofsd_socks`).
-    /// `kill_on_drop(true)` ensures they are terminated when the instance is removed.
+    /// Each child is registered before its socket wait and explicitly reaped on
+    /// destroy. `kill_on_drop` is only a fallback when the backend itself drops.
     pub(crate) virtiofsds: Vec<tokio::process::Child>,
     /// Unix socket paths created by each virtiofsd; removed on destroy.
     pub(crate) virtiofsd_socks: Vec<PathBuf>,
@@ -51,7 +53,7 @@ async fn wait_for_exit_or_kill(
     id: Uuid,
     grace: std::time::Duration,
 ) -> Result<GuestExit, VmmError> {
-    wait_for_process_exit_or_kill(instances, id, grace, "qemu", |inst| &mut inst.process).await
+    wait_for_process_exit_or_kill(instances, id, grace, "qemu", |inst| inst.process.as_mut()).await
 }
 
 /// Locate the virtiofsd binary: try `virtiofsd` on PATH, then well-known fallbacks.
@@ -84,8 +86,10 @@ async fn wait_for_socket(path: &std::path::Path) -> Result<(), VmmError> {
 pub struct QemuKvmBackend {
     pub(crate) binary: PathBuf,
     pub(crate) runtime_dir: PathBuf,
+    creation_locks: crate::creation::CreationLocks,
     pub(crate) instances: Arc<Mutex<HashMap<Uuid, QemuInstance>>>,
     cgroup: std::sync::Arc<crate::cgroup::CgroupSupervisor>,
+    virtiofsd_binary: PathBuf,
 }
 
 impl QemuKvmBackend {
@@ -96,8 +100,10 @@ impl QemuKvmBackend {
     ) -> Self {
         Self {
             binary: binary.into(),
+            virtiofsd_binary: virtiofsd_bin().into(),
             runtime_dir: runtime_dir.into(),
             instances: Arc::new(Mutex::new(HashMap::new())),
+            creation_locks: crate::creation::CreationLocks::default(),
             cgroup,
         }
     }
@@ -126,6 +132,11 @@ impl QemuKvmBackend {
     /// Build the full `qemu-system-*` argument vector. Pure function of
     /// (id, config, runtime paths) so it is unit-testable without spawning QEMU.
     pub fn build_args(&self, id: Uuid, config: &VmConfig) -> Result<Vec<String>, VmmError> {
+        if config.network_disabled && config.tap_device.is_some() {
+            return Err(VmmError::InvalidConfig(
+                "offline VM cannot attach a host TAP".into(),
+            ));
+        }
         #[cfg(target_arch = "aarch64")]
         let machine = "virt";
         #[cfg(not(target_arch = "aarch64"))]
@@ -319,11 +330,63 @@ impl QemuKvmBackend {
         }
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
 
-        let id = Uuid::new_v4();
+        let id = crate::creation_id(&config)?;
+        let _creation = self.creation_locks.lock(id).await;
+        if self.instances.lock().await.contains_key(&id) {
+            return Err(VmmError::InvalidConfig(
+                "requested VM UUID is already allocated".into(),
+            ));
+        }
         let args = self.build_args(id, &config)?;
 
-        // UEFI VMs need their own writable OVMF variable store. Copy the firmware
-        // template into the runtime dir; build_args points pflash unit=1 at it.
+        // Register before any per-VM file or child is created. A cancelled boot
+        // and every post-registration error leave a retryable resource owner.
+        let mut instances = self.instances.lock().await;
+        let cgroup = self
+            .cgroup
+            .create_vm_cgroup(id, config.vcpu_count, config.mem_size_mib)
+            .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
+        instances.insert(
+            id,
+            QemuInstance {
+                info: VmInfo {
+                    id,
+                    name: config.name.clone(),
+                    state: VmState::Creating,
+                    pid: None,
+                    vcpu_count: config.vcpu_count,
+                    mem_size_mib: config.mem_size_mib,
+                    vsock_cid: config.vsock_cid,
+                },
+                qmp_path: self.qmp_socket(id),
+                pidfile_path: self.pidfile(id),
+                serial_log_path: self.serial_log(id),
+                boot_log_path: self.boot_log(id),
+                process: None,
+                balloon: config.balloon,
+                virtiofsds: Vec::new(),
+                virtiofsd_socks: Vec::new(),
+                cgroup,
+            },
+        );
+        drop(instances);
+        match self.boot_tracked(id, &config, &args).await {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                if let Some(instance) = self.instances.lock().await.get_mut(&id) {
+                    instance.info.state = VmState::Failed;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn boot_tracked(
+        &self,
+        id: Uuid,
+        config: &VmConfig,
+        args: &[String],
+    ) -> Result<VmInfo, VmmError> {
         if let crate::BootMode::Uefi {
             ovmf_vars_template, ..
         } = &config.boot
@@ -337,58 +400,16 @@ impl QemuKvmBackend {
                 ))
             })?;
         }
-
-        // Detach QEMU's own stdio. `-nographic` otherwise binds the monitor/serial
-        // to the inherited stdio, which hangs whatever launched the daemon (e.g. a
-        // controlling terminal). stdin is null; QEMU's own stdout/stderr (startup
-        // and device errors, distinct from the guest serial console which `-serial
-        // file:` captures) go to a per-VM log for diagnostics.
         let boot_log_path = self.boot_log(id);
-
-        // Remove the per-VM artifacts (OVMF copy, logs, sockets) if create() bails
-        // before the instance is tracked, so a failed log open or spawn does not
-        // leak files. Disarmed once the tracked QemuInstance owns them.
-        struct PartialCreateGuard {
-            paths: Vec<std::path::PathBuf>,
-            armed: bool,
-        }
-        impl Drop for PartialCreateGuard {
-            fn drop(&mut self) {
-                if self.armed {
-                    for p in &self.paths {
-                        let _ = std::fs::remove_file(p);
-                    }
-                }
-            }
-        }
-        let mut artifacts = PartialCreateGuard {
-            paths: vec![
-                self.qmp_socket(id),
-                self.pidfile(id),
-                self.serial_log(id),
-                boot_log_path.clone(),
-                self.ovmf_vars_copy(id),
-            ],
-            armed: true,
-        };
-
         let log_out = std::fs::File::create(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("create qemu log: {e}")))?;
         let log_err = log_out
             .try_clone()
             .map_err(|e| VmmError::ProcessError(format!("clone qemu log handle: {e}")))?;
 
-        // Spawn one virtiofsd per host share before QEMU so the vhost-user sockets
-        // exist when QEMU enumerates its devices. kill_on_drop(true) ensures the
-        // children are killed if create() returns an error (Vec drops with the scope).
-        let mut virtiofsds: Vec<tokio::process::Child> = Vec::new();
-        let mut virtiofsd_socks: Vec<PathBuf> = Vec::new();
         for (n, share) in config.host_shares.iter().enumerate() {
             let sock = self.virtiofs_sock(id, n);
-            // Register the socket path in the cleanup guard before creating it, so
-            // a failure partway through still removes the already-created sockets.
-            artifacts.paths.push(sock.clone());
-            let mut cmd = tokio::process::Command::new(virtiofsd_bin());
+            let mut cmd = tokio::process::Command::new(&self.virtiofsd_binary);
             cmd.arg(format!("--socket-path={}", sock.display()))
                 .arg(format!("--shared-dir={}", share.host.display()))
                 .arg("--sandbox=none")
@@ -396,23 +417,28 @@ impl QemuKvmBackend {
             if share.read_only {
                 cmd.arg("--readonly");
             }
+            let mut instances = self.instances.lock().await;
+            let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+            instance.virtiofsd_socks.push(sock.clone());
+            // Spawn and publish synchronously before waiting for its socket.
             let child = cmd
                 .spawn()
                 .map_err(|e| VmmError::ProcessError(format!("spawn virtiofsd: {e}")))?;
+            let pid = child.id();
+            instance.virtiofsds.push(child);
+            if let Some(pid) = pid {
+                instance.cgroup.place(pid).map_err(|e| {
+                    VmmError::ProcessError(format!("place virtiofsd in cgroup: {e}"))
+                })?;
+            }
+            drop(instances);
             wait_for_socket(&sock).await?;
-            virtiofsd_socks.push(sock);
-            virtiofsds.push(child);
         }
 
-        // Create the per-VM cgroup before spawning so we can place the process
-        // immediately after obtaining its pid.
-        let vm_cgroup = self
-            .cgroup
-            .create_vm_cgroup(id, config.vcpu_count, config.mem_size_mib)
-            .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
-
+        let mut instances = self.instances.lock().await;
+        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
         let process = tokio::process::Command::new(&self.binary)
-            .args(&args)
+            .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(log_out)
             .stderr(log_err)
@@ -420,11 +446,15 @@ impl QemuKvmBackend {
             .spawn()
             .map_err(|e| VmmError::ProcessError(format!("spawn qemu: {e}")))?;
         let pid = process.id();
+        instance.process = Some(process);
+        instance.info.pid = pid;
         if let Some(pid) = pid {
-            vm_cgroup
+            instance
+                .cgroup
                 .place(pid)
                 .map_err(|e| VmmError::ProcessError(format!("place vmm in cgroup: {e}")))?;
         }
+        drop(instances);
 
         let qmp_path = self.qmp_socket(id);
         let mut appeared = false;
@@ -436,45 +466,16 @@ impl QemuKvmBackend {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         if !appeared {
-            // Capture diagnostics before cleanup: the guest serial log carries
-            // kernel panics (e.g. an unbootable rootfs); the boot log carries
-            // QEMU's own startup/device errors.
             let serial_tail = crate::tail_lines(&self.serial_log(id), 20);
             let boot_tail = crate::tail_lines(&boot_log_path, 20);
-            // `process` drops here (kill_on_drop) -> QEMU killed; `artifacts` drops
-            // on return and removes the per-VM files (after the tails are read).
             let mut msg = String::from("QMP socket did not appear within 5s");
             crate::append_log_tails(&mut msg, serial_tail, boot_tail, "qemu boot log");
             return Err(VmmError::ProcessError(msg));
         }
-
-        let info = VmInfo {
-            id,
-            name: config.name,
-            state: VmState::Running,
-            pid,
-            vcpu_count: config.vcpu_count,
-            mem_size_mib: config.mem_size_mib,
-            vsock_cid: config.vsock_cid,
-        };
-        self.instances.lock().await.insert(
-            id,
-            QemuInstance {
-                info: info.clone(),
-                qmp_path,
-                pidfile_path: self.pidfile(id),
-                serial_log_path: self.serial_log(id),
-                boot_log_path,
-                process,
-                balloon: config.balloon,
-                virtiofsds,
-                virtiofsd_socks,
-                cgroup: vm_cgroup,
-            },
-        );
-        // The tracked instance now owns these files; do not delete them on drop.
-        artifacts.armed = false;
-        Ok(info)
+        let mut instances = self.instances.lock().await;
+        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+        instance.info.state = VmState::Running;
+        Ok(instance.info.clone())
     }
 
     /// Stop the VM: ask the guest to power down over QMP, wait up to the shared
@@ -490,7 +491,10 @@ impl QemuKvmBackend {
         let qmp_path = {
             let mut instances = self.instances.lock().await;
             let inst = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
-            if matches!(inst.process.try_wait(), Ok(Some(_))) {
+            let process = inst.process.as_mut().ok_or_else(|| {
+                VmmError::ProcessError("QEMU instance has no child handle".into())
+            })?;
+            if matches!(process.try_wait(), Ok(Some(_))) {
                 settle_stopped(inst).await;
                 return Ok(());
             }
@@ -528,17 +532,15 @@ impl QemuKvmBackend {
     }
 
     pub async fn destroy(&self, id: Uuid) -> Result<(), VmmError> {
+        let _creation = self.creation_locks.lock(id).await;
         let mut instances = self.instances.lock().await;
-        let mut inst = instances.remove(&id).ok_or(VmmError::VmNotFound(id))?;
+        let inst = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
         tracing::debug!(%id, "destroying qemu VM");
-        if let Err(e) = inst.process.kill().await {
-            tracing::warn!(%id, error = %e, "failed to kill qemu process during destroy");
+        if let Some(process) = &mut inst.process {
+            crate::termination::terminate_child(process, "qemu").await?;
         }
-        // Kill virtiofsd children explicitly; kill_on_drop provides a backstop when
-        // inst drops at the end of this block, but an explicit kill lets us await
-        // the signal delivery and keeps the shutdown deterministic.
         for vfd in &mut inst.virtiofsds {
-            let _ = vfd.kill().await;
+            crate::termination::terminate_child(vfd, "virtiofsd").await?;
         }
         let ovmf_vars_copy = self.ovmf_vars_copy(id);
         for path in [
@@ -548,20 +550,15 @@ impl QemuKvmBackend {
             inst.boot_log_path.as_path(),
             ovmf_vars_copy.as_path(),
         ] {
-            if let Err(e) = tokio::fs::remove_file(path).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(%id, path = %path.display(), error = %e, "failed to remove qemu runtime file during destroy");
-            }
+            crate::termination::remove_runtime_file(path).await?;
         }
         for sock in &inst.virtiofsd_socks {
-            if let Err(e) = tokio::fs::remove_file(sock).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(%id, path = %sock.display(), error = %e, "failed to remove qemu virtiofsd socket during destroy");
-            }
+            crate::termination::remove_runtime_file(sock).await?;
         }
-        inst.cgroup.remove().await;
+        inst.cgroup.remove_confirmed().await.map_err(|error| {
+            VmmError::ProcessError(format!("confirm VMM cgroup cleanup: {error}"))
+        })?;
+        instances.remove(&id);
         Ok(())
     }
 
@@ -569,7 +566,10 @@ impl QemuKvmBackend {
         let mut instances = self.instances.lock().await;
         let inst = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
         if inst.info.state == VmState::Running || inst.info.state == VmState::Paused {
-            match inst.process.try_wait() {
+            let process = inst.process.as_mut().ok_or_else(|| {
+                VmmError::ProcessError("running QEMU instance has no child handle".into())
+            })?;
+            match process.try_wait() {
                 Ok(Some(_)) => settle_stopped(inst).await,
                 Ok(None) => {}
                 Err(_) => {
@@ -694,6 +694,10 @@ impl crate::VmmBackend for QemuKvmBackend {
         self.stop(id).await
     }
 
+    async fn abort_create(&self, id: Uuid) -> Result<(), VmmError> {
+        crate::abort_registered_create(self.destroy_vm(id).await)
+    }
+
     async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
         self.destroy(id).await
     }
@@ -757,6 +761,7 @@ mod tests {
 
     fn sample_config() -> VmConfig {
         VmConfig {
+            requested_id: None,
             name: "qvm".into(),
             vcpu_count: 2,
             mem_size_mib: 1024,
@@ -774,8 +779,134 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            network_disabled: false,
             host_shares: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_main_spawn_retains_owned_files_until_confirmed_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = test_backend(dir.path().join("missing-qemu"), dir.path().join("run"));
+        let id = Uuid::new_v4();
+        let mut cfg = sample_config();
+        cfg.requested_id = Some(id);
+        let error = be.create(cfg).await.unwrap_err();
+        assert!(error.to_string().contains("spawn qemu"));
+        assert_eq!(be.info(id).await.unwrap().state, VmState::Failed);
+        assert!(be.boot_log(id).exists());
+        assert!(
+            be.instances
+                .lock()
+                .await
+                .get(&id)
+                .unwrap()
+                .process
+                .is_none()
+        );
+        be.destroy(id).await.unwrap();
+        assert!(matches!(be.info(id).await, Err(VmmError::VmNotFound(_))));
+        assert!(std::fs::read_dir(&be.runtime_dir).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn control_socket_timeout_retains_main_child_and_diagnostic_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // This harmless process exits without producing a QMP socket.
+        let be = test_backend("/usr/bin/true", dir.path());
+        let id = Uuid::new_v4();
+        let mut cfg = sample_config();
+        cfg.requested_id = Some(id);
+        let error = be.create(cfg).await.unwrap_err();
+        assert!(error.to_string().contains("QMP socket did not appear"));
+        assert_eq!(be.info(id).await.unwrap().state, VmState::Failed);
+        assert!(be.boot_log(id).exists());
+        {
+            let mut instances = be.instances.lock().await;
+            assert!(
+                instances
+                    .get_mut(&id)
+                    .unwrap()
+                    .process
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        be.destroy(id).await.unwrap();
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_helper_startup_retains_every_child_and_retries_failed_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("helper.sh");
+        // The first helper produces a readiness placeholder. The second never
+        // becomes ready. Both exec their sleeper to avoid unowned shell children.
+        std::fs::write(&wrapper, "#!/bin/sh\nfor arg in \"$@\"; do\n case \"$arg\" in --socket-path=*) sock=${arg#--socket-path=};; esac\ndone\ncase \"$sock\" in *-fs0.sock) touch \"$sock\";; esac\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut be = test_backend("/usr/bin/true", dir.path().join("run"));
+        be.virtiofsd_binary = wrapper;
+        let be = Arc::new(be);
+        let id = Uuid::new_v4();
+        let mut cfg = sample_config();
+        cfg.requested_id = Some(id);
+        cfg.host_shares = (0..2)
+            .map(|index| crate::HostShare {
+                host: dir.path().to_path_buf(),
+                guest: format!("/share{index}"),
+                tag: format!("share{index}"),
+                read_only: true,
+            })
+            .collect();
+        let worker_backend = be.clone();
+        let worker = tokio::spawn(async move { worker_backend.create(cfg).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if be
+                    .instances
+                    .lock()
+                    .await
+                    .get(&id)
+                    .is_some_and(|instance| instance.virtiofsds.len() == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert_eq!(be.info(id).await.unwrap().state, VmState::Creating);
+        assert!(
+            be.instances
+                .lock()
+                .await
+                .get(&id)
+                .unwrap()
+                .process
+                .is_none()
+        );
+        let obstruction = be.qmp_socket(id);
+        std::fs::create_dir(&obstruction).unwrap();
+        assert!(be.destroy(id).await.is_err());
+        {
+            let mut instances = be.instances.lock().await;
+            let owned = instances.get_mut(&id).unwrap();
+            assert_eq!(owned.virtiofsds.len(), 2);
+            for child in &mut owned.virtiofsds {
+                assert!(child.try_wait().unwrap().is_some());
+            }
+        }
+        assert!(be.boot_log(id).exists());
+        std::fs::remove_dir(&obstruction).unwrap();
+        be.destroy(id).await.unwrap();
+        assert!(std::fs::read_dir(&be.runtime_dir).unwrap().next().is_none());
     }
 
     #[test]
@@ -862,7 +993,7 @@ mod tests {
                 pidfile_path: dir.path().join("x.pid"),
                 serial_log_path: dir.path().join("x.serial.log"),
                 boot_log_path: dir.path().join("x.boot.log"),
-                process: tokio::process::Command::new("true").spawn().unwrap(),
+                process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
@@ -902,14 +1033,34 @@ mod tests {
                 pidfile_path: pid.clone(),
                 serial_log_path: serial.clone(),
                 boot_log_path: dir.path().join("a.boot.log"),
-                process: tokio::process::Command::new("true").spawn().unwrap(),
+                process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
                 cgroup: noop_cgroup(),
             },
         );
+        tokio::fs::remove_file(&qmp).await.unwrap();
+        tokio::fs::create_dir(&qmp).await.unwrap();
+        assert!(be.destroy(id).await.is_err());
+        {
+            let mut instances = be.instances.lock().await;
+            let owned = instances
+                .get_mut(&id)
+                .expect("failed cleanup must retain instance");
+            assert!(
+                owned
+                    .process
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        tokio::fs::remove_dir(&qmp).await.unwrap();
         be.destroy(id).await.unwrap();
+        assert!(!be.instances.lock().await.contains_key(&id));
         assert!(!qmp.exists() && !pid.exists() && !serial.exists());
     }
 
@@ -935,7 +1086,7 @@ mod tests {
                 pidfile_path: dir.path().join("d.pid"),
                 serial_log_path: dir.path().join("d.serial.log"),
                 boot_log_path: dir.path().join("d.boot.log"),
-                process,
+                process: Some(process),
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
@@ -972,7 +1123,7 @@ mod tests {
                 pidfile_path: dir.join("stop.pid"),
                 serial_log_path: dir.join("stop.serial.log"),
                 boot_log_path: dir.join("stop.boot.log"),
-                process,
+                process: Some(process),
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
@@ -989,6 +1140,8 @@ mod tests {
             .get_mut(&id)
             .expect("the instance stays tracked after a stop")
             .process
+            .as_mut()
+            .expect("the stopped instance keeps its child handle")
             .try_wait()
             .unwrap()
             .is_some()
@@ -1260,7 +1413,7 @@ mod tests {
                 pidfile_path: dir.path().join("u.pid"),
                 serial_log_path: dir.path().join("u.serial.log"),
                 boot_log_path: dir.path().join("u.boot.log"),
-                process: tokio::process::Command::new("true").spawn().unwrap(),
+                process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],
@@ -1368,7 +1521,7 @@ mod tests {
                 pidfile_path: dir.path().join("nb.pid"),
                 serial_log_path: dir.path().join("nb.serial.log"),
                 boot_log_path: dir.path().join("nb.boot.log"),
-                process: tokio::process::Command::new("true").spawn().unwrap(),
+                process: Some(tokio::process::Command::new("true").spawn().unwrap()),
                 balloon: false,
                 virtiofsds: vec![],
                 virtiofsd_socks: vec![],

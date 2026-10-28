@@ -5,7 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+utoipa = ["dep:utoipa"]
+
 [dependencies]
+utoipa = { workspace = true, optional = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 husker-types = { workspace = true }
 rusqlite = { workspace = true }
 r2d2 = "0.8"

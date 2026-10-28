@@ -107,6 +107,13 @@ pub(crate) struct Config {
     pub(crate) exec_denylist: Vec<String>,
     #[serde(default)]
     pub(crate) exec_env_allowlist: Vec<String>,
+    #[serde(default)]
+    pub(crate) factory_jobs_enabled: bool,
+    #[serde(default)]
+    pub(crate) factory_resource_budget: Option<husker_state::jobs::FactoryResourceBudget>,
+    /// Explicit experimental offline VZ child backend (macOS, no linux-net).
+    #[serde(default)]
+    pub(crate) apple_vz_worker: Option<AppleVzWorkerConfig>,
     #[serde(default = "default_service_reconcile_interval")]
     pub(crate) service_reconcile_interval_secs: u64,
     #[serde(default = "default_true")]
@@ -155,6 +162,75 @@ pub(crate) struct Config {
     /// that opt in (via `--idle-timeout` or a profile) are affected.
     #[serde(default)]
     pub(crate) idle_policy: IdlePolicyToml,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AppleVzWorkerConfig {
+    pub(crate) executable: PathBuf,
+    pub(crate) sha256: String,
+    pub(crate) protocol_version: u32,
+    pub(crate) lifetime_secs: u64,
+}
+
+impl AppleVzWorkerConfig {
+    pub(crate) fn validate(&self) -> Result<[u8; 32]> {
+        if !self.executable.is_absolute()
+            || self.protocol_version != 1
+            || !(1..=3600).contains(&self.lifetime_secs)
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!(
+                "apple_vz_worker requires an absolute executable, lowercase SHA-256, protocol_version = 1 and lifetime_secs in 1..=3600"
+            );
+        }
+        let mut digest = [0; 32];
+        hex::decode_to_slice(&self.sha256, &mut digest).context("apple_vz_worker SHA-256")?;
+        Ok(digest)
+    }
+}
+
+#[cfg(test)]
+mod worker_config_tests {
+    use super::*;
+
+    #[test]
+    fn worker_routing_is_opt_in_and_requires_all_reviewed_fields() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.apple_vz_worker.is_none());
+        let valid = format!(
+            "[apple_vz_worker]\nexecutable = '/reviewed/husker-vz-worker'\nsha256 = '{}'\nprotocol_version = 1\nlifetime_secs = 3600\n",
+            "ab".repeat(32)
+        );
+        let config: Config = toml::from_str(&valid).unwrap();
+        assert_eq!(
+            config.apple_vz_worker.unwrap().validate().unwrap(),
+            [0xab; 32]
+        );
+        for invalid in [
+            valid.replace("protocol_version = 1\n", ""),
+            valid.replace("lifetime_secs = 3600\n", ""),
+            format!("{valid}unreviewed_field = true\n"),
+        ] {
+            assert!(toml::from_str::<Config>(&invalid).is_err());
+        }
+        for invalid in [
+            valid.replace("/reviewed/husker-vz-worker", "husker-vz-worker"),
+            valid.replace("protocol_version = 1", "protocol_version = 2"),
+            valid.replace("lifetime_secs = 3600", "lifetime_secs = 3601"),
+            valid.replace("lifetime_secs = 3600", "lifetime_secs = 0"),
+            valid.replace(&"ab".repeat(32), &"AB".repeat(32)),
+            valid.replace(&"ab".repeat(32), "abc"),
+            valid.replace(&"ab".repeat(32), &"gg".repeat(32)),
+        ] {
+            let config: Config = toml::from_str(&invalid).unwrap();
+            assert!(config.apple_vz_worker.unwrap().validate().is_err());
+        }
+    }
 }
 
 /// Named VM preset, selectable with `--profile <name>` on run/job. Every key
@@ -393,6 +469,9 @@ impl Default for Config {
             exec_allowlist: Vec::new(),
             exec_denylist: Vec::new(),
             exec_env_allowlist: Vec::new(),
+            factory_jobs_enabled: false,
+            factory_resource_budget: None,
+            apple_vz_worker: None,
             service_reconcile_interval_secs: default_service_reconcile_interval(),
             service_reconcile_enabled: default_true(),
             #[cfg(feature = "linux-net")]

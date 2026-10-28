@@ -41,7 +41,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Path to a VM's serial console log file.
     pub fn serial_log_path(&self, name: &str) -> Result<PathBuf, CoreError> {
         let record = self.lookup_vm(name)?;
-        Ok(self.runtime_dir.join(format!("{}.serial.log", record.id)))
+        Ok(self.runtime_dir.join(self.vmm.serial_log_file(record.id)))
     }
 
     /// Path to the captured userdata stdout/stderr log for a VM. Written by

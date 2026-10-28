@@ -1,0 +1,20 @@
+#!/bin/sh
+# Factory-only Linux PID 1. No network setup, model login or interactive getty.
+set -eu
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+mkdir -p /proc /sys /dev /run /tmp
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+# CONFIG_DEVTMPFS_MOUNT kernels populate /dev before PID 1. util-linux mount
+# rejects a duplicate mount, whereas BusyBox may permit it. Accept only the
+# expected existing filesystem; every actual mount failure still stops boot.
+if ! grep -q '^[^ ]* /dev devtmpfs ' /proc/self/mounts; then
+    mount -t devtmpfs devtmpfs /dev
+fi
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -t tmpfs -o mode=1777,nosuid,nodev,size=1g tmpfs /tmp
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup
+# Root cgroup needs pids delegated to command children before any source runs.
+printf '+pids\n' > /sys/fs/cgroup/cgroup.subtree_control
+exec /usr/local/bin/husker-agent --factory-supervisor

@@ -31,6 +31,9 @@ struct RecordingVmm {
     /// When set, `snapshot_vm` returns an error, to exercise capture-failure
     /// rollback in suspend.
     fail_snapshot: std::sync::atomic::AtomicBool,
+    /// When set, `restore_vm` fails after registering the attempt, as
+    /// Firecracker does when its snapshot load fails after spawning a child.
+    fail_restore: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -46,6 +49,7 @@ impl RecordingVmm {
             calls: Mutex::new(Calls::default()),
             snapshot_gate: Mutex::new(None),
             fail_snapshot: std::sync::atomic::AtomicBool::new(false),
+            fail_restore: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -152,6 +156,10 @@ impl VmmBackend for SharedRecordingVmm {
         Ok(())
     }
 
+    async fn abort_create(&self, id: Uuid) -> Result<(), VmmError> {
+        self.destroy_vm(id).await
+    }
+
     async fn vm_info(&self, id: Uuid) -> Result<VmInfo, VmmError> {
         self.0
             .vms
@@ -224,17 +232,36 @@ impl VmmBackend for SharedRecordingVmm {
             vsock_cid,
             ..
         }) = target;
+        let failing = self
+            .0
+            .fail_restore
+            .load(std::sync::atomic::Ordering::SeqCst);
         let info = VmInfo {
             id,
             name,
-            state: VmState::Running,
+            state: if failing {
+                VmState::Failed
+            } else {
+                VmState::Running
+            },
             pid: Some(1234),
             vcpu_count,
             mem_size_mib,
             vsock_cid,
         };
-        self.0.vms.lock().unwrap().insert(id, info.clone());
+        let mut vms = self.0.vms.lock().unwrap();
+        if vms.contains_key(&id) {
+            return Err(VmmError::ProcessError(
+                "restore VM UUID is already allocated".into(),
+            ));
+        }
+        vms.insert(id, info.clone());
         self.0.calls.lock().unwrap().restore.push(id);
+        if failing {
+            return Err(VmmError::ProcessError(
+                "injected snapshot load failure".into(),
+            ));
+        }
         Ok(info)
     }
 
@@ -660,6 +687,33 @@ async fn suspend_then_resume_round_trips() {
         1,
         "restore should be called once during resume"
     );
+}
+
+#[tokio::test]
+async fn failed_resume_releases_the_restore_attempt_and_stays_retryable() {
+    let (core, vmm, id, tmp) = core_with_running_vm("vmretry");
+    core.suspend_vm("vmretry").await.unwrap();
+    vmm.fail_restore
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let err = core.resume_vm("vmretry").await.unwrap_err();
+    assert!(
+        err.to_string().contains("injected snapshot load failure"),
+        "expected the injected load failure, got: {err}"
+    );
+    assert_eq!(vm_state(&core, id), "suspended");
+    let slot = tmp.path().join("suspend").join(id.to_string());
+    assert!(slot.exists(), "a failed resume must keep the snapshot");
+    assert!(
+        !vmm.vms.lock().unwrap().contains_key(&id),
+        "a failed resume must not leave the restore attempt registered"
+    );
+
+    vmm.fail_restore
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    core.resume_vm("vmretry").await.unwrap();
+    assert_eq!(vm_state(&core, id), "running");
+    assert_eq!(vmm.calls.lock().unwrap().restore.len(), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]

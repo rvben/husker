@@ -352,8 +352,32 @@ impl<B: VmmBackend> HuskerCore<B> {
         recovered
     }
 
+    /// Refuse an operation on a fork source whose disk is still stranded.
+    ///
+    /// Startup recovery consumes the backup, so one that is still present means
+    /// recovery failed and the source rootfs may be an alias of a fork clone.
+    /// Only backends that can fork are checked, matching that recovery.
+    pub(crate) fn require_reconciled_fork_source(
+        &self,
+        record: &VmRecord,
+    ) -> Result<(), CoreError> {
+        if !husker_vmm::Capabilities::for_backend_kind(record.vmm).fork {
+            return Ok(());
+        }
+        let backup = self
+            .storage
+            .vm_dir(&record.name)
+            .join("rootfs.ext4.fork-src-bak");
+        match std::fs::symlink_metadata(&backup) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Io(format!("inspect fork source backup: {e}"))),
+            Ok(_) => Err(CoreError::Io("fork source reconciliation pending; prior holder termination and source restoration must be confirmed".into())),
+        }
+    }
+
     /// Restore a suspended VM in place (same id/IP/CID/MAC).
     async fn restore_from_suspend(&self, record: &VmRecord) -> Result<(), CoreError> {
+        self.require_reconciled_fork_source(record)?;
         let slot = self.suspend_slot_dir(record.id);
         let paths = SnapshotPaths::in_dir(&slot);
 
@@ -380,7 +404,20 @@ impl<B: VmmBackend> HuskerCore<B> {
             mem_size_mib: record.mem_size_mib,
             vsock_cid: record.vsock_cid,
         };
-        let restored = self.vmm.restore_vm(&paths, target).await?;
+        let restored = match self.vmm.restore_vm(&paths, target).await {
+            Ok(restored) => restored,
+            Err(error) => {
+                // A failed restore can retain the process it spawned, which
+                // would refuse every later resume of this UUID. Release it;
+                // the VM stays suspended with its snapshot for a retry.
+                if let Err(abort) = self.vmm.abort_create(record.id).await {
+                    return Err(CoreError::Io(format!(
+                        "resume failed ({error}); restore attempt cleanup pending: {abort}"
+                    )));
+                }
+                return Err(error.into());
+            }
+        };
         // A restored realtime clock can retain the snapshot's old wall time.
         // Current agents reconcile it from the host without altering monotonic
         // timers. Keep old snapshots resumable and report unavailable hooks.
@@ -430,6 +467,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // source's rootfs aliased to a clone during `/snapshot/load`.
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
+        self.require_reconciled_fork_source(&record)?;
         self.ensure_vm_is_not_pool_template(&record)?;
         // Only a "suspended" restore removed DNAT and installed resume
         // listeners (see `suspend_vm_locked`); a "paused" VM never touched

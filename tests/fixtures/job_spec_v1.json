@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "image": {
+    "catalog_id": "01234567-89ab-cdef-0123-456789abcdef",
+    "rootfs_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "kernel_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "initrd_digest": null
+  },
+  "source": {
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "size_bytes": 4096
+  },
+  "acceptance": {
+    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "size_bytes": 4096
+  },
+  "commands": [
+    {
+      "argv": [
+        "printf",
+        "λ;$HOME\nquote\"\\ "
+      ],
+      "timeout_secs": 1200
+    }
+  ],
+  "working_directory": "/workspace",
+  "writable_directories": [
+    "target"
+  ],
+  "environment": {
+    "LANG": "C.UTF-8",
+    "HOME": "/tmp"
+  },
+  "uid": 1000,
+  "gid": 1000,
+  "resources": {
+    "vcpu_count": 2,
+    "mem_size_mib": 4096,
+    "disk_size_bytes": 21474836480,
+    "pids_limit": 128
+  },
+  "network": {
+    "mode": "none"
+  },
+  "deadline": "2033-05-18T03:33:20Z",
+  "artifacts": [],
+  "correlation": {
+    "job": "café-stage",
+    "stage": "candidate",
+    "round": 1
+  }
+}

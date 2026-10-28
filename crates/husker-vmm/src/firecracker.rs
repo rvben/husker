@@ -5,8 +5,7 @@ use std::sync::Arc;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Bytes;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -28,20 +27,24 @@ struct FcInstance {
     balloon: bool,
     /// Per-VM cgroup resource limits (no-op when the supervisor is disabled).
     cgroup: crate::cgroup::VmCgroup,
+    fork_source: Option<ForkSource>,
 }
 
-/// RAII guard that temporarily makes a snapshot's embedded source rootfs path
-/// resolve to a fork's reflink clone, so Firecracker opens the fork's writable
-/// disk on `/snapshot/load`. The source's real rootfs is moved aside and the
-/// embedded path symlinked to the clone; on drop (success or error) the real
-/// rootfs is restored, leaving Firecracker holding the clone's fd.
-///
-/// Forks of one source must be serialized (the caller holds the source's lock):
-/// two concurrent installs would both try to move the same source file aside.
+/// Source ownership follows the registered child, not its observation future.
+struct ForkSource {
+    _source_lock: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    alias: RootfsAlias,
+}
+
+/// Explicitly restored after load acknowledgment or confirmed child exit.
+/// Drop deliberately leaves ambiguous disk ownership stranded for reconciliation.
 struct RootfsAlias {
     source_rootfs: PathBuf,
+    fork_rootfs: PathBuf,
     backup: PathBuf,
-    active: bool,
+    original_identity: (u64, u64),
+    stashed: bool,
+    linked: bool,
 }
 
 /// Path of the backup that [`RootfsAlias`] stashes a source rootfs into while a
@@ -52,60 +55,137 @@ fn fork_src_backup_path(source_rootfs: &Path) -> PathBuf {
 
 /// Recover a source rootfs stranded by a fork that died after stashing the real
 /// disk aside (`<source_rootfs>.fork-src-bak`) but before restoring it, which
-/// leaves `source_rootfs` as a stale symlink to a fork clone. Drops the symlink
-/// and renames the backup back over it. Returns whether a recovery happened;
-/// a no-op (and `Ok(false)`) when no backup exists. Call at daemon startup for
-/// every VM's rootfs, before any resume could open a stale-symlinked source.
+/// leaves `source_rootfs` as a stale symlink to a fork clone. Atomically renames
+/// the regular backup over the symlink (or into a missing path). Returns whether a recovery happened;
+/// a no-op (and `Ok(false)`) when no backup exists. The caller MUST first confirm
+/// termination of every former fork that may open this path. This filesystem
+/// operation provides no process-death proof and is never run at daemon startup.
 pub fn recover_aliased_rootfs(source_rootfs: &Path) -> std::io::Result<bool> {
     let backup = fork_src_backup_path(source_rootfs);
-    if !backup.exists() {
-        return Ok(false);
+    match std::fs::symlink_metadata(&backup) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+        Ok(metadata) if metadata.is_file() => (),
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "fork source backup is not a regular file",
+            ));
+        }
     }
-    let _ = std::fs::remove_file(source_rootfs);
+    match std::fs::symlink_metadata(source_rootfs) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+        Ok(metadata) if metadata.file_type().is_symlink() => (),
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "fork source path unexpectedly occupied",
+            ));
+        }
+    }
     std::fs::rename(&backup, source_rootfs)?;
     Ok(true)
 }
 
 impl RootfsAlias {
-    fn install(source_rootfs: &Path, fork_rootfs: &Path) -> Result<Self, VmmError> {
-        // Crash recovery: a leftover backup means a previous fork died after the
-        // rename but before the undo, leaving `source_rootfs` as a stale symlink to
-        // a fork clone and the real rootfs in `backup`. Restore it before
-        // re-aliasing, so the source disk is never lost or overwritten.
-        recover_aliased_rootfs(source_rootfs).map_err(|e| {
-            VmmError::ProcessError(format!("fork: recover stranded source rootfs: {e}"))
-        })?;
+    fn prepare(source_rootfs: &Path, fork_rootfs: &Path) -> Result<Self, VmmError> {
+        use std::os::unix::fs::MetadataExt;
+        let source = std::fs::symlink_metadata(source_rootfs)?;
+        let fork = std::fs::symlink_metadata(fork_rootfs)?;
         let backup = fork_src_backup_path(source_rootfs);
-        std::fs::rename(source_rootfs, &backup)
-            .map_err(|e| VmmError::ProcessError(format!("fork: stash source rootfs aside: {e}")))?;
-        if let Err(e) = std::os::unix::fs::symlink(fork_rootfs, source_rootfs) {
-            // Restore immediately so a failed alias never strands the source.
-            let _ = std::fs::rename(&backup, source_rootfs);
-            return Err(VmmError::ProcessError(format!(
-                "fork: alias source rootfs to clone: {e}"
-            )));
+        if !source.is_file()
+            || !fork.is_file()
+            || source.nlink() != 1
+            || fork.nlink() != 1
+            || (source.dev(), source.ino()) == (fork.dev(), fork.ino())
+        {
+            return Err(VmmError::InvalidConfig(
+                "fork disks must be distinct regular files with one link".into(),
+            ));
+        }
+        match std::fs::symlink_metadata(&backup) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                return Err(VmmError::ProcessError(
+                    "fork source backup requires prior reconciliation".into(),
+                ));
+            }
         }
         Ok(Self {
             source_rootfs: source_rootfs.to_path_buf(),
+            fork_rootfs: fork_rootfs.to_path_buf(),
             backup,
-            active: true,
+            original_identity: (source.dev(), source.ino()),
+            stashed: false,
+            linked: false,
         })
     }
 
-    fn undo(&mut self) {
-        if !self.active {
-            return;
+    fn activate(&mut self) -> Result<(), VmmError> {
+        use std::os::unix::fs::MetadataExt;
+        let source = std::fs::symlink_metadata(&self.source_rootfs)?;
+        if !source.is_file() || (source.dev(), source.ino()) != self.original_identity {
+            return Err(VmmError::ProcessError(
+                "fork source identity changed before alias".into(),
+            ));
         }
-        self.active = false;
-        // Remove the symlink at the embedded path, then move the real rootfs back.
-        let _ = std::fs::remove_file(&self.source_rootfs);
-        let _ = std::fs::rename(&self.backup, &self.source_rootfs);
+        match std::fs::symlink_metadata(&self.backup) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                return Err(VmmError::ProcessError(
+                    "fork source backup unexpectedly occupied".into(),
+                ));
+            }
+        }
+        std::fs::rename(&self.source_rootfs, &self.backup)?;
+        self.stashed = true;
+        std::os::unix::fs::symlink(&self.fork_rootfs, &self.source_rootfs)?;
+        self.linked = true;
+        Ok(())
+    }
+
+    fn undo(&mut self) -> Result<(), VmmError> {
+        use std::os::unix::fs::MetadataExt;
+        if !self.stashed {
+            return Ok(());
+        }
+        let backup = std::fs::symlink_metadata(&self.backup)?;
+        if !backup.is_file() || (backup.dev(), backup.ino()) != self.original_identity {
+            return Err(VmmError::ProcessError(
+                "fork source backup identity changed".into(),
+            ));
+        }
+        if self.linked {
+            if std::fs::read_link(&self.source_rootfs)? != self.fork_rootfs {
+                return Err(VmmError::ProcessError(
+                    "fork source alias identity changed".into(),
+                ));
+            }
+        } else {
+            match std::fs::symlink_metadata(&self.source_rootfs) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+                Ok(_) => {
+                    return Err(VmmError::ProcessError(
+                        "fork source path unexpectedly occupied".into(),
+                    ));
+                }
+            }
+        }
+        // Atomically replace the owned symlink, preserving ownership on error.
+        std::fs::rename(&self.backup, &self.source_rootfs)?;
+        self.stashed = false;
+        self.linked = false;
+        Ok(())
     }
 }
 
 impl Drop for RootfsAlias {
     fn drop(&mut self) {
-        self.undo();
+        if self.stashed {
+            tracing::warn!(source = %self.source_rootfs.display(), "fork source alias remains unreconciled; no destruction proof on drop");
+        }
     }
 }
 
@@ -115,7 +195,10 @@ impl Drop for RootfsAlias {
 pub struct FirecrackerBackend {
     firecracker_bin: PathBuf,
     runtime_dir: PathBuf,
+    creation_locks: crate::creation::CreationLocks,
     instances: Arc<Mutex<HashMap<Uuid, FcInstance>>>,
+    /// Pre-allocation children survive cancelled observations until confirmed reap.
+    version_probes: Mutex<HashMap<Uuid, tokio::process::Child>>,
     cgroup: std::sync::Arc<crate::cgroup::CgroupSupervisor>,
 }
 
@@ -124,6 +207,8 @@ pub struct FirecrackerBackend {
 /// give each fork its own vsock socket so concurrent forks of one snapshot do
 /// not collide on the host UDS. The later of the two requirements wins.
 const FORK_MIN_FIRECRACKER: (u32, u32, u32) = (1, 16, 0);
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const VERSION_OUTPUT_LIMIT: usize = 4096;
 
 /// Record that `instance`'s Firecracker process has exited: the VM is stopped,
 /// has no pid, and its cgroup is released.
@@ -143,7 +228,7 @@ async fn wait_for_exit_or_kill(
     grace: std::time::Duration,
 ) -> Result<GuestExit, VmmError> {
     wait_for_process_exit_or_kill(instances, id, grace, "firecracker", |instance| {
-        &mut instance.process
+        Some(&mut instance.process)
     })
     .await
 }
@@ -182,6 +267,8 @@ impl FirecrackerBackend {
             firecracker_bin: firecracker_bin.into(),
             runtime_dir: runtime_dir.into(),
             instances: Arc::new(Mutex::new(HashMap::new())),
+            version_probes: Mutex::new(HashMap::new()),
+            creation_locks: crate::creation::CreationLocks::default(),
             cgroup,
         }
     }
@@ -189,18 +276,60 @@ impl FirecrackerBackend {
     /// Fail with a clear message when the installed Firecracker is too old to
     /// fork (it would otherwise reject the `network_overrides` / `vsock_override`
     /// fields with an opaque 400). Run `firecracker --version` and compare.
-    async fn assert_firecracker_supports_fork(&self) -> Result<(), VmmError> {
-        let output = tokio::process::Command::new(&self.firecracker_bin)
+    async fn assert_firecracker_supports_fork(&self, id: Uuid) -> Result<(), VmmError> {
+        use tokio::io::AsyncReadExt;
+        let mut probes = self.version_probes.lock().await;
+        if probes.contains_key(&id) {
+            return Err(VmmError::InvalidConfig(
+                "version probe UUID is already allocated".into(),
+            ));
+        }
+        let mut process = tokio::process::Command::new(&self.firecracker_bin)
             .arg("--version")
-            .output()
-            .await
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
             .map_err(|e| {
                 VmmError::ProcessError(format!(
                     "run `{} --version`: {e}",
                     self.firecracker_bin.display()
                 ))
             })?;
-        let text = String::from_utf8_lossy(&output.stdout);
+        let stdout = process.stdout.take().expect("piped version stdout");
+        probes.insert(id, process);
+        let process = probes.get_mut(&id).unwrap();
+        let result = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
+            let mut output = Vec::new();
+            stdout
+                .take((VERSION_OUTPUT_LIMIT + 1) as u64)
+                .read_to_end(&mut output)
+                .await?;
+            if output.len() > VERSION_OUTPUT_LIMIT {
+                return Err(VmmError::ProcessError(
+                    "Firecracker version output exceeds 4 KiB".into(),
+                ));
+            }
+            let status = process.wait().await?;
+            if !status.success() {
+                return Err(VmmError::ProcessError(
+                    "Firecracker version command failed".into(),
+                ));
+            }
+            Ok(output)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(VmmError::ProcessError(
+                "Firecracker version probe exceeded 3s".into(),
+            ))
+        });
+        // Keep ownership on cancellation or failed termination; the UUID cleanup
+        // path can retry. Only a confirmed exit releases this pre-allocation child.
+        crate::termination::terminate_child(process, "Firecracker version probe").await?;
+        let output = result?;
+        let text = String::from_utf8_lossy(&output);
         let version = parse_firecracker_version(&text).ok_or_else(|| {
             VmmError::ProcessError(format!(
                 "could not parse Firecracker version from: {}",
@@ -216,6 +345,7 @@ impl FirecrackerBackend {
                  found {a}.{b}.{c}. Upgrade firecracker."
             )));
         }
+        probes.remove(&id);
         Ok(())
     }
 
@@ -229,52 +359,89 @@ impl FirecrackerBackend {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<Bytes, VmmError> {
-        let socket_path = socket_path.to_owned();
-        let connector = tower::util::service_fn(move |_: hyper::Uri| {
-            let path = socket_path.clone();
-            Box::pin(async move {
-                let stream = tokio::net::UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(TokioIo::new(stream))
-            })
-        });
+        let budget = if matches!(path, "/snapshot/create" | "/snapshot/load") {
+            std::time::Duration::from_secs(120)
+        } else {
+            std::time::Duration::from_secs(10)
+        };
+        tokio::time::timeout(budget, Self::fc_exchange(socket_path, method, path, body))
+            .await
+            .map_err(|_| {
+                VmmError::ApiError(format!(
+                    "{method} {path} timed out after {}s",
+                    budget.as_secs()
+                ))
+            })?
+    }
 
-        let client = Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(connector);
-
+    async fn fc_exchange(
+        socket_path: &Path,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<Bytes, VmmError> {
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
         let body_bytes = match body {
             Some(v) => {
                 serde_json::to_vec(v).map_err(|e| VmmError::ApiError(format!("serialize: {e}")))?
             }
             None => Vec::new(),
         };
-
         let req = Request::builder()
             .method(method)
-            .uri(format!("http://localhost{path}"))
+            .uri(path)
+            .header("Host", "localhost")
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(body_bytes)))
             .map_err(|e| VmmError::ApiError(format!("build request: {e}")))?;
-
-        let resp = client
-            .request(req)
+        let stream = tokio::net::UnixStream::connect(socket_path)
+            .await
+            .map_err(|e| VmmError::ApiError(format!("connect Firecracker API: {e}")))?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|e| VmmError::ApiError(format!("Firecracker HTTP handshake: {e}")))?;
+        // The HTTP driver owns the socket. Always abort it on return, timeout or
+        // caller cancellation instead of leaving a detached pooled connection.
+        struct ConnectionTask(tokio::task::JoinHandle<()>);
+        impl Drop for ConnectionTask {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _connection = ConnectionTask(tokio::spawn(async move {
+            let _ = connection.await;
+        }));
+        let resp = sender
+            .send_request(req)
             .await
             .map_err(|e| VmmError::ApiError(format!("{method} {path}: {e}")))?;
-
         let status = resp.status();
-        let resp_body = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| VmmError::ApiError(format!("read response body: {e}")))?
-            .to_bytes();
-
+        let mut response = resp.into_body();
+        let mut retained = Vec::new();
+        while let Some(frame) = response.frame().await {
+            let frame =
+                frame.map_err(|e| VmmError::ApiError(format!("read response body: {e}")))?;
+            if let Ok(data) = frame.into_data() {
+                if data.len() > MAX_RESPONSE_BYTES - retained.len() {
+                    return Err(VmmError::ApiError(format!(
+                        "{method} {path} response exceeds 64 KiB"
+                    )));
+                }
+                retained.extend_from_slice(&data);
+            }
+        }
         if !status.is_success() {
-            let detail = String::from_utf8_lossy(&resp_body);
+            let detail = String::from_utf8_lossy(&retained[..retained.len().min(4096)]);
             return Err(VmmError::ApiError(format!(
-                "{method} {path} returned {status}: {detail}"
+                "{method} {path} returned {status}: {detail}{}",
+                if retained.len() > 4096 {
+                    " [error body truncated]"
+                } else {
+                    ""
+                }
             )));
         }
-
-        Ok(resp_body)
+        Ok(Bytes::from(retained))
     }
 
     /// Convenience wrapper for PUT requests (most Firecracker config endpoints).
@@ -370,6 +537,9 @@ impl FirecrackerBackend {
             .create_vm_cgroup(id, config.vcpu_count, config.mem_size_mib)
             .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
 
+        // Hold the registry across synchronous spawn and insertion: no await
+        // may strand a live child before a retryable owner is published.
+        let mut instances = self.instances.lock().await;
         // Spawn the Firecracker process
         let process = match tokio::process::Command::new(&self.firecracker_bin)
             .arg("--api-sock")
@@ -390,11 +560,34 @@ impl FirecrackerBackend {
         };
 
         let pid = process.id();
+        instances.insert(
+            id,
+            FcInstance {
+                info: VmInfo {
+                    id,
+                    name: config.name.clone(),
+                    state: VmState::Creating,
+                    pid,
+                    vcpu_count: config.vcpu_count,
+                    mem_size_mib: config.mem_size_mib,
+                    vsock_cid: config.vsock_cid,
+                },
+                socket_path: socket_path.to_owned(),
+                vsock_path: vsock_path.to_owned(),
+                boot_log_path: boot_log_path.to_owned(),
+                serial_log_path: serial_log_path.to_owned(),
+                process,
+                fork_source: None,
+                balloon: config.balloon,
+                cgroup: vm_cgroup,
+            },
+        );
         if let Some(p) = pid
-            && let Err(e) = vm_cgroup.place(p)
+            && let Err(e) = instances.get(&id).unwrap().cgroup.place(p)
         {
             return Err(VmmError::ProcessError(format!("place vmm in cgroup: {e}")));
         }
+        drop(instances);
 
         // Wait for the API socket to appear
         for _ in 0..50 {
@@ -531,18 +724,12 @@ impl FirecrackerBackend {
             vsock_cid: config.vsock_cid,
         };
 
-        let instance = FcInstance {
-            info: info.clone(),
-            socket_path: socket_path.to_owned(),
-            vsock_path: vsock_path.to_owned(),
-            boot_log_path: boot_log_path.to_owned(),
-            serial_log_path: serial_log_path.to_owned(),
-            process,
-            balloon: config.balloon,
-            cgroup: vm_cgroup,
-        };
-
-        self.instances.lock().await.insert(id, instance);
+        self.instances
+            .lock()
+            .await
+            .get_mut(&id)
+            .ok_or(VmmError::VmNotFound(id))?
+            .info = info.clone();
 
         Ok(info)
     }
@@ -580,11 +767,19 @@ impl VmmBackend for FirecrackerBackend {
             }
         }
 
-        let id = Uuid::new_v4();
+        let id = crate::creation_id(&config)?;
+        let _creation = self.creation_locks.lock(id).await;
+        if self.instances.lock().await.contains_key(&id)
+            || self.version_probes.lock().await.contains_key(&id)
+        {
+            return Err(VmmError::InvalidConfig(
+                "requested VM UUID is already allocated".into(),
+            ));
+        }
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
         let boot_log_path = self.runtime_dir.join(format!("{id}.boot.log"));
         let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
-        let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
+        let serial_log_path = self.runtime_dir.join(self.serial_log_file(id));
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
 
@@ -603,7 +798,8 @@ impl VmmBackend for FirecrackerBackend {
             .open(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
 
-        // Spawn, configure, and start — cleaning up the serial log on any failure.
+        // Spawn, configure, and start. Once spawned, a failed or cancelled boot
+        // retains its child, cgroup and runtime files until confirmed destroy.
         match self
             .spawn_and_configure(
                 id,
@@ -619,13 +815,19 @@ impl VmmBackend for FirecrackerBackend {
         {
             Ok(info) => Ok(CreatedVm::new(info, selection)),
             Err(e) => {
-                // Capture diagnostics before removing the artifacts.
+                // Capture diagnostics while retaining any spawned owner.
                 let serial_tail = crate::tail_lines(&serial_log_path, 20);
                 let boot_tail = crate::tail_lines(&boot_log_path, 20);
-                let _ = std::fs::remove_file(&serial_log_path);
-                let _ = std::fs::remove_file(&boot_log_path);
-                let _ = std::fs::remove_file(&socket_path);
-                let _ = std::fs::remove_file(&vsock_path);
+                let mut instances = self.instances.lock().await;
+                if let Some(instance) = instances.get_mut(&id) {
+                    instance.info.state = VmState::Failed;
+                } else {
+                    // No child was spawned; these files have no live owner.
+                    let _ = std::fs::remove_file(&serial_log_path);
+                    let _ = std::fs::remove_file(&boot_log_path);
+                    let _ = std::fs::remove_file(&socket_path);
+                    let _ = std::fs::remove_file(&vsock_path);
+                }
                 let mut msg = format!("{e}");
                 crate::append_log_tails(&mut msg, serial_tail, boot_tail, "firecracker boot log");
                 Err(VmmError::ProcessError(msg))
@@ -678,39 +880,45 @@ impl VmmBackend for FirecrackerBackend {
         Ok(())
     }
 
-    async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
-        let mut instances = self.instances.lock().await;
-        let mut instance = instances.remove(&id).ok_or(VmmError::VmNotFound(id))?;
+    async fn abort_create(&self, id: Uuid) -> Result<(), VmmError> {
+        crate::abort_registered_create(self.destroy_vm(id).await)
+    }
 
-        tracing::debug!(%id, "destroying firecracker VM");
-        match instance.process.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                if let Err(e) = instance.process.kill().await {
-                    tracing::warn!(%id, error = %e, "failed to kill firecracker process during destroy");
-                }
+    async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
+        let _creation = self.creation_locks.lock(id).await;
+        let probe_removed = {
+            let mut probes = self.version_probes.lock().await;
+            if let Some(probe) = probes.get_mut(&id) {
+                crate::termination::terminate_child(probe, "Firecracker version probe").await?;
+                probes.remove(&id);
+                true
+            } else {
+                false
             }
-            Err(e) => {
-                tracing::warn!(%id, error = %e, "failed to inspect firecracker process during destroy; attempting kill");
-                if let Err(kill_error) = instance.process.kill().await {
-                    tracing::warn!(%id, error = %kill_error, "failed to kill firecracker process during destroy");
-                }
-            }
+        };
+        let mut instances = self.instances.lock().await;
+        if probe_removed && !instances.contains_key(&id) {
+            return Ok(());
         }
+        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+        tracing::debug!(%id, "destroying firecracker VM");
+        crate::termination::terminate_child(&mut instance.process, "firecracker").await?;
+        if let Some(source) = instance.fork_source.as_mut() {
+            source.alias.undo()?;
+        }
+        instance.fork_source = None;
         for path in [
             &instance.socket_path,
             &instance.vsock_path,
             &instance.boot_log_path,
             &instance.serial_log_path,
         ] {
-            if let Err(e) = tokio::fs::remove_file(path).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(%id, path = %path.display(), error = %e, "failed to remove firecracker runtime file during destroy");
-            }
+            crate::termination::remove_runtime_file(path).await?;
         }
-        instance.cgroup.remove().await;
-
+        instance.cgroup.remove_confirmed().await.map_err(|error| {
+            VmmError::ProcessError(format!("confirm VMM cgroup cleanup: {error}"))
+        })?;
+        instances.remove(&id);
         Ok(())
     }
 
@@ -849,15 +1057,24 @@ impl VmmBackend for FirecrackerBackend {
                 tap_device,
                 source_rootfs,
                 fork_rootfs,
+                source_lock,
             } => (
                 id,
                 name,
                 vcpu_count,
                 mem_size_mib,
                 vsock_cid,
-                Some((tap_device, source_rootfs, fork_rootfs)),
+                Some((tap_device, source_rootfs, fork_rootfs, source_lock)),
             ),
         };
+        let _creation = self.creation_locks.lock(id).await;
+        if self.instances.lock().await.contains_key(&id)
+            || self.version_probes.lock().await.contains_key(&id)
+        {
+            return Err(VmmError::InvalidConfig(
+                "restore VM UUID is already allocated".into(),
+            ));
+        }
         let vsock_path = self.runtime_dir.join(format!("{id}.vsock"));
 
         // A fork rebinds the guest NIC to a fresh host TAP via the
@@ -865,8 +1082,16 @@ impl VmmBackend for FirecrackerBackend {
         // understands from 1.12.0 on. Check up front so an old binary fails with
         // a clear, actionable message instead of an opaque deserialization 400.
         if fork.is_some() {
-            self.assert_firecracker_supports_fork().await?;
+            self.assert_firecracker_supports_fork(id).await?;
         }
+
+        let fork_source = match &fork {
+            Some((_, source, clone, lock)) => Some(ForkSource {
+                _source_lock: lock.clone(),
+                alias: RootfsAlias::prepare(source, clone)?,
+            }),
+            None => None,
+        };
 
         // Convert the snapshot/memory/vsock paths to &str up front, before
         // creating any runtime files, so a (rare) non-UTF-8 path returns without
@@ -877,7 +1102,7 @@ impl VmmBackend for FirecrackerBackend {
 
         let socket_path = self.runtime_dir.join(format!("{id}.sock"));
         let boot_log_path = self.runtime_dir.join(format!("{id}.boot.log"));
-        let serial_log_path = self.runtime_dir.join(format!("{id}.serial.log"));
+        let serial_log_path = self.runtime_dir.join(self.serial_log_file(id));
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
         // Clear any stale socket so Firecracker can bind a fresh one.
@@ -892,11 +1117,14 @@ impl VmmBackend for FirecrackerBackend {
             .open(&boot_log_path)
             .map_err(|e| VmmError::ProcessError(format!("open FC log for stderr: {e}")))?;
 
-        let mut vm_cgroup = self
+        let vm_cgroup = self
             .cgroup
             .create_vm_cgroup(id, vcpu_count, mem_size_mib)
             .map_err(|e| VmmError::ProcessError(format!("create cgroup: {e}")))?;
 
+        // Publish the child before any readiness or API await. Destruction
+        // serializes with this restore and confirms exit before deleting files.
+        let mut instances = self.instances.lock().await;
         let process = match tokio::process::Command::new(&self.firecracker_bin)
             .arg("--api-sock")
             .arg(&socket_path)
@@ -911,113 +1139,109 @@ impl VmmBackend for FirecrackerBackend {
         {
             Ok(p) => p,
             Err(e) => {
-                vm_cgroup.remove().await;
                 return Err(VmmError::ProcessError(format!("spawn firecracker: {e}")));
             }
         };
         let pid = process.id();
+        instances.insert(
+            id,
+            FcInstance {
+                info: VmInfo {
+                    id,
+                    name,
+                    state: VmState::Creating,
+                    pid,
+                    vcpu_count,
+                    mem_size_mib,
+                    vsock_cid,
+                },
+                socket_path: socket_path.clone(),
+                vsock_path: vsock_path.clone(),
+                boot_log_path: boot_log_path.clone(),
+                serial_log_path: serial_log_path.clone(),
+                process,
+                fork_source,
+                balloon: false,
+                cgroup: vm_cgroup,
+            },
+        );
         if let Some(p) = pid
-            && let Err(e) = vm_cgroup.place(p)
+            && let Err(e) = instances.get(&id).unwrap().cgroup.place(p)
         {
-            vm_cgroup.remove().await;
-            let _ = tokio::fs::remove_file(&socket_path).await;
-            let _ = tokio::fs::remove_file(&serial_log_path).await;
-            let _ = tokio::fs::remove_file(&boot_log_path).await;
+            instances.get_mut(&id).unwrap().info.state = VmState::Failed;
             return Err(VmmError::ProcessError(format!("place vmm in cgroup: {e}")));
         }
+        drop(instances);
 
-        for _ in 0..50 {
-            if socket_path.exists() {
-                break;
+        let result = async {
+            for _ in 0..50 {
+                if socket_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        if !socket_path.exists() {
-            // The FC process dies via kill_on_drop; remove the runtime files it
-            // left so a timed-out restore does not leak the socket and logs.
-            vm_cgroup.remove().await;
-            let _ = tokio::fs::remove_file(&socket_path).await;
-            let _ = tokio::fs::remove_file(&serial_log_path).await;
-            let _ = tokio::fs::remove_file(&boot_log_path).await;
-            return Err(VmmError::ProcessError(
-                "Firecracker socket did not appear within 5s".into(),
-            ));
-        }
+            if !socket_path.exists() {
+                return Err(VmmError::ProcessError(
+                    "Firecracker socket did not appear within 5s".into(),
+                ));
+            }
 
-        // `vsock_override` rebinds the vsock to this VM's own socket path: a resumed
-        // VM rebinds its own, a fork gets a fresh one (so concurrent forks of one
-        // snapshot do not collide). Resume keeps the snapshot's NIC; fork rebinds
-        // the NIC to its own fresh TAP and aliases the embedded source rootfs to
-        // the fork's clone for the duration of the load.
-        let mut load_body = serde_json::json!({
-            "snapshot_path": snapshot,
-            "mem_file_path": mem,
-            "resume_vm": true,
-            "vsock_override": { "uds_path": vsock_path_str },
-        });
-        let _alias = match &fork {
-            Some((tap, source_rootfs, fork_rootfs)) => {
+            // `vsock_override` rebinds the vsock to this VM's own socket path: a resumed
+            // VM rebinds its own, a fork gets a fresh one (so concurrent forks of one
+            // snapshot do not collide). Resume keeps the snapshot's NIC; fork rebinds
+            // the NIC to its own fresh TAP and aliases the embedded source rootfs to
+            // the fork's clone for the duration of the load.
+            let mut load_body = serde_json::json!({
+                "snapshot_path": snapshot,
+                "mem_file_path": mem,
+                "resume_vm": true,
+                "vsock_override": { "uds_path": vsock_path_str },
+            });
+            if let Some((tap, _, _, _)) = &fork {
                 load_body["network_overrides"] = serde_json::json!([{
                     "iface_id": "eth0",
                     "host_dev_name": tap,
                 }]);
-                match RootfsAlias::install(source_rootfs, fork_rootfs) {
-                    Ok(alias) => Some(alias),
-                    Err(e) => {
-                        // The FC process was already spawned; clean up its runtime
-                        // files (the process itself dies via kill_on_drop) so a
-                        // failed alias does not leak the socket and logs.
-                        vm_cgroup.remove().await;
-                        let _ = tokio::fs::remove_file(&socket_path).await;
-                        let _ = tokio::fs::remove_file(&serial_log_path).await;
-                        let _ = tokio::fs::remove_file(&boot_log_path).await;
-                        return Err(e);
-                    }
-                }
+                let mut instances = self.instances.lock().await;
+                instances
+                    .get_mut(&id)
+                    .ok_or(VmmError::VmNotFound(id))?
+                    .fork_source
+                    .as_mut()
+                    .expect("registered fork source")
+                    .alias
+                    .activate()?;
             }
-            None => None,
-        };
 
-        if let Err(e) = Self::fc_put(&socket_path, "/snapshot/load", &load_body).await {
-            // Capture diagnostics before removing the artifacts. The alias guard
-            // drops here too, restoring the source's rootfs.
-            let serial_tail = crate::tail_lines(&serial_log_path, 20);
-            let boot_tail = crate::tail_lines(&boot_log_path, 20);
-            vm_cgroup.remove().await;
-            let _ = tokio::fs::remove_file(&socket_path).await;
-            let _ = tokio::fs::remove_file(&serial_log_path).await;
-            let _ = tokio::fs::remove_file(&boot_log_path).await;
-            let mut msg = format!("{e}");
-            crate::append_log_tails(&mut msg, serial_tail, boot_tail, "firecracker boot log");
-            return Err(VmmError::ProcessError(msg));
+            if let Err(e) = Self::fc_put(&socket_path, "/snapshot/load", &load_body).await {
+                // Capture diagnostics while retaining process and file ownership.
+                // Source alias and lock remain owned until confirmed destruction.
+                let serial_tail = crate::tail_lines(&serial_log_path, 20);
+                let boot_tail = crate::tail_lines(&boot_log_path, 20);
+                let mut msg = format!("{e}");
+                crate::append_log_tails(&mut msg, serial_tail, boot_tail, "firecracker boot log");
+                return Err(VmmError::ProcessError(msg));
+            }
+            // Firecracker now holds the fork's rootfs fd open; undo the alias so the
+            // source keeps its own disk for a later resume.
+            let mut instances = self.instances.lock().await;
+            let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+            if let Some(source) = instance.fork_source.as_mut() {
+                source.alias.undo()?;
+            }
+            instance.fork_source = None;
+            Ok(())
         }
-        // Firecracker now holds the fork's rootfs fd open; undo the alias so the
-        // source keeps its own disk for a later resume.
-        drop(_alias);
-
-        let info = VmInfo {
-            id,
-            name,
-            state: VmState::Running,
-            pid,
-            vcpu_count,
-            mem_size_mib,
-            vsock_cid,
+        .await;
+        let mut instances = self.instances.lock().await;
+        let instance = instances.get_mut(&id).ok_or(VmmError::VmNotFound(id))?;
+        instance.info.state = if result.is_ok() {
+            VmState::Running
+        } else {
+            VmState::Failed
         };
-        let instance = FcInstance {
-            info: info.clone(),
-            socket_path,
-            vsock_path,
-            boot_log_path,
-            serial_log_path,
-            process,
-            // A restored VM is not tracked as balloon-enabled; the snapshot restores
-            // whatever device set it had, and the balloon op is opt-in per VM.
-            balloon: false,
-            cgroup: vm_cgroup,
-        };
-        self.instances.lock().await.insert(id, instance);
-        Ok(info)
+        result?;
+        Ok(instance.info.clone())
     }
 
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
@@ -1056,6 +1280,69 @@ impl VmmBackend for FirecrackerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_api_headers_or_body_time_out_and_close_the_owned_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in ["headers", "body", "cancel"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("api.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let request = tokio::spawn(async move {
+                FirecrackerBackend::fc_request(&path, "GET", "/", None).await
+            });
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut incoming = [0; 1024];
+            assert!(peer.read(&mut incoming).await.unwrap() > 0);
+            if mode == "body" {
+                peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nx")
+                    .await
+                    .unwrap();
+            }
+            if mode == "cancel" {
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
+            } else {
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(10)).await;
+                let error = request.await.unwrap().unwrap_err();
+                assert!(error.to_string().contains("timed out after 10s"));
+                // Kernel socket closure is asynchronous; use the real clock
+                // instead of auto-advancing past its pending readiness event.
+                tokio::time::resume();
+            }
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), peer.read(&mut incoming))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_api_response_is_rejected_before_unbounded_collection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut incoming = [0; 1024];
+            assert!(stream.read(&mut incoming).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65537\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = stream.write_all(&vec![b'x'; 65537]).await;
+        });
+        let error = FirecrackerBackend::fc_request(&path, "GET", "/", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("response exceeds 64 KiB"));
+        peer.await.unwrap();
+    }
 
     fn noop_cgroup() -> crate::cgroup::VmCgroup {
         crate::cgroup::CgroupSupervisor::disabled()
@@ -1149,6 +1436,22 @@ mod tests {
     }
 
     #[test]
+    fn manual_fork_recovery_refuses_replacement_files_and_nonregular_backups() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let backup = fork_src_backup_path(&source);
+        std::fs::write(&source, b"replacement").unwrap();
+        std::fs::write(&backup, b"original").unwrap();
+        assert!(recover_aliased_rootfs(&source).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"original");
+        std::fs::remove_file(&backup).unwrap();
+        std::os::unix::fs::symlink("missing", &backup).unwrap();
+        assert!(recover_aliased_rootfs(&source).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
+    }
+
+    #[test]
     fn parse_firecracker_version_extracts_semver() {
         assert_eq!(
             parse_firecracker_version("Firecracker v1.16.0\nSupported ..."),
@@ -1170,6 +1473,277 @@ mod tests {
         // Junk lines yield nothing.
         assert_eq!(parse_firecracker_version("no version here"), None);
         assert_eq!(parse_firecracker_version(""), None);
+    }
+
+    #[cfg(unix)]
+    fn version_fixture(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("version-fixture");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_probe_bounds_output_checks_exit_and_retains_failed_receipts() {
+        for (body, expected) in [
+            ("printf 'Firecracker v1.16.0\\n'", None),
+            (
+                "printf 'Firecracker v1.16.0\\n'; exit 1",
+                Some("version command failed"),
+            ),
+            (
+                "printf 'Firecracker v1.10.0\\n'",
+                Some("requires Firecracker"),
+            ),
+            ("printf 'invalid\\n'", Some("could not parse")),
+            (
+                "i=0; while [ \"$i\" -lt 5000 ]; do printf x; i=$((i+1)); done",
+                Some("output exceeds 4 KiB"),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let backend = test_backend(version_fixture(temp.path(), body), temp.path());
+            let id = Uuid::new_v4();
+            let result = backend.assert_firecracker_supports_fork(id).await;
+            if let Some(expected) = expected {
+                assert!(result.unwrap_err().to_string().contains(expected));
+                let mut probes = backend.version_probes.lock().await;
+                assert!(probes.get_mut(&id).unwrap().try_wait().unwrap().is_some());
+                drop(probes);
+                // Failed pre-allocation is still an owned UUID until cleanup.
+                assert!(backend.assert_firecracker_supports_fork(id).await.is_err());
+                backend.destroy_vm(id).await.unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert!(backend.version_probes.lock().await.is_empty());
+            assert!(backend.instances.lock().await.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_probe_timeout_reaps_and_cancellation_retains_child_for_destroy() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(test_backend(
+            version_fixture(temp.path(), "exec /bin/sleep 30"),
+            temp.path(),
+        ));
+        let timed_out = Uuid::new_v4();
+        let error = backend
+            .assert_firecracker_supports_fork(timed_out)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded 3s"));
+        assert!(
+            backend
+                .version_probes
+                .lock()
+                .await
+                .get_mut(&timed_out)
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some()
+        );
+        backend.destroy_vm(timed_out).await.unwrap();
+
+        // A sentinel emitted before exec proves the probe is running before abort.
+        let sentinel = temp.path().join("started");
+        version_fixture(
+            temp.path(),
+            &format!(
+                "printf started > '{}'; exec /bin/sleep 30",
+                sentinel.display()
+            ),
+        );
+        let id = Uuid::new_v4();
+        let cloned = backend.clone();
+        let snapshot = SnapshotPaths::in_dir(temp.path().join("snapshot"));
+        let source_rootfs = temp.path().join("source.ext4");
+        let fork_rootfs = temp.path().join("fork.ext4");
+        let task = tokio::spawn(async move {
+            cloned
+                .restore_vm(
+                    &snapshot,
+                    RestoreTarget::Fork {
+                        id,
+                        name: "probe-cancellation".into(),
+                        vcpu_count: 1,
+                        mem_size_mib: 128,
+                        vsock_cid: 3,
+                        tap_device: "unused".into(),
+                        source_rootfs,
+                        fork_rootfs,
+                        source_lock: Arc::new(Arc::new(Mutex::new(())).lock_owned().await),
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !sentinel.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            backend
+                .version_probes
+                .lock()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        let duplicate = backend
+            .restore_vm(
+                &SnapshotPaths::in_dir(temp.path()),
+                RestoreTarget::Resume {
+                    id,
+                    name: "duplicate".into(),
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    vsock_cid: 3,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(duplicate, VmmError::InvalidConfig(_)));
+        assert!(!temp.path().join(format!("{id}.serial.log")).exists());
+        backend.destroy_vm(id).await.unwrap();
+        assert!(backend.version_probes.lock().await.is_empty());
+        assert!(backend.instances.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fork_alias_and_source_lock_survive_ambiguous_load_until_confirmed_cleanup() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for outcome in ["cancel", "reject", "success"] {
+            let temp = tempfile::tempdir().unwrap();
+            let binary = version_fixture(
+                temp.path(),
+                "if [ \"$1\" = --version ]; then printf 'Firecracker v1.16.0\\n'; exit 0; fi; exec /bin/sleep 30",
+            );
+            let backend = Arc::new(test_backend(binary, temp.path()));
+            let source = temp.path().join("source.ext4");
+            let fork = temp.path().join("fork.ext4");
+            std::fs::write(&source, b"original source").unwrap();
+            std::fs::write(&fork, b"private fork").unwrap();
+            let id = Uuid::new_v4();
+            let source_lock = Arc::new(Mutex::new(()));
+            let guard = Arc::new(source_lock.clone().lock_owned().await);
+            let target = RestoreTarget::Fork {
+                id,
+                name: "alias-test".into(),
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                vsock_cid: 3,
+                tap_device: "unused".into(),
+                source_rootfs: source.clone(),
+                fork_rootfs: fork.clone(),
+                source_lock: guard,
+            };
+            let cloned = backend.clone();
+            let snapshot = SnapshotPaths::in_dir(temp.path().join("snapshot"));
+            let task = tokio::spawn(async move { cloned.restore_vm(&snapshot, target).await });
+            let serial = temp.path().join(format!("{id}.serial.log"));
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !serial.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Serial creation follows stale-socket removal, so this bind cannot
+            // be erased by the restore's setup path.
+            let listener =
+                tokio::net::UnixListener::bind(temp.path().join(format!("{id}.sock"))).unwrap();
+            let (mut peer, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = vec![0; 4096];
+            let n = peer.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).contains("/snapshot/load"));
+            assert_eq!(std::fs::read_link(&source).unwrap(), fork);
+            assert!(source_lock.try_lock().is_err());
+            match outcome {
+                "cancel" => {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                }
+                "reject" => {
+                    peer.write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    assert!(task.await.unwrap().is_err());
+                }
+                "success" => {
+                    peer.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                        .await
+                        .unwrap();
+                    assert_eq!(task.await.unwrap().unwrap().state, VmState::Running);
+                    assert_eq!(std::fs::read(&source).unwrap(), b"original source");
+                    assert!(source_lock.try_lock().is_ok());
+                }
+                _ => unreachable!(),
+            }
+            if outcome != "success" {
+                assert!(
+                    backend
+                        .instances
+                        .lock()
+                        .await
+                        .get_mut(&id)
+                        .unwrap()
+                        .process
+                        .try_wait()
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(std::fs::read_link(&source).unwrap(), fork);
+                assert!(source_lock.try_lock().is_err());
+                // Restoration cannot overwrite an obstructing replacement path.
+                std::fs::remove_file(&source).unwrap();
+                std::fs::create_dir(&source).unwrap();
+                assert!(backend.destroy_vm(id).await.is_err());
+                assert!(
+                    backend
+                        .instances
+                        .lock()
+                        .await
+                        .get_mut(&id)
+                        .unwrap()
+                        .process
+                        .try_wait()
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(source.is_dir());
+                assert!(source_lock.try_lock().is_err());
+                assert_eq!(
+                    std::fs::read(fork_src_backup_path(&source)).unwrap(),
+                    b"original source"
+                );
+                std::fs::remove_dir(&source).unwrap();
+                std::os::unix::fs::symlink(&fork, &source).unwrap();
+            }
+            backend.destroy_vm(id).await.unwrap();
+            assert_eq!(std::fs::read(&source).unwrap(), b"original source");
+            assert_eq!(std::fs::read(&fork).unwrap(), b"private fork");
+            assert!(!fork_src_backup_path(&source).exists());
+            assert!(source_lock.try_lock().is_ok());
+            assert!(backend.instances.lock().await.is_empty());
+        }
     }
 
     #[test]
@@ -1217,6 +1791,7 @@ mod tests {
     #[test]
     fn vm_config_serialization() {
         let config = VmConfig {
+            requested_id: None,
             name: "test".into(),
             vcpu_count: 2,
             mem_size_mib: 256,
@@ -1232,6 +1807,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            network_disabled: false,
             host_shares: Vec::new(),
         };
         let json = serde_json::to_value(&config).unwrap();
@@ -1363,12 +1939,14 @@ mod tests {
             boot_log_path: dir.path().join("fake.boot.log"),
             serial_log_path: dir.path().join("fake.serial.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
+            fork_source: None,
             balloon: false,
             cgroup: noop_cgroup(),
         };
         backend.instances.lock().await.insert(id, instance);
 
         let config = VmConfig {
+            requested_id: None,
             name: "existing".into(),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -1384,6 +1962,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            network_disabled: false,
             host_shares: Vec::new(),
         };
 
@@ -1404,6 +1983,7 @@ mod tests {
         let backend = test_backend(dir.path().join("does-not-exist-firecracker"), dir.path());
 
         let config = VmConfig {
+            requested_id: None,
             name: "cleanup-on-fail".into(),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -1419,6 +1999,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            network_disabled: false,
             host_shares: Vec::new(),
         };
 
@@ -1504,12 +2085,25 @@ mod tests {
             boot_log_path: boot_log_path.clone(),
             serial_log_path: serial_log_path.clone(),
             process: tokio::process::Command::new("true").spawn().unwrap(),
+            fork_source: None,
             balloon: false,
             cgroup: noop_cgroup(),
         };
         backend.instances.lock().await.insert(id, instance);
 
+        tokio::fs::remove_file(&socket_path).await.unwrap();
+        tokio::fs::create_dir(&socket_path).await.unwrap();
+        assert!(backend.destroy_vm(id).await.is_err());
+        {
+            let mut instances = backend.instances.lock().await;
+            let owned = instances
+                .get_mut(&id)
+                .expect("failed cleanup must retain instance");
+            assert!(owned.process.try_wait().unwrap().is_some());
+        }
+        tokio::fs::remove_dir(&socket_path).await.unwrap();
         backend.destroy_vm(id).await.unwrap();
+        assert!(!backend.instances.lock().await.contains_key(&id));
 
         assert!(!socket_path.exists());
         assert!(!vsock_path.exists());
@@ -1541,6 +2135,7 @@ mod tests {
             boot_log_path: dir.path().join("test.boot.log"),
             serial_log_path: dir.path().join("test.serial.log"),
             process,
+            fork_source: None,
             balloon: false,
             cgroup: noop_cgroup(),
         };
@@ -1576,6 +2171,7 @@ mod tests {
             boot_log_path: dir.join(format!("{id}.boot.log")),
             serial_log_path: dir.join(format!("{id}.serial.log")),
             process,
+            fork_source: None,
             balloon: false,
             cgroup: noop_cgroup(),
         };
@@ -1757,6 +2353,7 @@ mod tests {
             boot_log_path: dir.path().join("nb.boot.log"),
             serial_log_path: dir.path().join("nb.serial.log"),
             process: tokio::process::Command::new("true").spawn().unwrap(),
+            fork_source: None,
             balloon: false,
             cgroup: noop_cgroup(),
         };
@@ -1785,6 +2382,7 @@ mod tests {
         let backend = test_backend("firecracker", dir.path());
 
         let mut config = VmConfig {
+            requested_id: None,
             name: "test-shares".into(),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -1800,6 +2398,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            network_disabled: false,
             host_shares: Vec::new(),
         };
         config.host_shares = vec![crate::HostShare {

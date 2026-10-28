@@ -4,10 +4,15 @@ description = "An open source microVM manager"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+default-run = "husker"
 
 [[bin]]
 name = "husker"
 path = "src/main.rs"
+
+[[bin]]
+name = "husker-vz-worker"
+path = "src/vz_worker_main.rs"
 
 [lib]
 name = "husker"

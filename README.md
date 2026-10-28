@@ -47,6 +47,8 @@ isolation evidence from a real deployment.
 
 For the prepared-image, agent, and private-preview workflow, see
 [Development computers](docs/development-computers.md).
+The experimental [factory jobs API](docs/factory-jobs.md) adds durable host evidence
+for offline checks; execution is disabled by default.
 
 ### Install
 
@@ -211,6 +213,7 @@ supports aarch64 (agent-less build - see below).
 | Host bind-mounts (`--mount`) | — | ✓ (virtiofs) | — |
 | Memory balloon (`--balloon`) | ✓ | ✓ | ✓ |
 | Bridged LAN (`--net bridged`) | — | ✓ ³ | — |
+| Offline network (`--net none`) | ✓ | ✓ | ✓ (no NIC attached) |
 | Per-VM egress allowlist (API `network: filtered`) | ✓ | ✓ | — |
 | Snapshots | ✓ | — | — |
 | Fork / pool checkout | ✓ | — | — |

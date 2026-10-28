@@ -677,6 +677,88 @@ async fn root_disk_preparation_removes_clone_when_resize_fails() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn sealed_image_produces_private_writable_disk_without_mutating_source_or_export() {
+    use std::io::{Seek, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("sealed.ext4");
+    let destination = dir.path().join("vm/rootfs.ext4");
+    let export = dir.path().join("export.ext4");
+    std::fs::write(&source, b"sealed rootfs").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o400)).unwrap();
+    LocalStorageDriver
+        .clone_rootfs(&source, &export)
+        .await
+        .unwrap();
+    LocalStorageDriver
+        .prepare_root_disk(RootDiskRequest {
+            source: &source,
+            destination: &destination,
+            size_bytes: None,
+            guest_agent: &[],
+        })
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(&source).unwrap().mode() & 0o777, 0o400);
+    assert_eq!(std::fs::metadata(&export).unwrap().mode() & 0o777, 0o400);
+    assert_eq!(
+        std::fs::metadata(&destination).unwrap().mode() & 0o777,
+        0o600
+    );
+    assert_ne!(
+        std::fs::metadata(&source).unwrap().ino(),
+        std::fs::metadata(&destination).unwrap().ino()
+    );
+    let mut disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&destination)
+        .unwrap();
+    disk.seek(std::io::SeekFrom::Start(0)).unwrap();
+    disk.write_all(b"guest!").unwrap();
+    disk.sync_all().unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), b"sealed rootfs");
+    assert_eq!(std::fs::read(&export).unwrap(), b"sealed rootfs");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"guest! rootfs");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_disk_preparation_preserves_existing_destinations_and_source_aliases() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("sealed.ext4");
+    std::fs::write(&source, b"sealed source").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let existing = dir.path().join("existing");
+    std::fs::write(&existing, b"preserve destination").unwrap();
+    let symlink = dir.path().join("symlink");
+    std::os::unix::fs::symlink(&source, &symlink).unwrap();
+    let dangling = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("missing"), &dangling).unwrap();
+    for destination in [&source, &existing, &symlink, &dangling] {
+        let error = LocalStorageDriver
+            .prepare_root_disk(RootDiskRequest {
+                source: &source,
+                destination,
+                size_bytes: None,
+                guest_agent: &[],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error,StorageError::Io(ref error) if error.kind()==std::io::ErrorKind::AlreadyExists)
+        );
+        assert!(std::fs::symlink_metadata(destination).is_ok());
+    }
+    assert_eq!(std::fs::read(&source).unwrap(), b"sealed source");
+    assert_eq!(std::fs::metadata(&source).unwrap().mode() & 0o777, 0o400);
+    assert_eq!(std::fs::read(existing).unwrap(), b"preserve destination");
+    assert!(!dir.path().join("missing").exists());
+}
+
 #[tokio::test]
 async fn cloud_disk_preparation_validates_before_creating_destination() {
     let dir = tempdir().unwrap();

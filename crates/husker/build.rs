@@ -12,6 +12,7 @@
 //! microVM path) still compile; cloud-image then errors clearly at runtime.
 
 use std::path::PathBuf;
+mod agent_staging;
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
@@ -37,12 +38,13 @@ fn main() {
     };
 
     if candidate.exists() {
-        std::fs::copy(&candidate, &dest).expect("copy embedded agent");
+        let bytes = std::fs::read(&candidate).expect("read embedded agent");
+        agent_staging::stage_agent(&dest, &bytes).expect("stage embedded agent");
         println!("cargo:rerun-if-changed={}", candidate.display());
     } else {
         // Stage an empty blob so normal builds compile. Cloud-image is opt-in;
         // warn only when the agent path was explicitly requested but does not exist.
-        std::fs::write(&dest, b"").expect("write empty agent placeholder");
+        agent_staging::stage_agent(&dest, b"").expect("write empty agent placeholder");
         if let Some(p) = &env_path {
             println!(
                 "cargo:warning=husker: HUSKER_EMBED_AGENT_BIN={p} does not exist - cloud-image agent not embedded"

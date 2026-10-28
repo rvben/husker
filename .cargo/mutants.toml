@@ -34,4 +34,27 @@ exclude_re = [
     'replace > with >= in read_exact_chunked', # `while remaining > 0`
     'replace \+= with \*= in base64_encode',   # `i += 3`
     'replace \+= with \*= in base64_decode',   # `i += 4`
+
+    # job_spec.rs: serde_json is built without `preserve_order`, so every Map
+    # is already key-sorted and `sort_json_keys` cannot change the output. It
+    # guards canonical digests should a dependency ever enable that feature;
+    # the canonical-JSON tests expect sorted literals and would then kill these.
+    'replace sort_json_keys with \(\)',
+    'delete match arm .* in sort_json_keys',
+
+    # frozen_bundle_fs.rs: libc open(2) flag sets are built from disjoint single
+    # bits and O_RDONLY is 0, so `|` and `^` produce the same value (in `open`,
+    # `^` binds tighter than `|`, so the mutated flags are the same bit union).
+    'replace \| with \^ in (open|names|walk|collect_declared_artifact|FrozenBundle::write_new_file|FrozenBundle::extract_new_directory)$',
+    # `names` opens "." of an already verified directory, and `extract_new_directory`
+    # opens the directory it has just created (or one `mkdir` reported as
+    # existing), so dropping O_DIRECTORY or O_CLOEXEC changes nothing observable.
+    'replace \| with & in (names|FrozenBundle::extract_new_directory)$',
+    # Reading `size + 1` instead of `size` bytes only matters for a file that
+    # grows during the read, which the length and metadata comparison after the
+    # read already rejects; `size * 1` therefore reads the same accepted inputs.
+    'replace \+ with \* in (walk|collect_declared_artifact)$',
+    # Any `mkdir` failure other than EEXIST leaves the component missing, so the
+    # `open` that follows fails with the same error; ignoring it is unobservable.
+    'replace match guard error.kind\(\) == io::ErrorKind::AlreadyExists with true in FrozenBundle::extract_new_directory',
 ]

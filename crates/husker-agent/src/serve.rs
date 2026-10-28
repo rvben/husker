@@ -2,6 +2,7 @@
 //! Unix socket (`HUSKER_AGENT_SOCKET`, dev/testing) and serve each one.
 
 use anyhow::{Context, Result};
+use std::os::unix::fs::PermissionsExt;
 use tracing::{error, info, warn};
 
 /// Pause after an accept error other than "no connection pending", so a
@@ -71,10 +72,18 @@ fn serve_connection<S>(
 async fn listen_unix(path: &str, limits: crate::AgentLimits) -> Result<()> {
     info!("listening on Unix socket: {path}");
     let listener = tokio::net::UnixListener::bind(path).context("binding Unix socket")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .context("restricting the Unix agent socket to its owner")?;
+    // Safety: geteuid(2) has no preconditions and cannot fail.
+    let allowed_uid = unsafe { libc::geteuid() };
     let power: std::sync::Arc<dyn crate::PowerControl> = std::sync::Arc::new(crate::NoPowerControl);
 
     loop {
         let (stream, _) = listener.accept().await?;
+        if let Err(error) = crate::transport::authorize_unix_peer(&stream, allowed_uid) {
+            warn!("rejecting unauthorized Unix agent peer: {error}");
+            continue;
+        }
         serve_connection(stream, limits, power.clone());
     }
 }
@@ -114,6 +123,10 @@ async fn listen_vsock(limits: crate::AgentLimits) -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        if !crate::transport::authorized_vsock_cid(addr.cid()) {
+            warn!("rejecting non-host vsock peer CID {}", addr.cid());
+            continue;
+        }
         info!("vsock connection from CID {}", addr.cid());
         serve_connection(stream, limits, power.clone());
     }

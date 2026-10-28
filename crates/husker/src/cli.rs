@@ -110,6 +110,11 @@ pub(crate) enum OutputFormat {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Freeze or verify a local factory input bundle without contacting a daemon
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
     /// Prepare and create development computers on the selected daemon
     Dev {
         #[command(subcommand)]
@@ -732,6 +737,24 @@ pub(crate) enum Commands {
     Completions {
         /// Target shell (bash, zsh, fish, powershell, elvish)
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BundleAction {
+    /// Copy a source tree into deterministic, credential-excluding frozen tar v1
+    Freeze {
+        source: PathBuf,
+        /// New file outside the source tree; existing files are refused
+        destination: PathBuf,
+    },
+    /// Authenticate bytes against the identity recorded in the execution spec
+    Verify {
+        bundle: PathBuf,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        size: u64,
     },
 }
 
@@ -1380,6 +1403,13 @@ const JOB_OUTPUT: &[F] = &[
     F::required("stderr", T::String),
     F::optional("retrieval", T::Object),
 ];
+const BUNDLE_OUTPUT: &[F] = &[
+    F::required("status", T::String),
+    F::required("version", T::Integer),
+    F::required("digest", T::String),
+    F::required("size_bytes", T::Integer),
+    F::required("file_count", T::Integer),
+];
 const CP_OUTPUT: &[F] = &[
     F::required("status", T::String),
     F::required("action", T::String),
@@ -1833,6 +1863,8 @@ pub(crate) const COMMAND_CONTRACTS: &[CommandContract] = &[
     CommandContract::object("capabilities", Effects::ReadOnly, CAPABILITIES_OUTPUT),
     CommandContract::unsupported("setup storage", Effects::Idempotent),
     CommandContract::object("doctor", Effects::ReadOnly, DOCTOR_OUTPUT),
+    CommandContract::object("bundle freeze", Effects::Idempotent, BUNDLE_OUTPUT),
+    CommandContract::object("bundle verify", Effects::ReadOnly, BUNDLE_OUTPUT),
     CommandContract::unsupported("completions", Effects::ReadOnly),
 ];
 

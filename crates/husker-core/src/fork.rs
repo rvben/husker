@@ -55,8 +55,8 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         // Serialize forks of the same source (the rootfs alias moves the source's
         // disk aside during load) and guard the new name against a racing create.
-        // `src_guard` is released inside try_fork_vm as soon as the disk work is
-        // done (see PERF-1 there); `_fork_guard` is held for the whole operation.
+        // `src_guard` transfers to the backend before load; it survives a cancelled
+        // observer until alias restoration. `_fork_guard` covers this operation.
         let src_guard = self.vm_name_lock(source_name).lock_owned().await;
         let _fork_guard = self.vm_name_lock(fork_name).lock_owned().await;
 
@@ -95,6 +95,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             Err(error) => return Err(error),
         }
 
+        self.require_reconciled_fork_source(&source)?;
         // Validate security state before allocating or restoring any resources.
         if let Some(serialized) = source.egress_policy.as_deref() {
             crate::egress::parse_persisted_rules(serialized)?;
@@ -114,7 +115,11 @@ impl<B: VmmBackend> HuskerCore<B> {
                 // Log the reason server-side: fork failures previously surfaced
                 // only in the HTTP 500 body, leaving the daemon journal silent.
                 warn!(%source_name, %fork_name, error = %e, "fork failed; rolling back");
-                self.rollback_create(resources).await;
+                if let Err(rollback) = self.rollback_create(resources).await {
+                    return Err(CoreError::Io(format!(
+                        "VM fork failed ({e}); rollback remains pending: {rollback}"
+                    )));
+                }
                 Err(e)
             }
         }
@@ -139,7 +144,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         let t_start = std::time::Instant::now();
         let guest_ip = self.ip_allocator.allocate()?;
         resources.guest_ip = Some(guest_ip);
-        let lease = self.state.begin_host_resource_lease(fork_name)?;
+        let fork_id = Uuid::new_v4();
+        let lease = self
+            .state
+            .begin_host_resource_lease_for_vm(fork_name, fork_id)?;
         let cid = lease.vsock_cid;
         resources.cid = Some(cid);
         resources.host_resource_lease_id = Some(lease.id);
@@ -178,8 +186,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Restore the fork from the source's snapshot, bound to its own TAP and
         // its own vsock UDS path (via FC `vsock_override`), so the source can be
         // forked many times concurrently without a host-socket collision.
-        let fork_id = Uuid::new_v4();
         let src_snapshot = SnapshotPaths::in_dir(self.suspend_slot_dir(source.id));
+        self.state
+            .enter_host_resource_lease_backend(lease.id, fork_id)?;
+        resources.vm_id = Some(fork_id);
+        resources.backend_allocation_entered = true;
         let info = self
             .vmm
             .restore_vm(
@@ -193,22 +204,22 @@ impl<B: VmmBackend> HuskerCore<B> {
                     tap_device: tap_name.clone(),
                     source_rootfs,
                     fork_rootfs,
+                    source_lock: Arc::new(src_guard),
                 },
             )
             .await?;
+        if info.id != fork_id {
+            resources.vm_id = None;
+            return Err(CoreError::Io(
+                "backend returned a different leased fork UUID".into(),
+            ));
+        }
         resources.vm_id = Some(info.id);
         let disk_phase = t_start.elapsed();
 
-        // PERF-1: the source name lock only needs to cover the disk work above.
-        // The FC snapshot restore aliases the source rootfs aside and reverts it
-        // before `restore_vm` returns, and everything below operates solely on
-        // the fork (its own clone, VMM instance, and TAP). Release the source
-        // lock now so a slow guest agent during the network re-home cannot stall
-        // concurrent checkouts from the same pool. Measured ~240ms (28% of a
-        // ~860ms fork) was held here needlessly on the happy path, and far more
-        // as the reconfigure retries toward its 10s deadline. Rollback on a later
-        // failure touches only the fork's resources, so it does not need this.
-        drop(src_guard);
+        // The backend releases the source lock only after acknowledging load and
+        // restoring the source path. The network re-home below touches the fork
+        // alone; ambiguous loads retain the source lock until backend cleanup.
 
         // Re-home the guest's network identity (new MAC + IP + gateway + DNS) live.
         self.reconfigure_fork_network(info.id, &guest_ip, prefix_len, gateway, &mac)

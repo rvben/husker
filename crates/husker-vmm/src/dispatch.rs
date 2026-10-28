@@ -167,7 +167,7 @@ impl VmmBackend for LinuxDispatchBackend {
     async fn create_vm(
         &self,
         selection: BackendSelection,
-        config: VmConfig,
+        mut config: VmConfig,
     ) -> Result<CreatedVm, VmmError> {
         selection.validate_config(&config)?;
         let kind = match selection.backend() {
@@ -179,12 +179,23 @@ impl VmmBackend for LinuxDispatchBackend {
                 ));
             }
         };
-        let created = match kind {
-            VmmKind::Firecracker => self.firecracker.create_vm(selection, config).await?,
-            VmmKind::Qemu => self.qemu.create_vm(selection, config).await?,
-        };
-        self.routes.lock().await.insert(created.info.id, kind);
-        Ok(created)
+        // Route before entering the backend: a failed or cancelled creation can
+        // retain a child that only a routed destroy or abort can reach.
+        let id = crate::creation_id(&config)?;
+        config.requested_id = Some(id);
+        {
+            let mut routes = self.routes.lock().await;
+            if routes.contains_key(&id) {
+                return Err(VmmError::InvalidConfig(
+                    "requested VM UUID is already allocated".into(),
+                ));
+            }
+            routes.insert(id, kind);
+        }
+        match kind {
+            VmmKind::Firecracker => self.firecracker.create_vm(selection, config).await,
+            VmmKind::Qemu => self.qemu.create_vm(selection, config).await,
+        }
     }
 
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
@@ -200,10 +211,28 @@ impl VmmBackend for LinuxDispatchBackend {
             VmmKind::Firecracker => self.firecracker.destroy_vm(id).await,
             VmmKind::Qemu => self.qemu.destroy_vm(id).await,
         };
-        // Remove the route unconditionally: if the backend destroy fails, a retry
-        // should still clean up state (core handles VmNotFound as "clean state only").
-        self.routes.lock().await.remove(&id);
+        // A failed destroy keeps its owner in the backend, so the route stays
+        // for the retry.
+        if matches!(result, Ok(()) | Err(VmmError::VmNotFound(_))) {
+            self.routes.lock().await.remove(&id);
+        }
         result
+    }
+
+    async fn abort_create(&self, id: Uuid) -> Result<(), VmmError> {
+        // Every creation is routed before it enters a backend, so an unrouted
+        // UUID never reached one.
+        let kind = match self.kind_of(id).await {
+            Ok(kind) => kind,
+            Err(VmmError::VmNotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match kind {
+            VmmKind::Firecracker => self.firecracker.abort_create(id).await,
+            VmmKind::Qemu => self.qemu.abort_create(id).await,
+        }?;
+        self.routes.lock().await.remove(&id);
+        Ok(())
     }
 
     async fn vm_info(&self, id: Uuid) -> Result<VmInfo, VmmError> {
@@ -239,16 +268,28 @@ impl VmmBackend for LinuxDispatchBackend {
         src: &SnapshotPaths,
         target: RestoreTarget,
     ) -> Result<VmInfo, VmmError> {
-        // restore_vm deliberately does NOT consult the route map: a VM is restored
-        // after its route was cleared (on suspend), so there is nothing to look up.
-        // This layer owns backend selection for restores (currently Firecracker) and
-        // (re-)registers the route after a successful restore.
-        let info = self.firecracker.restore_vm(src, target).await?;
-        self.routes
-            .lock()
-            .await
-            .insert(info.id, VmmKind::Firecracker);
-        Ok(info)
+        // A VM is restored after its route was cleared (on suspend), so there is
+        // no route to look up. This layer owns backend selection for restores
+        // (currently Firecracker) and routes the target before entering the
+        // backend: a failed or cancelled restore can retain a child that only a
+        // routed destroy can reach. A route left by a restore that retained
+        // nothing is harmless, since destroying it reports VmNotFound and clears it.
+        let id = match &target {
+            RestoreTarget::Resume { id, .. } | RestoreTarget::Fork { id, .. } => *id,
+        };
+        {
+            let mut routes = self.routes.lock().await;
+            if routes
+                .get(&id)
+                .is_some_and(|kind| *kind != VmmKind::Firecracker)
+            {
+                return Err(VmmError::InvalidConfig(
+                    "restore target UUID is routed to another backend".into(),
+                ));
+            }
+            routes.insert(id, VmmKind::Firecracker);
+        }
+        self.firecracker.restore_vm(src, target).await
     }
 
     async fn vsock_connect(&self, id: Uuid, port: u32) -> Result<Self::VsockStream, VmmError> {
@@ -403,6 +444,99 @@ mod tests {
         let dst = crate::SnapshotPaths::in_dir(dir.path());
         assert!(matches!(
             be.snapshot_vm(id, &dst).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+    }
+
+    fn missing_binary_dispatcher(dir: &std::path::Path) -> LinuxDispatchBackend {
+        let cgroup = std::sync::Arc::new(crate::cgroup::CgroupSupervisor::disabled());
+        let fc = crate::firecracker::FirecrackerBackend::new(
+            dir.join("missing-firecracker"),
+            dir,
+            std::sync::Arc::clone(&cgroup),
+        );
+        let qemu = crate::qemu::QemuKvmBackend::new(dir.join("missing-qemu"), dir, cgroup);
+        LinuxDispatchBackend::new(fc, qemu, crate::VmmKind::Firecracker)
+    }
+
+    fn direct_config(id: Uuid) -> crate::VmConfig {
+        crate::VmConfig {
+            requested_id: Some(id),
+            name: "routed".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_path: "/tmp/vmlinux".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            kernel_args: None,
+            initrd_path: None,
+            vsock_cid: 3,
+            tap_device: None,
+            guest_mac: None,
+            vmm: None,
+            boot: crate::BootMode::DirectKernel,
+            seed_path: None,
+            balloon: false,
+            volume_path: None,
+            network_disabled: false,
+            host_shares: Vec::new(),
+        }
+    }
+
+    // A failed create stays routed, so cleanup reaches the backend that ran
+    // it; the abort clears the route only once the backend proves absence.
+    #[tokio::test]
+    async fn failed_create_stays_routed_until_aborted() {
+        use crate::VmmBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let be = missing_binary_dispatcher(dir.path());
+        let id = Uuid::new_v4();
+        let config = direct_config(id);
+        let selection = be.select_backend_for_config(&config).unwrap();
+        assert!(be.create_vm(selection, config).await.is_err());
+        assert_eq!(be.kind_of(id).await.unwrap(), VmmKind::Firecracker);
+
+        // The routed UUID cannot be claimed by a second creation.
+        let config = direct_config(id);
+        let selection = be.select_backend_for_config(&config).unwrap();
+        let duplicate = be.create_vm(selection, config).await.unwrap_err();
+        assert!(
+            duplicate.to_string().contains("already allocated"),
+            "{duplicate}"
+        );
+
+        be.abort_create(id).await.unwrap();
+        assert!(matches!(
+            be.kind_of(id).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        // An unrouted UUID never entered a backend.
+        be.abort_create(id).await.unwrap();
+    }
+
+    // A failed restore stays routed so a routed destroy can reach any child it
+    // retained; destroying one that retained nothing clears the route.
+    #[tokio::test]
+    async fn failed_restore_stays_routed_until_destroyed() {
+        use crate::VmmBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let be = missing_binary_dispatcher(dir.path());
+        let id = Uuid::new_v4();
+        let src = crate::SnapshotPaths::in_dir(dir.path());
+        let target = crate::RestoreTarget::Resume {
+            id,
+            name: "restored".into(),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            vsock_cid: 3,
+        };
+        assert!(be.restore_vm(&src, target).await.is_err());
+        assert_eq!(be.kind_of(id).await.unwrap(), VmmKind::Firecracker);
+        assert!(matches!(
+            be.destroy_vm(id).await,
+            Err(crate::VmmError::VmNotFound(_))
+        ));
+        assert!(matches!(
+            be.kind_of(id).await,
             Err(crate::VmmError::VmNotFound(_))
         ));
     }

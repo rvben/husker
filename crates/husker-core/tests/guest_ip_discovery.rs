@@ -40,7 +40,7 @@ impl VmmBackend for UnreachableVsockVmm {
         selection: husker_vmm::BackendSelection,
         config: VmConfig,
     ) -> Result<CreatedVm, VmmError> {
-        let id = Uuid::new_v4();
+        let id = config.requested_id.unwrap_or_else(Uuid::new_v4);
         let info = VmInfo {
             id,
             name: config.name,

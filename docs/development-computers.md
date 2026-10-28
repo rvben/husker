@@ -93,8 +93,9 @@ and releases its idle guard while suspended so the configured suspend TTL applie
 If the guest stays unreachable for 30 seconds while the VM reports running, the
 monitor releases its idle guard and emits a warning. Accepted starts transfer the start/monitor handoff to the daemon, so cancelling
 the HTTP request does not cancel it. Guest session RPCs have a 10-second transport
-deadline. A timed-out start may already have been accepted: list sessions before
-retrying to avoid duplicate commands. Client disconnects do not stop the command. Guest-agent restart marks unfinished sessions interrupted;
+deadline. An unkeyed timed-out start may already have been accepted: list sessions before
+retrying to avoid duplicate commands, or use a
+[replay-safe submission](#replay-safe-submission). Client disconnects do not stop the command. Guest-agent restart marks unfinished sessions interrupted;
 stop/reboot/VM destruction do not preserve live processes. Completed logs survive
 agent restarts while the disk remains available. Empty unpublished start
 transactions are recovered on restart; incomplete records with retained output
@@ -102,6 +103,66 @@ are preserved for inspection. Status publication is atomic and synced to disk.
 The daemon logs session start/outcome audit events without storing arguments or
 environment values in those events. Prometheus exposes
 `husker_detached_sessions_total` and `husker_preview_connections_total`.
+
+## Replay-safe submission
+
+Automation that must survive lost responses submits commands with an execution
+key through `POST /v1/vms/{name}/session-submissions`. The body takes the usual
+exec fields plus a required `idempotency_key` of 1 to 128 UTF-8 bytes. It is a
+separate endpoint so that an older daemon fails the request instead of ignoring
+the replay policy. It needs guest agent protocol v6; unkeyed starts keep
+working on v5 guests.
+
+```python
+# Journal the key and the VM's UUID before this call.
+session = vm.start(["cargo", "test", "--offline"], workdir="/workspace",
+                   timeout_secs=1200, idempotency_key="job/stage/round/check-0")
+```
+
+The key is scoped to one **VM generation**, not to the VM's reusable name.
+Recreating a VM with the same name starts a new scope, so check that the VM's
+UUID still matches your journal before retrying after a reconnect. Keys are
+non-secret correlation data, shared by every operator of the daemon; they are
+not per-user authorization.
+
+Before spawning, the guest stores and syncs a hash of the effective executable,
+ordered argv, working directory, resolved environment and timeout. Replaying
+the same key with an identical command returns the same session (201); any
+difference returns 409. The daemon canonicalizes environment order, but a
+rotated secret or a changed daemon policy changes the hash and causes a
+conflict. Plaintext argv and environment are not kept in the receipt. Treat the
+hashes of sensitive inputs as sensitive too.
+
+- **Lost response:** retry with the identical key and command.
+- **Guest restart:** accepted but unfinished work, including a crash between
+  acceptance and spawn, is marked interrupted. Replay returns the interruption
+  and never runs the command again. Running it again needs a new key. A spawn
+  that fails also leaves an interrupted receipt.
+- **Cancellation:** asynchronous. Poll the status until it is terminal. When
+  completion and cancellation race, whichever the guest observes first wins.
+  Cancellation signals the process group; a descendant that starts its own
+  session escapes it, so destroy the VM as the final fallback. A cancellation
+  receipt does not prove that every guest process ended.
+- **Removal:** deleting a session removes its logs and status but keeps a
+  tombstone, so the same key returns 409 instead of running again. A guest holds
+  at most 1,024 removal tombstones; replace the VM when it reaches that limit.
+
+Receipts, status and logs live on the guest disk. They survive daemon restarts
+while the disk exists, and VM destruction deletes them. For evidence that must
+outlive the VM, use [factory jobs](factory-jobs.md).
+
+The opt-in `scripts/ci/session_replay_e2e.py` probe creates one offline VM on a
+daemon you point it at, exercises replay, reconnect, conflicts, cursor replay
+and cancellation of nested children, and then confirms the VM was destroyed.
+Run it only against an isolated test daemon:
+
+```sh
+HUSKER_RUN_SESSION_REPLAY_E2E=1 \
+  HUSKER_SESSION_REPLAY_E2E_URL=http://127.0.0.1:7777 \
+  HUSKER_SESSION_REPLAY_E2E_IMAGE=<prepared-v6-image> \
+  HUSKER_SESSION_REPLAY_E2E_TOKEN=<token> \
+  python3 scripts/ci/session_replay_e2e.py
+```
 
 ## Private application previews
 

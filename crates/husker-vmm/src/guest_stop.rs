@@ -67,7 +67,9 @@ where
 
 /// Wait for a hypervisor child process to exit and kill it when the guest does
 /// not shut down within `grace`. Shared by the backends that run the guest as
-/// a child process; `process` selects the child inside an instance.
+/// a child process; `process` selects the child inside an instance. An
+/// instance without a child handle has no guest to observe, so the wait fails
+/// instead of reporting an exit it never saw.
 ///
 /// The instance map is locked per check, never across the whole grace, because
 /// the map guards every VM: a stop that held it for the full grace would stall
@@ -77,7 +79,7 @@ pub(crate) async fn wait_for_process_exit_or_kill<I>(
     id: Uuid,
     grace: Duration,
     hypervisor: &str,
-    process: impl Fn(&mut I) -> &mut tokio::process::Child,
+    process: impl Fn(&mut I) -> Option<&mut tokio::process::Child>,
 ) -> Result<GuestExit, VmmError> {
     let process = &process;
     wait_for_guest_exit(
@@ -85,7 +87,9 @@ pub(crate) async fn wait_for_process_exit_or_kill<I>(
         || async move {
             let mut instances = instances.lock().await;
             match instances.get_mut(&id) {
-                Some(instance) => probe_process(process(instance), hypervisor).await,
+                Some(instance) => {
+                    probe_process(child_handle(process(instance), hypervisor)?, hypervisor).await
+                }
                 None => Ok(Some(GuestExit::Gone)),
             }
         },
@@ -93,7 +97,8 @@ pub(crate) async fn wait_for_process_exit_or_kill<I>(
             let mut instances = instances.lock().await;
             match instances.get_mut(&id) {
                 Some(instance) => {
-                    process(instance).kill().await.map_err(|error| {
+                    let child = child_handle(process(instance), hypervisor)?;
+                    child.kill().await.map_err(|error| {
                         VmmError::ProcessError(format!(
                             "{hypervisor} did not exit within {}s and force kill failed: {error}",
                             grace.as_secs_f64()
@@ -106,6 +111,14 @@ pub(crate) async fn wait_for_process_exit_or_kill<I>(
         },
     )
     .await
+}
+
+fn child_handle<'a>(
+    process: Option<&'a mut tokio::process::Child>,
+    hypervisor: &str,
+) -> Result<&'a mut tokio::process::Child, VmmError> {
+    process
+        .ok_or_else(|| VmmError::ProcessError(format!("{hypervisor} instance has no child handle")))
 }
 
 /// One liveness check of a hypervisor child: exited is `Clean`, alive is

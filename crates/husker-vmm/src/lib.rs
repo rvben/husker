@@ -1,7 +1,11 @@
 //! VMM abstraction and backend-neutral types for Firecracker, Apple VZ, and QEMU/KVM.
 
+mod creation;
 pub mod firecracker;
 pub(crate) mod guest_stop;
+#[cfg(all(unix, any(target_os = "macos", test)))]
+mod serial_capture;
+mod termination;
 pub mod vsock;
 
 #[cfg(unix)]
@@ -24,8 +28,20 @@ pub use dispatch::{LinuxDispatchBackend, LinuxVsockStream};
 pub mod apple_vz;
 #[cfg(target_os = "macos")]
 pub mod apple_vz_macos;
+#[cfg(target_os = "macos")]
+pub mod apple_vz_worker;
 
 pub mod macos_bundle;
+#[cfg(target_os = "macos")]
+pub mod vz_worker;
+#[cfg(target_os = "macos")]
+pub mod vz_worker_owner;
+#[cfg(target_os = "macos")]
+mod vz_worker_signing;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../build_source.rs"]
+mod build_source;
 
 use std::path::PathBuf;
 
@@ -55,6 +71,27 @@ pub const LEGACY_PROBE_SUPPRESSION: &str = "i8042.noaux i8042.nomux i8042.nopnp 
 /// Error text for backends that cannot run a macOS guest.
 pub const MACOS_GUEST_UNSUPPORTED: &str =
     "macOS guests require the Apple Virtualization.framework backend on an Apple Silicon Mac";
+/// `abort_create` for a backend that publishes a creation's owner in its
+/// registry before acquiring any process or device for it, and keeps it until
+/// `destroy_vm` confirms termination. Within that registry's lifetime an
+/// unknown UUID therefore never acquired anything, or has already been
+/// destroyed.
+pub(crate) fn abort_registered_create(destroyed: Result<(), VmmError>) -> Result<(), VmmError> {
+    match destroyed {
+        Ok(()) | Err(VmmError::VmNotFound(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn creation_id(config: &VmConfig) -> Result<Uuid, VmmError> {
+    match config.requested_id {
+        Some(id) if id.is_nil() => Err(VmmError::InvalidConfig(
+            "requested VM UUID must be nonnil".into(),
+        )),
+        Some(id) => Ok(id),
+        None => Ok(Uuid::new_v4()),
+    }
+}
 
 /// A host directory shared into the guest over virtiofs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +106,10 @@ pub struct HostShare {
 /// Configuration for creating a new VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
+    /// An orchestrator may persist this generation before allocating the VMM.
+    /// Omitted for ordinary creates, which generate a fresh UUID internally.
+    #[serde(default)]
+    pub requested_id: Option<Uuid>,
     pub name: String,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
@@ -100,6 +141,10 @@ pub struct VmConfig {
     /// `None` omits the drive; core sets this when a volume is attached.
     #[serde(default)]
     pub volume_path: Option<PathBuf>,
+    /// Omit every virtual network device. Defaults to false for old configs;
+    /// core must set this explicitly for network:none on Apple VZ.
+    #[serde(default)]
+    pub network_disabled: bool,
     /// Host directories to share into the guest over virtiofs. Empty by default;
     /// each entry becomes a virtiofs device with the entry's `tag`.
     #[serde(default)]
@@ -250,6 +295,11 @@ impl BackendSelection {
     }
 
     pub fn validate_config(self, config: &VmConfig) -> Result<(), VmmError> {
+        if config.network_disabled && config.tap_device.is_some() {
+            return Err(VmmError::InvalidConfig(
+                "offline VM cannot attach a host TAP".into(),
+            ));
+        }
         let actual = BackendRequirements::from_config(config);
         if actual == self.requirements {
             Ok(())
@@ -536,6 +586,10 @@ pub enum RestoreTarget {
         source_rootfs: PathBuf,
         /// The fork's reflink clone that the alias points at.
         fork_rootfs: PathBuf,
+        /// Owned caller lock serializing source resume, destruction and other forks.
+        /// Backend must retain it through ambiguous loads until source restoration
+        /// succeeds after load acknowledgment or confirmed child termination.
+        source_lock: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
     },
 }
 
@@ -598,11 +652,40 @@ pub trait VmmBackend: Send + Sync {
     /// ended itself is recorded as stopped without a request.
     fn stop_vm(&self, id: Uuid) -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
 
-    /// Force-kill a VM.
+    /// Force-kill the owned VM/allocation and confirm termination of every
+    /// backend-owned process/device before returning success. Unknown UUIDs
+    /// return `VmNotFound`; absence alone must never produce `Ok(())`.
     fn destroy_vm(
         &self,
         id: Uuid,
     ) -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
+
+    /// Undo a creation attempt that this backend instance ran for `id`,
+    /// whether `create_vm` failed, was cancelled, or succeeded before a later
+    /// step failed. `Ok(())` proves the attempt holds no host process or
+    /// device and can no longer acquire one: either it never published an
+    /// owner, or the owner it retained was destroyed.
+    ///
+    /// The proof rests on the backend publishing its owner before acquiring
+    /// anything, so it holds only within the lifetime of the instance that ran
+    /// the attempt. After a restart an empty registry proves nothing; recovery
+    /// must not call this. The default proves nothing.
+    fn abort_create(
+        &self,
+        _id: Uuid,
+    ) -> impl std::future::Future<Output = Result<(), VmmError>> + Send {
+        async {
+            Err(VmmError::Unsupported(
+                "this backend cannot prove a failed creation left nothing behind".into(),
+            ))
+        }
+    }
+
+    /// Where this backend writes the guest serial console log of `id`,
+    /// relative to the runtime directory it was constructed with.
+    fn serial_log_file(&self, id: Uuid) -> PathBuf {
+        PathBuf::from(format!("{id}.serial.log"))
+    }
 
     /// Get information about a VM.
     fn vm_info(
@@ -687,12 +770,13 @@ pub trait VmmBackend: Send + Sync {
 mod tests {
     use super::{
         BackendKind, BackendRequirements, BackendSelection, BootKind, BootMode, Capabilities,
-        HostShare, VmConfig, VmmKind, tail_lines,
+        HostShare, VmConfig, VmmKind, creation_id, tail_lines,
     };
     use std::io::Write;
 
     fn direct_config() -> VmConfig {
         VmConfig {
+            requested_id: None,
             name: "selection-test".into(),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -708,8 +792,22 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            network_disabled: false,
             host_shares: Vec::new(),
         }
+    }
+
+    #[test]
+    fn offline_config_rejects_host_tap_before_backend_allocation() {
+        let mut config = direct_config();
+        config.network_disabled = true;
+        let selection = BackendSelection::new(
+            BackendRequirements::from_config(&config),
+            BackendKind::AppleVz,
+        );
+        assert!(selection.validate_config(&config).is_ok());
+        config.tap_device = Some("forbidden".into());
+        assert!(selection.validate_config(&config).is_err());
     }
 
     #[test]
@@ -886,6 +984,10 @@ mod tests {
         let cfg: VmConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.boot, BootMode::DirectKernel);
         assert!(!cfg.balloon, "balloon defaults to false");
+        assert!(
+            !cfg.network_disabled,
+            "older configs preserve their network behavior"
+        );
         assert!(cfg.volume_path.is_none(), "volume_path defaults to None");
     }
 
@@ -942,6 +1044,7 @@ mod tests {
     fn vmconfig_default_has_no_host_shares() {
         use super::{BootMode, VmConfig};
         let c = VmConfig {
+            requested_id: None,
             name: "test".into(),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -957,6 +1060,7 @@ mod tests {
             seed_path: None,
             balloon: false,
             volume_path: None,
+            network_disabled: false,
             host_shares: Vec::new(),
         };
         assert!(c.host_shares.is_empty());
@@ -1011,5 +1115,18 @@ mod tests {
             guest_power_action(BackendKind::AppleVz),
             GuestPowerAction::PowerOff
         );
+    }
+
+    #[test]
+    fn requested_generation_is_preserved_and_legacy_creates_remain_fresh() {
+        let mut config = direct_config();
+        assert!(config.requested_id.is_none());
+        let first = creation_id(&config).unwrap();
+        assert!(!first.is_nil());
+        assert_ne!(creation_id(&config).unwrap(), first);
+        config.requested_id = Some(first);
+        assert_eq!(creation_id(&config).unwrap(), first);
+        config.requested_id = Some(uuid::Uuid::nil());
+        assert!(creation_id(&config).is_err());
     }
 }

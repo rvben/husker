@@ -33,6 +33,11 @@ pub(crate) fn is_rate_limited_route(method: &Method, path: &str) -> Option<&'sta
     {
         return Some("exec");
     }
+    if *method == Method::POST
+        && (path == "/v1/jobs" || (path.starts_with("/v1/jobs/") && path.ends_with("/cancel")))
+    {
+        return Some("exec");
+    }
     if *method == Method::GET && path.contains("/tunnel/") {
         return Some("tunnel");
     }
@@ -133,14 +138,33 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
     let rate_limit = Arc::new(SensitiveRateLimit::new(
         policy.sensitive_rate_limit_per_minute,
     ));
-    let router = Router::new()
+    let factory = Router::new()
+        .route("/v1/job-submissions", get(crate::jobs::lookup::<B>))
+        .route("/v1/jobs", post(crate::jobs::submit::<B>))
         .route(
-            "/v1/vms/{name}/sessions",
-            get(crate::sessions::list::<B>).post(crate::sessions::start::<B>),
+            "/v1/jobs/{id}",
+            get(crate::jobs::get::<B>).delete(crate::jobs::remove::<B>),
         )
+        .route("/v1/jobs/{id}/events", get(crate::jobs::events::<B>))
+        .route("/v1/jobs/{id}/artifacts", get(crate::jobs::artifacts::<B>))
+        .route(
+            "/v1/jobs/{id}/artifacts/{index}",
+            get(crate::jobs::artifact::<B>),
+        )
+        .route("/v1/jobs/{id}/cancel", post(crate::jobs::cancel::<B>))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_token.is_some(),
+            factory_auth_required,
+        ));
+    let router = Router::new()
+        .merge(factory)
         .route(
             "/v1/vms/{name}/session-submissions",
             post(crate::sessions::submit::<B>),
+        )
+        .route(
+            "/v1/vms/{name}/sessions",
+            get(crate::sessions::list::<B>).post(crate::sessions::start::<B>),
         )
         .route(
             "/v1/vms/{name}/sessions/{id}",
@@ -248,6 +272,7 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
 
     let mut openapi = ApiDoc::openapi();
     openapi.merge(crate::sessions::SessionApiDoc::openapi());
+    openapi.merge(crate::jobs::JobApiDoc::openapi());
 
     {
         let pf_doc = PortForwardApiDoc::openapi();
@@ -291,7 +316,7 @@ pub async fn serve_with_auth<B: VmmBackend + 'static>(
     addr: SocketAddr,
     auth_token: Option<BearerToken>,
 ) -> std::io::Result<()> {
-    let app = router_with_auth(core, policy, auth_token);
+    let app = router_with_auth(Arc::clone(&core), policy, auth_token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "husker daemon listening");
 
@@ -309,6 +334,7 @@ pub async fn serve_with_auth<B: VmmBackend + 'static>(
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
+        core.close_factory_admission();
         notify.notify_one();
     });
 
@@ -492,6 +518,24 @@ fn is_unauthenticated_route(path: &str) -> bool {
 
 pub(crate) fn is_protected_route(path: &str) -> bool {
     !is_unauthenticated_route(path)
+}
+
+/// Factory evidence must remain private even when legacy VM routes intentionally
+/// run without a bearer token. Refuse the entire factory surface in that mode.
+async fn factory_auth_required(
+    State(configured): State<bool>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if configured {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::FORBIDDEN,
+        error_response_with_hint("factory_auth_required",
+            "factory execution and evidence require configured bearer authentication",
+            "configure a nonempty daemon API token; use authenticated headers, not token-bearing URLs"),
+    ).into_response()
 }
 
 async fn auth_middleware(

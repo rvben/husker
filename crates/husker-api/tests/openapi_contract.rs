@@ -89,6 +89,13 @@ async fn openapi_contains_critical_paths() {
     let paths = doc["paths"].as_object().expect("paths must be an object");
 
     for required in [
+        "/v1/job-submissions",
+        "/v1/jobs",
+        "/v1/jobs/{id}",
+        "/v1/jobs/{id}/events",
+        "/v1/jobs/{id}/artifacts",
+        "/v1/jobs/{id}/artifacts/{index}",
+        "/v1/jobs/{id}/cancel",
         "/v1/health",
         "/v1/metrics",
         "/v1/host-groups",
@@ -392,4 +399,58 @@ async fn openapi_documents_ephemeral_vm_creation_contract() {
             .is_some(),
         "egress rule schema is missing"
     );
+}
+
+#[tokio::test]
+async fn openapi_documents_fail_closed_session_replay() {
+    let spec = fetch_openapi().await;
+    let operation = &spec["paths"]["/v1/vms/{name}/session-submissions"]["post"];
+    assert!(operation.is_object());
+    for status in ["201", "409", "501"] {
+        assert!(operation["responses"][status].is_object());
+    }
+    let schema = &spec["components"]["schemas"]["SessionSubmission"];
+    let fields = schema["allOf"].as_array().expect("flattened exec schema");
+    assert!(
+        fields.iter().any(|field| field["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|v| v == "idempotency_key"))),
+        "{schema}"
+    );
+}
+
+#[tokio::test]
+async fn factory_openapi_requires_bearer_authentication_on_every_operation() {
+    let doc = fetch_openapi().await;
+    let record = &doc["components"]["schemas"]["JobRecord"];
+    for flag in ["vm_destroyed", "vm_allocation_aborted", "cleanup_pending"] {
+        assert_eq!(record["properties"][flag]["type"], "boolean");
+        assert!(
+            record["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == flag)
+        );
+    }
+    let scheme = &doc["components"]["securitySchemes"]["factoryBearer"];
+    assert_eq!(scheme["type"], "http");
+    assert_eq!(scheme["scheme"], "bearer");
+    for (path, methods) in [
+        ("/v1/job-submissions", vec!["get"]),
+        ("/v1/jobs", vec!["post"]),
+        ("/v1/jobs/{id}", vec!["get", "delete"]),
+        ("/v1/jobs/{id}/events", vec!["get"]),
+        ("/v1/jobs/{id}/artifacts", vec!["get"]),
+        ("/v1/jobs/{id}/artifacts/{index}", vec!["get"]),
+        ("/v1/jobs/{id}/cancel", vec!["post"]),
+    ] {
+        for method in methods {
+            assert_eq!(
+                doc["paths"][path][method]["security"],
+                serde_json::json!([{ "factoryBearer": [] }])
+            );
+        }
+    }
+    assert!(doc["paths"]["/v1/health"]["get"]["security"].is_null());
 }

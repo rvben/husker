@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Shared bounds for factory boot preparation and host diagnostics. Admission
+/// must charge these same bounds rather than a separate estimate.
+pub mod factory_limits {
+    pub const KERNEL_BYTES: u64 = 256 * 1024 * 1024;
+    pub const INITRD_BYTES: u64 = 512 * 1024 * 1024;
+    pub const SERIAL_BYTES: u64 = 8 * 1024 * 1024;
+}
+
 /// The concrete VMM implementation that owns a VM.
 ///
 /// This identity crosses orchestration, runtime dispatch, persistence, and API
