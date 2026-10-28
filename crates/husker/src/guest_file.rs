@@ -78,6 +78,28 @@ pub(crate) async fn read_guest_file(
     path: &str,
     connect_timeout_secs: Option<u64>,
 ) -> Result<GuestFile> {
+    read_guest_file_inner(daemon, vm, path, connect_timeout_secs, None).await
+}
+
+/// Bound the complete transfer, including legacy responses and agents whose
+/// reported size disagrees with the bytes returned. Check before growing buf.
+pub(crate) async fn read_guest_file_limited(
+    daemon: &DaemonClient,
+    vm: &str,
+    path: &str,
+    connect_timeout_secs: Option<u64>,
+    max_bytes: u64,
+) -> Result<GuestFile> {
+    read_guest_file_inner(daemon, vm, path, connect_timeout_secs, Some(max_bytes)).await
+}
+
+async fn read_guest_file_inner(
+    daemon: &DaemonClient,
+    vm: &str,
+    path: &str,
+    connect_timeout_secs: Option<u64>,
+    max_bytes: Option<u64>,
+) -> Result<GuestFile> {
     let mut buf: Vec<u8> = Vec::new();
     // What the first response said about the file, re-checked against every
     // later one: a file rewritten underneath a multi-request transfer would
@@ -89,14 +111,11 @@ pub(crate) async fn read_guest_file(
 
     loop {
         let offset = buf.len() as u64;
+        let request_bytes = max_bytes.map_or(GUEST_READ_CHUNK_BYTES, |limit| {
+            GUEST_READ_CHUNK_BYTES.min(limit.saturating_sub(offset).saturating_add(1))
+        });
         let body = match daemon
-            .read_file(
-                vm,
-                path,
-                offset,
-                Some(GUEST_READ_CHUNK_BYTES),
-                connect_timeout_secs,
-            )
+            .read_file(vm, path, offset, Some(request_bytes), connect_timeout_secs)
             .await?
         {
             FileReadOutcome::Read(body) => body,
@@ -117,6 +136,19 @@ pub(crate) async fn read_guest_file(
             }
         };
 
+        let too_large = |limit| {
+            GuestFile::Failed(
+                format!(
+                    "reading {path} from VM '{vm}': guest file exceeds the transfer limit of {limit} bytes"
+                )
+                .into(),
+            )
+        };
+        if let Some(limit) = max_bytes
+            && body.total_size.is_some_and(|size| size > limit)
+        {
+            return Ok(too_large(limit));
+        }
         let chunk = match husker_agent_proto::base64_decode(&body.data) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -130,6 +162,11 @@ pub(crate) async fn read_guest_file(
         // it as a size would make every such file look empty.
         let total = body.total_size;
         let modified = body.modified_nanos;
+        if let Some(limit) = max_bytes
+            && chunk.len() as u64 > limit.saturating_sub(offset)
+        {
+            return Ok(too_large(limit));
+        }
         buf.extend_from_slice(&chunk);
 
         let Some(total) = total else {
@@ -573,5 +610,60 @@ mod tests {
             }
         }
         server.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_transfer_stops_on_reported_size_and_accepts_exact_limit() {
+        let content = vec![42; GUEST_READ_CHUNK_BYTES as usize + 17];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (url, server) = serve_stub(ranged_file_route(content.clone(), calls.clone())).await;
+        let client = DaemonClient::new(&url, None);
+        let denied = read_guest_file_limited(&client, "vm", "/out", None, content.len() as u64 - 1)
+            .await
+            .unwrap();
+        let GuestFile::Failed(failure) = denied else {
+            panic!("oversized transfer accepted")
+        };
+        assert!(failure.message.contains("transfer limit"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "stop after first size report"
+        );
+        calls.store(0, Ordering::SeqCst);
+        let got = read_guest_file_limited(&client, "vm", "/out", None, content.len() as u64)
+            .await
+            .unwrap();
+        let GuestFile::Read(bytes) = got else {
+            panic!("exact boundary rejected")
+        };
+        assert_eq!(bytes, content);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_transfer_checks_actual_bytes_for_legacy_and_lying_agents() {
+        for total in [None, Some(1_u64)] {
+            let route = Router::new().route(
+                "/v1/vms/{name}/files/read",
+                post(move || async move {
+                    Json(serde_json::json!({
+                        "data": husker_agent_proto::base64_encode(b"too much"),
+                        "size": 8,
+                        "total_size": total,
+                    }))
+                }),
+            );
+            let (url, server) = serve_stub(route).await;
+            let client = DaemonClient::new(&url, None);
+            let got = read_guest_file_limited(&client, "vm", "/out", None, 4)
+                .await
+                .unwrap();
+            let GuestFile::Failed(failure) = got else {
+                panic!("oversized response accepted")
+            };
+            assert!(failure.message.contains("transfer limit of 4 bytes"));
+            server.abort();
+        }
     }
 }

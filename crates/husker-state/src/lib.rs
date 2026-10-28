@@ -1,6 +1,9 @@
 //! SQLite-backed persistent state store for VM records, CID allocation, port
 //! forwards, host groups, and services.
 
+mod boot_epoch;
+mod connection;
+mod durable;
 pub mod jobs;
 
 use std::path::Path;
@@ -17,7 +20,7 @@ pub use husker_types::{BackendKind, BootKind, ImageKind, NetworkMode, UserdataSt
 
 /// A connection checked out of the pool. Derefs to `rusqlite::Connection`, so
 /// every call site that used the old `MutexGuard<Connection>` is unchanged.
-type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
+type PooledConn = r2d2::PooledConnection<connection::StateManager>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -445,7 +448,7 @@ pub struct VolumeRecord {
 /// while an in-memory store uses a single connection so its ephemeral database
 /// persists across checkouts.
 pub struct StateStore {
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: r2d2::Pool<connection::StateManager>,
 }
 
 /// Apply an idempotent `ALTER TABLE ... ADD COLUMN` migration.
@@ -820,6 +823,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
                 OR NEW.tap_device IS NOT OLD.tap_device OR NEW.guest_ip IS NOT OLD.guest_ip))
             OR (NEW.allocation_aborted=1 AND (NEW.backend_entered<>0 OR NEW.vm_id IS NULL))
           BEGIN SELECT RAISE(ABORT, 'invalid planned creation lease transition'); END;"),
+    (23, boot_epoch::SCHEMA),
 ];
 
 /// The newest schema version this build knows: the last migration's number.
@@ -1047,32 +1051,6 @@ fn insert_vm_expiration_on(
 /// both the write lock a statement waits for and the WAL switch at open.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 
-/// A pooled connection running synchronous=FULL until it returns to the pool.
-pub(crate) struct DurableConn(PooledConn);
-
-impl std::ops::Deref for DurableConn {
-    type Target = Connection;
-
-    fn deref(&self) -> &Connection {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for DurableConn {
-    fn deref_mut(&mut self) -> &mut Connection {
-        &mut self.0
-    }
-}
-
-impl Drop for DurableConn {
-    fn drop(&mut self) {
-        // A failed reset leaves this connection on FULL: slower, never less durable.
-        if let Err(error) = self.0.execute_batch("PRAGMA synchronous=NORMAL;") {
-            tracing::warn!(%error, "could not restore synchronous=NORMAL on a pooled connection");
-        }
-    }
-}
-
 /// Pause between attempts to switch a busy database to WAL at open.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1087,7 +1065,9 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// stalls the executor for the disk's flush latency. In WAL mode the database
 /// stays consistent across any crash under NORMAL; only a power loss or kernel
 /// panic can roll back the newest commits, which the daemon tolerates because
-/// no VM survives the host and every VM row is reconciled at startup.
+/// no VM survives the host and every VM row is reconciled at startup. Ownership
+/// and job receipts, whose success a client acts on, borrow a FULL connection
+/// with `lock_durable` instead, restoring NORMAL on return.
 fn init_connection(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(LOCK_WAIT)?;
     conn.execute_batch(
@@ -1138,9 +1118,10 @@ impl StateStore {
             // SQLite connections are local and don't go stale like a network DB,
             // so skip the per-checkout test query.
             .test_on_check_out(false)
-            .build(manager)?;
+            .build(connection::StateManager(manager))?;
         let store = Self { pool };
         store.migrate()?;
+        store.observe_legacy_lease_boots()?;
         Ok(store)
     }
 
@@ -1157,9 +1138,10 @@ impl StateStore {
         let pool = r2d2::Pool::builder()
             .max_size(1)
             .test_on_check_out(false)
-            .build(manager)?;
+            .build(connection::StateManager(manager))?;
         let store = Self { pool };
         store.migrate()?;
+        store.observe_legacy_lease_boots()?;
         Ok(store)
     }
 
@@ -1167,17 +1149,8 @@ impl StateStore {
         Ok(self.pool.get()?)
     }
 
-    /// A connection whose commits survive power loss.
-    ///
-    /// The pool runs synchronous=NORMAL (see `init_connection`). A write whose
-    /// success a client acts on, such as an accepted or finished job, must not
-    /// be rolled back by a power loss, so it fsyncs the WAL on commit. That
-    /// fsync covers every earlier WAL frame, so it also makes the preceding
-    /// NORMAL commits durable.
-    pub(crate) fn durable_lock(&self) -> Result<DurableConn, StateError> {
-        let conn = self.lock()?;
-        conn.execute_batch("PRAGMA synchronous=FULL;")?;
-        Ok(DurableConn(conn))
+    fn lock_durable(&self) -> Result<durable::DurableConn, StateError> {
+        durable::DurableConn::new(self.lock()?)
     }
 
     fn migrate(&self) -> Result<(), StateError> {
@@ -2529,7 +2502,7 @@ impl StateStore {
         vm_name: &str,
         vm_id: Option<Uuid>,
     ) -> Result<HostResourceLease, StateError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let lease = insert_host_resource_lease(&tx, vm_name, vm_id)?;
         tx.commit()?;
@@ -2592,11 +2565,19 @@ impl StateStore {
         id: Uuid,
         vm_id: Uuid,
     ) -> Result<(), StateError> {
-        let conn = self.lock()?;
-        if conn.execute("UPDATE host_resource_leases SET vm_id=?2,backend_entered=1 WHERE id=?1 AND backend_entered=0 AND (vm_id IS NULL OR vm_id=?2) AND vm_destroyed=0 AND allocation_aborted=0",
+        let mut conn = self.lock_durable()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM host_resource_leases WHERE id=?1 AND backend_entered=0 AND (vm_id IS NULL OR vm_id=?2) AND vm_destroyed=0 AND allocation_aborted=0)",
+            params![id.to_string(),vm_id.to_string()], |row| row.get(0))?;
+        if !eligible || vm_id.is_nil() {
+            return Err(StateError::HostResourceLeaseMismatch(id));
+        }
+        boot_epoch::prepare_entry_on(&tx, id, boot_epoch::current())?;
+        if tx.execute("UPDATE host_resource_leases SET vm_id=?2,backend_entered=1 WHERE id=?1 AND backend_entered=0 AND (vm_id IS NULL OR vm_id=?2) AND vm_destroyed=0 AND allocation_aborted=0",
             params![id.to_string(), vm_id.to_string()])? != 1 {
             return Err(StateError::HostResourceLeaseMismatch(id));
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2606,7 +2587,7 @@ impl StateStore {
         id: Uuid,
         vm_id: Uuid,
     ) -> Result<(), StateError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         if conn.execute("UPDATE host_resource_leases SET vm_destroyed=1 WHERE id=?1 AND vm_id=?2 AND backend_entered=1",
             params![id.to_string(), vm_id.to_string()])? != 1 {
             return Err(StateError::HostResourceLeaseMismatch(id));
@@ -2622,7 +2603,7 @@ impl StateStore {
         tap_device: Option<&str>,
         guest_ip: Option<&str>,
     ) -> Result<(), StateError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         let updated = conn.execute(
             "UPDATE host_resource_leases SET tap_device = ?2, guest_ip = ?3 WHERE id = ?1",
             params![id.to_string(), tap_device, guest_ip],
@@ -2655,7 +2636,7 @@ impl StateStore {
         if expiration.is_some_and(|value| value.vm_id != record.id) {
             return Err(StateError::VmExpirationMismatch(record.id));
         }
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let lease = tx
             .query_row(
@@ -2704,7 +2685,7 @@ impl StateStore {
 
     /// Release a creation lease and return its CID to the allocator atomically.
     pub fn release_host_resource_lease(&self, id: Uuid) -> Result<(), StateError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let ownership: Option<(u32, bool, bool)> = tx
             .query_row(
@@ -2714,7 +2695,7 @@ impl StateStore {
             )
             .optional()?;
         if let Some((cid, entered, destroyed)) = ownership {
-            if entered && !destroyed {
+            if entered && !destroyed && !boot_epoch::confirmed_on(&tx, id)? {
                 return Err(StateError::HostResourceLeaseMismatch(id));
             }
             tx.execute(
@@ -3429,6 +3410,7 @@ pub(crate) fn insert_host_resource_lease(
             other => StateError::Database(other),
         });
     }
+    boot_epoch::observe_on(tx, lease.id)?;
     Ok(lease)
 }
 
@@ -3956,10 +3938,7 @@ mod tests {
             let synchronous: i64 = conn
                 .query_row("PRAGMA synchronous", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(
-                synchronous, 1,
-                "synchronous must be NORMAL (1), not FULL (2)"
-            );
+            assert_eq!(synchronous, 1, "ordinary connections must use NORMAL (1)");
         }
     }
 
@@ -4178,10 +4157,12 @@ mod tests {
         let path = temp.path().join("legacy.db");
         drop(StateStore::open(&path).unwrap());
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TRIGGER creation_lease_planned_identity_is_immutable;
+        conn.execute_batch("DROP TRIGGER creation_lease_release_requires_proof;
+        DROP TRIGGER creation_lease_cannot_reenter_after_reboot;
+        DROP TABLE creation_lease_boot_epochs;
+        DROP TRIGGER creation_lease_planned_identity_is_immutable;
             ALTER TABLE host_resource_leases DROP COLUMN allocation_aborted;
             DROP TRIGGER creation_lease_identity_is_immutable;
-            DROP TRIGGER creation_lease_release_requires_proof;
             ALTER TABLE host_resource_leases DROP COLUMN vm_destroyed;
             ALTER TABLE host_resource_leases DROP COLUMN backend_entered;
             ALTER TABLE host_resource_leases DROP COLUMN vm_id;
@@ -6987,24 +6968,20 @@ mod job_database_durability_tests {
     }
 
     #[test]
-    fn durable_lock_runs_full_and_returns_the_connection_on_normal() {
+    fn durable_receipts_use_full_synchronous_on_every_connection() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::open(&temp.path().join("durable.sqlite")).unwrap();
-        let synchronous = |connection: &Connection| -> u32 {
-            connection
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let connection = store.lock_durable().unwrap();
+            let synchronous: u32 = connection
                 .query_row("PRAGMA synchronous", [], |r| r.get(0))
-                .unwrap()
-        };
-        // Every pooled connection passes through FULL once, so the check
-        // below covers each one the pool hands back.
-        let durable: Vec<_> = (0..8).map(|_| store.durable_lock().unwrap()).collect();
-        for connection in &durable {
-            assert_eq!(synchronous(connection), 2, "durable writes use FULL");
-        }
-        drop(durable);
-        let held: Vec<_> = (0..8).map(|_| store.lock().unwrap()).collect();
-        for connection in &held {
-            assert_eq!(synchronous(connection), 1, "the pool keeps NORMAL");
+                .unwrap();
+            assert_eq!(
+                synchronous, 2,
+                "each connection must use SQLite FULL durability"
+            );
+            held.push(connection);
         }
     }
 }

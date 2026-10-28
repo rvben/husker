@@ -10,12 +10,13 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use husker::archive::OutputLimits;
 use husker_api::{ExecRequest, ExecResponse};
 
 use crate::cli::OutputFormat;
 use crate::cli_contract::{CliErrorKind, guest_command_status, structured_output};
 use crate::daemon_client::{ApiFailure, DaemonClient, DaemonExecEvent};
-use crate::guest_file::{GuestFile, read_guest_file};
+use crate::guest_file::{GuestFile, read_guest_file_limited};
 use crate::vm_creation::PreparedVmCreationPlan;
 use crate::{
     SYNC_ARCHIVE_GUEST_PATH, SYNC_MANIFEST_GUEST_PATH, SYNC_OUTPUT_GUEST_PATH, SYNC_WORKDIR,
@@ -167,6 +168,7 @@ pub(crate) struct JobRequest<'a> {
     pub sync_cwd: bool,
     pub write_back: bool,
     pub out: &'a [PathBuf],
+    pub output_limits: OutputLimits,
     pub command: &'a [String],
     pub env: &'a [String],
     pub secret_env: &'a HashMap<String, String>,
@@ -418,7 +420,15 @@ async fn execute_created_job(req: &JobRequest<'_>) -> Result<JobOutcome> {
     if let Some(cwd) = &sync_cwd_dir
         && !retrieve_paths.is_empty()
     {
-        let r = retrieve_outputs(daemon, name, cwd, &retrieve_paths, req.out).await?;
+        let r = retrieve_outputs(
+            daemon,
+            name,
+            cwd,
+            &retrieve_paths,
+            req.out,
+            req.output_limits,
+        )
+        .await?;
         retrieval = Some(r);
     }
     Ok(JobOutcome {
@@ -675,28 +685,35 @@ async fn retrieve_outputs(
     cwd: &std::path::Path,
     retrieve_paths: &[PathBuf],
     out: &[PathBuf],
+    limits: OutputLimits,
 ) -> Result<Retrieval> {
-    let manifest = match read_guest_file(daemon, name, SYNC_MANIFEST_GUEST_PATH, None).await? {
-        GuestFile::Read(bytes) => bytes,
-        GuestFile::Failed(failure) => {
-            return Ok(Retrieval {
-                error: Some(ApiFailure {
-                    message: format!(
-                        "could not read the retrieval manifest from VM '{name}': {}",
-                        failure.message
-                    ),
-                    hint: Some(
-                        "the sandbox writes it after the command finishes, so a command that \
-                         replaces or kills the shell it runs in prevents both the manifest and \
-                         the outputs from being produced"
-                            .to_string(),
-                    ),
-                    ..failure
-                }),
-                ..Retrieval::default()
-            });
-        }
-    };
+    // At most one decimal index plus newline per requested pattern. A hostile
+    // guest must not bypass the archive budget with an unbounded manifest.
+    let manifest_limit = (retrieve_paths.len() as u64).saturating_mul(21).max(1);
+    let manifest =
+        match read_guest_file_limited(daemon, name, SYNC_MANIFEST_GUEST_PATH, None, manifest_limit)
+            .await?
+        {
+            GuestFile::Read(bytes) => bytes,
+            GuestFile::Failed(failure) => {
+                return Ok(Retrieval {
+                    error: Some(ApiFailure {
+                        message: format!(
+                            "could not read the retrieval manifest from VM '{name}': {}",
+                            failure.message
+                        ),
+                        hint: Some(
+                            "the sandbox writes one numeric index per unmatched pattern after the \
+                         command finishes; keep its shell wrapper running and do not modify \
+                         the retrieval manifest"
+                                .to_string(),
+                        ),
+                        ..failure
+                    }),
+                    ..Retrieval::default()
+                });
+            }
+        };
 
     let out_set: std::collections::HashSet<&PathBuf> = out.iter().collect();
     let mut unmatched_out = Vec::new();
@@ -722,7 +739,15 @@ async fn retrieve_outputs(
         });
     }
 
-    let archive = match read_guest_file(daemon, name, SYNC_OUTPUT_GUEST_PATH, None).await? {
+    let archive = match read_guest_file_limited(
+        daemon,
+        name,
+        SYNC_OUTPUT_GUEST_PATH,
+        None,
+        limits.max_archive_bytes,
+    )
+    .await?
+    {
         GuestFile::Read(bytes) => bytes,
         GuestFile::Failed(failure) => {
             return Ok(Retrieval {
@@ -741,11 +766,15 @@ async fn retrieve_outputs(
         }
     };
 
+    let (files, error) = match extract_archive_over(archive, cwd, limits).await {
+        Ok(files) => (files, None),
+        Err(error) => (Vec::new(), Some(ApiFailure::from_error(&error))),
+    };
     Ok(Retrieval {
-        files: extract_archive_over(&archive, cwd)?,
+        files,
         unmatched_out,
         unmatched_write_back,
-        error: None,
+        error,
     })
 }
 
@@ -924,6 +953,7 @@ mod tests {
             sync_cwd: false,
             write_back: false,
             out: &[],
+            output_limits: OutputLimits::default(),
             command,
             env: &[],
             secret_env,
@@ -1596,9 +1626,16 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("big.bin")];
         let client = DaemonClient::new(&api_url, None);
-        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
-            .await
-            .expect("the stub daemon is reachable");
+        let retrieval = retrieve_outputs(
+            &client,
+            "job-x",
+            dst.path(),
+            &requested,
+            &requested,
+            OutputLimits::default(),
+        )
+        .await
+        .expect("the stub daemon is reachable");
 
         assert!(
             retrieval.error.is_none(),
@@ -1635,9 +1672,16 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("dist/app")];
         let client = DaemonClient::new(&api_url, None);
-        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
-            .await
-            .unwrap();
+        let retrieval = retrieve_outputs(
+            &client,
+            "job-x",
+            dst.path(),
+            &requested,
+            &requested,
+            OutputLimits::default(),
+        )
+        .await
+        .unwrap();
 
         let failure = retrieval
             .failure()
@@ -1679,9 +1723,16 @@ mod tests {
         let requested = vec![PathBuf::from("src/main.rs"), PathBuf::from("dist/*.whl")];
         let out = vec![PathBuf::from("dist/*.whl")];
         let client = DaemonClient::new(&api_url, None);
-        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &out)
-            .await
-            .unwrap();
+        let retrieval = retrieve_outputs(
+            &client,
+            "job-x",
+            dst.path(),
+            &requested,
+            &out,
+            OutputLimits::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(retrieval.unmatched_out, vec!["dist/*.whl".to_string()]);
         assert!(retrieval.unmatched_write_back.is_empty());
@@ -1728,6 +1779,7 @@ mod tests {
             &requested,
             // Neither path was named with --out: both came from --write-back.
             &[],
+            OutputLimits::default(),
         )
         .await
         .unwrap();
@@ -1758,9 +1810,16 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("a"), PathBuf::from("b")];
         let client = DaemonClient::new(&api_url, None);
-        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
-            .await
-            .unwrap();
+        let retrieval = retrieve_outputs(
+            &client,
+            "job-x",
+            dst.path(),
+            &requested,
+            &requested,
+            OutputLimits::default(),
+        )
+        .await
+        .unwrap();
 
         // The stub has no archive: had one been requested, this would be an
         // error rather than a clean pair of unmatched patterns.
@@ -1783,9 +1842,16 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let requested = vec![PathBuf::from("out/app")];
         let client = DaemonClient::new(&api_url, None);
-        let retrieval = retrieve_outputs(&client, "job-x", dst.path(), &requested, &requested)
-            .await
-            .unwrap();
+        let retrieval = retrieve_outputs(
+            &client,
+            "job-x",
+            dst.path(),
+            &requested,
+            &requested,
+            OutputLimits::default(),
+        )
+        .await
+        .unwrap();
 
         let failure = retrieval
             .failure()
@@ -1870,6 +1936,85 @@ mod tests {
             "the guest serial console has no output yet; \
              run `husker logs --source serial job-x` to inspect it"
         );
+        server.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retrieval_limit_failures_are_reported_without_changing_outputs() {
+        let payload = vec![0; 64 * 1024];
+        let archive = tar_gz_of(&[("artifact", &payload)]);
+        let (url, server) = serve_stub(guest_files_route(
+            vec![
+                (SYNC_MANIFEST_GUEST_PATH.into(), Vec::new()),
+                (SYNC_OUTPUT_GUEST_PATH.into(), archive.clone()),
+            ],
+            1024 * 1024,
+        ))
+        .await;
+        let client = DaemonClient::new(&url, None);
+        let requested = vec![PathBuf::from("artifact")];
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("artifact"), b"original").unwrap();
+        for limits in [
+            OutputLimits {
+                max_archive_bytes: archive.len() as u64 - 1,
+                max_expanded_bytes: 1024 * 1024,
+            },
+            OutputLimits {
+                max_archive_bytes: archive.len() as u64,
+                max_expanded_bytes: 1024,
+            },
+        ] {
+            let retrieval =
+                retrieve_outputs(&client, "vm", dst.path(), &requested, &requested, limits)
+                    .await
+                    .unwrap();
+            assert!(retrieval.files.is_empty());
+            assert!(
+                retrieval.unmatched_out.is_empty(),
+                "size failure is not missing output"
+            );
+            assert!(
+                retrieval.failure().is_some(),
+                "size failures must fail the job"
+            );
+            assert!(retrieval.to_json()["error"].as_str().is_some());
+            assert_eq!(
+                std::fs::read(dst.path().join("artifact")).unwrap(),
+                b"original"
+            );
+        }
+        server.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_manifest_is_refused_before_fetching_outputs() {
+        let (url, server) = serve_stub(guest_files_route(
+            vec![(SYNC_MANIFEST_GUEST_PATH.into(), b"1\n".repeat(20))],
+            1024 * 1024,
+        ))
+        .await;
+        let client = DaemonClient::new(&url, None);
+        let dst = tempfile::tempdir().unwrap();
+        let requested = vec![PathBuf::from("artifact")];
+        let retrieval = retrieve_outputs(
+            &client,
+            "vm",
+            dst.path(),
+            &requested,
+            &requested,
+            OutputLimits::default(),
+        )
+        .await
+        .unwrap();
+        let failure = retrieval
+            .failure()
+            .expect("oversized manifest must fail retrieval");
+        assert!(
+            failure.message.contains("transfer limit of 21 bytes"),
+            "{}",
+            failure.message
+        );
+        assert!(retrieval.files.is_empty());
+        assert_eq!(std::fs::read_dir(dst.path()).unwrap().count(), 0);
         server.abort();
     }
 }

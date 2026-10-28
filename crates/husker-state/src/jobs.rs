@@ -443,7 +443,7 @@ impl StateStore {
     /// transport failure during subsequent transfers must not erase it.
     pub fn stage_job_manifest(&self, id: Uuid, manifest: &str) -> Result<(), JournalError> {
         bounded_json(manifest, MAX_MANIFEST_BYTES)?;
-        let mut conn = self.durable_lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job = get_on(&tx, id)?;
         if job.state != JobState::Running || job.collection != CollectionState::Pending {
@@ -485,7 +485,7 @@ impl StateStore {
         if digest != expected_digest {
             return Err(JournalError::Invalid("artifact digest mismatch"));
         }
-        let mut conn = self.durable_lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job = get_on(&tx, id)?;
         let old = tx.query_row("SELECT path,digest,data FROM execution_job_artifacts WHERE job_id=?1 AND artifact_index=?2",
@@ -615,7 +615,7 @@ impl StateStore {
             "sha256:{}",
             hex::encode(Sha256::digest(specification.as_bytes()))
         );
-        let mut conn = self.durable_lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now();
         // A tombstone only has to outlive its deadline: past it, an identical
@@ -794,7 +794,7 @@ impl StateStore {
     }
 
     fn reserve_job_vm_inner(&self, id: Uuid, replay: bool) -> Result<JobRecord, JournalError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job = get_on(&tx, id)?;
         if job.vm_name.is_some() && !replay {
@@ -823,7 +823,7 @@ impl StateStore {
         vm_id: Uuid,
         name: &str,
     ) -> Result<JobRecord, JournalError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         bind_on(&tx, id, vm_id, name)?;
         let job = get_on(&tx, id)?;
@@ -840,7 +840,7 @@ impl StateStore {
         vm_id: Uuid,
         name: &str,
     ) -> Result<(JobRecord, crate::HostResourceLease), JournalError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if get_on(&tx, id)?.vm_id.is_some() {
             return Err(JournalError::Conflict("VM generation is already bound"));
@@ -853,7 +853,7 @@ impl StateStore {
     }
 
     pub fn mark_job_running(&self, id: Uuid) -> Result<(), JournalError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         let changed = conn.execute("UPDATE execution_jobs SET state='running' WHERE id=?1 AND state='preparing' AND vm_id IS NOT NULL AND vm_destroyed=0 AND vm_allocation_aborted=0 AND deadline>?2", params![id.to_string(), Utc::now().timestamp()])?;
         if changed == 0 {
             let job = get_on(&conn, id)?;
@@ -876,7 +876,7 @@ impl StateStore {
         if events.len() > EVENT_PAGE_SIZE {
             return Err(JournalError::Invalid("event batch exceeds page limit"));
         }
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job = get_on(&tx, id)?;
         if job.collection != CollectionState::Pending {
@@ -993,7 +993,7 @@ impl StateStore {
             ));
         }
         bounded_json(manifest, MAX_MANIFEST_BYTES)?;
-        let mut conn = self.durable_lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = get_on(&tx, id)?;
         if old.state.terminal() {
@@ -1125,7 +1125,7 @@ impl StateStore {
     /// absence of a VM row is not a destruction receipt. Persist before removing
     /// storage/state so crash recovery can finish cleanup without guessing.
     pub fn record_job_vm_destruction(&self, vm_id: Uuid) -> Result<(), JournalError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         conn.execute(
             "UPDATE execution_jobs SET vm_destroyed=1 WHERE vm_id=?1",
             [vm_id.to_string()],
@@ -1141,7 +1141,7 @@ impl StateStore {
         id: Uuid,
         vm_id: Uuid,
     ) -> Result<(), JournalError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         let changed = conn.execute(
             "UPDATE execution_jobs SET vm_allocation_aborted=1 WHERE id=?1 AND vm_id=?2 AND vm_destroyed=0 AND cleanup_pending=1 AND state IN ('preparing','infrastructure_failed','interrupted','cancelled','timed_out','unknown')",
             params![id.to_string(), vm_id.to_string()],
@@ -1165,7 +1165,7 @@ impl StateStore {
         vm_id: Uuid,
         lease_id: Uuid,
     ) -> Result<(), JournalError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job = get_on(&tx, id)?;
         let name = format!("job-{id}");
@@ -1207,7 +1207,7 @@ impl StateStore {
     /// Clear only after destruction or allocation abort was confirmed. This
     /// separate flag permits repeated cleanup attempts after terminal status.
     pub fn confirm_job_cleanup(&self, id: Uuid, vm_id: Uuid) -> Result<(), JournalError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         let changed = conn.execute("UPDATE execution_jobs SET cleanup_pending=0 WHERE id=?1 AND vm_id=?2 AND (vm_destroyed=1 OR vm_allocation_aborted=1) AND state NOT IN ('accepted','preparing','running','deleted')",
             params![id.to_string(), vm_id.to_string()])?;
         if changed == 0 {
@@ -1228,7 +1228,7 @@ impl StateStore {
         id: Uuid,
         name: &str,
     ) -> Result<(), JournalError> {
-        let conn = self.lock()?;
+        let conn = self.lock_durable()?;
         let changed = conn.execute(
             "UPDATE execution_jobs SET cleanup_pending=0 WHERE id=?1 AND vm_id IS NULL AND vm_name=?2 AND state NOT IN ('accepted','preparing','running','deleted')",
             params![id.to_string(), name],
@@ -1256,7 +1256,7 @@ impl StateStore {
     /// submission tombstone until the job's deadline has passed. Cleanup
     /// ownership must never be erased.
     pub fn delete_job_evidence(&self, id: Uuid) -> Result<(), JournalError> {
-        let mut conn = self.durable_lock()?;
+        let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job = get_on(&tx, id)?;
         if !job.state.terminal() || job.cleanup_pending {

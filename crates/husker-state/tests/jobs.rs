@@ -991,10 +991,12 @@ fn cleanup_ownership_survives_retention_expiry_and_two_jobs_cannot_share_one_vm(
 
 fn remove_creation_lease_schemas(conn: &rusqlite::Connection) {
     conn.execute_batch(
-        "DROP TRIGGER creation_lease_planned_identity_is_immutable;
+        "DROP TRIGGER creation_lease_release_requires_proof;
+        DROP TRIGGER creation_lease_cannot_reenter_after_reboot;
+        DROP TABLE creation_lease_boot_epochs;
+        DROP TRIGGER creation_lease_planned_identity_is_immutable;
         ALTER TABLE host_resource_leases DROP COLUMN allocation_aborted;
         DROP TRIGGER creation_lease_identity_is_immutable;
-        DROP TRIGGER creation_lease_release_requires_proof;
         ALTER TABLE host_resource_leases DROP COLUMN vm_destroyed;
         ALTER TABLE host_resource_leases DROP COLUMN backend_entered;
         ALTER TABLE host_resource_leases DROP COLUMN vm_id;",
@@ -1029,7 +1031,7 @@ fn migration_16_upgrades_existing_database_and_identity_cannot_be_rewritten() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
             .unwrap(),
-        22
+        23
     );
 }
 

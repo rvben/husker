@@ -314,49 +314,34 @@ impl<B: VmmBackend> HuskerCore<B> {
         Ok(reconciled)
     }
 
-    /// Recover source rootfs disks left stranded by a fork that crashed mid-load
-    /// on a prior daemon run. Such a fork leaves the source's `rootfs.ext4` as a
-    /// stale symlink to the fork clone, with the real disk in a
-    /// `rootfs.ext4.fork-src-bak` backup. Restore each one before any resume can
-    /// open the stale symlink and boot the source against the wrong disk. Run at
-    /// daemon startup. Returns the number recovered.
-    ///
-    /// Only VMs on a backend that can fork are examined: the backup is a fork
-    /// artifact, and the recovery replaces the rootfs with it, so a stray file
-    /// of that name beside another backend's disk must not be consumed.
-    pub fn recover_stranded_fork_rootfs(&self) -> usize {
+    /// Inspect source rootfs backups stranded by an interrupted fork. Startup
+    /// cannot infer that a former fork has stopped opening the alias merely from
+    /// the absence of a registered instance, so both paths are preserved for
+    /// reconciliation and the source stays blocked. Returns the number found.
+    pub fn inspect_stranded_fork_rootfs(&self) -> usize {
         let vms = match self.state.list_vms() {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "failed to list VMs for stranded-fork rootfs recovery");
+                warn!(error = %e, "failed to inspect stranded fork sources");
                 return 0;
             }
         };
-        let mut recovered = 0;
+        let mut stranded = 0;
         for vm in vms {
-            if !husker_vmm::Capabilities::for_backend_kind(vm.vmm).fork {
-                continue;
-            }
-            let rootfs = self.storage.vm_dir(&vm.name).join("rootfs.ext4");
-            match husker_vmm::firecracker::recover_aliased_rootfs(&rootfs) {
-                Ok(true) => {
-                    warn!(vm = %vm.name, "recovered source rootfs stranded by an interrupted fork");
-                    recovered += 1;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(vm = %vm.name, error = %e, "failed to recover stranded fork source rootfs")
-                }
+            if let Err(error) = self.require_reconciled_fork_source(&vm) {
+                warn!(vm = %vm.name, %error, "preserving stranded fork source until prior holder termination is confirmed");
+                stranded += 1;
             }
         }
-        recovered
+        stranded
     }
 
     /// Refuse an operation on a fork source whose disk is still stranded.
     ///
-    /// Startup recovery consumes the backup, so one that is still present means
-    /// recovery failed and the source rootfs may be an alias of a fork clone.
-    /// Only backends that can fork are checked, matching that recovery.
+    /// A backup that is still present means a former fork may hold the source
+    /// rootfs path as an alias of its clone. Only backends that can fork are
+    /// checked: a file of that name beside another backend's disk is not a
+    /// fork artifact.
     pub(crate) fn require_reconciled_fork_source(
         &self,
         record: &VmRecord,

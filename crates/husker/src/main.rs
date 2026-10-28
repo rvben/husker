@@ -1585,6 +1585,8 @@ async fn run(cli: Cli) -> Result<()> {
             sync_cwd,
             out,
             write_back,
+            max_output_archive_bytes,
+            max_output_bytes,
             command,
         } => {
             let config = load_config(config_path.as_deref());
@@ -1653,6 +1655,10 @@ async fn run(cli: Cli) -> Result<()> {
                 sync_cwd,
                 write_back,
                 out: &out,
+                output_limits: husker::archive::OutputLimits {
+                    max_archive_bytes: max_output_archive_bytes,
+                    max_expanded_bytes: max_output_bytes,
+                },
                 command: &command,
                 env: &env,
                 secret_env: &secret_env,
@@ -4875,7 +4881,10 @@ pub(crate) fn wrap_sync_command(
              if [ -e \"$__m\" ]; then set -- \"$@\" \"$__m\"; __n=1; fi; done; \
              if [ $__n -eq 0 ]; then printf '%s\\n' \"$__i\" >> {manifest_path}; fi; done; \
              IFS=$__oifs; \
-             if [ $# -gt 0 ]; then tar -czf {output_path} \"$@\" 2>/dev/null || true; fi; \
+             if [ $# -gt 0 ]; then \
+             __tar_opts=; if tar --version 2>/dev/null | grep -q bsdtar; then \
+             __tar_opts='--no-xattrs --no-acls --no-fflags'; fi; \
+             TAR_OPTIONS= COPYFILE_DISABLE=1 tar $__tar_opts -czf {output_path} \"$@\" 2>/dev/null || true; fi; \
              exit $__rc"
         )
     };
@@ -4884,30 +4893,13 @@ pub(crate) fn wrap_sync_command(
     ("sh".to_string(), args)
 }
 
-/// Unpack a gzip+tar archive over `dst`, returning the relative paths written.
-/// Entries that would escape `dst` (absolute paths, `..`) are skipped.
-pub(crate) fn extract_archive_over(bytes: &[u8], dst: &Path) -> Result<Vec<String>> {
-    let gz = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(gz);
-    let mut written = Vec::new();
-    for entry in archive.entries().context("reading retrieval archive")? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-        {
-            continue;
-        }
-        if entry.unpack_in(dst)? {
-            // Only record regular files (directories are structural).
-            if entry.header().entry_type().is_file() {
-                written.push(path.to_string_lossy().replace('\\', "/"));
-            }
-        }
-    }
-    Ok(written)
+/// Extract guest outputs with strict tar decoding and confined filesystem writes.
+pub(crate) async fn extract_archive_over(
+    bytes: Vec<u8>,
+    dst: &Path,
+    limits: husker::archive::OutputLimits,
+) -> Result<Vec<String>> {
+    husker::archive::extract_outputs_with_limits(bytes, dst.to_path_buf(), limits).await
 }
 
 /// Human-facing phrase describing what backend a capability requires.
@@ -5803,7 +5795,7 @@ mod tests {
             "captures the command exit code: {script}"
         );
         assert!(
-            script.contains("tar -czf /tmp/.husker-out.tgz "),
+            script.contains("-czf /tmp/.husker-out.tgz "),
             "packs the output archive: {script}"
         );
         assert!(
@@ -5829,12 +5821,8 @@ mod tests {
         assert_eq!(shell_single_quote("$(rm -rf /)"), "'$(rm -rf /)'");
     }
 
-    #[test]
-    fn extract_archive_over_writes_files_into_nested_dirs() {
-        // The tar crate refuses to even build a `..` entry, and its unpack also
-        // blocks traversal; combined with our explicit guard, extraction stays
-        // confined to the target dir. Here we verify the happy path: nested files
-        // land at their relative location and are reported.
+    #[tokio::test]
+    async fn extract_archive_over_writes_files_into_nested_dirs() {
         let mut buf = Vec::new();
         {
             let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
@@ -5848,7 +5836,10 @@ mod tests {
             b.into_inner().unwrap().finish().unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
-        let written = extract_archive_over(&buf, dir.path()).unwrap();
+        let written =
+            extract_archive_over(buf, dir.path(), husker::archive::OutputLimits::default())
+                .await
+                .unwrap();
         assert!(
             written.contains(&"out/app.bin".to_string()),
             "reports the written file: {written:?}"
@@ -5856,6 +5847,58 @@ mod tests {
         let extracted = dir.path().join("out/app.bin");
         assert!(extracted.exists(), "writes nested file into the target dir");
         assert_eq!(std::fs::read(&extracted).unwrap(), b"hello");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn retrieved_bsdtar_outputs_do_not_require_vendor_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let name = "a".repeat(110); // Force pax path records as well as xattrs.
+        let file = work.join(&name);
+        std::fs::write(&file, b"output").unwrap();
+        assert!(
+            std::process::Command::new("/usr/bin/xattr")
+                .args(["-w", "com.example.husker", "metadata"])
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.path().join("input.tgz");
+        let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let builder = tar::Builder::new(enc);
+        std::fs::write(&input, builder.into_inner().unwrap().finish().unwrap()).unwrap();
+        let output = dir.path().join("output.tgz");
+        let manifest = dir.path().join("manifest");
+        let (command, args) = wrap_sync_command(
+            input.to_str().unwrap(),
+            work.to_str().unwrap(),
+            &["true".into()],
+            output.to_str().unwrap(),
+            manifest.to_str().unwrap(),
+            &[PathBuf::from(&name)],
+        );
+        assert!(
+            std::process::Command::new(command)
+                .args(args)
+                // Ambient settings must not turn metadata back on.
+                .env("TAR_OPTIONS", "--xattrs")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let dest = tempfile::tempdir().unwrap();
+        let paths = extract_archive_over(
+            std::fs::read(output).unwrap(),
+            dest.path(),
+            husker::archive::OutputLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paths.as_slice(), std::slice::from_ref(&name));
+        assert_eq!(std::fs::read(dest.path().join(name)).unwrap(), b"output");
     }
     fn env_mutex() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -8574,5 +8617,36 @@ default_auto_resume = false
             mutating,
             "setup storage can write scripts with --out and cannot be auto-approved as read-only"
         );
+    }
+    #[test]
+    fn job_output_budget_flags_parse_and_reject_unsafe_values() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "job",
+            "--max-output-archive-bytes",
+            "12345",
+            "--max-output-bytes",
+            "67890",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Commands::Job {
+            max_output_archive_bytes,
+            max_output_bytes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected job")
+        };
+        assert_eq!(max_output_archive_bytes, 12345);
+        assert_eq!(max_output_bytes, 67890);
+        for (flag, value) in [
+            ("--max-output-archive-bytes", "0"),
+            ("--max-output-bytes", "0"),
+            ("--max-output-bytes", "18446744073709551615"),
+        ] {
+            assert!(Cli::try_parse_from(["husker", "job", flag, value, "--", "true"]).is_err());
+        }
     }
 }

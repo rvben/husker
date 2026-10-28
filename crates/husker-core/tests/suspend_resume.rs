@@ -562,35 +562,61 @@ fn strand_fork_source(
 }
 
 #[tokio::test]
-async fn recover_stranded_fork_rootfs_restores_source_disk() {
-    // A fork that crashed mid-load leaves the source VM's rootfs as a stale
-    // symlink to the fork clone, with the real disk in `.fork-src-bak`. Startup
-    // recovery must restore the real disk at the exact path fork uses, so a
-    // later resume does not load the wrong disk.
+async fn startup_preserves_stranded_fork_and_blocks_source_resume_and_deletion() {
+    // No process receipt proves the old fork has exited. A missing in-memory
+    // instance must not restore the source path or delete either disk.
     let (core, _id, tmp) = core_store_with_vm("vmsrc", "suspended");
     let (rootfs, backup) = strand_fork_source(tmp.path(), "vmsrc");
-
-    let n = core.recover_stranded_fork_rootfs();
-    assert_eq!(n, 1, "one stranded source rootfs should be recovered");
-    assert!(!backup.exists(), "backup must be consumed");
-    assert_eq!(
-        std::fs::read(&rootfs).unwrap(),
-        b"real-source-disk",
-        "source rootfs must hold the real disk, not the fork clone"
+    let clone = std::fs::read_link(&rootfs).unwrap();
+    assert_eq!(core.inspect_stranded_fork_rootfs(), 1);
+    assert_eq!(std::fs::read_link(&rootfs).unwrap(), clone);
+    assert!(
+        core.resume_vm("vmsrc")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("fork source reconciliation pending")
+    );
+    assert!(
+        core.destroy_vm("vmsrc")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("fork source reconciliation pending")
+    );
+    assert!(
+        core.stop_vm("vmsrc")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("fork source reconciliation pending")
+    );
+    assert_eq!(std::fs::read(&backup).unwrap(), b"real-source-disk");
+    assert_eq!(std::fs::read(&clone).unwrap(), b"fork-disk");
+    assert_eq!(std::fs::read_link(&rootfs).unwrap(), clone);
+    // Dangling backup links are also ownership markers and fail closed.
+    std::fs::remove_file(&backup).unwrap();
+    std::os::unix::fs::symlink("missing", &backup).unwrap();
+    assert!(
+        core.resume_vm("vmsrc")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("fork source reconciliation pending")
     );
 }
 
 #[tokio::test]
-async fn recover_stranded_fork_rootfs_leaves_other_backends_alone() {
+async fn stranded_fork_inspection_ignores_backends_without_fork() {
     // The stranded layout is a Firecracker fork artifact, and fork is refused
     // on a backend without the capability, so a backup of that name beside
-    // another backend's disk was never written by husker. Recovery must not
-    // replace that VM's rootfs with it.
+    // another backend's disk was never written by husker. It must neither be
+    // reported as stranded nor touched.
     let (core, _id, tmp) = core_store_with_vm_on("vmvz", "stopped", BackendKind::AppleVz);
     let (rootfs, backup) = strand_fork_source(tmp.path(), "vmvz");
 
-    let n = core.recover_stranded_fork_rootfs();
-    assert_eq!(n, 0, "a backend without fork has nothing to recover");
+    let n = core.inspect_stranded_fork_rootfs();
+    assert_eq!(n, 0, "a backend without fork has no stranded fork source");
     assert_eq!(
         std::fs::read(&backup).unwrap(),
         b"real-source-disk",

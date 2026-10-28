@@ -159,12 +159,12 @@ pub fn router_with_auth<B: VmmBackend + 'static>(
     let router = Router::new()
         .merge(factory)
         .route(
-            "/v1/vms/{name}/session-submissions",
-            post(crate::sessions::submit::<B>),
-        )
-        .route(
             "/v1/vms/{name}/sessions",
             get(crate::sessions::list::<B>).post(crate::sessions::start::<B>),
+        )
+        .route(
+            "/v1/vms/{name}/session-submissions",
+            post(crate::sessions::submit::<B>),
         )
         .route(
             "/v1/vms/{name}/sessions/{id}",

@@ -51,6 +51,8 @@ flate2 = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
+tar-codec = { workspace = true }
+async-compression = { workspace = true }
 libc = "0.2"
 # The 0700 mount directory `macos provision` attaches the guest disk under.
 tempfile = "3"

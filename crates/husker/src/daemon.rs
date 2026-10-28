@@ -441,7 +441,12 @@ async fn reconcile_host_resources(
         .collect();
     let factory_generations: std::collections::HashSet<_> =
         jobs.iter().filter_map(|job| job.vm_id).collect();
-    let known_ids: std::collections::HashSet<uuid::Uuid> = vms.iter().map(|v| v.id).collect();
+    let known_ids: std::collections::HashSet<uuid::Uuid> = vms
+        .iter()
+        .map(|v| v.id)
+        .chain(leases.iter().filter_map(|lease| lease.vm_id))
+        .chain(factory_generations.iter().copied())
+        .collect();
 
     #[cfg(feature = "linux-net")]
     let mut taps = 0usize;
@@ -915,14 +920,13 @@ async fn run_mac_daemon<B: husker_vmm::VmmBackend + 'static>(
 async fn run_initial_service_reconcile<B: husker_vmm::VmmBackend + 'static>(
     core: &Arc<husker_core::HuskerCore<B>>,
 ) {
-    // Recover any source rootfs left stranded by a fork that crashed mid-load,
-    // BEFORE the suspend reconcile (which can leave VMs resumable): a later
-    // resume must not open a stale symlink to a fork clone.
-    let recovered_disks = core.recover_stranded_fork_rootfs();
-    if recovered_disks > 0 {
-        tracing::info!(
-            recovered_disks,
-            "recovered source rootfs disks stranded by interrupted forks"
+    // Preserve ambiguous disk aliases: an absent backend instance is not proof
+    // that a prior fork has finished opening its snapshot's embedded disk path.
+    let stranded_disks = core.inspect_stranded_fork_rootfs();
+    if stranded_disks > 0 {
+        tracing::warn!(
+            stranded_disks,
+            "fork source reconciliation pending; resume and source deletion remain blocked"
         );
     }
     // Recover any VM interrupted mid-suspend on the previous run, so a VM whose

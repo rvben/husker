@@ -43,8 +43,6 @@ boundary.
 
 For the prepared-image, agent, and private-preview workflow, see
 [Development computers](docs/development-computers.md).
-The experimental [factory jobs API](docs/factory-jobs.md) adds durable host evidence
-for offline checks; execution is disabled by default.
 
 ### Install
 

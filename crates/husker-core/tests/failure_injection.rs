@@ -1805,6 +1805,41 @@ async fn restart_preserves_factory_creation_lease_until_positive_allocation_abor
 
 #[cfg(feature = "linux-net")]
 #[tokio::test]
+async fn creation_lease_recovery_preserves_a_vm_record_and_its_disk_with_the_same_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (kernel, rootfs) = boot_fixture(tmp.path());
+    let state_path = tmp.path().join("replacement-state.db");
+    let core = fresh_linux_core_with_state(
+        tmp.path(),
+        husker_state::StateStore::open(&state_path).unwrap(),
+        Arc::new(TestHostNetwork::default()),
+    );
+    let record = core
+        .create_vm(create_request("replacement-owner", &kernel, &rootfs))
+        .await
+        .unwrap();
+    let inspected = husker_state::StateStore::open(&state_path).unwrap();
+    let lease = inspected.begin_host_resource_lease(&record.name).unwrap();
+    let disk = tmp.path().join("vms/replacement-owner/rootfs.ext4");
+    let before = std::fs::read(&disk).unwrap();
+    assert_eq!(
+        core.recover_host_resource_leases().await.unwrap(),
+        husker_core::HostResourceRecovery {
+            recovered: 0,
+            failed: 1
+        }
+    );
+    assert_eq!(core.get_vm(&record.name).unwrap().id, record.id);
+    assert_eq!(std::fs::read(&disk).unwrap(), before);
+    assert_eq!(
+        inspected.list_host_resource_leases().unwrap()[0].id,
+        lease.id
+    );
+    assert_ne!(inspected.allocate_cid().unwrap(), lease.vsock_cid);
+}
+
+#[cfg(feature = "linux-net")]
+#[tokio::test]
 async fn restart_preserves_entered_generic_lease_until_durable_destruction() {
     let tmp = tempfile::tempdir().unwrap();
     let state_path = tmp.path().join("entered-state.db");

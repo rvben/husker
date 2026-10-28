@@ -1062,6 +1062,8 @@ pub struct HuskerCore<B: VmmBackend> {
     /// from absence. Successful creation transfers its lease to the VM row.
     factory_destroyed_allocations:
         parking_lot::Mutex<std::collections::HashMap<Uuid, (Uuid, Option<Uuid>)>>,
+    /// Confirmed generic allocation destruction awaiting its durable lease receipt.
+    destroyed_creation_leases: parking_lot::Mutex<std::collections::HashMap<Uuid, Uuid>>,
     /// Per-VM-name locks guarding the create/destroy critical section.
     vm_name_locks:
         parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -1268,6 +1270,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             factory_shutdown_lock: tokio::sync::Mutex::new(()),
             factory_workers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             factory_destroyed_allocations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            destroyed_creation_leases: parking_lot::Mutex::new(std::collections::HashMap::new()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             job_lifecycle_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -1322,6 +1325,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             factory_shutdown_lock: tokio::sync::Mutex::new(()),
             factory_workers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             factory_destroyed_allocations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            destroyed_creation_leases: parking_lot::Mutex::new(std::collections::HashMap::new()),
             vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             job_lifecycle_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -3506,7 +3510,7 @@ mod tests {
         (core, tmp)
     }
 
-    #[cfg(feature = "linux-net")]
+    #[cfg(all(target_os = "linux", feature = "linux-net"))]
     #[tokio::test]
     async fn destroy_retained_by_directory_failure_keeps_its_address_for_the_retry() {
         use std::os::unix::fs::PermissionsExt;
@@ -3554,19 +3558,12 @@ mod tests {
             .enter_host_resource_lease_backend(lease.id, vm_id)
             .unwrap();
         core.ip_allocator.reserve(address).unwrap();
-        assert_eq!(
-            core.recover_host_resource_leases().await.unwrap(),
-            HostResourceRecovery {
-                recovered: 0,
-                failed: 1
-            }
-        );
-        core.state
-            .record_host_resource_lease_destruction(lease.id, vm_id)
-            .unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TRIGGER injected_lease_release_failure BEFORE DELETE ON host_resource_leases BEGIN SELECT RAISE(ABORT, 'injected lease release failure'); END;").unwrap();
-        assert!(core.recover_host_resource_leases().await.is_err());
+        assert!(matches!(
+            core.recover_host_resource_leases().await,
+            Err(CoreError::State(_))
+        ));
         assert_eq!(
             core.state.get_host_resource_lease(lease.id).unwrap().vm_id,
             Some(vm_id)
@@ -6282,6 +6279,50 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
+    async fn rollback_keeps_abort_proof_across_a_failed_receipt_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
+        let lease = core
+            .state
+            .begin_host_resource_lease("rollback-receipt")
+            .unwrap();
+        let vm_id = Uuid::new_v4();
+        core.state
+            .enter_host_resource_lease_backend(lease.id, vm_id)
+            .unwrap();
+        let directory = core.storage.vm_dir(&lease.vm_name);
+        std::fs::create_dir_all(&directory).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_receipt BEFORE UPDATE OF vm_destroyed ON host_resource_leases BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;").unwrap();
+        assert!(
+            core.rollback_create(AllocatedResources {
+                vm_id: Some(vm_id),
+                vm_dir: Some(directory.clone()),
+                cid: Some(lease.vsock_cid),
+                host_resource_lease_id: Some(lease.id),
+                backend_allocation_entered: true,
+            })
+            .await
+            .is_err()
+        );
+        assert!(directory.exists());
+        conn.execute_batch("DROP TRIGGER fail_receipt;").unwrap();
+        // The backend no longer knows the aborted VM, so only the proof kept
+        // from the successful abort can release the lease.
+        assert_eq!(
+            core.recover_host_resource_leases().await.unwrap(),
+            HostResourceRecovery {
+                recovered: 1,
+                failed: 0
+            }
+        );
+        assert!(core.state.list_host_resource_leases().unwrap().is_empty());
+        assert!(!directory.exists());
+    }
+
+    #[cfg(not(feature = "linux-net"))]
+    #[tokio::test]
     async fn macos_restart_recovers_safe_leases_and_preserves_uncertain_disk_and_cid() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state.db");
@@ -6829,10 +6870,11 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let directory = core.storage.vm_dir(&lease.vm_name);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("rootfs.ext4"), b"preserve").unwrap();
+        core.state.begin_host_resource_lease("healthy").unwrap();
         assert_eq!(
             core.recover_host_resource_leases().await.unwrap(),
             HostResourceRecovery {
-                recovered: 0,
+                recovered: 1,
                 failed: 1
             }
         );

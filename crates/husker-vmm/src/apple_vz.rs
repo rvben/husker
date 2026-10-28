@@ -668,11 +668,6 @@ impl VmmBackend for AppleVzBackend {
                 "requested VM UUID is already allocated".into(),
             ));
         }
-        if matches!(config.boot, crate::BootMode::Uefi { .. }) {
-            return Err(VmmError::InvalidConfig(
-                "OVMF boot is a Linux/QEMU mode; macOS uses EFI boot".into(),
-            ));
-        }
         let mut instances = self.instances.lock().await;
         // Check name and UUID in the same registry critical section as insertion.
         // Different UUID creation locks do not serialize a shared VM name.
@@ -757,9 +752,6 @@ impl VmmBackend for AppleVzBackend {
         let owner = self.instance(id).await?;
         let (vm, queue) = {
             let inst = owner.lock().await;
-            if inst.info.state == VmState::Stopped {
-                return Ok(());
-            }
             (inst.machine()?, inst.queue.clone())
         };
 

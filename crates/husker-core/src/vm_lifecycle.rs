@@ -29,9 +29,12 @@ impl<B: VmmBackend> HuskerCore<B> {
             // A contract-violating backend may own either identity. Preserve the
             // lease/files instead of treating one destroyed ID as full cleanup.
             resources.vm_id = None;
-            return Err(CoreError::Io(
-                "backend returned a different leased VM UUID".into(),
-            ));
+            tracing::error!(planned_vm = %id, returned_vm = %created.info.id,
+                "backend returned a different leased VM UUID; both identities require reconciliation");
+            return Err(CoreError::Io(format!(
+                "backend returned VM {} instead of leased VM {id}",
+                created.info.id
+            )));
         }
         Ok(created)
     }
@@ -1264,8 +1267,13 @@ impl<B: VmmBackend> HuskerCore<B> {
             } else {
                 self.vmm.abort_create(vm_id).await?;
                 if let Some(lease) = resources.host_resource_lease_id {
+                    // The backend has forgotten the aborted VM, so keep the
+                    // proof before the fallible receipt write: recovery can
+                    // then release the lease without asking the backend.
+                    self.destroyed_creation_leases.lock().insert(lease, vm_id);
                     self.state
                         .record_host_resource_lease_destruction(lease, vm_id)?;
+                    self.destroyed_creation_leases.lock().remove(&lease);
                 }
             }
         }
@@ -1301,7 +1309,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         #[cfg(feature = "linux-net")]
         if let Some(guest_ip) = resources.guest_ip {
             debug!(%guest_ip, "rolling back: releasing IP");
-            self.ip_allocator.release(guest_ip)?;
+            match self.ip_allocator.release(guest_ip) {
+                Ok(()) | Err(husker_net::NetError::NotAllocated(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }

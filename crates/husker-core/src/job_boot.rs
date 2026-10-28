@@ -18,6 +18,17 @@ fn invalid(message: impl Into<String>) -> CoreError {
     CoreError::InvalidArgument(message.into())
 }
 
+/// Keep store failures classified as state errors so callers can tell a
+/// failing journal from a refuted ownership or evidence check.
+pub(crate) fn journal(error: husker_state::jobs::JournalError) -> CoreError {
+    use husker_state::jobs::JournalError;
+    match error {
+        JournalError::State(error) => error.into(),
+        JournalError::Database(error) => husker_state::StateError::from(error).into(),
+        other => invalid(other.to_string()),
+    }
+}
+
 #[cfg(unix)]
 fn private_directory(path: &std::path::Path) -> Result<(), CoreError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -159,10 +170,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         lease_id: Option<Uuid>,
         teardown: FactoryTeardown,
     ) -> Result<(), CoreError> {
-        let job = self
-            .state
-            .get_job(job_id)
-            .map_err(|error| invalid(error.to_string()))?;
+        let job = self.state.get_job(job_id).map_err(journal)?;
         let name = format!("job-{job_id}");
         if job.vm_id != Some(vm_id)
             || job.vm_name.as_deref() != Some(&name)
@@ -278,7 +286,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         self.state
             .record_job_vm_destruction(vm_id)
-            .map_err(|error| invalid(error.to_string()))?;
+            .map_err(journal)?;
         self.factory_destroyed_allocations.lock().remove(&vm_id);
         Ok(())
     }

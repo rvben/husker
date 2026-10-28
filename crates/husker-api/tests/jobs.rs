@@ -50,7 +50,7 @@ fn spec(bundle: &FrozenBundle) -> JobSpec {
         "acceptance":{"digest":bundle.digest(),"size_bytes":bundle.bytes().len()},
         "commands":[{"argv":["true"],"timeout_secs":20}],"working_directory":"/workspace",
         "writable_directories":[],"environment":{},"uid":1000,"gid":1000,
-        "resources":{"vcpu_count":1,"mem_size_mib":512,"disk_size_bytes":2147483648_u64,"pids_limit":32},
+        "resources":{"vcpu_count":1,"mem_size_mib":512,"disk_size_bytes":1073741824_u64,"pids_limit":32},
         "network":{"mode":"none"},"deadline":chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp()+60,0),"artifacts":[],
         "correlation":{"job":"http-fixture","stage":"baseline","round":1}
     })).unwrap()
@@ -155,15 +155,6 @@ async fn retained_evidence_auth_replay_cancel_and_deletion_contract() {
     store
         .bind_job_vm(active.id, Uuid::new_v4(), &format!("job-{}", active.id))
         .unwrap();
-    let waiting = store
-        .accept_job(
-            "shutdown-unstarted",
-            &spec.canonical_json().unwrap(),
-            spec.deadline,
-            spec.deadline + chrono::Duration::hours(1),
-        )
-        .unwrap()
-        .0;
     let storage = husker_storage::StorageConfig {
         data_dir: temp.path().into(),
         state_dir: temp.path().into(),
@@ -487,6 +478,17 @@ async fn retained_evidence_auth_replay_cancel_and_deletion_contract() {
         request(&app, "POST", "/v1/jobs", payload, true).await.0,
         StatusCode::CONFLICT
     );
+    // Reserve the shutdown-only job when its contract is exercised.
+    let waiting = StateStore::open(&temp.path().join("state.db"))
+        .unwrap()
+        .accept_job(
+            "shutdown-unstarted",
+            &spec.canonical_json().unwrap(),
+            spec.deadline,
+            spec.deadline + chrono::Duration::hours(1),
+        )
+        .unwrap()
+        .0;
     let shutdown = core
         .shutdown_factory_jobs(std::time::Duration::from_secs(1))
         .await
