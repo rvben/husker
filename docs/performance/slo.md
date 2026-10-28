@@ -46,7 +46,7 @@ remote (SSH) transport varies by a second or more between runs on an idle host, 
 **wall clock cannot detect a regression of this size; guest uptime can** (it holds
 to about +/-0.04s across reps).
 
-Reference sample, husker01 (Intel N100, 16GB, NVMe, XFS data dir, Firecracker),
+Reference sample, an Intel N100 host (16GB, NVMe, XFS data dir, Firecracker),
 `--cpus 2 --memory 2048`, median of 5:
 
 | | guest uptime at exec | kernel to `/init` | userspace |
@@ -71,7 +71,7 @@ Both fail if the suppression tokens are dropped from a cmdline builder.
 
 ## Expansion backlog
 
-- Automate the boot-latency sample above (currently measured by hand on husker01).
+- Automate the boot-latency sample above (currently measured by hand).
 - Add multi-VM soak and contention profiling lane.
 - Investigate the remaining ~0.56s of kernel boot: the guest kernel still compiles
   in `CONFIG_SERIO_I8042`, `e100`, `e1000`, `e1000e`, `sky2`, `agpgart` and 9p,

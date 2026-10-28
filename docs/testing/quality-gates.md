@@ -39,8 +39,6 @@
   - `crates/husker/src/main.rs` (CLI binary entrypoint orchestration)
   - `crates/husker-agent/src/main.rs` (agent binary entrypoint bootstrap)
   - `crates/husker-vmm/src/apple_vz.rs` (platform-specific Virtualization.framework FFI shim)
-- Last validated:
-  - 2026-02-17 (`make coverage-ci` passed with 77.15% line coverage in enforced scope)
 
 ## Mutation policy
 

@@ -39,10 +39,6 @@ already responsible for their state. Separate untrusted internet-only jobs from
 trusted jobs that need private-network access instead of weakening one shared
 boundary.
 
-The [two-host homelab case study](docs/case-studies/homelab.md) documents these
-patterns with observed build, runner, scheduler, boot, storage, and network
-isolation evidence from a real deployment.
-
 ## Quick Start
 
 For the prepared-image, agent, and private-preview workflow, see
