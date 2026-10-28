@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.55](https://github.com/rvben/husker/compare/v0.4.54...v0.4.55) - 2026-10-29
+
+### Added
+
+- **jobs**: add durable factory jobs API ([aa972a0](https://github.com/rvben/husker/commit/aa972a00bf95927b89d9ff78759f1d446deb8a79))
+- **factory**: checkpoint experimental offline execution ([0b136c9](https://github.com/rvben/husker/commit/0b136c927218b10c755c734bb3e74145f9eb49e0))
+- **factory**: add frozen job contracts and bundle commands ([db275e1](https://github.com/rvben/husker/commit/db275e1373bfd1ea4a7985ce7e2d2ec99efb8336))
+- **sessions**: add durable generation-scoped submissions ([160c4f7](https://github.com/rvben/husker/commit/160c4f7e7861b3083f791eeb1d33800c2235f96b))
+
+### Fixed
+
+- **vmm**: cap Firecracker and QEMU serial logs at 8 MiB ([8e6968e](https://github.com/rvben/husker/commit/8e6968e0469be58e803127d49f9f784b0098e899))
+- **api**: show serial logs with invalid UTF-8 instead of failing ([1d6749f](https://github.com/rvben/husker/commit/1d6749feaf5fee3a81c25a816dab5af420682c4d))
+- **ci**: install nextest for nightly mutation tests ([859e7aa](https://github.com/rvben/husker/commit/859e7aa94929a250dd1ec47d332516a1817457a1))
+- **archives**: bound guest output transfers and expansion ([42c7664](https://github.com/rvben/husker/commit/42c76645a41413d8030ea2e034bd0552f8916001))
+- **archives**: validate downloads and guest outputs with tar-codec ([61d1be3](https://github.com/rvben/husker/commit/61d1be3d60c3a3756d4424e9ca85d1142adb52c1))
+
 ## [0.4.54](https://github.com/rvben/husker/compare/v0.4.53...v0.4.54) - 2026-10-27
 
 ### Fixed
