@@ -2337,8 +2337,8 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
                         ),
                     )
                 })?;
-            let mut buf = String::new();
-            file.read_to_string(&mut buf).await.map_err(|e| {
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     error_response(
@@ -2347,9 +2347,12 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
                     ),
                 )
             })?;
-            format!("[... truncated, showing last 1 MiB ...]\n{buf}")
+            format!(
+                "[... truncated, showing last 1 MiB ...]\n{}",
+                String::from_utf8_lossy(&buf)
+            )
         } else {
-            tokio::fs::read_to_string(&log_path).await.map_err(|e| {
+            let bytes = tokio::fs::read(&log_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     error_response(
@@ -2357,7 +2360,8 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
                         format!("reading {log_label} log: {e}"),
                     ),
                 )
-            })?
+            })?;
+            String::from_utf8_lossy(&bytes).into_owned()
         };
         if let Some(n) = params.tail {
             initial_content = tail_lines(&initial_content, n);
@@ -2451,8 +2455,8 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
                         ),
                     )
                 })?;
-            let mut buf = String::new();
-            file.read_to_string(&mut buf).await.map_err(|e| {
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     error_response(
@@ -2461,9 +2465,12 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
                     ),
                 )
             })?;
-            format!("[... truncated, showing last 1 MiB ...]\n{buf}")
+            format!(
+                "[... truncated, showing last 1 MiB ...]\n{}",
+                String::from_utf8_lossy(&buf)
+            )
         } else {
-            tokio::fs::read_to_string(&log_path).await.map_err(|e| {
+            let bytes = tokio::fs::read(&log_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     error_response(
@@ -2471,7 +2478,8 @@ pub(crate) async fn get_logs<B: VmmBackend + 'static>(
                         format!("reading {log_label} log: {e}"),
                     ),
                 )
-            })?
+            })?;
+            String::from_utf8_lossy(&bytes).into_owned()
         };
 
         let output = if let Some(n) = params.tail {

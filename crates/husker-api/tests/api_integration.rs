@@ -2558,3 +2558,47 @@ async fn logs_large_file_is_truncated() {
         body.len()
     );
 }
+
+#[tokio::test]
+async fn logs_that_are_not_valid_utf8_are_shown_lossily() {
+    // A guest can print any bytes on its console, and the last-1-MiB window
+    // of a large log can start inside a multibyte character: "é" starts at
+    // every odd offset below, and the window starts at an even one.
+    let large = ["a", &"é".repeat(1 << 20), "b"].concat().into_bytes();
+    for (content, expected_start, expected_end) in [
+        (
+            &b"before \xff after\n"[..],
+            "before \u{FFFD} after\n",
+            "after\n",
+        ),
+        (
+            &large[..],
+            "[... truncated, showing last 1 MiB ...]\n\u{FFFD}é",
+            "éb",
+        ),
+    ] {
+        let (core, dir) = logs_test_core("lossy", Some(""));
+        let serial_log = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with(".serial.log"))
+            .unwrap();
+        std::fs::write(&serial_log, content).unwrap();
+        let response = router(core)
+            .oneshot(
+                Request::get("/v1/vms/lossy/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.starts_with(expected_start),
+            "{:?}",
+            &body[..64.min(body.len())]
+        );
+        assert!(body.ends_with(expected_end));
+    }
+}
