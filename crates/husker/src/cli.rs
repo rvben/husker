@@ -556,6 +556,18 @@ pub(crate) enum Commands {
         #[arg(long = "write-back", requires = "sync_cwd")]
         write_back: bool,
 
+        /// Maximum compressed bytes retrieved for --out/--write-back (256 MiB)
+        #[arg(long, env = "HUSKER_MAX_OUTPUT_ARCHIVE_BYTES",
+            default_value_t = husker::archive::DEFAULT_MAX_OUTPUT_ARCHIVE_BYTES,
+            value_parser = clap::value_parser!(u64).range(1..))]
+        max_output_archive_bytes: u64,
+
+        /// Maximum expanded output tar bytes, including headers/padding (1 GiB)
+        #[arg(long, env = "HUSKER_MAX_OUTPUT_BYTES",
+            default_value_t = husker::archive::DEFAULT_MAX_OUTPUT_BYTES,
+            value_parser = clap::value_parser!(u64).range(1..=u64::MAX - 1))]
+        max_output_bytes: u64,
+
         /// Command and arguments (after --). Omit to run an imported OCI image's
         /// default (its Entrypoint + Cmd), like `docker run <image>`.
         #[arg(last = true)]

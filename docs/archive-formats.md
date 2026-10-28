@@ -44,6 +44,36 @@ leave earlier outputs in place. It is not a transaction over the working tree.
 Payload validation streams data rather than retaining expanded files in memory;
 the compressed output archive is already held by the guest transfer code.
 
+### Output size limits
+
+Each `husker job --out` / `--write-back` retrieval defaults to:
+
+- 256 MiB compressed (`--max-output-archive-bytes`, or
+  `HUSKER_MAX_OUTPUT_ARCHIVE_BYTES`). The transfer checks the guest's reported
+  size and the actual bytes before growing the archive buffer.
+- 1 GiB expanded (`--max-output-bytes`, or `HUSKER_MAX_OUTPUT_BYTES`). This is
+  the entire decompressed tar, including all files, metadata, headers, and zero
+  padding. It is checked during preflight, before extraction writes anything.
+
+Values are positive integer byte counts; flags override environment variables.
+For larger trusted outputs, for example:
+
+```sh
+husker job --sync-cwd --out dist \
+  --max-output-archive-bytes 536870912 \
+  --max-output-bytes 2147483648 -- make dist
+```
+
+Exceeding either limit fails retrieval rather than reporting missing outputs or
+silently truncating them. Existing destination files are unchanged by a limit
+failure. The retrieval manifest is bounded separately to 21 bytes per requested
+pattern (enough for a decimal index and newline).
+
+These are logical byte limits, not a disk quota or free-space reservation.
+Filesystem allocation and metadata can use additional space. Extraction can
+still fail for insufficient free space, and remains an overlay operation.
+The limits apply to guest job outputs; `husker cp` retains its existing behavior.
+
 ## OCI layers
 
 OCI layer application is a separate compatibility boundary. It streams gzip

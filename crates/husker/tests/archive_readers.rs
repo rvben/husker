@@ -293,3 +293,119 @@ async fn published_firecracker_release_compatibility() {
     let binary = firecracker_binary(bytes, name).await.unwrap();
     assert!(binary.starts_with(b"\x7fELF"));
 }
+
+#[tokio::test]
+async fn guest_output_limits_accept_exact_boundaries() {
+    use husker::archive::{OutputLimits, extract_outputs_with_limits};
+    let expanded = tar(&[("output", b"payload")]);
+    let bytes = gzip(&expanded);
+    let limits = OutputLimits {
+        max_archive_bytes: bytes.len() as u64,
+        max_expanded_bytes: expanded.len() as u64,
+    };
+    let dst = tempfile::tempdir().unwrap();
+    let files = extract_outputs_with_limits(bytes, dst.path().into(), limits)
+        .await
+        .unwrap();
+    assert_eq!(files, ["output"]);
+    assert_eq!(
+        std::fs::read(dst.path().join("output")).unwrap(),
+        b"payload"
+    );
+}
+
+#[tokio::test]
+async fn guest_output_limits_reject_before_overwriting_or_creating_files() {
+    use husker::archive::{OutputLimits, extract_outputs_with_limits};
+    let bomb = vec![0; 1024 * 1024];
+    let expanded = tar(&[("existing", b"replacement"), ("bomb", &bomb)]);
+    let bytes = gzip(&expanded);
+    assert!(bytes.len() < 4096, "fixture must be highly compressed");
+    for limits in [
+        OutputLimits {
+            max_archive_bytes: bytes.len() as u64 - 1,
+            max_expanded_bytes: expanded.len() as u64,
+        },
+        OutputLimits {
+            max_archive_bytes: bytes.len() as u64,
+            max_expanded_bytes: 4096,
+        },
+    ] {
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("existing"), b"original").unwrap();
+        let err = extract_outputs_with_limits(bytes.clone(), dst.path().into(), limits)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("--max-output"), "{err:#}");
+        assert_eq!(
+            std::fs::read(dst.path().join("existing")).unwrap(),
+            b"original"
+        );
+        assert!(!dst.path().join("bomb").exists());
+    }
+}
+
+#[tokio::test]
+async fn expanded_budget_includes_aggregate_payloads_and_trailing_padding() {
+    use husker::archive::{OutputLimits, extract_outputs_with_limits};
+    let payload = vec![42; 2048];
+    let aggregate = tar(&[("first", &payload), ("second", &payload)]);
+    let mut padded = tar(&[("first", b"small")]);
+    padded.extend_from_slice(&[0; 8192]);
+    for expanded in [aggregate, padded] {
+        let dst = tempfile::tempdir().unwrap();
+        let limits = OutputLimits {
+            max_archive_bytes: 4096,
+            max_expanded_bytes: 4096,
+        };
+        let err = extract_outputs_with_limits(gzip(&expanded), dst.path().into(), limits)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("--max-output-bytes"), "{err:#}");
+        assert!(!dst.path().join("first").exists());
+    }
+}
+
+#[tokio::test]
+async fn invalid_output_budgets_are_errors_not_panics() {
+    use husker::archive::{OutputLimits, extract_outputs_with_limits};
+    for (compressed, expanded) in [(0, 1), (1, 0), (1, u64::MAX)] {
+        let dst = tempfile::tempdir().unwrap();
+        assert!(
+            extract_outputs_with_limits(
+                Vec::new(),
+                dst.path().into(),
+                OutputLimits {
+                    max_archive_bytes: compressed,
+                    max_expanded_bytes: expanded,
+                }
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparse_formats_cannot_bypass_the_expanded_output_budget() {
+    let mut old_gnu = tar(&[("first", b"okay"), ("sparse", b"x")]);
+    let mut header = tar::Header::from_byte_slice(&old_gnu[1024..1536]).clone();
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    header.set_cksum();
+    old_gnu[1024..1536].copy_from_slice(header.as_bytes());
+
+    let mut pax = tar::Builder::new(Vec::new());
+    append(&mut pax, "first", b"okay");
+    pax.append_pax_extensions([("GNU.sparse.realsize", b"1099511627776".as_slice())])
+        .unwrap();
+    append(&mut pax, "sparse", b"x");
+    for expanded in [old_gnu, pax.into_inner().unwrap()] {
+        let dst = tempfile::tempdir().unwrap();
+        assert!(
+            extract_outputs(gzip(&expanded), dst.path().into())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(dst.path()).unwrap().count(), 0);
+    }
+}

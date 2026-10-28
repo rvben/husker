@@ -1577,6 +1577,8 @@ async fn run(cli: Cli) -> Result<()> {
             sync_cwd,
             out,
             write_back,
+            max_output_archive_bytes,
+            max_output_bytes,
             command,
         } => {
             let config = load_config(config_path.as_deref());
@@ -1645,6 +1647,10 @@ async fn run(cli: Cli) -> Result<()> {
                 sync_cwd,
                 write_back,
                 out: &out,
+                output_limits: husker::archive::OutputLimits {
+                    max_archive_bytes: max_output_archive_bytes,
+                    max_expanded_bytes: max_output_bytes,
+                },
                 command: &command,
                 env: &env,
                 secret_env: &secret_env,
@@ -4879,8 +4885,12 @@ pub(crate) fn wrap_sync_command(
 }
 
 /// Extract guest outputs with strict tar decoding and confined filesystem writes.
-pub(crate) async fn extract_archive_over(bytes: Vec<u8>, dst: &Path) -> Result<Vec<String>> {
-    husker::archive::extract_outputs(bytes, dst.to_path_buf()).await
+pub(crate) async fn extract_archive_over(
+    bytes: Vec<u8>,
+    dst: &Path,
+    limits: husker::archive::OutputLimits,
+) -> Result<Vec<String>> {
+    husker::archive::extract_outputs_with_limits(bytes, dst.to_path_buf(), limits).await
 }
 
 /// Human-facing phrase describing what backend a capability requires.
@@ -5817,7 +5827,10 @@ mod tests {
             b.into_inner().unwrap().finish().unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
-        let written = extract_archive_over(buf, dir.path()).await.unwrap();
+        let written =
+            extract_archive_over(buf, dir.path(), husker::archive::OutputLimits::default())
+                .await
+                .unwrap();
         assert!(
             written.contains(&"out/app.bin".to_string()),
             "reports the written file: {written:?}"
@@ -5868,9 +5881,13 @@ mod tests {
                 .success()
         );
         let dest = tempfile::tempdir().unwrap();
-        let paths = extract_archive_over(std::fs::read(output).unwrap(), dest.path())
-            .await
-            .unwrap();
+        let paths = extract_archive_over(
+            std::fs::read(output).unwrap(),
+            dest.path(),
+            husker::archive::OutputLimits::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(paths.as_slice(), std::slice::from_ref(&name));
         assert_eq!(std::fs::read(dest.path().join(name)).unwrap(), b"output");
     }
@@ -8591,5 +8608,36 @@ default_auto_resume = false
             mutating,
             "setup storage can write scripts with --out and cannot be auto-approved as read-only"
         );
+    }
+    #[test]
+    fn job_output_budget_flags_parse_and_reject_unsafe_values() {
+        let cli = Cli::try_parse_from([
+            "husker",
+            "job",
+            "--max-output-archive-bytes",
+            "12345",
+            "--max-output-bytes",
+            "67890",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Commands::Job {
+            max_output_archive_bytes,
+            max_output_bytes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected job")
+        };
+        assert_eq!(max_output_archive_bytes, 12345);
+        assert_eq!(max_output_bytes, 67890);
+        for (flag, value) in [
+            ("--max-output-archive-bytes", "0"),
+            ("--max-output-bytes", "0"),
+            ("--max-output-bytes", "18446744073709551615"),
+        ] {
+            assert!(Cli::try_parse_from(["husker", "job", flag, value, "--", "true"]).is_err());
+        }
     }
 }

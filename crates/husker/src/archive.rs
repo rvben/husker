@@ -11,6 +11,28 @@ use tokio::io::{AsyncReadExt as _, Take};
 /// Limit both compressed downloads and the complete decompressed release tar.
 pub const MAX_FIRECRACKER_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default compressed guest-output transfer limit (256 MiB).
+pub const DEFAULT_MAX_OUTPUT_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+/// Default expanded tar limit, including headers and padding (1 GiB).
+pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Per-retrieval byte budgets. These bound logical archive bytes, not filesystem
+/// allocation; small files and filesystem metadata can consume additional space.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputLimits {
+    pub max_archive_bytes: u64,
+    pub max_expanded_bytes: u64,
+}
+
+impl Default for OutputLimits {
+    fn default() -> Self {
+        Self {
+            max_archive_bytes: DEFAULT_MAX_OUTPUT_ARCHIVE_BYTES,
+            max_expanded_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
 type GzipStream<'a> = Take<GzipDecoder<&'a [u8]>>;
 
 fn gzip(bytes: &[u8], limit: u64) -> GzipStream<'_> {
@@ -121,20 +143,73 @@ async fn read_firecracker(bytes: &[u8], binary_name: &str) -> Result<Vec<u8>> {
 /// files and paths escaping the destination are rejected rather than skipped.
 /// As with tar-codec itself, callers must ensure exclusive access to `dst`.
 pub async fn extract_outputs(bytes: Vec<u8>, dst: PathBuf) -> Result<Vec<String>> {
+    extract_outputs_with_limits(bytes, dst, OutputLimits::default()).await
+}
+
+/// Extract with explicit compressed and expanded byte budgets. Limit failures
+/// are detected in preflight, before any destination files are changed.
+pub async fn extract_outputs_with_limits(
+    bytes: Vec<u8>,
+    dst: PathBuf,
+    limits: OutputLimits,
+) -> Result<Vec<String>> {
+    ensure!(
+        limits.max_archive_bytes > 0,
+        "output archive limit must be positive"
+    );
+    ensure!(
+        limits.max_expanded_bytes > 0 && limits.max_expanded_bytes < u64::MAX,
+        "expanded output limit must be between 1 and {} bytes",
+        u64::MAX - 1
+    );
+    ensure!(
+        bytes.len() as u64 <= limits.max_archive_bytes,
+        "compressed guest outputs exceed --max-output-archive-bytes ({} bytes)",
+        limits.max_archive_bytes
+    );
     tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(extract_outputs_local(&bytes, &dst))
+        tokio::runtime::Handle::current().block_on(extract_outputs_local(&bytes, &dst, limits))
     })
     .await
     .context("guest archive task")?
 }
 
-async fn extract_outputs_local(bytes: &[u8], dst: &Path) -> Result<Vec<String>> {
+async fn extract_outputs_local(
+    bytes: &[u8],
+    dst: &Path,
+    limits: OutputLimits,
+) -> Result<Vec<String>> {
     // Outputs can be large. Stream payload validation without buffering their
     // expanded contents; the transfer already holds the compressed archive.
-    let mut reader = gzip(bytes, u64::MAX - 1);
+    let mut reader = gzip(bytes, limits.max_expanded_bytes);
+    let validation = validate_outputs(&mut reader).await;
+    ensure!(
+        reader.limit() != 0,
+        "expanded guest outputs exceed --max-output-bytes ({} bytes, including tar headers and padding)",
+        limits.max_expanded_bytes
+    );
+    let written = validation?;
+
+    let policy = tar_codec::extract::ExtractPolicy::default().link_policy(
+        tar_codec::extract::LinkPolicy::default()
+            // Guest tar can coalesce identical inodes. tar-codec only permits
+            // hard-link targets established within this archive, under dst.
+            .allow_hard_links(true)
+            // This flag affects symbolic-link targets only; hard links still
+            // cannot alias pre-existing working-tree files.
+            .allow_ambient_targets(true),
+    );
+    TarArchive::new(gzip(bytes, limits.max_expanded_bytes))
+        .extract_in(dst, policy)
+        .await
+        .context("extracting guest outputs")?;
+    Ok(written)
+}
+
+async fn validate_outputs(reader: &mut GzipStream<'_>) -> Result<Vec<String>> {
     let mut written = Vec::new();
     {
-        let mut members = TarArchive::new(&mut reader).members();
+        let mut members = TarArchive::new(&mut *reader).members();
         while let Some(member) = members
             .next()
             .await
@@ -153,20 +228,6 @@ async fn extract_outputs_local(bytes: &[u8], dst: &Path) -> Result<Vec<String>> 
             }
         }
     }
-    finish_gzip(&mut reader).await?;
-
-    let policy = tar_codec::extract::ExtractPolicy::default().link_policy(
-        tar_codec::extract::LinkPolicy::default()
-            // Guest tar can coalesce identical inodes. tar-codec only permits
-            // hard-link targets established within this archive, under dst.
-            .allow_hard_links(true)
-            // This flag affects symbolic-link targets only; hard links still
-            // cannot alias pre-existing working-tree files.
-            .allow_ambient_targets(true),
-    );
-    TarArchive::new(gzip(bytes, u64::MAX - 1))
-        .extract_in(dst, policy)
-        .await
-        .context("extracting guest outputs")?;
+    finish_gzip(reader).await?;
     Ok(written)
 }
