@@ -746,8 +746,9 @@ impl VmmBackend for AppleVzBackend {
     /// shared grace period for the VZVirtualMachine to stop, and force it off
     /// otherwise. On return the Virtualization.framework helper no longer holds
     /// the rootfs or serves the vsock device, so the caller may release them at
-    /// once. A guest that already ended itself (the agent powered it off on the
-    /// host's request) is recorded as stopped without a request.
+    /// once. When the guest already ended itself (the agent powered it off on
+    /// the host's request), VZ refuses the request and the VM is recorded as
+    /// stopped.
     async fn stop_vm(&self, id: Uuid) -> Result<(), VmmError> {
         let owner = self.instance(id).await?;
         let (vm, queue) = {
@@ -769,9 +770,9 @@ impl VmmBackend for AppleVzBackend {
         .await;
         if let Err(error) = requested {
             // VZ refuses the request for a VM that is not running. When the
-            // guest ended itself between the state check above and the request,
-            // that refusal is the outcome the stop wanted; the wait below then
-            // observes the stopped state at once.
+            // guest has already ended itself, that refusal is the outcome the
+            // stop wanted; the wait below then observes the stopped state at
+            // once.
             if !matches!(
                 live_vz_state(&queue, &vm).await?,
                 VZVirtualMachineState::Stopped | VZVirtualMachineState::Stopping
