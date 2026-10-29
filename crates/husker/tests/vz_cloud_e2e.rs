@@ -501,7 +501,7 @@ async fn vz_cloud_port_forward_reaches_guest() {
 
     // ── Start a TCP service inside the guest (detached, survives the exec) ──────
     const GUEST_PORT: u16 = 8088;
-    let (code, _out) = guest_exec(
+    let (code, out) = guest_exec(
         &client,
         &base,
         vm_name,
@@ -510,12 +510,27 @@ async fn vz_cloud_port_forward_reaches_guest() {
         &[
             "-c",
             &format!(
-                "setsid python3 -m http.server {GUEST_PORT} >/tmp/pf.log 2>&1 </dev/null & sleep 1; echo up"
+                "exec 2>&1; set -eu; command -v python3; setsid python3 -m http.server {GUEST_PORT} --bind 0.0.0.0 >/tmp/pf.log 2>&1 </dev/null & \
+                 pid=$!; for i in 1 2 3 4 5; do \
+                 if python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:{GUEST_PORT}/\", timeout=1).read()' 2>/dev/null; then exit 0; fi; \
+                 if ! kill -0 \"$pid\" 2>/dev/null; then cat /tmp/pf.log; exit 1; fi; sleep 1; done; \
+                 cat /tmp/pf.log; exit 1"
             ),
         ],
     )
     .await;
-    assert_eq!(code, 0, "failed to start guest http server");
+    assert_eq!(code, 0, "guest HTTP readiness failed: {out}");
+
+    // Establish the host-to-guest NAT prerequisite separately from the proxy.
+    // A healthy guest-local listener does not prove the host can dial its IP.
+    let direct = client.get(format!("http://{guest_ip}:{GUEST_PORT}/"))
+        .timeout(Duration::from_secs(5)).send().await
+        .expect("guest HTTP service is ready but host-to-guest NAT is unreachable; check the runner's bridge, routing and network permissions");
+    assert!(
+        direct.status().is_success(),
+        "direct guest HTTP returned {}",
+        direct.status()
+    );
 
     // ── Add the port forward ───────────────────────────────────────────────────
     let host_port = free_port();
