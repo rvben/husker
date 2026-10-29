@@ -2817,6 +2817,50 @@ async fn commit_fixture() -> CommitFixture {
 }
 
 #[tokio::test]
+async fn commit_refuses_a_stranded_fork_source() {
+    // Until a fork source is reconciled its rootfs path is an alias for the
+    // fork's clone and the real disk sits in the backup. A commit through the
+    // alias would publish the fork's disk as the source's image, so it must
+    // be refused with both disks left in place.
+    if !e2fsprogs_available() {
+        return;
+    }
+    let CommitFixture {
+        _tmp,
+        prepared_path,
+        core,
+    } = commit_fixture().await;
+    let vm_dir = prepared_path.parent().unwrap();
+    let backup = vm_dir.join("rootfs.ext4.fork-src-bak");
+    let clone = vm_dir.join("fork-clone.ext4");
+    std::fs::rename(&prepared_path, &backup).unwrap();
+    ext4_rootfs(&clone, b"base-rootfs-with-fork-writes").await;
+    std::os::unix::fs::symlink(&clone, &prepared_path).unwrap();
+    let source = std::fs::read(&backup).unwrap();
+    let fork = std::fs::read(&clone).unwrap();
+
+    let err = core
+        .commit_vm_image(
+            "preparer",
+            CommitVmImageRequest {
+                name: "tools-python-3.13.7".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("fork source reconciliation pending"),
+        "{err}"
+    );
+
+    assert!(core.get_image("tools-python-3.13.7").is_err());
+    assert_eq!(std::fs::read(&backup).unwrap(), source);
+    assert_eq!(std::fs::read(&clone).unwrap(), fork);
+    assert_eq!(std::fs::read_link(&prepared_path).unwrap(), clone);
+}
+
+#[tokio::test]
 async fn commit_stopped_vm_image_is_immutable_idempotent_and_preserves_boot_contract() {
     if !e2fsprogs_available() {
         return;

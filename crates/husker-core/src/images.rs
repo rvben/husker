@@ -158,6 +158,9 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let vm = self.lookup_vm(vm_name)?;
         self.ensure_vm_is_not_pool_template(&vm)?;
+        // A stranded fork source's rootfs path points at the fork's clone;
+        // publishing through it would commit the wrong disk.
+        self.require_reconciled_fork_source(&vm)?;
         if vm.state != VmLifecycleState::Stopped {
             return Err(CoreError::InvalidState {
                 name: vm_name.into(),

@@ -7,7 +7,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         req: CreateSnapshotRequest,
     ) -> Result<SnapshotRecord, CoreError> {
         validate_resource_name("snapshot", &req.name)?;
+        // Hold the per-VM mutation lock so a concurrent fork, resume or
+        // destroy cannot change the source disk between the checks and the
+        // clone below.
+        let _vm_guard = self.vm_name_lock(&req.vm).lock_owned().await;
         let vm = self.lookup_vm(&req.vm)?;
+        // A stranded fork source's rootfs path points at the fork's clone;
+        // copying through it would capture the wrong disk.
+        self.require_reconciled_fork_source(&vm)?;
         if vm.state != VmLifecycleState::Stopped {
             return Err(CoreError::InvalidState {
                 name: vm.name,

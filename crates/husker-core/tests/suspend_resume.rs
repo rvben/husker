@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use husker_core::{
-    BackendKind, CoreError, CreatePoolRequest, HuskerCore, NetworkMode, VmLifecycleState,
+    BackendKind, CoreError, CreatePoolRequest, CreateSnapshotRequest, HuskerCore, NetworkMode,
+    VmLifecycleState,
 };
 use husker_vmm::{
     CreatedVm, RestoreTarget, SnapshotMeta, SnapshotPaths, VmConfig, VmInfo, VmState, VmmBackend,
@@ -622,6 +623,35 @@ async fn the_runbook_restore_of_a_stranded_fork_source_lifts_the_block() {
     assert_eq!(std::fs::read(&rootfs).unwrap(), b"real-source-disk");
     assert_eq!(std::fs::read(&clone).unwrap(), b"fork-disk");
     core.destroy_vm("vmsrc").await.unwrap();
+}
+
+#[tokio::test]
+async fn stranded_fork_source_cannot_be_snapshotted() {
+    // The source's rootfs path is an alias for the fork's clone until it is
+    // reconciled, so a snapshot copied through it would hold the fork's disk
+    // under the source's name. It must be refused and leave the disks as
+    // they are.
+    let (core, _id, tmp) = core_store_with_vm("vmsrc", "stopped");
+    let (rootfs, backup) = strand_fork_source(tmp.path(), "vmsrc");
+    let clone = std::fs::read_link(&rootfs).unwrap();
+
+    let err = core
+        .create_snapshot(CreateSnapshotRequest {
+            name: "snap-of-src".into(),
+            vm: "vmsrc".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("fork source reconciliation pending"),
+        "{err}"
+    );
+
+    assert!(core.list_snapshots().unwrap().is_empty());
+    assert_eq!(std::fs::read(&backup).unwrap(), b"real-source-disk");
+    assert_eq!(std::fs::read(&clone).unwrap(), b"fork-disk");
+    assert_eq!(std::fs::read_link(&rootfs).unwrap(), clone);
 }
 
 #[tokio::test]
