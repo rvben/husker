@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.56](https://github.com/rvben/husker/compare/v0.4.55...v0.4.56) - 2026-10-29
+
+### Added
+
+- **factory**: assemble pinned native reaper bundles offline ([ee4a524](https://github.com/rvben/husker/commit/ee4a524667e496c2489ae96e2fec81a1be40b773))
+
+### Fixed
+
+- **core**: drop per-name lock entries once no caller holds them ([9d0549f](https://github.com/rvben/husker/commit/9d0549ffab60e22f8fbf3c06237f33c88e6ce767))
+- **core**: refuse snapshots and image commits of an unreconciled fork source ([70dda51](https://github.com/rvben/husker/commit/70dda514bddab671d0259f85257972bee496bfc9))
+- **core**: point stranded fork sources at an offline recovery runbook ([ce7baac](https://github.com/rvben/husker/commit/ce7baaced22a588ea9b617febcb30066fd3d1d95))
+- **macos**: forward guest ports through VM-bound agent tunnels ([0c8b339](https://github.com/rvben/husker/commit/0c8b339371bfdf82bd0457383741d08bd24f4a4b))
+- **factory**: recover supervised Firecracker allocations after restart ([b755676](https://github.com/rvben/husker/commit/b75567698b25db158aeaaa2bae3376b4889a055e))
+- **build**: inject the factory job runner in update-rootfs ([bcfc17f](https://github.com/rvben/husker/commit/bcfc17f0ca5593d9d83c9128d264eb6ea0da7be0))
+- **build**: sign the binary cargo installed instead of `which husker` ([26c1e6d](https://github.com/rvben/husker/commit/26c1e6d611bba8392e9e1a5a010273595244b325))
+
 ## [0.4.55](https://github.com/rvben/husker/compare/v0.4.54...v0.4.55) - 2026-10-29
 
 ### Added
