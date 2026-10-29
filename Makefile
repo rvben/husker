@@ -169,12 +169,16 @@ clean:
 
 # Install husker binary (auto-detects macOS to disable linux-net and sign).
 # On macOS, builds the aarch64-musl agent first and embeds it for VZ cloud-image support.
+# Signs the file cargo installed: `which husker` can resolve to a version
+# manager's shim, and signing that leaves the real binary without entitlements.
+INSTALLED_HUSKER = $(or $(CARGO_INSTALL_ROOT),$(CARGO_HOME),$(HOME)/.cargo)/bin/husker
+
 install:
 ifeq ($(shell uname -s),Darwin)
 	$(MAKE) build-agent-aarch64
 	HUSKER_EMBED_AGENT_BIN="$(CARGO_TARGET_DIR_ABS)/aarch64-unknown-linux-musl/agent/husker-agent" \
 		cargo install --path crates/husker --no-default-features
-	codesign --entitlements husker.entitlements --force --sign - "$$(which husker)"
+	codesign --entitlements husker.entitlements --force --sign - "$(INSTALLED_HUSKER)"
 else
 	cargo install --path crates/husker
 endif
