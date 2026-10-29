@@ -30,37 +30,77 @@ KVM, Firecracker, `ip`, `nft`, `ss`, and Python 3.11+. Allow at least 64 GiB fre
 network/CID ranges with concurrently starting daemons. No downloads, builds or
 service installations are performed by this check.
 
-Stage independent regular files under an absolute private `0700` directory:
+Assemble a new bundle from five **prebuilt, pinned local artifacts**. The
+preparation command needs Git and Python on Linux or macOS, but no root, KVM,
+network access, daemon or filesystem mounts. It copies the supplied rootfs;
+it does not compile binaries, build a rootfs, install tools, or resolve versions.
 
-| Bundle path | Input |
-| --- | --- |
-| `bin/husker` | Linux daemon built from the revision under test, with guest agent embedded |
-| `bin/firecracker` | Compatible Firecracker executable |
-| `bin/factory-lifecycle-probe` | Probe built from `guest/factory/lifecycle_probe.c` |
-| `prepared/vmlinux` | Firecracker-compatible kernel |
-| `prepared/rootfs.ext4` | Prepared factory rootfs, at most 8 GiB, with matching agent, job runner and factory init |
-| `inputs/source.tar` | Frozen lifecycle probe and `frozen-sentinel` payload |
-| `inputs/acceptance.tar` | Frozen `frozen-sentinel` acceptance payload |
+Write a version-one JSON plan with these exact keys (replace paths, digests and
+the full declared daemon build commit with reviewed values):
 
-Use the existing factory preparation/lifecycle tooling to produce those guest
-inputs. The harness validates the exact payload contents before any API POST.
-The bundle is trusted executable input: review its provenance, including the
-rootfs and daemon build, before activation. A digest records identity; it does
-not establish provenance.
-
-From the source revision under test, freeze the SDK, harness and controller and
-record every file's SHA-256:
-
-```sh
-python3 scripts/ci/factory_native_reaper_e2e.py prepare --bundle /var/tmp/reaper-bundle
+```json
+{
+  "version": 1,
+  "daemon_build_revision": "0123456789abcdef0123456789abcdef01234567",
+  "inputs": {
+    "daemon": {"path": "/staged/husker", "digest": "sha256:DAEMON_SHA256"},
+    "firecracker": {"path": "/staged/firecracker", "digest": "sha256:FIRECRACKER_SHA256"},
+    "probe": {"path": "/staged/factory-lifecycle-probe", "digest": "sha256:PROBE_SHA256"},
+    "kernel": {"path": "/staged/vmlinux", "digest": "sha256:KERNEL_SHA256"},
+    "rootfs": {"path": "/staged/rootfs.ext4", "digest": "sha256:ROOTFS_SHA256"}
+  }
+}
 ```
 
-Save the printed manifest `sha256`. Preparation does not start anything and
-refuses a previously prepared bundle. Transfer the complete bundle to the test
-host if necessary. Before privileged execution, make the bundle and all its
-contents root-owned, keep the root directory `0700`, prohibit group/other writes,
-and make `bin/husker` and `bin/firecracker` executable. Do not modify inputs after
-preparation.
+Every digest is `sha256:` followed by 64 lowercase hexadecimal digits. Inputs
+must be independent regular files, with no symlink in the final component or
+hardlinks. Binary/kernel headers must identify little-endian x86_64 ELF64;
+the rootfs must have an ext4 superblock and be at most 8 GiB. These are format
+checks, not proof that the guest can boot.
+
+The daemon must have its guest agent embedded. Supply a compatible Firecracker,
+a probe compiled from `guest/factory/lifecycle-probe.c`, a Firecracker-compatible
+kernel, and an already prepared factory rootfs containing the matching agent,
+job runner and factory init. Use the existing guest image/build tooling for
+those artifacts. This command records their reviewed pins, not their build
+provenance. It never invokes an input executable.
+
+From the source checkout whose SDK/controller you want to freeze:
+
+```sh
+python3 scripts/prepare_factory_native_reaper.py \
+  --plan /staged/reaper-plan.json --output /var/tmp/reaper-bundle
+```
+
+The output must not exist. Its parent must be an absolute canonical directory
+(use the real `/private/...` path on macOS). The command:
+
+- Copies each artifact into private storage while checking its expected hash,
+  size bound and file identity, then seals the copy read-only.
+- Generates deterministic `inputs/source.tar` and `inputs/acceptance.tar` from
+  the frozen probe and sentinel; validates them with the existing job parser.
+- Freezes the SDK/controller and records the checkout's Git revision, relevant
+  dirty-source status, source-file hashes, and artifact hashes/sizes in
+  `preparation.json`. Source changes during assembly fail the preparation.
+- Binds that receipt into a version-two `manifest.json` and verifies the whole
+  bundle. The same unchanged source and artifacts produce identical manifests
+  across different output locations.
+
+The supplied daemon's `daemon_build_revision` is explicitly a declaration:
+`daemon_build_revision_verified` remains `false`. The checkout revision describes
+preparation/support code. It does not prove which source produced a prebuilt
+binary. `runtime_verified` and `hermetic_build` also remain `false`. A dirty
+checkout is recorded as such with exact relevant file hashes; use a clean checkout
+for a bundle reproducible from its recorded Git commit. The `source_files_clean`
+flag covers the preparation/support files listed in the receipt.
+
+Save the printed manifest `sha256`. Failed assembly removes only its newly
+created output; an existing output is never adopted or overwritten. The helper
+copies whole rootfs contents, so budget for the output's full disk size.
+Transfer the complete bundle to the test host if necessary. Before privileged
+execution, make it and all its contents root-owned, retain its `0700` root
+permissions, and prohibit group/other writes. Executables already have mode
+`0500`. Do not modify inputs after preparation.
 
 Verify using the frozen controller and the saved digest:
 
@@ -68,6 +108,10 @@ Verify using the frozen controller and the saved digest:
 sudo python3 /var/tmp/reaper-bundle/support/scripts/ci/factory_native_reaper_e2e.py \
   verify --bundle /var/tmp/reaper-bundle --sha256 MANIFEST_SHA256
 ```
+
+The older `factory_native_reaper_e2e.py prepare --bundle ...` mode still accepts
+a manually staged directory and emits a version-one manifest. The verifier
+supports both versions; new version-two receipts are hashed as required inputs.
 
 ## Run once
 

@@ -75,7 +75,7 @@ def write_once(path, value):
         os.close(fd)
 
 
-def prepare(bundle):
+def prepare(bundle, preparation=None):
     private_directory(bundle, os.geteuid())
     require(not (bundle/'manifest.json').exists() and not (bundle/'control').exists(),
             'existing preparation or execution must never be reused')
@@ -84,6 +84,10 @@ def prepare(bundle):
             if parent == bundle: break
             require(not parent.is_symlink(), 'symlink input directory')
         pin(bundle/name, limit)
+    if preparation is not None:
+        write_once(bundle/'preparation.json', preparation)
+    else:
+        require(not (bundle/'preparation.json').exists(), 'unbound preparation receipt')
     support = bundle/'support'
     support.mkdir(mode=0o700)
     repo = Path(__file__).resolve().parents[2]
@@ -94,7 +98,9 @@ def prepare(bundle):
         destination.chmod(0o500 if relative.endswith('factory_native_reaper_e2e.py') else 0o400)
     files = {name: pin(bundle/name, limit) for name, limit in INPUTS.items()}
     files.update({'support/'+name: pin(support/name, 1024**2) for name in SUPPORT})
-    write_once(bundle/'manifest.json', dict(version=1, files=files))
+    if preparation is not None:
+        files['preparation.json'] = pin(bundle/'preparation.json', 65536)
+    write_once(bundle/'manifest.json', dict(version=2 if preparation is not None else 1, files=files))
     return dict(status='prepared', activated=False,
                 sha256=pin(bundle/'manifest.json', 1024**2)['sha256'])
 
@@ -104,7 +110,10 @@ def verify(bundle, expected):
     require(pin(bundle/'manifest.json', 1024**2)['sha256'] == expected, 'manifest digest mismatch')
     manifest = json.loads((bundle/'manifest.json').read_text())
     limits = dict(INPUTS, **{'support/'+name: 1024**2 for name in SUPPORT})
-    require(manifest.get('version') == 1 and set(manifest['files']) == set(limits),
+    if manifest.get('version') == 2:
+        limits['preparation.json'] = 65536
+    require(type(manifest.get('version')) is int and manifest['version'] in (1, 2)
+            and set(manifest['files']) == set(limits),
             'unsupported manifest inventory')
     for name, limit in limits.items():
         path = bundle/name
