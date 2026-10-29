@@ -1664,21 +1664,24 @@ mod tests {
             let snapshot = SnapshotPaths::in_dir(temp.path().join("snapshot"));
             let task = tokio::spawn(async move { cloned.restore_vm(&snapshot, target).await });
             let serial = temp.path().join(format!("{id}.serial.log"));
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            // This is fixture readiness, not the behavior under test. Coverage
+            // instrumentation and shared runners can delay process/fs setup;
+            // avoid a busy poll and leave room for the 3s version probe.
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 while !serial.exists() {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             })
             .await
-            .unwrap();
+            .expect("restore did not reach serial setup within 10s");
             // Serial creation follows stale-socket removal, so this bind cannot
             // be erased by the restore's setup path.
             let listener =
                 tokio::net::UnixListener::bind(temp.path().join(format!("{id}.sock"))).unwrap();
             let (mut peer, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
                     .await
-                    .unwrap()
+                    .expect("restore did not connect to the fixture API within 10s")
                     .unwrap();
             let mut request = vec![0; 4096];
             let n = peer.read(&mut request).await.unwrap();
