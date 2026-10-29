@@ -1,4 +1,4 @@
-.PHONY: test-sdk test-dev-e2e-gated all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-deploy-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline test-kernel-config coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
+.PHONY: test-sdk test-dev-e2e-gated all build build-release build-agent build-agent-aarch64 build-with-agent build-release-with-agent build-deploy-with-agent build-release-macos sign-macos test test-unit test-macos test-e2e test-e2e-gated test-net-e2e-gated test-qemu-e2e-gated test-vz-cloud-e2e-gated test-vz-stop-e2e-gated test-idle-policy-e2e-gated test-oci-boot-e2e-gated test-suspend-fork-e2e-gated test-pool-e2e-gated test-contracts test-failure-injection test-perf-baseline test-kernel-config coverage-ci mutation-gate fuzz-check fuzz-smoke graceful-shutdown-drill test-linux-shutdown-drill-gated test-deploy-rollback-drill-gated chaos-tests nightly-quality lint fmt fmt-check clippy clippy-macos check check-macos check-deploy-script deploy-husker-dev clean install install-restart run-daemon update-rootfs build-initramfs test-initramfs build-kernel-image build-rootfs build-k3s-rootfs build-k3s-kernel test-k3s build-microvm-kernel audit deny update-deps check-deps setup release-patch release-minor release-major post-release
 
 # Target architecture for guest build targets (aarch64 = macOS VZ, x86_64 = Firecracker).
 ARCH ?= aarch64
@@ -246,6 +246,30 @@ test-vz-cloud-e2e-gated: ## Gated VZ cloud-image e2e (macOS only)
 	else \
 		echo "Skipping VZ cloud-image e2e (set HUSKER_RUN_VZ_CLOUD_E2E=1; macOS + qemu-img + HUSKER_VZ_CLOUD_IMAGE)"; \
 		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=vz cloud e2e gate not run::VZ cloud-image e2e was SKIPPED (HUSKER_RUN_VZ_CLOUD_E2E is not '1'); this job is green but exercised no e2e"; \
+		true; \
+	fi
+
+# Gated Apple VZ stop e2e (macOS only): boots a real VM, so the test binary is
+# signed with the virtualization entitlement before it runs. Defaults to the
+# local install's boot images.
+# Usage: HUSKER_RUN_VZ_STOP_E2E=1 make test-vz-stop-e2e-gated
+VZ_E2E_DATA = $(HOME)/.local/share/husker
+HUSKER_VZ_KERNEL ?= $(VZ_E2E_DATA)/kernels/Image-virt
+HUSKER_VZ_INITRD ?= $(VZ_E2E_DATA)/kernels/initramfs-virt.gz
+HUSKER_VZ_ROOTFS ?= $(VZ_E2E_DATA)/images/alpine-aarch64.ext4
+test-vz-stop-e2e-gated: ## Gated VZ stop e2e (macOS only)
+	@if [ "$${HUSKER_RUN_VZ_STOP_E2E:-0}" = "1" ]; then \
+		build=$$(cargo test -p husker-vmm --test vz_stop_e2e --no-run 2>&1) || \
+			{ echo "$$build"; exit 1; }; \
+		bin=$$(echo "$$build" | sed -n 's/^ *Executable tests\/vz_stop_e2e\.rs (\(.*\))$$/\1/p'); \
+		[ -n "$$bin" ] || { echo "$$build"; echo "no vz_stop_e2e test executable in the build output"; exit 1; }; \
+		codesign --entitlements husker.entitlements --force --sign - "$$bin" && \
+		HUSKER_VZ_KERNEL="$(HUSKER_VZ_KERNEL)" HUSKER_VZ_INITRD="$(HUSKER_VZ_INITRD)" \
+			HUSKER_VZ_ROOTFS="$(HUSKER_VZ_ROOTFS)" "$$bin" --ignored --exact --nocapture \
+			stop_returns_only_after_the_guest_has_released_its_rootfs; \
+	else \
+		echo "Skipping VZ stop e2e (set HUSKER_RUN_VZ_STOP_E2E=1; macOS + local boot images)"; \
+		[ -n "$${GITHUB_ACTIONS:-}" ] && echo "::warning title=vz stop e2e gate not run::VZ stop e2e was SKIPPED (HUSKER_RUN_VZ_STOP_E2E is not '1'); this job is green but exercised no e2e"; \
 		true; \
 	fi
 
