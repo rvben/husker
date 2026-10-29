@@ -43,7 +43,9 @@ def arm(client, journal, key, image, source, acceptance, resources, before_path)
     journal.bind(key, job.receipt)
     if job.receipt.replayed is not False:
         raise ValueError('fresh acceptance required; inspect without resubmitting')
-    deadline = time.monotonic()+90
+    # Cold pinned-image copies consume the same 600s stage budget. Allow them
+    # to finish before deciding whether a running guest is safe to fault.
+    deadline = time.monotonic()+300
     while True:
         snapshot = job.info()
         stdout, stderr = lifecycle.boundary.collect_logs(job)
