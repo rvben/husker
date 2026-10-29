@@ -54,6 +54,41 @@ released only after cleanup of the job's VM and files is confirmed. A rejected
 fresh request receives HTTP 429 and creates no receipt. Independently of the
 budget, a daemon holds at most 16 active or cleanup-pending jobs.
 
+## Prepare the job image
+
+A job boots a catalog image directly with the daemon's kernel, and the guest
+starts through the image's `/sbin/init`. The image must be an ext4 `rootfs`
+imported from a file. Images pulled from an OCI registry boot the agent as PID 1
+instead and are refused. The image must also contain two binaries from the same
+build as the daemon:
+
+| Path | Built from |
+| --- | --- |
+| `/usr/local/bin/husker-agent` | the `husker-agent` binary of the `husker-agent` crate |
+| `/usr/local/bin/husker-job-runner` | the `husker-job-runner` binary of the same crate |
+
+`make update-rootfs ROOTFS_IMAGE=<image.ext4>` builds both for aarch64,
+writes them into the image and verifies the bytes. For x86_64, build them with
+`cargo build --package husker-agent --profile agent --target
+x86_64-unknown-linux-musl` and write them into the image the same way.
+
+A missing piece is reported on the job, not at submission. An agent older than
+protocol 7 ends the job in `infrastructure_failed` with "guest agent does not
+support durable session replay"; a missing runner ends it in
+`infrastructure_failed` with an `exec failed to start
+/usr/local/bin/husker-job-runner` staging error. Both are recorded in the job's
+result manifest.
+
+The specification pins the image by identity. `catalog_id` is the image's
+catalog ID, `rootfs_digest` must equal the image's `content_digest`, and
+`kernel_digest` must be the SHA-256 of the file at the daemon's
+`default_kernel`. Set `initrd_digest` to the SHA-256 of `default_initrd` to boot
+with it, or to `null` to boot without an initrd. Each file is copied for the
+job and verified against its digest before boot, so replacing a file under the
+same path makes later jobs fail instead of running different bytes. Import an
+image with `husker image import --source <image.ext4> <name>` and read both
+identities from `husker image get <name> -o json`.
+
 ## Authentication and trust
 
 Every factory route requires the configured bearer token, including over
@@ -186,8 +221,9 @@ never counts as passing.
 `POST /v1/jobs/{id}/cancel` persists a cancellation decision. It returns 202
 while cleanup is still pending and 200 once cleanup is confirmed, with the job
 inspection in both cases. The first terminal decision wins: cancelling a job
-that already completed returns the completed outcome. Cancellation keeps the output captured so far and
-marks collection failed when the final tail is unavailable. A VM created while
+that already completed returns the completed outcome. Cancellation keeps the
+output captured so far and marks collection failed when the final tail is
+unavailable. A VM created while
 cancellation was in flight still belongs to the job and is cleaned up with it.
 
 Acknowledged cancellation does not mean the VM is gone. Inspect the job until
