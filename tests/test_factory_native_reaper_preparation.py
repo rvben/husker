@@ -49,6 +49,9 @@ class NativeReaperPreparationTests(unittest.TestCase):
             self.assertFalse(provenance['daemon_build_revision_verified'])
             self.assertEqual(provenance['source_revision'], subprocess.check_output(
                 ['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip())
+            # Golden archive emitted by Rust FrozenBundle::from_files, not Python tarfile.
+            self.assertEqual((bundle/'inputs/acceptance.tar').read_bytes(),
+                             (ROOT/'tests/fixtures/lifecycle-acceptance.frozen.tar').read_bytes())
             with tarfile.open(bundle/'inputs/source.tar') as archive:
                 self.assertEqual(set(archive.getnames()), {'factory-lifecycle-probe', 'frozen-sentinel'})
                 self.assertEqual(archive.extractfile('factory-lifecycle-probe').read(), (root/'probe').read_bytes())

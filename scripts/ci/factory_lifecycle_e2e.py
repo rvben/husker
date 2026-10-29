@@ -30,6 +30,30 @@ def outcome(case):
 READY = dict(type='ready',scope='escaped-family-v1',descendants=2,setsid=True,ignore_sigterm=True)
 
 
+def frozen_payload(probe=None):
+    """Exact FrozenBundle v1 bytes for this probe's two finite payload shapes."""
+    files = {'frozen-sentinel': (0o644, boundary.SENTINEL)}
+    if probe is not None:
+        if not isinstance(probe, bytes) or not 0 < len(probe) <= 4*1024**2:
+            raise ValueError('bounded lifecycle probe bytes required')
+        files['factory-lifecycle-probe'] = (0o755, probe)
+    result = bytearray()
+    for name, (mode, data) in sorted(files.items()):
+        item = tarfile.TarInfo(name)
+        item.uid = item.gid = item.mtime = 0
+        item.mode, item.size = mode, len(data)
+        header = bytearray(item.tobuf(format=tarfile.USTAR_FORMAT))
+        # Rust tar::Header::set_cksum uses seven octal digits plus NUL,
+        # unlike Python's six digits plus NUL/space. No record-size padding.
+        checksum = sum(header[:148])+8*ord(' ')+sum(header[156:])
+        header[148:156] = ('%07o\0' % checksum).encode('ascii')
+        result.extend(header)
+        result.extend(data)
+        result.extend(b'\0'*(-len(data) % 512))
+    result.extend(b'\0'*1024)
+    return bytes(result)
+
+
 def validate_inputs(source, acceptance, probe_digest):
     for data, names in ((source, {'factory-lifecycle-probe','frozen-sentinel'}),
                         (acceptance, {'frozen-sentinel'})):
@@ -44,6 +68,9 @@ def validate_inputs(source, acceptance, probe_digest):
                 item = archive.getmember('factory-lifecycle-probe')
                 if item.mode != 0o755 or digest(archive.extractfile(item).read()) != probe_digest:
                     raise ValueError('reviewed lifecycle probe pin mismatch')
+            probe_bytes = archive.extractfile('factory-lifecycle-probe').read() if 'factory-lifecycle-probe' in names else None
+            if data != frozen_payload(probe_bytes):
+                raise ValueError('payload is not canonical FrozenBundle v1')
 
 
 def command(case):

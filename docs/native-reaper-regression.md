@@ -77,8 +77,10 @@ The output must not exist. Its parent must be an absolute canonical directory
 
 - Copies each artifact into private storage while checking its expected hash,
   size bound and file identity, then seals the copy read-only.
-- Generates deterministic `inputs/source.tar` and `inputs/acceptance.tar` from
-  the frozen probe and sentinel; validates them with the existing job parser.
+- Generates canonical FrozenBundle v1 `inputs/source.tar` and
+  `inputs/acceptance.tar` from the frozen probe and sentinel. Checks exact
+  header encoding, file modes and padding before any API submission; ordinary
+  Python/system tar archives are not interchangeable with this wire format.
 - Freezes the SDK/controller and records the checkout's Git revision, relevant
   dirty-source status, source-file hashes, and artifact hashes/sizes in
   `preparation.json`. Source changes during assembly fail the preparation.

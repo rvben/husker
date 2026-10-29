@@ -335,3 +335,24 @@ mod filesystem {
         assert_eq!(fs::read_dir(foreign.path()).unwrap().count(), 0);
     }
 }
+
+// These tiny fixtures were emitted by the Rust CLI, and the Python assembler
+// must match them byte-for-byte. Keep both sides on the same frozen-wire seam.
+#[test]
+fn lifecycle_payload_fixtures_are_canonical_frozen_v1() {
+    let source =
+        decode(include_bytes!("../../../tests/fixtures/lifecycle-source.frozen.tar").to_vec())
+            .unwrap();
+    assert_eq!(source.files().len(), 2);
+    assert_eq!(source.files()["factory-lifecycle-probe"].data, b"probe\n");
+    assert!(source.files()["factory-lifecycle-probe"].executable);
+    let acceptance =
+        decode(include_bytes!("../../../tests/fixtures/lifecycle-acceptance.frozen.tar").to_vec())
+            .unwrap();
+    assert_eq!(acceptance.files().len(), 1);
+    assert_eq!(
+        acceptance.files()["frozen-sentinel"].data,
+        b"factory-boundary-sentinel-v1\n"
+    );
+    assert!(!acceptance.files()["frozen-sentinel"].executable);
+}

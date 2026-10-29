@@ -5,7 +5,6 @@ Copies prebuilt artifacts; never downloads, builds, installs, starts a daemon,
 boots a VM, or injects a fault. See docs/native-reaper-regression.md.
 """
 import argparse
-import io
 import json
 import os
 from pathlib import Path
@@ -14,7 +13,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +25,6 @@ ARTIFACTS = {'daemon': 'bin/husker', 'firecracker': 'bin/firecracker',
              'probe': 'bin/factory-lifecycle-probe', 'kernel': 'prepared/vmlinux',
              'rootfs': 'prepared/rootfs.ext4'}
 SOURCE_FILES = native.SUPPORT+['scripts/prepare_factory_native_reaper.py', 'scripts/prepare_factory_arm64.py']
-SENTINEL = b'factory-boundary-sentinel-v1\n'
 
 
 def source_identity():
@@ -53,15 +50,9 @@ def validate_artifact_headers(bundle):
 
 
 def payload(path, probe=None):
-    entries = {'frozen-sentinel': (0o444, SENTINEL)}
-    if probe is not None:
-        entries['factory-lifecycle-probe'] = (0o755, probe.read_bytes())
-    with tarfile.open(path, 'x', format=tarfile.USTAR_FORMAT) as archive:
-        for name, (mode, data) in sorted(entries.items()):
-            item = tarfile.TarInfo(name)
-            item.uid = item.gid = item.mtime = 0
-            item.mode, item.size = mode, len(data)
-            archive.addfile(item, io.BytesIO(data))
+    import factory_lifecycle_e2e as lifecycle
+    with path.open('xb') as archive:
+        archive.write(lifecycle.frozen_payload(None if probe is None else probe.read_bytes()))
 
 
 def assemble(plan, output):

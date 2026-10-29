@@ -1,5 +1,7 @@
 import copy
 import importlib.util
+import io
+import tarfile
 import json
 from pathlib import Path
 import shutil
@@ -15,6 +17,25 @@ spec.loader.exec_module(probe)
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_payload_bytes_match_rust_frozen_bundle_fixtures(self):
+        fixtures = Path(__file__).parent/'fixtures'
+        source = (fixtures/'lifecycle-source.frozen.tar').read_bytes()
+        acceptance = (fixtures/'lifecycle-acceptance.frozen.tar').read_bytes()
+        self.assertEqual(probe.frozen_payload(b'probe\n'), source)
+        self.assertEqual(probe.frozen_payload(), acceptance)
+        probe.validate_inputs(source, acceptance, probe.digest(b'probe\n'))
+
+    def test_readable_but_noncanonical_tar_is_rejected_before_submission(self):
+        source = (Path(__file__).parent/'fixtures/lifecycle-source.frozen.tar').read_bytes()
+        for mode in (0o444, 0o644):
+            stream = io.BytesIO()
+            with tarfile.open(fileobj=stream, mode='w', format=tarfile.USTAR_FORMAT) as archive:
+                item = tarfile.TarInfo('frozen-sentinel')
+                item.mode, item.size = mode, len(probe.boundary.SENTINEL)
+                archive.addfile(item, io.BytesIO(probe.boundary.SENTINEL))
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'canonical FrozenBundle'):
+                probe.validate_inputs(source, stream.getvalue(), probe.digest(b'probe\n'))
+
     def fixture(self, case):
         submission = probe.submission_for_stage('key',{'id':'image'},b'source',b'acceptance',
             [probe.command(case)['argv']],correlation=dict(job='escaped-family-proof',stage='baseline',round=probe.ALL_CASES.index(case)),
