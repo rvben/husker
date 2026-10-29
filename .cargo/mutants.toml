@@ -1,13 +1,11 @@
 # cargo-mutants configuration for `make mutation-gate`.
 #
-# The gate runs real mutation testing on husker-agent-proto (the length-prefix
-# framing + base64 shared by host and guest agent). Every mutant that models a
-# real behavioural property is killed by a test in `src/lib.rs`. The exclusions
-# below are mutants that are provably equivalent or only observable as a
-# non-deterministic wall-clock timeout, so pinning them would add brittle or
-# flaky tests without catching a real defect. Each is anchored narrowly so it
-# does not mask a genuine survivor.
+# Exercise the shared wire, frozen-input and result contracts. Insertion-order
+# maps make canonical key sorting observable even when a consumer enables that
+# serde_json feature; ordinary package tests retain the default map mode.
+features = ["serde_json/preserve_order"]
 #
+# Exclusions below cover proven equivalence or existing timeout-only mutants.
 # All exclusions are anchored on the containing function name (not line numbers)
 # so they survive edits elsewhere in the file. The chunked payload read lives in
 # its own `read_exact_chunked` helper precisely so its loop-counter mutant can be
@@ -35,21 +33,13 @@ exclude_re = [
     'replace \+= with \*= in base64_encode',   # `i += 3`
     'replace \+= with \*= in base64_decode',   # `i += 4`
 
-    # job_spec.rs: serde_json is built without `preserve_order`, so every Map
-    # is already key-sorted and `sort_json_keys` cannot change the output. It
-    # guards canonical digests should a dependency ever enable that feature;
-    # the canonical-JSON tests expect sorted literals and would then kill these.
-    'replace sort_json_keys with \(\)',
-    'delete match arm .* in sort_json_keys',
-
-    # frozen_bundle_fs.rs: libc open(2) flag sets are built from disjoint single
-    # bits and O_RDONLY is 0, so `|` and `^` produce the same value (in `open`,
-    # `^` binds tighter than `|`, so the mutated flags are the same bit union).
-    'replace \| with \^ in (open|names|walk|collect_declared_artifact|FrozenBundle::write_new_file|FrozenBundle::extract_new_directory)$',
-    # `names` opens "." of an already verified directory, and `extract_new_directory`
-    # opens the directory it has just created (or one `mkdir` reported as
-    # existing), so dropping O_DIRECTORY or O_CLOEXEC changes nothing observable.
-    'replace \| with & in (names|FrozenBundle::extract_new_directory)$',
+    # These call sites combine disjoint constant Unix flags (O_RDONLY is zero),
+    # so OR and XOR are identical. The generic `open` helper is deliberately
+    # tested with flags already present: toggling either security bit must fail.
+    'replace \| with \^ in (open_fresh_directory|walk|collect_declared_artifact|FrozenBundle::write_new_file|FrozenBundle::extract_new_directory)$',
+    # Extraction opens a directory just created or reported as existing. Removing
+    # the redundant O_DIRECTORY flag cannot make a successful extraction differ.
+    'replace \| with & in FrozenBundle::extract_new_directory$',
     # Reading `size + 1` instead of `size` bytes only matters for a file that
     # grows during the read, which the length and metadata comparison after the
     # read already rejects; `size * 1` therefore reads the same accepted inputs.

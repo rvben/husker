@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use super::{
@@ -27,7 +27,7 @@ fn open(parent: &File, name: &str, flags: i32) -> Result<File, BundleError> {
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            (flags | libc::O_CLOEXEC) | libc::O_NOFOLLOW,
             0o600,
         )
     };
@@ -131,27 +131,30 @@ pub fn collect_declared_artifact(
     Err(BundleError::Invalid("empty artifact path"))
 }
 
-fn names(directory: &File) -> Result<Vec<String>, BundleError> {
+fn open_fresh_directory(directory: &File) -> Result<File, BundleError> {
     // Open a fresh directory description; dup would share readdir's offset.
     let dot = CString::new(".").expect("static component");
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             dot.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    let stream = unsafe { libc::fdopendir(fd) };
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn names(directory: &File) -> Result<Vec<String>, BundleError> {
+    let descriptor = open_fresh_directory(directory)?;
+    let stream = unsafe { libc::fdopendir(descriptor.as_raw_fd()) };
     if stream.is_null() {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(error.into());
+        return Err(io::Error::last_os_error().into());
     }
+    // fdopendir owns the descriptor only after it succeeds.
+    let _fd = descriptor.into_raw_fd();
     struct Directory(*mut libc::DIR);
     impl Drop for Directory {
         fn drop(&mut self) {
@@ -455,6 +458,16 @@ mod tests {
         assert_eq!(unsafe { libc::close(0) }, 0);
         let file = open(&parent, "f", libc::O_RDONLY).unwrap();
         assert_eq!(file.as_raw_fd(), 0);
+    }
+
+    #[test]
+    fn directory_open_is_close_on_exec_before_fdopendir_can_set_the_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = directory(temp.path());
+        let descriptor = open_fresh_directory(&parent).unwrap();
+        assert!(descriptor.metadata().unwrap().is_dir());
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
