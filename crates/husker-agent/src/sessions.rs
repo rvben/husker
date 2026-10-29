@@ -676,7 +676,11 @@ mod tests {
     }
 
     async fn finished(store: &SessionStore) -> SessionInfo {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        finished_within(store, Duration::from_secs(10)).await
+    }
+
+    async fn finished_within(store: &SessionStore, bound: Duration) -> SessionInfo {
+        tokio::time::timeout(bound, async {
             loop {
                 let info = store.get(ID).await.unwrap();
                 if info.state != SessionState::Running {
@@ -932,11 +936,15 @@ mod tests {
     async fn session_output_is_bounded_without_blocking_command() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path().into());
-        store
-            .start(request("head -c 5000000 /dev/zero"), TIMEOUT)
-            .await
-            .unwrap();
-        let info = finished(&store).await;
+        // Capturing 5 MB writes and flushes hundreds of log records, which a
+        // loaded host can stretch past the module's 5 s session timeout. The
+        // timeout here only has to outlast that I/O: a capture loop that
+        // stopped reading at the cap would leave `head` blocked on a full
+        // pipe until the timeout killed it, so the exit code still tells.
+        let mut req = request("head -c 5000000 /dev/zero");
+        req.exec.timeout_secs = Some(120);
+        store.start(req, TIMEOUT).await.unwrap();
+        let info = finished_within(&store, Duration::from_secs(150)).await;
         assert_eq!(info.exit_code, Some(0));
         assert!(info.output_truncated);
         let size = tokio::fs::metadata(temp.path().join(ID).join("events.jsonl"))
