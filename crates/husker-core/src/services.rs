@@ -2,10 +2,7 @@ use super::*;
 
 impl<B: VmmBackend> HuskerCore<B> {
     fn reconcile_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.reconcile_locks.lock();
-        map.entry(id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        self.reconcile_locks.get(&id)
     }
 
     /// Create a host group.

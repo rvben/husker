@@ -8,6 +8,7 @@ pub mod job_worker;
 #[cfg(any(target_os = "linux", test))]
 mod orphan_process;
 use job_boot::PreparedBoot;
+use named_locks::NamedLocks;
 pub mod job_spec;
 
 /// Userspace TCP port-forward proxy. Used on backends without host nftables
@@ -24,6 +25,7 @@ mod host_resources;
 mod idle;
 mod images;
 pub mod macos_guest;
+mod named_locks;
 mod network;
 #[cfg(feature = "linux-net")]
 mod oci_materializer;
@@ -1065,24 +1067,17 @@ pub struct HuskerCore<B: VmmBackend> {
     /// Confirmed generic allocation destruction awaiting its durable lease receipt.
     destroyed_creation_leases: parking_lot::Mutex<std::collections::HashMap<Uuid, Uuid>>,
     /// Per-VM-name locks guarding the create/destroy critical section.
-    vm_name_locks:
-        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Factory lifecycle locks span allocation and cleanup. Weak entries are
-    /// pruned on access so completed jobs do not accumulate lock-map entries.
-    job_lifecycle_locks: parking_lot::Mutex<
-        std::collections::HashMap<Uuid, std::sync::Weak<tokio::sync::Mutex<()>>>,
-    >,
+    vm_name_locks: NamedLocks<String>,
+    /// Factory lifecycle locks span allocation and cleanup.
+    job_lifecycle_locks: NamedLocks<Uuid>,
     /// Per-image-name locks serialize catalog publication and make a repeated
     /// commit idempotent without allowing two VMs to race on the same path.
-    image_name_locks:
-        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    image_name_locks: NamedLocks<String>,
     /// Per-volume locks span asynchronous VM preparation and catalog deletion,
     /// closing the gap that cannot safely be covered by a SQLite transaction.
-    volume_locks:
-        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    volume_locks: NamedLocks<String>,
     /// Per-service reconcile locks; serialize concurrent reconciles of the same service.
-    reconcile_locks:
-        parking_lot::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    reconcile_locks: NamedLocks<Uuid>,
     /// Last control-plane activity (exec/shell/API touch) per VM, feeding the
     /// idle policy's `idle_for` calculation. In-memory only; a daemon restart
     /// loses history, but `seed_activity` reseeds a VM's clock on next sighting.
@@ -1271,11 +1266,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             factory_workers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             factory_destroyed_allocations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             destroyed_creation_leases: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            job_lifecycle_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            vm_name_locks: NamedLocks::new(),
+            job_lifecycle_locks: NamedLocks::new(),
+            image_name_locks: NamedLocks::new(),
+            volume_locks: NamedLocks::new(),
+            reconcile_locks: NamedLocks::new(),
             control_plane_last_active: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -1326,11 +1321,11 @@ impl<B: VmmBackend> HuskerCore<B> {
             factory_workers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             factory_destroyed_allocations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             destroyed_creation_leases: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            vm_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            job_lifecycle_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            image_name_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            volume_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            reconcile_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            vm_name_locks: NamedLocks::new(),
+            job_lifecycle_locks: NamedLocks::new(),
+            image_name_locks: NamedLocks::new(),
+            volume_locks: NamedLocks::new(),
+            reconcile_locks: NamedLocks::new(),
             control_plane_last_active: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -1550,35 +1545,19 @@ impl<B: VmmBackend> HuskerCore<B> {
     }
 
     fn vm_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.vm_name_locks.lock();
-        map.entry(name.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        self.vm_name_locks.get(name)
     }
 
     fn job_lifecycle_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.job_lifecycle_locks.lock();
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(&id).and_then(std::sync::Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        locks.insert(id, Arc::downgrade(&lock));
-        lock
+        self.job_lifecycle_locks.get(&id)
     }
 
     fn image_name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.image_name_locks.lock();
-        map.entry(name.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        self.image_name_locks.get(name)
     }
 
     fn volume_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.volume_locks.lock();
-        map.entry(name.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        self.volume_locks.get(name)
     }
 }
 
@@ -5611,6 +5590,61 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             serde_json::from_str(r#"{"name":"svc","kernel_path":"/k","rootfs_path":"/r"}"#)
                 .unwrap();
         assert!(req.volume.is_none(), "volume must default to None");
+    }
+
+    /// Requests naming VMs, volumes and images that do not exist still take
+    /// the per-name lock before looking the name up. None of them may leave a
+    /// lock-map entry behind, or every typo and every since-deleted name grows
+    /// the daemon's memory for its whole lifetime.
+    #[tokio::test]
+    async fn requests_for_missing_names_leave_no_lock_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = husker_state::StateStore::open_memory().unwrap();
+        let storage = husker_storage::StorageConfig {
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+        };
+        let runtime_dir = tmp.path().join("run");
+        #[cfg(not(feature = "linux-net"))]
+        let core = HuskerCore::new(
+            husker_vmm::apple_vz::AppleVzBackend::new(&runtime_dir),
+            state,
+            storage,
+            runtime_dir,
+        );
+        #[cfg(feature = "linux-net")]
+        let core = HuskerCore::new(
+            husker_vmm::firecracker::FirecrackerBackend::new(
+                std::path::Path::new("firecracker"),
+                &runtime_dir,
+                std::sync::Arc::new(husker_vmm::cgroup::CgroupSupervisor::disabled()),
+            ),
+            state,
+            husker_net::IpAllocator::new(std::net::Ipv4Addr::new(172, 20, 0, 0), 24),
+            storage,
+            "husker0".into(),
+            vec![],
+            runtime_dir,
+        );
+        let core = Arc::new(core);
+
+        for i in 0..100 {
+            let name = format!("missing-{i}");
+            assert!(matches!(
+                core.stop_vm(&name).await,
+                Err(CoreError::VmNotFound(_))
+            ));
+            assert!(matches!(
+                core.delete_volume(&name).await,
+                Err(CoreError::VolumeNotFound(_))
+            ));
+            assert!(core.delete_image(&name).await.is_err());
+        }
+
+        // Pruning runs on access, so only the last released name may remain.
+        assert!(core.vm_name_locks.entries() <= 1);
+        assert!(core.volume_locks.entries() <= 1);
+        assert!(core.image_name_locks.entries() <= 1);
     }
 
     /// `create_volume` with mkfs.ext4 available: creates the sparse file and
