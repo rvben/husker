@@ -363,19 +363,20 @@ chaos-tests:
 # Nightly long-run quality suite
 nightly-quality: test-perf-baseline test-failure-injection mutation-gate graceful-shutdown-drill chaos-tests test-e2e-gated test-net-e2e-gated
 
-# Update guest rootfs image with latest agent binary and inittab.
+# Update guest rootfs image with latest agent, factory job runner and inittab.
 # Requires: aarch64-linux-musl-gcc cross-compiler, e2fsprogs (brew install e2fsprogs)
 ROOTFS_IMAGE ?= $(HOME)/.local/share/husker/images/alpine-aarch64.ext4
 DEBUGFS ?= $(shell find /opt/homebrew/Cellar/e2fsprogs -name debugfs -type f 2>/dev/null | head -1)
 AGENT_BIN = target/aarch64-unknown-linux-musl/agent/husker-agent
+JOB_RUNNER_BIN = target/aarch64-unknown-linux-musl/agent/husker-job-runner
 GUEST_INITTAB = guest/inittab
 
 update-rootfs: build-agent-aarch64
 	@test -f "$(ROOTFS_IMAGE)" || { echo "Error: rootfs not found at $(ROOTFS_IMAGE)"; exit 1; }
 	@test -n "$(DEBUGFS)" || { echo "Error: debugfs not found. Install e2fsprogs: brew install e2fsprogs"; exit 1; }
-	@echo "Injecting agent and inittab into $(ROOTFS_IMAGE) (single debugfs session)..."
-	@printf 'rm /usr/local/bin/husker-agent\nwrite %s /usr/local/bin/husker-agent\nset_inode_field /usr/local/bin/husker-agent mode 0100755\nrm /etc/inittab\nwrite %s /etc/inittab\n' \
-		"$(AGENT_BIN)" "$(GUEST_INITTAB)" | $(DEBUGFS) -w "$(ROOTFS_IMAGE)"
+	@echo "Injecting agent, job runner and inittab into $(ROOTFS_IMAGE) (single debugfs session)..."
+	@printf 'rm /usr/local/bin/husker-agent\nwrite %s /usr/local/bin/husker-agent\nset_inode_field /usr/local/bin/husker-agent mode 0100755\nrm /usr/local/bin/husker-job-runner\nwrite %s /usr/local/bin/husker-job-runner\nset_inode_field /usr/local/bin/husker-job-runner mode 0100755\nrm /etc/inittab\nwrite %s /etc/inittab\n' \
+		"$(AGENT_BIN)" "$(JOB_RUNNER_BIN)" "$(GUEST_INITTAB)" | $(DEBUGFS) -w "$(ROOTFS_IMAGE)"
 	@echo "Verifying injected files..."
 	@$(DEBUGFS) -R "dump /etc/inittab /tmp/husker-inittab-verify" "$(ROOTFS_IMAGE)" 2>/dev/null && \
 		cmp -s "$(GUEST_INITTAB)" /tmp/husker-inittab-verify && \
@@ -385,6 +386,10 @@ update-rootfs: build-agent-aarch64
 		cmp -s "$(AGENT_BIN)" /tmp/husker-agent-verify && \
 		rm -f /tmp/husker-agent-verify || \
 		{ echo "Error: /usr/local/bin/husker-agent in image does not match $(AGENT_BIN) -- injection failed"; rm -f /tmp/husker-agent-verify; exit 1; }
+	@$(DEBUGFS) -R "dump /usr/local/bin/husker-job-runner /tmp/husker-job-runner-verify" "$(ROOTFS_IMAGE)" 2>/dev/null && \
+		cmp -s "$(JOB_RUNNER_BIN)" /tmp/husker-job-runner-verify && \
+		rm -f /tmp/husker-job-runner-verify || \
+		{ echo "Error: /usr/local/bin/husker-job-runner in image does not match $(JOB_RUNNER_BIN) -- injection failed"; rm -f /tmp/husker-job-runner-verify; exit 1; }
 	@echo "Rootfs updated and verified."
 
 # Build initramfs for Alpine-based husker VMs.
