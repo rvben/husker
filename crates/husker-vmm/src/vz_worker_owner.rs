@@ -449,6 +449,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: true,
+            factory_recovery: false,
             host_shares: vec![],
         };
         let now = SystemTime::now()

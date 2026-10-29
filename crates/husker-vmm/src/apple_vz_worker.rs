@@ -506,6 +506,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: true,
+            factory_recovery: false,
             host_shares: vec![],
         };
         let runtime = backend.runtime_dir.join(generation_dir(id));

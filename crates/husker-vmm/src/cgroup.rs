@@ -158,6 +158,13 @@ impl CgroupSupervisor {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recovery_path(&self, id: uuid::Uuid) -> Option<PathBuf> {
+        self.base
+            .as_ref()
+            .map(|base| base.join(vm_cgroup_dir_name(id)))
+    }
+
     pub fn create_vm_cgroup(
         &self,
         id: uuid::Uuid,

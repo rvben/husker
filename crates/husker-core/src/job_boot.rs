@@ -226,6 +226,13 @@ impl<B: VmmBackend> HuskerCore<B> {
             Err(husker_state::StateError::VmNotFoundByName(_)) => (),
             Err(error) => return Err(error.into()),
         }
+        if record.as_ref().is_some_and(|vm| {
+            vm.network != NetworkMode::Isolated || vm.tap_device.is_some() || vm.guest_ip.is_some()
+        }) {
+            return Err(invalid(
+                "factory VM row has an incompatible offline profile",
+            ));
+        }
         let cid = if let Some(lease) = lease {
             if record
                 .as_ref()
@@ -272,7 +279,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
             match teardown {
                 FactoryTeardown::AbortAttempt => self.vmm.abort_create(vm_id).await?,
-                FactoryTeardown::Destroy => self.vmm.destroy_vm(vm_id).await?,
+                FactoryTeardown::Destroy => match self.vmm.destroy_vm(vm_id).await {
+                    Ok(()) => (),
+                    Err(husker_vmm::VmmError::VmNotFound(missing)) if missing == vm_id => {
+                        self.vmm
+                            .recover_factory_allocation(vm_id, &name, cid)
+                            .await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                },
             }
             // No await or fallible operation between positive destruction and
             // retained proof. Later retries do not infer death from VmNotFound.
@@ -419,6 +434,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             husker_vmm::serial_log::compaction_staging_path(&serial_log),
             serial_log,
             self.runtime_dir.join(format!("{vm_id}.boot.log")),
+            self.runtime_dir.join(format!("{vm_id}.recovery.json")),
         ] {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => (),
@@ -804,6 +820,8 @@ mod allocation_recovery_tests {
         destroys: AtomicUsize,
         aborts: AtomicUsize,
         observations: AtomicUsize,
+        durable: bool,
+        recoveries: AtomicUsize,
     }
 
     impl VmmBackend for OwnedAllocation {
@@ -835,6 +853,28 @@ mod allocation_recovery_tests {
             self.owned.store(false, Ordering::SeqCst);
             *self.info.lock() = None;
             Ok(())
+        }
+        async fn recover_factory_allocation(
+            &self,
+            id: Uuid,
+            name: &str,
+            cid: u32,
+        ) -> Result<(), husker_vmm::VmmError> {
+            self.recoveries.fetch_add(1, Ordering::SeqCst);
+            if self.durable
+                && id == self.id
+                && self
+                    .info
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|info| info.name == name && info.vsock_cid == cid)
+            {
+                Ok(())
+            } else {
+                Err(husker_vmm::VmmError::Unsupported(
+                    "missing durable proof".into(),
+                ))
+            }
         }
         // Mirrors Firecracker: an attempt that never published an owner holds
         // nothing, so absence from this instance's registry proves the abort.
@@ -926,11 +966,13 @@ mod allocation_recovery_tests {
             } else {
                 Some(info)
             }),
-            owned: AtomicBool::new(profile != "missing"),
+            owned: AtomicBool::new(!matches!(profile, "missing" | "recoverable")),
             fail_destroy: AtomicBool::new(profile == "destroy-fails"),
             destroys: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
             observations: AtomicUsize::new(0),
+            durable: profile == "recoverable",
+            recoveries: AtomicUsize::new(0),
         };
         let storage = husker_storage::StorageConfig {
             data_dir: path.to_path_buf(),
@@ -958,6 +1000,39 @@ mod allocation_recovery_tests {
         core.state
             .finish_job(job, JobState::Unknown, CollectionState::Failed, "{}")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_backend_recovery_journals_death_before_releasing_resources() {
+        for blocked in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (core, job, lease) = fixture(tmp.path(), "recoverable");
+            terminal(&core, job.id);
+            let connection = rusqlite::Connection::open(tmp.path().join("journal.sqlite")).unwrap();
+            if blocked {
+                connection.execute_batch("CREATE TRIGGER block_death BEFORE UPDATE OF vm_destroyed ON host_resource_leases BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;").unwrap();
+                assert!(core.cleanup_job_vm(job.id).await.is_err());
+                assert!(core.storage.vm_dir(&lease.vm_name).exists());
+                assert!(!core.state.get_job(job.id).unwrap().vm_destroyed);
+                assert_eq!(core.state.list_host_resource_leases().unwrap().len(), 1);
+                connection
+                    .execute_batch("DROP TRIGGER block_death;")
+                    .unwrap();
+                // Simulate losing the process-local proof in another crash.
+                core.factory_destroyed_allocations.lock().clear();
+            }
+            core.cleanup_job_vm(job.id).await.unwrap();
+            let receipt = core.state.get_job(job.id).unwrap();
+            assert!(receipt.vm_destroyed && !receipt.cleanup_pending);
+            assert_eq!(receipt.state, JobState::Unknown);
+            assert!(core.state.list_host_resource_leases().unwrap().is_empty());
+            assert!(!core.storage.vm_dir(&lease.vm_name).exists());
+            assert_eq!(
+                core.vmm.recoveries.load(Ordering::SeqCst),
+                if blocked { 2 } else { 1 }
+            );
+            core.cleanup_job_vm(job.id).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1250,6 +1325,8 @@ mod allocation_recovery_tests {
             destroys: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
             observations: AtomicUsize::new(0),
+            durable: false,
+            recoveries: AtomicUsize::new(0),
         };
         let storage = husker_storage::StorageConfig {
             data_dir: tmp.path().to_path_buf(),

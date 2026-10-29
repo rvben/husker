@@ -205,6 +205,22 @@ impl VmmBackend for LinuxDispatchBackend {
         }
     }
 
+    async fn recover_factory_allocation(
+        &self,
+        id: Uuid,
+        name: &str,
+        cid: u32,
+    ) -> Result<(), VmmError> {
+        if self.routes.lock().await.contains_key(&id) {
+            return Err(VmmError::InvalidConfig(
+                "factory generation still has a live backend route".into(),
+            ));
+        }
+        self.firecracker
+            .recover_factory_allocation(id, name, cid)
+            .await
+    }
+
     async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
         let kind = self.kind_of(id).await?;
         let result = match kind {
@@ -448,6 +464,20 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn recovery_refuses_a_generation_with_a_live_backend_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = missing_binary_dispatcher(dir.path());
+        let id = Uuid::new_v4();
+        backend.routes.lock().await.insert(id, VmmKind::Qemu);
+        let error = backend
+            .recover_factory_allocation(id, &format!("job-{}", Uuid::new_v4()), 31000)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("live backend route"));
+        assert_eq!(backend.kind_of(id).await.unwrap(), VmmKind::Qemu);
+    }
+
     fn missing_binary_dispatcher(dir: &std::path::Path) -> LinuxDispatchBackend {
         let cgroup = std::sync::Arc::new(crate::cgroup::CgroupSupervisor::disabled());
         let fc = crate::firecracker::FirecrackerBackend::new(
@@ -478,6 +508,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         }
     }

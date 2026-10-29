@@ -3,6 +3,8 @@
 mod creation;
 pub mod firecracker;
 pub(crate) mod guest_stop;
+#[cfg(target_os = "linux")]
+mod recovery;
 #[cfg(unix)]
 mod serial_capture;
 #[cfg(unix)]
@@ -147,6 +149,9 @@ pub struct VmConfig {
     /// core must set this explicitly for network:none on Apple VZ.
     #[serde(default)]
     pub network_disabled: bool,
+    /// Core-owned factory allocation, eligible for durable crash recovery.
+    #[serde(default)]
+    pub factory_recovery: bool,
     /// Host directories to share into the guest over virtiofs. Empty by default;
     /// each entry becomes a virtiofs device with the entry's `tag`.
     #[serde(default)]
@@ -662,6 +667,22 @@ pub trait VmmBackend: Send + Sync {
         id: Uuid,
     ) -> impl std::future::Future<Output = Result<(), VmmError>> + Send;
 
+    /// Recover an offline factory allocation using a durable backend receipt.
+    /// Called only after ordinary destruction reports an unknown generation.
+    /// Missing registries, PIDs or receipts alone are never success.
+    fn recover_factory_allocation(
+        &self,
+        _id: Uuid,
+        _name: &str,
+        _vsock_cid: u32,
+    ) -> impl std::future::Future<Output = Result<(), VmmError>> + Send {
+        async {
+            Err(VmmError::Unsupported(
+                "durable factory recovery unavailable".into(),
+            ))
+        }
+    }
+
     /// Undo a creation attempt that this backend instance ran for `id`,
     /// whether `create_vm` failed, was cancelled, or succeeded before a later
     /// step failed. `Ok(())` proves the attempt holds no host process or
@@ -795,6 +816,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         }
     }
@@ -1063,6 +1085,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         };
         assert!(c.host_shares.is_empty());

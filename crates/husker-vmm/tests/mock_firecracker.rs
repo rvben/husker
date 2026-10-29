@@ -212,6 +212,7 @@ async fn create_vm_missing_binary() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
 
@@ -256,6 +257,7 @@ async fn create_vm_failure_cleans_up_serial_log() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
 
@@ -342,6 +344,7 @@ async fn create_vm_api_failure_retains_child_and_files_until_confirmed_destroy()
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
 
@@ -413,6 +416,7 @@ async fn cancelled_boot_retains_spawned_child_for_confirmed_destroy() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
     let worker_backend = backend.clone();

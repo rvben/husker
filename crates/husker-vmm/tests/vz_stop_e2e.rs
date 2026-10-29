@@ -84,6 +84,7 @@ async fn stop_returns_only_after_the_guest_has_released_its_rootfs() {
         balloon: false,
         volume_path: None,
         network_disabled: true,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
     let selection = backend.select_backend_for_config(&config).expect("select");

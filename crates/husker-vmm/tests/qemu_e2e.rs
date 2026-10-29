@@ -76,6 +76,7 @@ async fn qemu_boots_and_vsock() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
     let info = backend
@@ -153,6 +154,7 @@ async fn qemu_create_failure_surfaces_boot_log_tail() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
     let err = backend.create(config).await.expect_err("create must fail");
@@ -216,6 +218,7 @@ async fn qemu_uefi_boots_cloud_image() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: Vec::new(),
     };
     let info = backend.create(config).await.expect("UEFI VM should boot");
@@ -289,6 +292,7 @@ async fn qemu_host_share_visible_in_guest() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: vec![husker_vmm::HostShare {
             host: share_dir.path().to_path_buf(),
             guest: "/share".into(),
@@ -424,6 +428,7 @@ async fn qemu_host_share_via_initramfs() {
         balloon: false,
         volume_path: None,
         network_disabled: false,
+        factory_recovery: false,
         host_shares: vec![husker_vmm::HostShare {
             host: share_dir.path().to_path_buf(),
             guest: "/share".into(),

@@ -592,7 +592,31 @@ impl FirecrackerBackend {
         {
             return Err(VmmError::ProcessError(format!("place vmm in cgroup: {e}")));
         }
+        #[cfg(target_os = "linux")]
+        let recovery = if config.factory_recovery
+            && config.network_disabled
+            && config.tap_device.is_none()
+            && let Some(cgroup) = self.cgroup.recovery_path(id)
+        {
+            Some(crate::recovery::Receipt::capture(
+                &instances.get(&id).unwrap().info,
+                &cgroup,
+            )?)
+        } else {
+            None
+        };
         drop(instances);
+        #[cfg(target_os = "linux")]
+        if let Some(receipt) = recovery {
+            // Persist before API configuration acquires guest devices. A crash
+            // before this receipt remains pending; never infer proof from absence.
+            let runtime = self.runtime_dir.clone();
+            tokio::task::spawn_blocking(move || receipt.persist(&runtime))
+                .await
+                .map_err(|error| {
+                    VmmError::ProcessError(format!("persist recovery receipt: {error}"))
+                })??;
+        }
 
         // Wait for the API socket to appear
         for _ in 0..50 {
@@ -772,6 +796,19 @@ impl VmmBackend for FirecrackerBackend {
             }
         }
 
+        if config.factory_recovery
+            && (!config.network_disabled
+                || config.tap_device.is_some()
+                || config
+                    .name
+                    .strip_prefix("job-")
+                    .and_then(|job| Uuid::parse_str(job).ok())
+                    .is_none())
+        {
+            return Err(VmmError::InvalidConfig(
+                "factory recovery requires an offline job generation".into(),
+            ));
+        }
         let id = crate::creation_id(&config)?;
         let _creation = self.creation_locks.lock(id).await;
         if self.instances.lock().await.contains_key(&id)
@@ -889,6 +926,41 @@ impl VmmBackend for FirecrackerBackend {
 
     async fn abort_create(&self, id: Uuid) -> Result<(), VmmError> {
         crate::abort_registered_create(self.destroy_vm(id).await)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn recover_factory_allocation(
+        &self,
+        id: Uuid,
+        name: &str,
+        cid: u32,
+    ) -> Result<(), VmmError> {
+        let _creation = self.creation_locks.lock(id).await;
+        if self.instances.lock().await.contains_key(&id)
+            || self.version_probes.lock().await.contains_key(&id)
+        {
+            return Err(VmmError::InvalidConfig(
+                "factory generation still has a backend owner".into(),
+            ));
+        }
+        let cgroup = self.cgroup.recovery_path(id).ok_or_else(|| {
+            VmmError::Unsupported("factory recovery requires cgroup supervision".into())
+        })?;
+        let receipt = crate::recovery::Receipt::load(&self.runtime_dir, id)?;
+        receipt
+            .confirm(id, name, cid, &self.runtime_dir, &cgroup)
+            .await?;
+        for suffix in ["sock", "vsock", "boot.log"] {
+            crate::termination::remove_runtime_file(
+                &self.runtime_dir.join(format!("{id}.{suffix}")),
+            )
+            .await?;
+        }
+        crate::serial_capture::remove_serial_log(&self.runtime_dir.join(self.serial_log_file(id)))
+            .await?;
+        // Retain the receipt until core durably journals destruction. Retries
+        // after a journal failure can repeat the same exact-generation proof.
+        Ok(())
     }
 
     async fn destroy_vm(&self, id: Uuid) -> Result<(), VmmError> {
@@ -1820,6 +1892,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         };
         let json = serde_json::to_value(&config).unwrap();
@@ -1976,6 +2049,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         };
 
@@ -2013,6 +2087,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         };
 
@@ -2420,6 +2495,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         };
         config.host_shares = vec![crate::HostShare {

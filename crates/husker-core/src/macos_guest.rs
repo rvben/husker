@@ -200,6 +200,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             balloon: req.balloon,
             volume_path: None,
             network_disabled: network_mode == NetworkMode::Isolated,
+            factory_recovery: false,
             host_shares: vec![],
         };
 

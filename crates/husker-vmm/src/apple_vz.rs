@@ -1544,6 +1544,7 @@ mod tests {
             balloon: false,
             volume_path: None,
             network_disabled: false,
+            factory_recovery: false,
             host_shares: Vec::new(),
         }
     }
