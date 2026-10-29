@@ -2577,28 +2577,38 @@ async fn logs_that_are_not_valid_utf8_are_shown_lossily() {
             "éb",
         ),
     ] {
-        let (core, dir) = logs_test_core("lossy", Some(""));
-        let serial_log = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.to_string_lossy().ends_with(".serial.log"))
-            .unwrap();
-        std::fs::write(&serial_log, content).unwrap();
-        let response = router(core)
-            .oneshot(
-                Request::get("/v1/vms/lossy/logs")
-                    .body(Body::empty())
-                    .unwrap(),
+        // A follow response never ends while the log exists, so its preload
+        // is read as the stream's first frame.
+        for uri in ["/v1/vms/lossy/logs", "/v1/vms/lossy/logs?follow=true"] {
+            let (core, dir) = logs_test_core("lossy", Some(""));
+            let serial_log = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.to_string_lossy().ends_with(".serial.log"))
+                .unwrap();
+            std::fs::write(&serial_log, content).unwrap();
+            let response = router(core)
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                response.into_body().frame(),
             )
             .await
+            .unwrap_or_else(|_| panic!("{uri}: no body within 10 s"))
+            .expect("a body frame")
+            .unwrap()
+            .into_data()
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_text(response).await;
-        assert!(
-            body.starts_with(expected_start),
-            "{:?}",
-            &body[..64.min(body.len())]
-        );
-        assert!(body.ends_with(expected_end));
+            let body = String::from_utf8(frame.to_vec()).unwrap();
+            assert!(
+                body.starts_with(expected_start),
+                "{uri}: {:?}",
+                body.chars().take(64).collect::<String>()
+            );
+            assert!(body.ends_with(expected_end), "{uri}");
+        }
     }
 }
