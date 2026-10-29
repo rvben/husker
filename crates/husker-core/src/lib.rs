@@ -7164,21 +7164,19 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         assert!(matches!(err, CoreError::InvalidState { .. }));
     }
 
-    /// macOS: a running VM without a discovered guest IP is a state conflict.
+    /// macOS: forwarding uses the guest agent, so DHCP discovery is unnecessary.
     #[cfg(not(feature = "linux-net"))]
     #[tokio::test]
-    async fn add_port_forward_rejects_missing_guest_ip() {
+    async fn add_port_forward_accepts_missing_guest_ip() {
         let tmp = tempfile::tempdir().unwrap();
         let state = husker_state::StateStore::open_memory().unwrap();
         let mut vm = running_nat_vm("pf-noip");
         vm.guest_ip = None;
         state.insert_vm(&vm).unwrap();
         let core = Arc::new(make_vz_core(state, tmp.path()));
-        let err = core
-            .add_port_forward("pf-noip", 18081, 80, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, CoreError::InvalidState { .. }));
+        let forward = core.add_port_forward("pf-noip", 0, 80, None).await.unwrap();
+        assert_ne!(forward.host_port, 0);
+        assert_eq!(forward.bind_addr.as_deref(), Some("127.0.0.1"));
     }
 
     /// macOS: destroying a VM aborts its userspace proxy listeners and drops the

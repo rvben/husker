@@ -3,8 +3,7 @@
 //! A `PortProxy` binds a host TCP listener per forward and relays each accepted
 //! connection to the guest through a `GuestDialer`. The dialer is the seam that
 //! isolates the data path: `DirectIpDialer` connects to `guest_ip:guest_port`
-//! over the VZ NAT today; a vsock-relay dialer can replace it (Approach B)
-//! without touching the accept loop.
+//! over a guest network; macOS forwards use a VM-bound guest-agent tunnel.
 
 use std::collections::HashMap;
 use std::io;
@@ -42,9 +41,8 @@ impl GuestDialer for DirectIpDialer {
     }
 }
 
-/// The dialer the daemon uses today on macOS/VZ (no host nftables, so forwards
-/// are userspace-proxied). Swapping this alias to a vsock-relay dialer is the
-/// only change needed to move to Approach B.
+/// Default dialer for standalone proxies. The macOS core supplies a VM-bound
+/// agent dialer for each forward through `add_with_dialer`.
 #[cfg(not(feature = "linux-net"))]
 pub type ActiveDialer = DirectIpDialer;
 
@@ -128,6 +126,9 @@ impl Drop for Forward {
 
 /// Per-VM set of active userspace forwards.
 pub struct PortProxy<D: GuestDialer> {
+    // macOS production supplies a VM-specific dialer per forward; standalone
+    // proxy tests and Linux resume listeners use this default dialer.
+    #[cfg_attr(not(feature = "linux-net"), allow(dead_code))]
     dialer: D,
     forwards: Mutex<HashMap<Uuid, HashMap<u16, Forward>>>,
 }
@@ -142,7 +143,7 @@ impl<D: GuestDialer> PortProxy<D> {
 
     /// Bind a host listener and start relaying. Returns the bound host port
     /// (equal to `host_port` unless `host_port == 0`, which asks the OS to pick).
-    #[cfg(not(feature = "linux-net"))]
+    #[cfg(all(not(feature = "linux-net"), test))]
     pub async fn add(
         &self,
         vm_id: Uuid,
@@ -151,9 +152,30 @@ impl<D: GuestDialer> PortProxy<D> {
         guest_ip: Ipv4Addr,
         guest_port: u16,
     ) -> io::Result<u16> {
+        self.add_with_dialer(
+            vm_id,
+            bind_addr,
+            host_port,
+            guest_ip,
+            guest_port,
+            self.dialer.clone(),
+        )
+        .await
+    }
+
+    /// Bind a forward to a transport belonging to one VM instance.
+    #[cfg(not(feature = "linux-net"))]
+    pub async fn add_with_dialer<T: GuestDialer>(
+        &self,
+        vm_id: Uuid,
+        bind_addr: IpAddr,
+        host_port: u16,
+        guest_ip: Ipv4Addr,
+        guest_port: u16,
+        dialer: T,
+    ) -> io::Result<u16> {
         let listener = TcpListener::bind(SocketAddr::new(bind_addr, host_port)).await?;
         let bound = listener.local_addr()?.port();
-        let dialer = self.dialer.clone();
         let handle = tokio::spawn(accept_loop(
             Arc::new(listener),
             dialer,

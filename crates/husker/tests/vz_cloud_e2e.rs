@@ -468,8 +468,8 @@ async fn guest_exec(
 /// End-to-end proof that the macOS userspace proxy forwards a host TCP port to a
 /// real service inside a VZ cloud guest, and that removal tears the listener down.
 ///
-/// This is the live confirmation of the Approach A routability assumption: the
-/// host process opens a TCP connection to `guest_ip:guest_port` over the VZ NAT.
+/// The guest service binds only loopback: reaching it proves the VM-bound agent
+/// tunnel works without host access to the VZ NAT subnet.
 #[tokio::test]
 #[ignore = "gated: set HUSKER_RUN_VZ_CLOUD_E2E=1 and HUSKER_VZ_CLOUD_IMAGE=<path>"]
 async fn vz_cloud_port_forward_reaches_guest() {
@@ -510,7 +510,7 @@ async fn vz_cloud_port_forward_reaches_guest() {
         &[
             "-c",
             &format!(
-                "exec 2>&1; set -eu; command -v python3; setsid python3 -m http.server {GUEST_PORT} --bind 0.0.0.0 >/tmp/pf.log 2>&1 </dev/null & \
+                "exec 2>&1; set -eu; command -v python3; setsid python3 -m http.server {GUEST_PORT} --bind 127.0.0.1 >/tmp/pf.log 2>&1 </dev/null & \
                  pid=$!; for i in 1 2 3 4 5; do \
                  if python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:{GUEST_PORT}/\", timeout=1).read()' 2>/dev/null; then exit 0; fi; \
                  if ! kill -0 \"$pid\" 2>/dev/null; then cat /tmp/pf.log; exit 1; fi; sleep 1; done; \
@@ -521,16 +521,7 @@ async fn vz_cloud_port_forward_reaches_guest() {
     .await;
     assert_eq!(code, 0, "guest HTTP readiness failed: {out}");
 
-    // Establish the host-to-guest NAT prerequisite separately from the proxy.
-    // A healthy guest-local listener does not prove the host can dial its IP.
-    let direct = client.get(format!("http://{guest_ip}:{GUEST_PORT}/"))
-        .timeout(Duration::from_secs(5)).send().await
-        .expect("guest HTTP service is ready but host-to-guest NAT is unreachable; check the runner's bridge, routing and network permissions");
-    assert!(
-        direct.status().is_success(),
-        "direct guest HTTP returned {}",
-        direct.status()
-    );
+    // Forward through the VM agent; host access to the NAT subnet is unnecessary.
 
     // ── Add the port forward ───────────────────────────────────────────────────
     let host_port = free_port();

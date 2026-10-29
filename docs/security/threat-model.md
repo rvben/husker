@@ -1,13 +1,13 @@
 # Threat Model (STRIDE)
 
-Last updated: 2026-10-26
+Last updated: 2026-10-29
 
 ## Scope
 
 - Daemon API (`crates/husker-api`)
 - Core lifecycle/state engine (`crates/husker-core`, `crates/husker-state`)
 - Guest agent channel (`crates/husker-agent`, `crates/husker-agent-proto`)
-- Host networking and port-forward path (`crates/husker-net`, Linux only)
+- Host networking and port-forward path (`crates/husker-net` on Linux, guest-agent tunnels on macOS)
 - OCI image import (`crates/husker-oci`)
 
 ## Assets
@@ -30,7 +30,7 @@ Last updated: 2026-10-26
 | Denial of Service | Abuse via shell/exec/files endpoints | Sliding-window per-client rate limit on sensitive routes; request body max limit | Rate-limit middleware tests (429 path) |
 | Elevation of Privilege | Dangerous guest commands or env injection | Exec allow/deny policy, env allowlist, timeout | Exec policy tests in API crate |
 | Tampering/DoS | State/network drift after crash/restart | Startup reconciliation of persisted port forwards; idempotent lifecycle ops | Core startup reconciliation + lifecycle tests |
-| Spoofing | A compromised guest reports another address as its own (the host's LAN or NAT-gateway address, a public address) so that the VM's port forwards dial it | An agent-reported address is accepted only when it is plain unicast, not one of the host's own addresses and in the subnet of a host interface; anything else is logged and ignored. Another machine on such a subnet stays nameable, which adds nothing the guest cannot reach through NAT already | `husker-core` guest IP check unit tests |
+| Spoofing | A compromised guest reports another address so its forward reaches the host or another guest | macOS forwarding uses a vsock tunnel bound to the captured VM ID; the agent connects only to guest IPv4 loopback. It never falls back to host IP routing. Replacement VMs with the same name are rejected. Reported IP addresses remain validated for display | Agent tunnel binary/EOF tests; forwarding identity regression; live VZ test with a loopback-only guest service |
 | Spoofing / Elevation of Privilege | A guest's outbound connection on a forwarded port, or transit traffic the host routes for another network, is rewritten by a port forward's DNAT rule | The DNAT rule matches only packets that enter from outside the guest bridge and are addressed to a host-local address (`iifname != <bridge>`, `fib daddr type local`) | `husker-net` port-forward rule unit tests; bridge E2E |
 | Denial of Service | A hostile or oversized OCI image exhausts memory or disk during import (giant blobs, a decompression bomb, an unbounded manifest or error body) | Blobs stream to a spool file and are charged against a 2 GiB download cap as they arrive (declared sizes are checked first but not trusted); layers unpack under an 8 GiB cumulative budget that stops extraction mid-stream; the flattened tree is measured again before the ext4 image is built; manifest, token and error responses are read up to a fixed size | `husker-oci` budget unit tests and mock-registry tests; `husker-core` materializer size test |
 | Information Disclosure / Spoofing | A registry's error response is echoed into husker's own error, letting a hostile registry plant text in logs and API responses | Only the OCI error document's codes and messages (printable characters, bounded count and length) or the HTTP reason phrase are reported | `husker-oci` error-detail unit tests and mock-registry tests |
@@ -79,3 +79,14 @@ Last updated: 2026-10-26
 - CI security gates: `cargo deny`, `cargo audit`, security regression tests.
 - Nightly drills: chaos restart + graceful shutdown scripts.
 - Pre-release checklist: no open high/critical dependency findings.
+
+## macOS forwarding compatibility
+
+macOS forwards require a tunnel-capable guest agent (protocol 5 or newer).
+Refresh older guest images before using forwarding. Creation reserves the host
+listener; agent compatibility and service connection errors are reported in the
+daemon log when a client connects. There is no fallback to the guest NAT IP.
+The guest service must listen on `127.0.0.1` or an IPv4 wildcard address; a
+service bound only to a specific guest NIC address or IPv6 is not reachable by
+this tunnel. Active tunnel connections keep the VM active for idle policy;
+explicit stop/destroy still terminates the VM and its connections.

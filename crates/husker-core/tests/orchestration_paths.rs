@@ -56,6 +56,7 @@ struct MockInner {
     destroy_gate: Mutex<Option<Arc<DestroyGate>>>,
     pause_gate: Mutex<Option<Arc<PauseGate>>>,
     agent_socket: Mutex<Option<PathBuf>>,
+    vsock_connect_calls: std::sync::atomic::AtomicUsize,
     // Only needed by the kernel_args_composition tests (not(linux-net) builds).
     #[cfg(not(feature = "linux-net"))]
     last_config: Mutex<Option<VmConfig>>,
@@ -99,6 +100,7 @@ impl MockVmm {
                 destroy_gate: Mutex::new(None),
                 pause_gate: Mutex::new(None),
                 agent_socket: Mutex::new(None),
+                vsock_connect_calls: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(not(feature = "linux-net"))]
                 last_config: Mutex::new(None),
             }),
@@ -309,6 +311,9 @@ impl VmmBackend for MockVmm {
     }
 
     async fn vsock_connect(&self, id: Uuid, _port: u32) -> Result<Self::VsockStream, VmmError> {
+        self.inner
+            .vsock_connect_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.inner.vms.lock().await.contains_key(&id) {
             return Err(VmmError::VmNotFound(id));
         }
@@ -452,6 +457,125 @@ async fn spawn_agent() -> (tempfile::TempDir, PathBuf) {
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     (dir, path)
+}
+
+#[cfg(not(feature = "linux-net"))]
+#[tokio::test]
+async fn macos_forward_uses_agent_and_refuses_replacement_vm() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let (_agent_dir, socket) = spawn_agent().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let database = tmp.path().join("state.db");
+    let state = StateStore::open(&database).unwrap();
+    let id = Uuid::new_v4();
+    let mut record = vm_record(
+        id,
+        "forward",
+        "running",
+        None,
+        None,
+        None,
+        Some("192.0.2.1".into()),
+        None,
+    );
+    state.insert_vm(&record).unwrap();
+    let mock = MockVmm::new();
+    mock.set_agent_socket(Some(socket)).await;
+    mock.upsert_vm(VmInfo {
+        id,
+        name: "forward".into(),
+        state: VmState::Running,
+        pid: None,
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 7,
+    })
+    .await;
+    let core = build_core(mock.clone(), state, tmp.path(), tmp.path());
+    let guest = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let port = guest.local_addr().unwrap().port();
+    let echo_listener = Arc::clone(&guest);
+    let echo = tokio::spawn(async move {
+        let (mut socket, _) = echo_listener.accept().await.unwrap();
+        let mut data = Vec::new();
+        socket.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, [0, 255, 128, 42]);
+        socket.write_all(&data).await.unwrap();
+    });
+    let forward = core
+        .add_port_forward("forward", 0, port, None)
+        .await
+        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", forward.host_port))
+        .await
+        .unwrap();
+    client.write_all(&[0, 255, 128, 42]).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, [0, 255, 128, 42]);
+    echo.await.unwrap();
+    assert_eq!(
+        mock.inner
+            .vsock_connect_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while core.active_session_count(id) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Simulate a stale listener after state replacement. A name match must
+    // never attach an old forward to the new VM or fall back to its IP.
+    let state = StateStore::open(&database).unwrap();
+    state.delete_vm(id).unwrap();
+    record.id = Uuid::new_v4();
+    state.insert_vm(&record).unwrap();
+    mock.upsert_vm(VmInfo {
+        id: record.id,
+        name: "forward".into(),
+        state: VmState::Running,
+        pid: None,
+        vcpu_count: 1,
+        mem_size_mib: 128,
+        vsock_cid: 8,
+    })
+    .await;
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", forward.host_port))
+        .await
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(core.active_session_count(record.id), 0);
+    assert_eq!(
+        mock.inner
+            .vsock_connect_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), guest.accept())
+            .await
+            .is_err()
+    );
+    // The dialer holds a weak controller reference, so forwards cannot leak it.
+    let weak = Arc::downgrade(&core);
+    drop(core);
+    assert!(weak.upgrade().is_none());
 }
 
 #[tokio::test]

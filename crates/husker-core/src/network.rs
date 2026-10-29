@@ -1,5 +1,70 @@
 use super::*;
 
+/// A forward belongs to a VM identity, never to a guest-reported IP address.
+/// Weak ownership avoids a cycle from core -> proxy -> dialer -> core.
+#[cfg(not(feature = "linux-net"))]
+struct AgentTunnelDialer<B: VmmBackend> {
+    core: std::sync::Weak<HuskerCore<B>>,
+    vm_id: Uuid,
+    name: String,
+}
+
+#[cfg(not(feature = "linux-net"))]
+impl<B: VmmBackend> Clone for AgentTunnelDialer<B> {
+    fn clone(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            vm_id: self.vm_id,
+            name: self.name.clone(),
+        }
+    }
+}
+
+#[cfg(not(feature = "linux-net"))]
+impl<B: VmmBackend + 'static> crate::port_proxy::GuestDialer for AgentTunnelDialer<B> {
+    type Stream = crate::agent_client::AgentTunnel<B::VsockStream>;
+
+    async fn dial(
+        &self,
+        _guest_ip: std::net::Ipv4Addr,
+        port: u16,
+    ) -> std::io::Result<Self::Stream> {
+        use std::io::{Error, ErrorKind};
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let core = self
+                .core
+                .upgrade()
+                .ok_or_else(|| Error::new(ErrorKind::NotConnected, "VM controller stopped"))?;
+            let _guard = core.vm_name_lock(&self.name).lock_owned().await;
+            let vm = core.lookup_vm(&self.name).map_err(Error::other)?;
+            if vm.id != self.vm_id || vm.state != VmLifecycleState::Running {
+                return Err(Error::new(
+                    ErrorKind::NotConnected,
+                    "forward's VM instance is no longer running",
+                ));
+            }
+            let session = core.begin_session(self.vm_id);
+            core.note_activity(self.vm_id);
+            // The backend dials the captured VM ID, so a concurrent stop or
+            // name replacement cannot redirect it. Do not serialize slow
+            // agent handshakes with other connections or lifecycle operations.
+            drop(_guard);
+            let stream = core
+                .vmm
+                .vsock_connect(self.vm_id, husker_agent_proto::AGENT_VSOCK_PORT)
+                .await
+                .map_err(Error::other)?;
+            crate::agent_client::AgentConnection::new(stream)
+                .with_session_guard(session)
+                .tunnel(port)
+                .await
+                .map_err(Error::other)
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "guest tunnel connection timed out"))?
+    }
+}
+
 impl<B: VmmBackend> HuskerCore<B> {
     /// Fill guest_ip for a running EFI-boot VM that does not have one yet.
     ///
@@ -249,16 +314,21 @@ impl<B: VmmBackend> HuskerCore<B> {
     /// Add a port forward via the userspace proxy (macOS).
     ///
     /// Binds a host TCP listener and relays accepted connections to the guest.
+    /// The guest agent connects to guest loopback over vsock; no host-to-guest
+    /// IP permission is needed. Guests need a tunnel-capable agent (protocol 5+).
     /// The forward is bound to the running VM instance; it is torn down on stop
     /// or destroy and does not survive a daemon restart.
     #[cfg(not(feature = "linux-net"))]
     pub async fn add_port_forward(
-        &self,
+        self: &Arc<Self>,
         name: &str,
         host_port: u16,
         guest_port: u16,
         bind_addr: Option<std::net::IpAddr>,
-    ) -> Result<husker_state::PortForwardRecord, CoreError> {
+    ) -> Result<husker_state::PortForwardRecord, CoreError>
+    where
+        B: 'static,
+    {
         let _guard = self.vm_name_lock(name).lock_owned().await;
         let record = self.lookup_vm(name)?;
         if record.network != NetworkMode::Nat {
@@ -274,17 +344,6 @@ impl<B: VmmBackend> HuskerCore<B> {
                 expected: "running".into(),
             });
         }
-        let guest_ip: std::net::Ipv4Addr = record
-            .guest_ip
-            .as_deref()
-            .ok_or_else(|| CoreError::InvalidState {
-                name: name.into(),
-                actual: "running without a discovered guest IP".into(),
-                expected: "running with a guest IP".into(),
-            })?
-            .parse()
-            .map_err(|_| CoreError::InvalidArgument(format!("{name}: invalid guest IP")))?;
-
         let bind = bind_addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let bind_str = bind.to_string();
 
@@ -303,7 +362,18 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let bound = self
             .port_proxy
-            .add(record.id, bind, host_port, guest_ip, guest_port)
+            .add_with_dialer(
+                record.id,
+                bind,
+                host_port,
+                std::net::Ipv4Addr::LOCALHOST,
+                guest_port,
+                AgentTunnelDialer {
+                    core: Arc::downgrade(self),
+                    vm_id: record.id,
+                    name: name.into(),
+                },
+            )
             .await
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::AddrInUse => CoreError::PortForwardConflict(host_port),
