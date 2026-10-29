@@ -55,39 +55,6 @@ fn fork_src_backup_path(source_rootfs: &Path) -> PathBuf {
     PathBuf::from(format!("{}.fork-src-bak", source_rootfs.display()))
 }
 
-/// Recover a source rootfs stranded by a fork that died after stashing the real
-/// disk aside (`<source_rootfs>.fork-src-bak`) but before restoring it, which
-/// leaves `source_rootfs` as a stale symlink to a fork clone. Atomically renames
-/// the regular backup over the symlink (or into a missing path). Returns whether a recovery happened;
-/// a no-op (and `Ok(false)`) when no backup exists. The caller MUST first confirm
-/// termination of every former fork that may open this path. This filesystem
-/// operation provides no process-death proof and is never run at daemon startup.
-pub fn recover_aliased_rootfs(source_rootfs: &Path) -> std::io::Result<bool> {
-    let backup = fork_src_backup_path(source_rootfs);
-    match std::fs::symlink_metadata(&backup) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-        Ok(metadata) if metadata.is_file() => (),
-        Ok(_) => {
-            return Err(std::io::Error::other(
-                "fork source backup is not a regular file",
-            ));
-        }
-    }
-    match std::fs::symlink_metadata(source_rootfs) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e),
-        Ok(metadata) if metadata.file_type().is_symlink() => (),
-        Ok(_) => {
-            return Err(std::io::Error::other(
-                "fork source path unexpectedly occupied",
-            ));
-        }
-    }
-    std::fs::rename(&backup, source_rootfs)?;
-    Ok(true)
-}
-
 impl RootfsAlias {
     fn prepare(source_rootfs: &Path, fork_rootfs: &Path) -> Result<Self, VmmError> {
         use std::os::unix::fs::MetadataExt;
@@ -1474,62 +1441,6 @@ mod tests {
             message.contains("\"qemu\"") && message.contains("firecracker only"),
             "message must name the request and the running backend: {message}"
         );
-    }
-
-    #[test]
-    fn recover_aliased_rootfs_restores_real_disk_over_stale_symlink() {
-        // Simulate a fork that crashed mid-load: source is a stale symlink to a
-        // fork clone, and the real rootfs sits in the `.fork-src-bak` backup.
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("rootfs.ext4");
-        let clone = dir.path().join("fork-clone.ext4");
-        let backup = fork_src_backup_path(&source);
-        std::fs::write(&clone, b"fork-disk").unwrap();
-        std::fs::write(&backup, b"real-source-disk").unwrap();
-        std::os::unix::fs::symlink(&clone, &source).unwrap();
-
-        let recovered = recover_aliased_rootfs(&source).unwrap();
-
-        assert!(recovered, "a stranded backup must be reported as recovered");
-        assert!(!backup.exists(), "backup must be consumed");
-        assert!(
-            !std::fs::symlink_metadata(&source)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "source must no longer be a symlink"
-        );
-        assert_eq!(
-            std::fs::read(&source).unwrap(),
-            b"real-source-disk",
-            "source must hold the real disk again, not the fork clone"
-        );
-    }
-
-    #[test]
-    fn recover_aliased_rootfs_is_noop_without_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("rootfs.ext4");
-        std::fs::write(&source, b"intact").unwrap();
-        let recovered = recover_aliased_rootfs(&source).unwrap();
-        assert!(!recovered, "no backup means nothing to recover");
-        assert_eq!(std::fs::read(&source).unwrap(), b"intact");
-    }
-
-    #[test]
-    fn manual_fork_recovery_refuses_replacement_files_and_nonregular_backups() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let backup = fork_src_backup_path(&source);
-        std::fs::write(&source, b"replacement").unwrap();
-        std::fs::write(&backup, b"original").unwrap();
-        assert!(recover_aliased_rootfs(&source).is_err());
-        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
-        assert_eq!(std::fs::read(&backup).unwrap(), b"original");
-        std::fs::remove_file(&backup).unwrap();
-        std::os::unix::fs::symlink("missing", &backup).unwrap();
-        assert!(recover_aliased_rootfs(&source).is_err());
-        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
     }
 
     #[test]

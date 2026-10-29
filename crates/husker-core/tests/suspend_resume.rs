@@ -607,6 +607,24 @@ async fn startup_preserves_stranded_fork_and_blocks_source_resume_and_deletion()
 }
 
 #[tokio::test]
+async fn the_runbook_restore_of_a_stranded_fork_source_lifts_the_block() {
+    // docs/operations/runbooks.md restores the source offline by renaming the
+    // backup over the alias. That must be all the daemon needs to accept the
+    // VM again, with the original disk in place and the clone kept.
+    let (core, _id, tmp) = core_store_with_vm("vmsrc", "stopped");
+    let (rootfs, backup) = strand_fork_source(tmp.path(), "vmsrc");
+    let clone = std::fs::read_link(&rootfs).unwrap();
+    assert_eq!(core.inspect_stranded_fork_rootfs(), 1);
+
+    std::fs::rename(&backup, &rootfs).unwrap();
+
+    assert_eq!(core.inspect_stranded_fork_rootfs(), 0);
+    assert_eq!(std::fs::read(&rootfs).unwrap(), b"real-source-disk");
+    assert_eq!(std::fs::read(&clone).unwrap(), b"fork-disk");
+    core.destroy_vm("vmsrc").await.unwrap();
+}
+
+#[tokio::test]
 async fn stranded_fork_inspection_ignores_backends_without_fork() {
     // The stranded layout is a Firecracker fork artifact, and fork is refused
     // on a backend without the capability, so a backup of that name beside

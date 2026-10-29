@@ -356,7 +356,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         match std::fs::symlink_metadata(&backup) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(CoreError::Io(format!("inspect fork source backup: {e}"))),
-            Ok(_) => Err(CoreError::Io("fork source reconciliation pending; prior holder termination and source restoration must be confirmed".into())),
+            Ok(_) => Err(CoreError::Io(
+                "fork source reconciliation pending; restore the source disk offline \
+                 (docs/operations/runbooks.md, \"Fork source reconciliation pending\")"
+                    .into(),
+            )),
         }
     }
 
