@@ -211,10 +211,21 @@ pub async fn pull_image(
         .build()
         .map_err(|e| OciError::Http(e.to_string()))?;
 
-    let token = fetch_pull_token(&client, &r).await?;
+    // Public registries need not have a token endpoint. For example, Google's
+    // Artifact Registry serves public manifests anonymously, while /token is
+    // an unrelated HTML page. Ask for the manifest before trying authentication;
+    // only an authentication challenge warrants a token request.
+    let (token, (body, media_type)) = match get_manifest(&client, &r, &r.reference, "").await {
+        Ok(manifest) => (String::new(), manifest),
+        Err(OciError::Status { status: 401, .. }) => {
+            let token = fetch_pull_token(&client, &r).await?;
+            let manifest = get_manifest(&client, &r, &r.reference, &token).await?;
+            (token, manifest)
+        }
+        Err(error) => return Err(error),
+    };
 
-    // Fetch the manifest; resolve a manifest list/index to the arch-specific one.
-    let (body, media_type) = get_manifest(&client, &r, &r.reference, &token).await?;
+    // Resolve a manifest list/index to the arch-specific manifest.
     let manifest: Manifest = if is_index(&media_type, &body) {
         let index: ManifestIndex = serde_json::from_slice(&body)
             .map_err(|e| OciError::Malformed(format!("manifest index: {e}")))?;

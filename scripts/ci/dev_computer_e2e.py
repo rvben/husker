@@ -27,6 +27,52 @@ def fetch(vm, path):
     return json.loads(result.stdout)
 
 
+def check_lifecycle(vm):
+    """Prove retry safety and full-state preservation on an existing test VM."""
+    generation = vm.info()["id"]
+    marker = "/tmp/husker-lifecycle-" + uuid4().hex
+    contents = uuid4().hex.encode()
+    vm.write_file(marker, contents)
+    # The nonce exists only in this process's memory. Matching it and the PID
+    # after resume distinguishes a full-state restore from restarting a command.
+    process = vm.start(["python3", "-u", "-c",
+        "import json,os,sys,time; "
+        "state=json.dumps(dict(pid=os.getpid(),nonce=os.urandom(32).hex())); "
+        "print(state); "
+        "\nwhile not os.path.exists(sys.argv[1]): time.sleep(.1)\n"
+        "print(state)", marker + ".continue"], workdir="/", timeout_secs=180)
+    deadline = time.monotonic() + 15
+    while True:
+        before = b"".join(e.data for e in process.events().events if e.stream == "stdout")
+        if before.endswith(b"\n"):
+            break
+        require(time.monotonic() < deadline, "process did not publish its in-memory nonce")
+        time.sleep(.1)
+
+    for _ in range(2):
+        vm.suspend()
+        suspended = vm.info()
+        require(suspended["state"] == "suspended" and suspended["pid"] is None,
+                "repeated suspend must preserve the snapshot and release the VMM")
+        require(suspended["id"] == generation, "suspend changed VM generation")
+
+    vm.resume()
+    resumed = vm.info()
+    require(resumed["state"] == "running" and resumed["pid"] is not None,
+            "resume must restore a running VMM")
+    vm.resume()
+    repeated = vm.info()
+    require(repeated["state"] == "running" and repeated["pid"] == resumed["pid"],
+            "repeated resume restarted the VMM")
+    require(resumed["id"] == repeated["id"] == generation, "resume replaced the original VM")
+    require(vm.read_file(marker) == contents, "guest file changed across resume")
+    vm.write_file(marker + ".continue", b"continue")
+    require(process.wait(timeout=15).exit_code == 0, "resumed process did not finish")
+    output = b"".join(e.data for e in process.iter_events() if e.stream == "stdout")
+    require(output == before + before, "process PID or in-memory nonce changed across resume")
+    vm.exec(["rm", "-f", marker, marker + ".continue"], workdir="/", check=True)
+
+
 def main():
     if os.environ.get("HUSKER_RUN_DEV_E2E") != "1":
         print("SKIPPED: set HUSKER_RUN_DEV_E2E=1, HUSKER_DEV_E2E_URL and HUSKER_DEV_E2E_IMAGE")
@@ -60,6 +106,7 @@ def main():
         cancelled = vm.start(["sleep", "60"], timeout_secs=120)
         cancelled.cancel()
         require(cancelled.wait(timeout=10).state == "cancelled", "command did not cancel")
+        check_lifecycle(vm)
 
         vm.write_file("/workspace/dev-proof.py", Path(__file__).with_name("dev_proof_guest.py").read_bytes())
         service = vm.start(["python3", "/workspace/dev-proof.py"], workdir="/workspace", timeout_secs=600)
@@ -137,6 +184,8 @@ def main():
         print(json.dumps(dict(status="passed", elapsed_secs=round(time.monotonic()-started, 2),
             forks=measurements,
             checks=["tools", "docker-container", "reconnect", "cancel", "warm-fork-service",
+                    "repeat-suspend", "repeat-resume", "stable-vm-generation",
+                    "session-pid-and-memory", "vmm-released",
                     "disk-isolation", "ram-isolation", "warm-pid", "entropy-divergence",
                     "monotonic-timers", "wall-clock", "resumed-session", "private-preview"])))
     finally:

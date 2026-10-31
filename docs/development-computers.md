@@ -247,6 +247,21 @@ establish a local forward explicitly and pass its HTTP origin to `Client`.
 
 ## Restore and backend guarantees
 
+An image and a suspended VM serve different purposes. A prepared image stores
+installed tools and project files for a fresh boot. Suspending a Firecracker VM
+preserves that machine's RAM and disk, including running guest processes, while
+releasing its VMM process. A warm pool forks independent machines from a captured
+template; it does not resume the template as a new task.
+
+Keep scheduling, agent choice, and task retries in the orchestration layer.
+For lifecycle retries, reconcile the existing VM's state and `id` before acting.
+On Firecracker, repeating suspend on a suspended VM or resume on a running VM
+succeeds without replacing the machine. A stopped VM is not a suspended VM and
+cannot recover its former in-memory state. Do not destroy and recreate it
+automatically to handle a failed resume. Treat only a typed `vm_not_found`
+response as evidence that a VM is absent; another HTTP 404 can describe a missing
+endpoint or guest resource.
+
 | Capability | Linux / Firecracker | Linux / QEMU | macOS / Apple VZ |
 | --- | --- | --- | --- |
 | Development image, sessions, private previews | Available with guest agent v5+ | Available with guest agent v5+ | Available with guest agent v5+ |
@@ -299,7 +314,8 @@ the updated guest agent, a prepared development image, and a container-capable
 kernel with VMGenID. It creates uniquely named VMs, verifies reconnect,
 cancellation, preserved warm-service PIDs, independent RAM counters and disks,
 kernel entropy divergence, monotonic timers, wall clocks, resumed sessions,
-VMM-process release while suspended, and private preview HTTP, then destroys
+repeated suspend/resume, stable VM identity, preserved session PIDs and in-memory
+nonces, VMM-process release while suspended, and private preview HTTP, then destroys
 only the VMs it created. It does not install or restart a daemon:
 
 ```sh

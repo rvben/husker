@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use husker_oci::{ImportLimits, OciError};
@@ -112,6 +112,9 @@ struct MockRegistry {
     manifest: (StatusCode, Vec<u8>),
     blobs: HashMap<String, Vec<u8>>,
     blob_requests: AtomicUsize,
+    require_token: bool,
+    token_response: (StatusCode, Vec<u8>),
+    token_requests: AtomicUsize,
 }
 
 impl MockRegistry {
@@ -121,6 +124,9 @@ impl MockRegistry {
             manifest: (StatusCode::OK, manifest),
             blobs: blobs.into_iter().map(|b| (b.digest, b.bytes)).collect(),
             blob_requests: AtomicUsize::new(0),
+            require_token: false,
+            token_response: (StatusCode::NOT_FOUND, vec![]),
+            token_requests: AtomicUsize::new(0),
         }
     }
 
@@ -130,11 +136,33 @@ impl MockRegistry {
             manifest: (status, body.to_vec()),
             blobs: HashMap::new(),
             blob_requests: AtomicUsize::new(0),
+            require_token: false,
+            token_response: (StatusCode::NOT_FOUND, vec![]),
+            token_requests: AtomicUsize::new(0),
         }
     }
 }
 
-async fn serve_manifest(State(reg): State<Arc<MockRegistry>>) -> impl IntoResponse {
+fn authorized(reg: &MockRegistry, headers: &HeaderMap) -> bool {
+    !reg.require_token
+        || headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            == Some("Bearer fixture-pull-token")
+}
+
+async fn serve_token(State(reg): State<Arc<MockRegistry>>) -> impl IntoResponse {
+    reg.token_requests.fetch_add(1, Ordering::SeqCst);
+    (reg.token_response.0, reg.token_response.1.clone())
+}
+
+async fn serve_manifest(
+    State(reg): State<Arc<MockRegistry>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !authorized(&reg, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let (status, body) = &reg.manifest;
     (
         *status,
@@ -144,13 +172,18 @@ async fn serve_manifest(State(reg): State<Arc<MockRegistry>>) -> impl IntoRespon
         )],
         body.clone(),
     )
+        .into_response()
 }
 
 async fn serve_blob(
     State(reg): State<Arc<MockRegistry>>,
     Path((_repo, digest)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     reg.blob_requests.fetch_add(1, Ordering::SeqCst);
+    if !authorized(&reg, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     match reg.blobs.get(&digest) {
         Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -161,8 +194,7 @@ async fn serve_blob(
 /// selects the http scheme, so the client talks to the mock.
 async fn spawn(registry: &Arc<MockRegistry>) -> u16 {
     let app = Router::new()
-        // 404 on /token => the client proceeds with an anonymous (empty) token.
-        .route("/token", get(|| async { StatusCode::NOT_FOUND }))
+        .route("/token", get(serve_token))
         .route("/v2/{repo}/manifests/{reference}", get(serve_manifest))
         .route("/v2/{repo}/blobs/{digest}", get(serve_blob))
         .with_state(Arc::clone(registry));
@@ -172,6 +204,58 @@ async fn spawn(registry: &Arc<MockRegistry>) -> u16 {
         axum::serve(listener, app).await.unwrap();
     });
     port
+}
+
+#[tokio::test]
+async fn anonymous_registry_never_requests_an_unrelated_token_page() {
+    let config = config_blob();
+    let manifest = manifest_for(&config, &[]);
+    let mut registry = MockRegistry::serving(manifest, vec![config]);
+    // Mirrors Artifact Registry's unrelated /token page, which previously
+    // failed the token-response size/JSON checks before a manifest was tried.
+    registry.token_response = (StatusCode::OK, vec![b'x'; 65 * 1024]);
+    let registry = Arc::new(registry);
+    let port = spawn(&registry).await;
+    Import::new().run(port, ROOMY).await.unwrap();
+    assert_eq!(registry.token_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(registry.blob_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unauthorized_manifest_retries_with_token_for_manifest_and_blobs() {
+    let config = config_blob();
+    let layer = blob(gzip(&tar_one("authenticated.txt", b"content")));
+    let manifest = manifest_for(&config, &[&layer]);
+    let mut registry = MockRegistry::serving(manifest, vec![config, layer]);
+    registry.require_token = true;
+    registry.token_response = (
+        StatusCode::OK,
+        br#"{"token":"fixture-pull-token"}"#.to_vec(),
+    );
+    let registry = Arc::new(registry);
+    let port = spawn(&registry).await;
+    let import = Import::new();
+    import.run(port, ROOMY).await.unwrap();
+    assert!(import.dest.path().join("authenticated.txt").exists());
+    assert_eq!(registry.token_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.blob_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn manifest_failures_other_than_unauthorized_do_not_attempt_authentication() {
+    for status in [
+        StatusCode::FORBIDDEN,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::BAD_GATEWAY,
+    ] {
+        let registry = Arc::new(MockRegistry::failing(status, b""));
+        let port = spawn(&registry).await;
+        let error = Import::new().run(port, ROOMY).await.unwrap_err();
+        assert!(
+            matches!(error, OciError::Status { status: actual, .. } if actual == status.as_u16())
+        );
+        assert_eq!(registry.token_requests.load(Ordering::SeqCst), 0);
+    }
 }
 
 struct Import {
