@@ -28,7 +28,7 @@ categories = ["virtualization"]
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.53.3", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -57,7 +57,7 @@ anyhow = "1"
 
 # Compression / archive
 flate2 = "1"
-tar = "0.4"
+tar = "0.4.46"
 tar-codec = "=0.0.15"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 
