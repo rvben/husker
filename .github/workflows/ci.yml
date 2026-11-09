@@ -45,7 +45,7 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: nextest
       - name: Install qemu-utils for the qemu-img-backed storage tests
@@ -104,7 +104,7 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: nextest
       - run: make test-perf-baseline
@@ -118,7 +118,7 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -183,7 +183,7 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: nextest
       - run: make test-macos
@@ -199,7 +199,7 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-audit
       - run: make audit
@@ -213,7 +213,7 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-deny
       - run: make deny
