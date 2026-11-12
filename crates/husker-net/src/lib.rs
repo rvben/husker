@@ -41,6 +41,23 @@ pub type NetworkFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, NetError>>
 /// Keeping command execution behind this boundary lets core exercise failure
 /// and rollback behavior without root privileges or changes to the host.
 pub trait HostNetwork: Send + Sync {
+    fn bind_guest_source<'a>(
+        &'a self,
+        _tap: &'a str,
+        _ip: Ipv4Addr,
+        _mac: &'a str,
+        _gateway: Ipv4Addr,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(async {
+            Err(NetError::CommandFailed {
+                cmd: "bind guest source".into(),
+                message: "source binding is not implemented by this network driver".into(),
+            })
+        })
+    }
+    fn unbind_guest_source<'a>(&'a self, _tap: &'a str) -> NetworkFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
     fn create_tap<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()>;
 
     fn delete_tap<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()>;
@@ -133,6 +150,28 @@ pub trait DaemonNetwork: Send + Sync {
 pub struct SystemHostNetwork;
 
 impl HostNetwork for SystemHostNetwork {
+    fn bind_guest_source<'a>(
+        &'a self,
+        tap: &'a str,
+        ip: Ipv4Addr,
+        mac: &'a str,
+        gateway: Ipv4Addr,
+    ) -> NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            let script = guest_source_script(tap, ip, mac, gateway)?;
+            run_cmd_with_input("nft", &["-f", "-"], script.as_bytes()).await?;
+            Ok(())
+        })
+    }
+    fn unbind_guest_source<'a>(&'a self, tap: &'a str) -> NetworkFuture<'a, ()> {
+        Box::pin(async move {
+            validate_interface_name(tap)?;
+            let table = guest_source_table(tap);
+            let script = format!("add table bridge {table}\ndelete table bridge {table}\n");
+            run_cmd_with_input("nft", &["-f", "-"], script.as_bytes()).await?;
+            Ok(())
+        })
+    }
     fn create_tap<'a>(&'a self, name: &'a str) -> NetworkFuture<'a, ()> {
         Box::pin(create_tap(name))
     }
@@ -621,13 +660,63 @@ pub async fn delete_tap(name: &str) -> Result<(), NetError> {
     validate_interface_name(name)?;
     info!(tap = name, "deleting TAP device");
     match run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {}
         Err(error) if error.is_missing_interface(name) => {
             debug!(tap = name, "TAP already absent");
-            Ok(())
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
     }
+    Ok(())
+}
+
+fn guest_source_table(tap: &str) -> String {
+    format!(
+        "husker_src_{}",
+        tap.as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Pin a NAT guest's identity before its TAP joins the bridge. Ingress identity
+/// is supplied by the kernel, so guest-controlled source addresses cannot select
+/// another guest's policy or poison the host's neighbor entry for that guest.
+pub fn guest_source_script(
+    tap: &str,
+    ip: Ipv4Addr,
+    mac: &str,
+    gateway: Ipv4Addr,
+) -> Result<String, NetError> {
+    validate_interface_name(tap)?;
+    if mac.split(':').count() != 6
+        || !mac
+            .split(':')
+            .all(|p| p.len() == 2 && u8::from_str_radix(p, 16).is_ok())
+    {
+        return Err(NetError::CommandFailed {
+            cmd: "bind guest source".into(),
+            message: "invalid guest MAC".into(),
+        });
+    }
+    let table = guest_source_table(tap);
+    Ok(format!(
+        r#"add table bridge {table}
+flush table bridge {table}
+table bridge {table} {{
+ chain source {{
+  type filter hook prerouting priority -350; policy accept;
+  iifname "{tap}" ether saddr != {mac} counter drop
+  iifname "{tap}" ether type arp arp saddr ether != {mac} counter drop
+  iifname "{tap}" ether type arp arp saddr ip != {ip} counter drop
+  iifname "{tap}" ether type arp arp daddr ip != {gateway} counter drop
+  iifname "{tap}" ether type arp arp operation != {{ request, reply }} counter drop
+  iifname "{tap}" ether type ip ip saddr != {ip} counter drop
+  iifname "{tap}" ether type != {{ arp, ip }} counter drop
+ }}
+}}
+"#
+    ))
 }
 
 impl NetError {

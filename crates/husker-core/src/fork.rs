@@ -167,6 +167,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         // the shared L2. It joins the bridge only after ReconfigureNetwork below.
         resources.tap_name = Some(tap_name.clone());
         self.host_network.create_tap(&tap_name).await?;
+        if self.guest_source_binding {
+            self.host_network
+                .bind_guest_source(&tap_name, guest_ip, &mac, gateway)
+                .await?;
+        }
 
         // Clone the source's live rootfs into the fork's dir (reflink CoW).
         let fork_dir = self.storage.vm_dir(fork_name);

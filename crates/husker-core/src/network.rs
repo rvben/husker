@@ -513,6 +513,11 @@ impl<B: VmmBackend> HuskerCore<B> {
         &self,
         vm: &VmRecord,
     ) -> Result<bool, CoreError> {
+        if self.guest_source_binding && vm.network == NetworkMode::Bridged {
+            return Err(CoreError::InvalidArgument(
+                "isolated workers refuse bridged networking".into(),
+            ));
+        }
         let Some(bridge) = self.suspended_vm_bridge(vm)? else {
             return Ok(false);
         };
@@ -526,6 +531,25 @@ impl<B: VmmBackend> HuskerCore<B> {
             })?;
         if let Some(serialized) = vm.egress_policy.as_deref() {
             self.apply_persisted_egress_policy(tap, serialized).await?;
+        }
+        if self.guest_source_binding {
+            let ip = vm
+                .guest_ip
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    CoreError::InvalidArgument(
+                        "NAT guest has no valid persisted source address".into(),
+                    )
+                })?;
+            self.host_network
+                .bind_guest_source(
+                    tap,
+                    ip,
+                    &husker_net::generate_mac(vm.vsock_cid),
+                    self.ip_allocator.gateway(),
+                )
+                .await?;
         }
         match self.host_network.attach_to_bridge(tap, bridge).await {
             Ok(()) => Ok(false),

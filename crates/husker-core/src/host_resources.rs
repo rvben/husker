@@ -13,9 +13,15 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await;
         let tap_result = self.host_network.delete_tap(tap).await;
 
+        let binding_result = if self.guest_source_binding && tap_result.is_ok() {
+            self.host_network.unbind_guest_source(tap).await
+        } else {
+            Ok(())
+        };
         egress_result?;
         forward_result?;
         tap_result?;
+        binding_result?;
         Ok(())
     }
 

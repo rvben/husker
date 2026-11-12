@@ -1001,6 +1001,8 @@ pub struct HuskerCore<B: VmmBackend> {
     ip_allocator: husker_net::IpAllocator,
     #[cfg(feature = "linux-net")]
     host_network: Arc<dyn husker_net::HostNetwork>,
+    #[cfg(feature = "linux-net")]
+    guest_source_binding: bool,
     storage: husker_storage::StorageConfig,
     storage_driver: Arc<dyn husker_storage::StorageDriver>,
     #[cfg(feature = "linux-net")]
@@ -1237,6 +1239,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             state,
             ip_allocator,
             host_network: Arc::new(husker_net::SystemHostNetwork),
+            guest_source_binding: false,
             storage,
             storage_driver: husker_storage::default_storage_driver(),
             oci_materializer: Arc::new(LocalOciImageMaterializer),
@@ -1406,6 +1409,12 @@ impl<B: VmmBackend> HuskerCore<B> {
     #[cfg(feature = "linux-net")]
     pub fn with_host_network(mut self, host_network: Arc<dyn husker_net::HostNetwork>) -> Self {
         self.host_network = host_network;
+        self
+    }
+
+    #[cfg(feature = "linux-net")]
+    pub fn with_guest_source_binding(mut self, enabled: bool) -> Self {
+        self.guest_source_binding = enabled;
         self
     }
 
@@ -2766,7 +2775,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[cfg(feature = "linux-net")]
-    struct SuccessfulHostNetwork;
+    #[derive(Default)]
+    struct SuccessfulHostNetwork {
+        attachments: std::sync::atomic::AtomicUsize,
+    }
 
     #[cfg(feature = "linux-net")]
     impl husker_net::HostNetwork for SuccessfulHostNetwork {
@@ -2783,7 +2795,11 @@ mod tests {
             _tap_name: &'a str,
             _bridge_name: &'a str,
         ) -> husker_net::NetworkFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                self.attachments
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
         }
 
         fn add_port_forward<'a>(
@@ -3038,7 +3054,7 @@ mod tests {
                 vec![],
                 runtime_dir,
             )
-            .with_host_network(Arc::new(SuccessfulHostNetwork)),
+            .with_host_network(Arc::new(SuccessfulHostNetwork::default())),
         )
     }
 
@@ -3485,8 +3501,86 @@ mod tests {
             vec![],
             runtime_dir,
         )
-        .with_host_network(Arc::new(SuccessfulHostNetwork));
+        .with_host_network(Arc::new(SuccessfulHostNetwork::default()));
         (core, tmp)
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn isolated_worker_create_never_attaches_without_source_binding() {
+        let (core, temp) = resume_mock_core(false).await;
+        let network = Arc::new(SuccessfulHostNetwork::default());
+        let core = Arc::new(
+            core.with_guest_source_binding(true)
+                .with_host_network(network.clone()),
+        );
+        let kernel = temp.path().join("Image");
+        let rootfs = temp.path().join("rootfs.ext4");
+        let mut image = vec![0u8; 64];
+        image[56..60].copy_from_slice(b"ARMd");
+        std::fs::write(&kernel, image).unwrap();
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+        for mode in ["nat", "bridged"] {
+            let error = core
+                .create_vm(CreateVmRequest {
+                    name: format!("binding-required-{mode}"),
+                    kernel_path: Some(kernel.clone()),
+                    rootfs_path: Some(rootfs.clone()),
+                    network: Some(mode.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(if mode == "nat" {
+                    "source binding"
+                } else {
+                    "refuse bridged"
+                }),
+                "{error}"
+            );
+            assert!(core.list_vms().unwrap().is_empty());
+            assert_eq!(
+                network
+                    .attachments
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
+    }
+
+    #[cfg(feature = "linux-net")]
+    #[tokio::test]
+    async fn isolated_worker_refuses_resume_when_source_binding_is_unavailable() {
+        let (core, _temp) = resume_mock_core(false).await;
+        let core = core.with_guest_source_binding(true);
+        let mut vm = sample_vm_record("binding-required");
+        vm.network = NetworkMode::Nat;
+        vm.guest_ip = Some("172.20.0.2".into());
+        vm.tap_device = Some("husker7".into());
+        let error = core.restore_suspended_vm_network(&vm).await.unwrap_err();
+        assert!(error.to_string().contains("source binding"), "{error}");
+        assert_eq!(
+            core.vmm
+                .connect_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        vm.network = NetworkMode::Bridged;
+        assert!(
+            core.restore_suspended_vm_network(&vm)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("refuse bridged")
+        );
+        vm.network = NetworkMode::Nat;
+        vm.guest_ip = Some("invalid".into());
+        let error = core.restore_suspended_vm_network(&vm).await.unwrap_err();
+        assert!(
+            error.to_string().contains("persisted source address"),
+            "{error}"
+        );
     }
 
     #[cfg(all(target_os = "linux", feature = "linux-net"))]

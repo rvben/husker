@@ -203,6 +203,14 @@ impl<B: VmmBackend> HuskerCore<B> {
                 "bridged networking is only supported on Linux".into(),
             ));
         }
+        #[cfg(feature = "linux-net")]
+        if self.guest_source_binding
+            && validate_network_mode(req.network.as_deref())? == NetworkMode::Bridged
+        {
+            return Err(CoreError::InvalidArgument(
+                "isolated workers refuse bridged networking".into(),
+            ));
+        }
         if req.macos_image.is_some() {
             crate::macos_guest::validate_macos_request(&req)?;
         }
@@ -438,6 +446,16 @@ impl<B: VmmBackend> HuskerCore<B> {
         if has_host_networking {
             resources.tap_name = Some(tap_name.clone());
             self.host_network.create_tap(&tap_name).await?;
+            if self.guest_source_binding {
+                let ip = guest_ip.ok_or_else(|| {
+                    CoreError::InvalidArgument(
+                        "isolated worker requires a guest source address".into(),
+                    )
+                })?;
+                self.host_network
+                    .bind_guest_source(&tap_name, ip, &mac, gateway)
+                    .await?;
+            }
 
             // Attach the TAP to the appropriate bridge: the LAN bridge for bridged mode,
             // or the husker NAT bridge for NAT mode.

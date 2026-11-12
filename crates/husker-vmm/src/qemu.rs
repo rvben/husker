@@ -230,8 +230,28 @@ impl QemuKvmBackend {
                 let base_args = base_args
                     .split_whitespace()
                     .filter(|tok| *tok != "pci=off")
+                    .map(|tok| {
+                        if cfg!(target_arch = "aarch64")
+                            && let Some(suffix) = tok.strip_prefix("console=ttyS0")
+                            && (suffix.is_empty() || suffix.starts_with(','))
+                        {
+                            format!("console=ttyAMA0{suffix}")
+                        } else {
+                            tok.to_string()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
+                // Static guest networking names eth0 in the kernel ip= argument.
+                #[cfg(target_arch = "aarch64")]
+                let base_args = if base_args
+                    .split_whitespace()
+                    .any(|arg| arg.starts_with("net.ifnames="))
+                {
+                    base_args
+                } else {
+                    format!("{base_args} net.ifnames=0")
+                };
                 args.push("-kernel".into());
                 args.push(config.kernel_path.display().to_string());
                 if let Some(initrd) = &config.initrd_path {
@@ -960,9 +980,32 @@ mod tests {
             .find(|a| a.contains("root=/dev/vda"))
             .expect("append root= missing");
         assert!(
-            append.contains("console=ttyS0"),
+            append.contains(if cfg!(target_arch = "aarch64") {
+                "console=ttyAMA0"
+            } else {
+                "console=ttyS0"
+            }),
             "append dropped kernel_args: {append}"
         );
+    }
+
+    #[test]
+    fn build_args_preserves_console_baud_and_explicit_interface_naming() {
+        let be = test_backend("qemu-system-x86_64", "/tmp");
+        let mut cfg = sample_config();
+        cfg.kernel_args = Some("console=ttyS0,115200 net.ifnames=0".into());
+        let args = be.build_args(Uuid::nil(), &cfg).unwrap();
+        let append = args
+            .iter()
+            .find(|arg| arg.contains("root=/dev/vda"))
+            .unwrap();
+        let console = if cfg!(target_arch = "aarch64") {
+            "console=ttyAMA0,115200"
+        } else {
+            "console=ttyS0,115200"
+        };
+        assert!(append.contains(console));
+        assert_eq!(append.matches("net.ifnames=").count(), 1);
     }
 
     #[test]
@@ -1307,10 +1350,19 @@ mod tests {
             "pci=off must be stripped for QEMU: {append}"
         );
         assert!(
-            append.contains("console=ttyS0"),
+            append.contains(if cfg!(target_arch = "aarch64") {
+                "console=ttyAMA0"
+            } else {
+                "console=ttyS0"
+            }),
             "other args preserved: {append}"
         );
         assert!(append.contains("panic=1"), "other args preserved: {append}");
+        assert!(append.contains("ip=192.0.2.2::192.0.2.1:255.255.255.252::eth0:off"));
+        if cfg!(target_arch = "aarch64") {
+            assert!(append.contains("net.ifnames=0"));
+            assert!(!append.contains("console=ttyS0"));
+        }
     }
 
     fn uefi_config() -> VmConfig {

@@ -760,6 +760,7 @@ pub(crate) async fn start_daemon(
                         runtime_dir.clone(),
                     )
                     .with_host_network(host_network.clone())
+                    .with_guest_source_binding(config.guest_isolation)
                     .with_embedded_agent(husker::EMBEDDED_AGENT)
                     .with_storage_volume(config.storage_volume)
                     .with_resource_limits(config.resource_limits)
@@ -808,6 +809,7 @@ pub(crate) async fn start_daemon(
                         runtime_dir.clone(),
                     )
                     .with_host_network(host_network.clone())
+                    .with_guest_source_binding(config.guest_isolation)
                     .with_storage_volume(config.storage_volume)
                     .with_resource_limits(config.resource_limits)
                     .with_factory_resource_budget(config.factory_resource_budget)
