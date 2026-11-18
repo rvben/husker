@@ -641,6 +641,22 @@ async fn dispatch_vz_op_inner(
         .map_err(|_| VmmError::ProcessError("completion channel closed".into()))?
 }
 
+// Apple documents Error as unrecoverable. An invalid stop transition must not
+// prevent releasing its VZ object. All live/transitional states
+// still retain ownership, including when the stop callback reported success.
+fn confirm_destroy_state(
+    state: VZVirtualMachineState,
+    stop: Result<(), VmmError>,
+) -> Result<(), VmmError> {
+    if vz_has_ended(state) {
+        Ok(())
+    } else {
+        Err(stop.err().unwrap_or_else(|| {
+            VmmError::ProcessError(format!("VZ remains in state {state:?} after force-stop"))
+        }))
+    }
+}
+
 // ── VmmBackend impl ─────────────────────────────────────────────────────
 
 impl VmmBackend for AppleVzBackend {
@@ -852,11 +868,7 @@ impl VmmBackend for AppleVzBackend {
         )
         .await
         .map_err(|_| VmmError::ProcessError("VZ stopped-state query timed out".into()))??;
-        if state != VZVirtualMachineState::Stopped {
-            return Err(stop.err().unwrap_or_else(|| {
-                VmmError::ProcessError(format!("VZ remains in state {state:?} after force-stop"))
-            }));
-        }
+        confirm_destroy_state(state, stop)?;
         if let Some(capture) = &mut instance.serial_capture {
             capture.finish().await?;
         }
@@ -1108,6 +1120,44 @@ fn balloon_target_bytes(mem_size_bytes: u64, amount_mib: u32) -> Result<u64, Vmm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destroy_accepts_terminal_error_after_invalid_stop_transition() {
+        for state in [VZVirtualMachineState::Stopped, VZVirtualMachineState::Error] {
+            assert!(confirm_destroy_state(state, Ok(())).is_ok());
+            assert!(
+                confirm_destroy_state(
+                    state,
+                    Err(VmmError::ProcessError(
+                        "invalid transition to stopping".into()
+                    ))
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn destroy_retains_every_live_or_transitional_state_even_after_stop_ack() {
+        for state in [
+            VZVirtualMachineState::Running,
+            VZVirtualMachineState::Paused,
+            VZVirtualMachineState::Starting,
+            VZVirtualMachineState::Pausing,
+            VZVirtualMachineState::Stopping,
+            VZVirtualMachineState::Resuming,
+            VZVirtualMachineState::Restoring,
+            VZVirtualMachineState::Saving,
+        ] {
+            assert!(confirm_destroy_state(state, Ok(())).is_err());
+            let error = confirm_destroy_state(
+                state,
+                Err(VmmError::ProcessError("original stop failure".into())),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("original stop failure"));
+        }
+    }
 
     async fn tracked_fixture(backend: &AppleVzBackend, id: Uuid, name: &str) -> VzOwner {
         let path = backend.runtime_dir.join(format!("{id}-{name}.serial.log"));
