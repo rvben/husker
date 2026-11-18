@@ -860,6 +860,13 @@ mod tests {
     }
 
     #[test]
+    fn deadline_requires_an_explicit_seconds_field() {
+        let mut json: serde_json::Value = serde_json::from_str(CANONICAL).unwrap();
+        json["deadline"] = "2027-01-15T08:00Z".into();
+        assert!(serde_json::from_value::<JobSpec>(json).is_err());
+    }
+
+    #[test]
     fn canonical_json_sorts_keys_inside_arrays_and_the_network_tag() {
         let mut spec = canonical_fixture();
         spec.network = JobNetwork::None {};
