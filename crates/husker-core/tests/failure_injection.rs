@@ -382,7 +382,7 @@ impl husker_core::OciImageMaterializer for CatalogRacingOciMaterializer {
                     content_digest: None,
                     parent_image: None,
                     size_bytes: 1,
-                    created_at: chrono::Utc::now(),
+                    created_at: jiff::Timestamp::now(),
                 })
                 .map_err(|error| {
                     husker_core::OciMaterializationError::Runtime(error.to_string())
@@ -637,7 +637,7 @@ fn core_with_vm(name: &str, state: &str, fail_ops: &[&'static str]) -> Arc<Huske
     };
 
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let record = husker_state::VmRecord {
         id,
         name: name.into(),
@@ -1587,7 +1587,7 @@ async fn recovery_never_reclaims_the_resources_of_a_committed_vm() {
     state
         .set_host_resource_lease_network(lease.id, Some("husker3"), Some("172.20.0.2"))
         .unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     state
         .insert_vm(&husker_state::VmRecord {
             id: Uuid::new_v4(),
@@ -1733,13 +1733,13 @@ async fn restart_preserves_factory_creation_lease_until_positive_allocation_abor
     let tmp = tempfile::tempdir().unwrap();
     let state_path = tmp.path().join("factory-state.db");
     let store = husker_state::StateStore::open(&state_path).unwrap();
-    let deadline = chrono::Utc::now() + chrono::Duration::minutes(10);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10);
     let job = store
         .accept_job(
             "uncertain-creation",
             "{\"version\":1}",
             deadline,
-            deadline + chrono::Duration::days(1),
+            deadline + jiff::SignedDuration::from_hours(24),
         )
         .unwrap()
         .0;

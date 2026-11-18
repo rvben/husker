@@ -1818,9 +1818,9 @@ mod runtime_tests {
         let runtime = temp.path().join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         let lease = state.begin_host_resource_lease("leased-creation").unwrap();
-        let current = std::time::SystemTime::now();
-        let deadline = (current + std::time::Duration::from_secs(300)).into();
-        let retention = (current + std::time::Duration::from_secs(86400)).into();
+        let current = jiff::Timestamp::now();
+        let deadline = current + jiff::SignedDuration::from_mins(5);
+        let retention = current + jiff::SignedDuration::from_hours(24);
         let mut jobs = Vec::new();
         for key in ["no-vm-row", "has-vm-row"] {
             let job = state
@@ -1842,7 +1842,7 @@ mod runtime_tests {
             jobs.push((job.id, name, vm_id));
         }
         let (_, name, vm_id) = &jobs[1];
-        let now = std::time::SystemTime::now().into();
+        let now = jiff::Timestamp::now();
         state
             .insert_vm(&husker_state::VmRecord {
                 id: *vm_id,

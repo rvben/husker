@@ -7,7 +7,7 @@ impl<B: VmmBackend> HuskerCore<B> {
 
         let key = load_or_create_secret_key(&self.storage.data_dir)?;
         let (ciphertext, nonce) = encrypt_secret(&key, req.value.as_bytes())?;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let record = SecretRecord {
             id: Uuid::new_v4(),
             name: req.name,

@@ -1,6 +1,5 @@
 //! Collect over real framed agent messages into real SQLite; no VMM/runtime
 //! claim is made by this synthetic guest transport.
-use chrono::{TimeZone, Utc};
 use husker_agent_proto::job_spec::JobSpec;
 use husker_agent_proto::*;
 use husker_core::agent_client::AgentConnection;
@@ -13,7 +12,7 @@ use uuid::Uuid;
 fn fixture(store: &StateStore) -> (JobRecord, JobSpec, Vec<u8>) {
     let data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
     let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
-    let deadline = Utc.timestamp_opt(Utc::now().timestamp() + 60, 0).unwrap();
+    let deadline = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 60).unwrap();
     let spec: JobSpec = serde_json::from_value(json!({
         "version": 1, "image": {"catalog_id": Uuid::new_v4(), "rootfs_digest": format!("sha256:{}", "a".repeat(64)), "kernel_digest": format!("sha256:{}", "b".repeat(64)), "initrd_digest": null},
         "source": {"digest": digest, "size_bytes": 1024}, "acceptance": {"digest": digest, "size_bytes": 1024},
@@ -29,7 +28,7 @@ fn fixture(store: &StateStore) -> (JobRecord, JobSpec, Vec<u8>) {
             "submission",
             &spec.canonical_json().unwrap(),
             deadline,
-            deadline + chrono::Duration::days(1),
+            deadline + jiff::SignedDuration::from_hours(24),
         )
         .unwrap()
         .0;
@@ -164,7 +163,7 @@ async fn collects_cursor_reconnect_binary_artifacts_and_manifest_before_vm_row_d
     task.await.unwrap();
     let generation = job.vm_id.unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'disposable','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![generation.to_string(), Utc::now().to_rfc3339()]).unwrap();
+    db.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'disposable','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![generation.to_string(), husker_state::format_timestamp(jiff::Timestamp::now())]).unwrap();
     store.delete_vm(generation).unwrap();
     drop(store);
     let store = StateStore::open(&path).unwrap();

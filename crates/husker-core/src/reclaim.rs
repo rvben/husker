@@ -16,8 +16,6 @@
 // macOS build (no linux-net) there are no host-network leaks to reclaim, so it
 // is intentionally absent there rather than silenced with `allow(dead_code)`.
 #[cfg(any(feature = "linux-net", test))]
-use chrono::{DateTime, Duration, Utc};
-#[cfg(any(feature = "linux-net", test))]
 use husker_state::VmRecord;
 #[cfg(test)]
 use husker_state::{BackendKind, BootKind, NetworkMode, VmLifecycleState};
@@ -31,12 +29,16 @@ use husker_state::{BackendKind, BootKind, NetworkMode, VmLifecycleState};
 /// `now - updated_at` approximates the stopped-for duration: `update_vm_state`
 /// stamps `updated_at` on the stop and nothing mutates a stopped VM afterward.
 #[cfg(any(feature = "linux-net", test))]
-pub(crate) fn is_reclaimable_leak(vm: &VmRecord, now: DateTime<Utc>, grace: Duration) -> bool {
+pub(crate) fn is_reclaimable_leak(
+    vm: &VmRecord,
+    now: jiff::Timestamp,
+    grace: jiff::SignedDuration,
+) -> bool {
     let terminal = vm.state.is_terminal();
     let standalone = vm.service_id.is_none();
     let not_suspended = vm.suspended_at.is_none();
     let holds_resources = vm.tap_device.is_some() || vm.guest_ip.is_some() || vm.host_ip.is_some();
-    let stopped_long_enough = now.signed_duration_since(vm.updated_at) >= grace;
+    let stopped_long_enough = now.duration_since(vm.updated_at) >= grace;
     terminal && standalone && not_suspended && holds_resources && stopped_long_enough
 }
 
@@ -64,8 +66,8 @@ impl<B: husker_vmm::VmmBackend> super::HuskerCore<B> {
     /// the record cleanly (its cleared fields make the destroy-on-replace a
     /// no-op, so nothing is double-released).
     pub async fn reclaim_abandoned_vms(&self, grace_secs: u64) -> usize {
-        let grace = Duration::seconds(grace_secs as i64);
-        let now = Utc::now();
+        let grace = jiff::SignedDuration::from_secs(grace_secs as i64);
+        let now = jiff::Timestamp::now();
         self.reclaim_vm_network_resources(
             |vm| is_reclaimable_leak(vm, now, grace),
             ReclaimReason::Abandoned,
@@ -160,14 +162,13 @@ enum ReclaimReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
     use uuid::Uuid;
 
     /// A fully-populated running VM record; tests tweak only the fields under
     /// test. Mirrors the shape of the production record so field additions
     /// surface here.
     fn base_vm() -> VmRecord {
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         VmRecord {
             id: Uuid::new_v4(),
             name: "vm".into(),
@@ -203,25 +204,29 @@ mod tests {
         }
     }
 
-    const GRACE: Duration = Duration::seconds(300);
+    const GRACE: jiff::SignedDuration = jiff::SignedDuration::from_secs(300);
 
     /// A stopped VM whose resources were leaked long ago is reclaimable.
     fn stopped_long_ago() -> VmRecord {
         let mut vm = base_vm();
-        vm.updated_at = Utc::now() - Duration::seconds(600);
+        vm.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600);
         vm
     }
 
     #[test]
     fn abandoned_stopped_vm_is_reclaimable() {
-        assert!(is_reclaimable_leak(&stopped_long_ago(), Utc::now(), GRACE));
+        assert!(is_reclaimable_leak(
+            &stopped_long_ago(),
+            jiff::Timestamp::now(),
+            GRACE
+        ));
     }
 
     #[test]
     fn failed_state_is_also_reclaimable() {
         let mut vm = stopped_long_ago();
         vm.state = VmLifecycleState::Failed;
-        assert!(is_reclaimable_leak(&vm, Utc::now(), GRACE));
+        assert!(is_reclaimable_leak(&vm, jiff::Timestamp::now(), GRACE));
     }
 
     #[test]
@@ -230,7 +235,7 @@ mod tests {
             let mut vm = stopped_long_ago();
             vm.state = state.parse().expect("test fixture uses a known VM state");
             assert!(
-                !is_reclaimable_leak(&vm, Utc::now(), GRACE),
+                !is_reclaimable_leak(&vm, jiff::Timestamp::now(), GRACE),
                 "state {state} must not be reclaimed"
             );
         }
@@ -239,13 +244,13 @@ mod tests {
     #[test]
     fn recently_stopped_vm_is_within_grace() {
         let mut vm = base_vm();
-        vm.updated_at = Utc::now() - Duration::seconds(60); // < 300s grace
-        assert!(!is_reclaimable_leak(&vm, Utc::now(), GRACE));
+        vm.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60); // < 300s grace
+        assert!(!is_reclaimable_leak(&vm, jiff::Timestamp::now(), GRACE));
     }
 
     #[test]
     fn exactly_at_grace_boundary_is_reclaimable() {
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         let mut vm = base_vm();
         vm.updated_at = now - GRACE; // now - updated_at == grace, `>=` holds
         assert!(is_reclaimable_leak(&vm, now, GRACE));
@@ -255,7 +260,7 @@ mod tests {
     fn service_instance_is_left_to_the_reconciler() {
         let mut vm = stopped_long_ago();
         vm.service_id = Some(Uuid::new_v4());
-        assert!(!is_reclaimable_leak(&vm, Utc::now(), GRACE));
+        assert!(!is_reclaimable_leak(&vm, jiff::Timestamp::now(), GRACE));
     }
 
     #[test]
@@ -271,7 +276,7 @@ mod tests {
             let mut vm = base_vm();
             vm.state = state.parse().expect("test fixture uses a known VM state");
             if state == "suspended" {
-                vm.suspended_at = Some(Utc::now());
+                vm.suspended_at = Some(jiff::Timestamp::now());
             }
             assert!(!is_shutdown_reclaimable(&vm), "state {state}");
         }
@@ -280,8 +285,8 @@ mod tests {
     #[test]
     fn suspended_vm_keeps_its_resources_for_resume() {
         let mut vm = stopped_long_ago();
-        vm.suspended_at = Some(Utc::now() - Duration::seconds(600));
-        assert!(!is_reclaimable_leak(&vm, Utc::now(), GRACE));
+        vm.suspended_at = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600));
+        assert!(!is_reclaimable_leak(&vm, jiff::Timestamp::now(), GRACE));
     }
 
     #[test]
@@ -290,7 +295,7 @@ mod tests {
         vm.tap_device = None;
         vm.host_ip = None;
         vm.guest_ip = None;
-        assert!(!is_reclaimable_leak(&vm, Utc::now(), GRACE));
+        assert!(!is_reclaimable_leak(&vm, jiff::Timestamp::now(), GRACE));
     }
 
     #[test]
@@ -299,6 +304,6 @@ mod tests {
         vm.tap_device = None;
         vm.host_ip = None;
         // guest_ip still set -> the IP allocation is leaked.
-        assert!(is_reclaimable_leak(&vm, Utc::now(), GRACE));
+        assert!(is_reclaimable_leak(&vm, jiff::Timestamp::now(), GRACE));
     }
 }

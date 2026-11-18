@@ -1,4 +1,3 @@
-use chrono::Utc;
 use husker_state::{
     BackendKind, NetworkMode, PortForwardRecord, StateStore, VmLifecycleState, VmRecord,
 };
@@ -19,8 +18,8 @@ fn make_record(name: &str) -> VmRecord {
         guest_ip: Some("172.20.0.2".into()),
         kernel_path: "/boot/vmlinux".into(),
         rootfs_path: "/images/rootfs.ext4".into(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: jiff::Timestamp::now(),
+        updated_at: jiff::Timestamp::now(),
         userdata: None,
         userdata_status: None,
         userdata_env: None,
@@ -31,7 +30,7 @@ fn make_record(name: &str) -> VmRecord {
         balloon: false,
         volume: None,
         network: NetworkMode::Nat,
-        last_activity_at: Utc::now(),
+        last_activity_at: jiff::Timestamp::now(),
         suspended_at: None,
         idle_timeout_secs: None,
         suspend_ttl_secs: None,
@@ -164,7 +163,7 @@ fn port_forward_persistence() {
                 guest_port: 80,
                 protocol: "tcp".into(),
                 bind_addr: None,
-                created_at: Utc::now(),
+                created_at: jiff::Timestamp::now(),
             })
             .unwrap();
     }

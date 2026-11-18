@@ -2,7 +2,6 @@
 //!
 //! This is persistence, not a scheduler: orchestration must verify/freeze the
 //! specification, enforce policy, and fence VM/session identity before execution.
-use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -403,7 +402,9 @@ fn bind_on(
             if job.vm_name.as_deref() != Some(name) || !job.cleanup_pending {
                 return Err(JournalError::Conflict("VM reservation changed or released"));
             }
-        } else if job.state != JobState::Accepted || job.deadline <= Utc::now().timestamp() {
+        } else if job.state != JobState::Accepted
+            || job.deadline <= jiff::Timestamp::now().as_second()
+        {
             return Err(JournalError::Conflict("job is no longer accepting a VM"));
         }
         let owned: bool = tx.query_row(
@@ -571,8 +572,8 @@ impl StateStore {
         &self,
         key: &str,
         specification: &str,
-        deadline: DateTime<Utc>,
-        retention_until: DateTime<Utc>,
+        deadline: jiff::Timestamp,
+        retention_until: jiff::Timestamp,
     ) -> Result<(JobRecord, bool), JournalError> {
         self.accept_job_inner(key, specification, deadline, retention_until, None)
     }
@@ -582,8 +583,8 @@ impl StateStore {
         &self,
         key: &str,
         specification: &str,
-        deadline: DateTime<Utc>,
-        retention_until: DateTime<Utc>,
+        deadline: jiff::Timestamp,
+        retention_until: jiff::Timestamp,
         budget: &FactoryResourceBudget,
         observe_storage: impl FnOnce() -> Result<FactoryAvailableStorage, JournalError>,
     ) -> Result<(JobRecord, bool), JournalError> {
@@ -601,8 +602,8 @@ impl StateStore {
         &self,
         key: &str,
         specification: &str,
-        deadline: DateTime<Utc>,
-        retention_until: DateTime<Utc>,
+        deadline: jiff::Timestamp,
+        retention_until: jiff::Timestamp,
         budget: Option<(&FactoryResourceBudget, StorageObservation<'_>)>,
     ) -> Result<(JobRecord, bool), JournalError> {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
@@ -617,13 +618,13 @@ impl StateStore {
         );
         let mut conn = self.lock_durable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         // A tombstone only has to outlive its deadline: past it, an identical
         // replay is refused as invalid, so dropping it cannot rerun the work
         // and the receipt cap bounds only submissions still in flight.
         tx.execute(
             "DELETE FROM execution_jobs WHERE state='deleted' AND deadline<=?1",
-            [now.timestamp()],
+            [now.as_second()],
         )?;
         let old = tx
             .query_row(
@@ -645,7 +646,7 @@ impl StateStore {
                     "evidence explicitly deleted; use a new key",
                 ));
             }
-            if old_digest != digest || old_deadline != deadline.timestamp() {
+            if old_digest != digest || old_deadline != deadline.as_second() {
                 return Err(JournalError::Conflict(
                     "immutable specification or deadline changed",
                 ));
@@ -654,9 +655,9 @@ impl StateStore {
             tx.commit()?;
             return Ok((record, false));
         }
-        if deadline.timestamp() <= now.timestamp()
+        if deadline.as_second() <= now.as_second()
             || retention_until <= deadline
-            || retention_until > now + chrono::Duration::days(30)
+            || retention_until > now + jiff::SignedDuration::from_hours(720)
         {
             return Err(JournalError::Invalid(
                 "deadline must be future; retention must exceed deadline and be at most 30 days",
@@ -723,7 +724,7 @@ impl StateStore {
         let id = Uuid::new_v4();
         let session = Uuid::new_v4();
         tx.execute("INSERT INTO execution_jobs(id,submission_key,spec_digest,specification,state,created_at,deadline,retention_until,session_id) VALUES (?1,?2,?3,?4,'accepted',?5,?6,?7,?8)",
-            params![id.to_string(), key, digest, specification, now.timestamp(), deadline.timestamp(), retention_until.timestamp(), session.to_string()])?;
+            params![id.to_string(), key, digest, specification, now.as_second(), deadline.as_second(), retention_until.as_second(), session.to_string()])?;
         let record = get_on(&tx, id)?;
         tx.commit()?;
         Ok((record, true))
@@ -801,7 +802,8 @@ impl StateStore {
             return Err(JournalError::Conflict("allocation already claimed"));
         }
         if job.vm_name.is_none() {
-            if job.state != JobState::Accepted || job.deadline <= Utc::now().timestamp() {
+            if job.state != JobState::Accepted || job.deadline <= jiff::Timestamp::now().as_second()
+            {
                 return Err(JournalError::Conflict("job is no longer accepting a VM"));
             }
             tx.execute(
@@ -854,7 +856,7 @@ impl StateStore {
 
     pub fn mark_job_running(&self, id: Uuid) -> Result<(), JournalError> {
         let conn = self.lock_durable()?;
-        let changed = conn.execute("UPDATE execution_jobs SET state='running' WHERE id=?1 AND state='preparing' AND vm_id IS NOT NULL AND vm_destroyed=0 AND vm_allocation_aborted=0 AND deadline>?2", params![id.to_string(), Utc::now().timestamp()])?;
+        let changed = conn.execute("UPDATE execution_jobs SET state='running' WHERE id=?1 AND state='preparing' AND vm_id IS NOT NULL AND vm_destroyed=0 AND vm_allocation_aborted=0 AND deadline>?2", params![id.to_string(), jiff::Timestamp::now().as_second()])?;
         if changed == 0 {
             let job = get_on(&conn, id)?;
             if job.state != JobState::Running || job.vm_destroyed || job.vm_allocation_aborted {
@@ -1277,11 +1279,11 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn expire_job_evidence(&self, now: DateTime<Utc>) -> Result<usize, JournalError> {
+    pub fn expire_job_evidence(&self, now: jiff::Timestamp) -> Result<usize, JournalError> {
         let ids = {
             let conn = self.lock()?;
             let mut stmt = conn.prepare("SELECT id FROM execution_jobs WHERE state NOT IN ('accepted','preparing','running','deleted') AND cleanup_pending=0 AND retention_until<=?1")?;
-            stmt.query_map([now.timestamp()], |r| uuid(r.get(0)?))?
+            stmt.query_map([now.as_second()], |r| uuid(r.get(0)?))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for id in &ids {

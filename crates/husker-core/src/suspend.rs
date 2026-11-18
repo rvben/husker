@@ -159,7 +159,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Stamp the reap anchor before the network transition, so a crash mid
         // transition still leaves a suspended VM whose TTL clock is running.
         self.state
-            .set_suspended_at(record.id, Some(chrono::Utc::now()))?;
+            .set_suspended_at(record.id, Some(jiff::Timestamp::now()))?;
 
         #[cfg(feature = "linux-net")]
         {
@@ -545,7 +545,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             self.network_last_active.lock().insert(record.id, now);
             let _ = self
                 .state
-                .touch_last_activity(record.id, chrono::Utc::now());
+                .touch_last_activity(record.id, jiff::Timestamp::now());
             self.state.set_suspended_at(record.id, None)?;
         }
 

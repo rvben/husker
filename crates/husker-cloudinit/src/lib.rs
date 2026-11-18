@@ -8,6 +8,38 @@
 use std::io::Write;
 use std::net::Ipv4Addr;
 
+#[derive(Debug)]
+struct SeedTimeProvider;
+
+// Without its chrono feature, fatfs defaults to zero month and day fields.
+// Use UTC for seed files so their on-disk dates remain valid on any host.
+impl fatfs::TimeProvider for SeedTimeProvider {
+    fn get_current_date(&self) -> fatfs::Date {
+        self.get_current_date_time().date
+    }
+
+    fn get_current_date_time(&self) -> fatfs::DateTime {
+        let now = jiff::tz::Offset::UTC.to_datetime(jiff::Timestamp::now());
+        let date = now.date().clamp(
+            jiff::civil::date(1980, 1, 1),
+            jiff::civil::date(2107, 12, 31),
+        );
+        fatfs::DateTime {
+            date: fatfs::Date {
+                year: date.year() as u16,
+                month: date.month() as u16,
+                day: date.day() as u16,
+            },
+            time: fatfs::Time {
+                hour: now.hour() as u16,
+                min: now.minute() as u16,
+                sec: now.second() as u16,
+                millis: (now.subsec_nanosecond() / 1_000_000) as u16,
+            },
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CloudInitError {
     #[error("seed image IO error: {0}")]
@@ -90,8 +122,11 @@ pub fn build_seed(spec: &SeedSpec) -> Result<Vec<u8>, CloudInitError> {
     }
     {
         let cursor = std::io::Cursor::new(&mut buf[..]);
-        let fs = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new())
-            .map_err(|e| CloudInitError::Fat(e.to_string()))?;
+        let fs = fatfs::FileSystem::new(
+            cursor,
+            fatfs::FsOptions::new().time_provider(&SeedTimeProvider),
+        )
+        .map_err(|e| CloudInitError::Fat(e.to_string()))?;
         let root = fs.root_dir();
         for (name, data) in [
             ("meta-data", meta_data.as_bytes()),
@@ -220,6 +255,11 @@ mod tests {
         let fs = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()).unwrap();
         let label = fs.volume_label();
         assert!(label.eq_ignore_ascii_case("cidata"), "label was {label:?}");
+        for entry in fs.root_dir().iter() {
+            let date = entry.unwrap().created().date;
+            assert!((1..=12).contains(&date.month));
+            assert!((1..=31).contains(&date.day));
+        }
         for name in ["meta-data", "user-data", "network-config"] {
             assert!(fs.root_dir().open_file(name).is_ok(), "missing {name}");
         }

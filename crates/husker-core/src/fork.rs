@@ -243,7 +243,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             .await?;
 
         // Persist the fork as a running VM.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let record = VmRecord {
             id: fork_id,
             name: fork_name.into(),

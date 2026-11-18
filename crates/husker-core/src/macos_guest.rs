@@ -211,7 +211,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let info = created.info;
 
         let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let record = VmRecord {
             id: info.id,
             name: req.name,

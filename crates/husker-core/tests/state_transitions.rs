@@ -131,7 +131,7 @@ fn mock_core_with_vm(name: &str, state: &str) -> (Arc<HuskerCore<MockVmm>>, Uuid
         state_dir: PathBuf::from("/tmp/husker-mock-test"),
     };
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let id = Uuid::new_v4();
     let record = husker_state::VmRecord {
         id,

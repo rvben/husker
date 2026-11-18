@@ -1,5 +1,4 @@
 //! Framed synthetic guest + actual SQLite, not a live VM proof.
-use chrono::{TimeZone, Utc};
 use husker_agent_proto::frozen_bundle::{BundleFile, FrozenBundle};
 use husker_agent_proto::job_spec::JobSpec;
 use husker_agent_proto::*;
@@ -34,9 +33,8 @@ fn fixture_with_lifetime(
         },
     )]))
     .unwrap();
-    let deadline = Utc
-        .timestamp_opt(Utc::now().timestamp() + seconds, 0)
-        .unwrap();
+    let deadline =
+        jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + seconds).unwrap();
     let digest = format!("sha256:{}", "a".repeat(64));
     let spec: JobSpec = serde_json::from_value(json!({
         "version":1,"image":{"catalog_id":Uuid::new_v4(),"rootfs_digest":digest,"kernel_digest":digest,"initrd_digest":null},
@@ -53,7 +51,7 @@ fn fixture_with_lifetime(
             "launch",
             &spec.canonical_json().unwrap(),
             deadline,
-            deadline + chrono::Duration::hours(1),
+            deadline + jiff::SignedDuration::from_hours(1),
         )
         .unwrap();
     store
@@ -352,9 +350,9 @@ async fn stalled_staging_obeys_absolute_deadline_and_never_submits_session() {
             .await
             .is_err()
     );
-    let finished = Utc::now();
+    let finished = jiff::Timestamp::now();
     assert!(
-        finished.timestamp_millis() < job.deadline * 1000 + 200,
+        finished.as_millisecond() < job.deadline * 1000 + 200,
         "deadline acquired extra whole-second grace"
     );
     let failed = store.get_job(job.id).unwrap();

@@ -20,7 +20,7 @@ axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
@@ -37,7 +37,7 @@ husker-storage = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 tempfile = "3"
 # Breaks a state store underneath a live core in the health tests.
 rusqlite = { workspace = true }

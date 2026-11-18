@@ -1,17 +1,16 @@
 //! Journal fault/replay contracts, using real on-disk SQLite databases.
-use chrono::{Duration, Utc};
 use husker_state::StateStore;
 use husker_state::jobs::*;
 use uuid::Uuid;
 
 fn submit(store: &StateStore, key: &str) -> JobRecord {
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     store
         .accept_job(
             key,
             r#"{"source":"sha256:source","acceptance":"sha256:acceptance","argv":["true"]}"#,
-            now + Duration::hours(1),
-            now + Duration::days(1),
+            now + jiff::SignedDuration::from_hours(1),
+            now + jiff::SignedDuration::from_hours(24),
         )
         .unwrap()
         .0
@@ -54,8 +53,8 @@ fn budget_submit(
     store.accept_job_with_budget(
         key,
         budget_spec(),
-        Utc::now() + Duration::hours(1),
-        Utc::now() + Duration::days(1),
+        jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+        jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
         budget,
         || {
             Ok(FactoryAvailableStorage {
@@ -98,8 +97,8 @@ fn each_resource_budget_rejects_before_acceptance_and_replay_remains_available()
             .accept_job_with_budget(
                 "first",
                 &first.specification,
-                chrono::DateTime::from_timestamp(first.deadline, 0).unwrap(),
-                chrono::DateTime::from_timestamp(first.retention_until, 0).unwrap(),
+                jiff::Timestamp::from_second(first.deadline).unwrap(),
+                jiff::Timestamp::from_second(first.retention_until).unwrap(),
                 &budget,
                 || panic!("replay must not observe storage"),
             )
@@ -167,9 +166,9 @@ fn boot_storage_reservation_counts_two_disks_and_stays_owned_until_full_cleanup(
 #[test]
 fn doubled_disk_reservation_overflow_and_missing_configuration_fail_closed() {
     let store = StateStore::open_memory().unwrap();
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     store.accept_job("legacy-huge-disk", r#"{"resources":{"vcpu_count":1,"mem_size_mib":512,"disk_size_bytes":18446744073709551615}}"#,
-        now + Duration::hours(1), now + Duration::days(1)).unwrap();
+        now + jiff::SignedDuration::from_hours(1), now + jiff::SignedDuration::from_hours(24)).unwrap();
     let mut budget = budget();
     budget.max_root_disk_bytes = u64::MAX;
     budget.max_boot_storage_bytes = u64::MAX;
@@ -237,13 +236,13 @@ fn unreadable_legacy_resources_and_arithmetic_overflow_fail_closed() {
         r#"{"resources":{"vcpu_count":18446744073709551615,"mem_size_mib":512,"disk_size_bytes":1073741824}}"#,
     ] {
         let store = StateStore::open_memory().unwrap();
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         store
             .accept_job(
                 "legacy",
                 specification,
-                now + Duration::hours(1),
-                now + Duration::days(1),
+                now + jiff::SignedDuration::from_hours(1),
+                now + jiff::SignedDuration::from_hours(24),
             )
             .unwrap();
         let mut budget = budget();
@@ -415,9 +414,9 @@ fn prebackend_abort_rolls_back_lease_fence_when_job_receipt_cannot_commit() {
 fn lost_acceptance_response_restart_replays_identity_and_changed_inputs_conflict() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite");
-    let now = Utc::now();
-    let deadline = now + Duration::hours(1);
-    let retention = now + Duration::days(1);
+    let now = jiff::Timestamp::now();
+    let deadline = now + jiff::SignedDuration::from_hours(1);
+    let retention = now + jiff::SignedDuration::from_hours(24);
     let spec = r#"{"image":"sha256:one","source":"sha256:two","acceptance":"sha256:three","commands":[["true"]]}"#;
     let id;
     let session;
@@ -442,7 +441,12 @@ fn lost_acceptance_response_restart_replays_identity_and_changed_inputs_conflict
         Err(JournalError::Conflict(_))
     ));
     assert!(matches!(
-        store.accept_job("key", spec, deadline + Duration::seconds(1), retention),
+        store.accept_job(
+            "key",
+            spec,
+            deadline + jiff::SignedDuration::from_secs(1),
+            retention
+        ),
         Err(JournalError::Conflict(_))
     ));
     // An identical retry still resolves after the deadline; it cannot reset TTL.
@@ -456,7 +460,7 @@ fn concurrent_connections_accept_exactly_one_receipt() {
     let first = StateStore::open(&path).unwrap();
     let second = StateStore::open(&path).unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     let handles: Vec<_> = [first, second]
         .into_iter()
         .map(|store| {
@@ -467,8 +471,8 @@ fn concurrent_connections_accept_exactly_one_receipt() {
                     .accept_job(
                         "same",
                         "{}",
-                        now + Duration::hours(1),
-                        now + Duration::days(1),
+                        now + jiff::SignedDuration::from_hours(1),
+                        now + jiff::SignedDuration::from_hours(24),
                     )
                     .unwrap()
             })
@@ -512,7 +516,7 @@ fn binding_and_cleanup_fence_vm_generations_and_keep_evidence_after_vm_deletion(
     assert!(store.delete_job_evidence(job.id).is_err());
     // Use a VM row whose UUID is the job's recorded generation, then delete it.
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'disposable','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![generation.to_string(), Utc::now().to_rfc3339()]).unwrap();
+    conn.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'disposable','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![generation.to_string(), husker_state::format_timestamp(jiff::Timestamp::now())]).unwrap();
     store.delete_vm(generation).unwrap();
     drop(store);
     let store = StateStore::open(&path).unwrap();
@@ -534,8 +538,8 @@ fn binding_and_cleanup_fence_vm_generations_and_keep_evidence_after_vm_deletion(
         store.accept_job(
             "vm-bound",
             &job.specification,
-            chrono::DateTime::from_timestamp(job.deadline, 0).unwrap(),
-            chrono::DateTime::from_timestamp(job.retention_until, 0).unwrap()
+            jiff::Timestamp::from_second(job.deadline).unwrap(),
+            jiff::Timestamp::from_second(job.retention_until).unwrap()
         ),
         Err(JournalError::Conflict(_))
     ));
@@ -702,8 +706,8 @@ fn cleanup_pending_reserves_admission_across_terminal_outcomes_and_restart() {
             store.accept_job(
                 "next-reservation",
                 "{}",
-                Utc::now() + Duration::hours(1),
-                Utc::now() + Duration::days(1)
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)
             ),
             Err(JournalError::Capacity("active jobs"))
         ));
@@ -716,8 +720,8 @@ fn cleanup_pending_reserves_admission_across_terminal_outcomes_and_restart() {
             .accept_job(
                 "reserved-0",
                 &old.specification,
-                chrono::DateTime::from_timestamp(old.deadline, 0).unwrap(),
-                chrono::DateTime::from_timestamp(old.retention_until, 0).unwrap()
+                jiff::Timestamp::from_second(old.deadline).unwrap(),
+                jiff::Timestamp::from_second(old.retention_until).unwrap()
             )
             .unwrap()
             .1
@@ -734,8 +738,8 @@ fn cleanup_pending_reserves_admission_across_terminal_outcomes_and_restart() {
         store.accept_job(
             "one-too-many",
             "{}",
-            Utc::now() + Duration::hours(1),
-            Utc::now() + Duration::days(1)
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)
         ),
         Err(JournalError::Capacity("active jobs"))
     ));
@@ -751,8 +755,8 @@ fn admission_and_retention_are_bounded_and_deletion_never_allows_key_reexecution
         store.accept_job(
             "over-active",
             "{}",
-            Utc::now() + Duration::hours(1),
-            Utc::now() + Duration::days(1)
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)
         ),
         Err(JournalError::Capacity(_))
     ));
@@ -763,8 +767,8 @@ fn admission_and_retention_are_bounded_and_deletion_never_allows_key_reexecution
             .accept_job(
                 "job-0",
                 &job.specification,
-                chrono::DateTime::from_timestamp(job.deadline, 0).unwrap(),
-                chrono::DateTime::from_timestamp(job.retention_until, 0).unwrap()
+                jiff::Timestamp::from_second(job.deadline).unwrap(),
+                jiff::Timestamp::from_second(job.retention_until).unwrap()
             )
             .unwrap()
             .1
@@ -789,14 +793,14 @@ fn admission_and_retention_are_bounded_and_deletion_never_allows_key_reexecution
         store.accept_job(
             "over-retained",
             "{}",
-            Utc::now() + Duration::hours(1),
-            Utc::now() + Duration::days(1)
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)
         ),
         Err(JournalError::Capacity(_))
     ));
     assert_eq!(
         store
-            .expire_job_evidence(Utc::now() + Duration::days(2))
+            .expire_job_evidence(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(48))
             .unwrap(),
         MAX_RETAINED_JOBS
     );
@@ -806,8 +810,8 @@ fn admission_and_retention_are_bounded_and_deletion_never_allows_key_reexecution
         store.accept_job(
             "job-0",
             "{}",
-            Utc::now() + Duration::hours(1),
-            Utc::now() + Duration::days(1)
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)
         ),
         Err(JournalError::Conflict(_))
     ));
@@ -816,7 +820,7 @@ fn admission_and_retention_are_bounded_and_deletion_never_allows_key_reexecution
 #[test]
 fn invalid_or_oversized_evidence_and_expired_initial_acceptance_are_rejected() {
     let store = StateStore::open_memory().unwrap();
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     for spec in [
         "[]".to_owned(),
         "not-json".to_owned(),
@@ -827,8 +831,8 @@ fn invalid_or_oversized_evidence_and_expired_initial_acceptance_are_rejected() {
                 .accept_job(
                     "invalid",
                     &spec,
-                    now + Duration::hours(1),
-                    now + Duration::days(1)
+                    now + jiff::SignedDuration::from_hours(1),
+                    now + jiff::SignedDuration::from_hours(24)
                 )
                 .is_err()
         );
@@ -838,8 +842,8 @@ fn invalid_or_oversized_evidence_and_expired_initial_acceptance_are_rejected() {
             .accept_job(
                 "expired",
                 "{}",
-                now - Duration::seconds(1),
-                now + Duration::days(1)
+                now - jiff::SignedDuration::from_secs(1),
+                now + jiff::SignedDuration::from_hours(24)
             )
             .is_err()
     );
@@ -848,8 +852,8 @@ fn invalid_or_oversized_evidence_and_expired_initial_acceptance_are_rejected() {
             .accept_job(
                 "retention",
                 "{}",
-                now + Duration::hours(1),
-                now + Duration::days(31)
+                now + jiff::SignedDuration::from_hours(1),
+                now + jiff::SignedDuration::from_hours(744)
             )
             .is_err()
     );
@@ -892,13 +896,23 @@ fn fill_receipts_with_tombstones(store: &StateStore) {
 fn receipt_capacity_bounds_tombstones_whose_deadline_is_still_ahead() {
     let store = StateStore::open_memory().unwrap();
     fill_receipts_with_tombstones(&store);
-    let deadline = Utc::now() + Duration::hours(1);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
     assert!(matches!(
-        store.accept_job("overflow", "{}", deadline, deadline + Duration::days(1)),
+        store.accept_job(
+            "overflow",
+            "{}",
+            deadline,
+            deadline + jiff::SignedDuration::from_hours(24)
+        ),
         Err(JournalError::Capacity("submission receipts"))
     ));
     assert!(matches!(
-        store.accept_job("receipt-0", "{}", deadline, deadline + Duration::days(1)),
+        store.accept_job(
+            "receipt-0",
+            "{}",
+            deadline,
+            deadline + jiff::SignedDuration::from_hours(24)
+        ),
         Err(JournalError::Conflict(_))
     ));
 }
@@ -909,7 +923,7 @@ fn tombstones_past_their_deadline_free_receipt_capacity_without_reexecution() {
     let path = temp.path().join("tombstones.sqlite");
     let store = StateStore::open(&path).unwrap();
     fill_receipts_with_tombstones(&store);
-    let past = (Utc::now() - Duration::seconds(1)).timestamp();
+    let past = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).as_second();
     let conn = rusqlite::Connection::open(&path).unwrap();
     // Deadlines are immutable, so age the journal as elapsed time would.
     conn.execute_batch(&format!(
@@ -922,9 +936,14 @@ fn tombstones_past_their_deadline_free_receipt_capacity_without_reexecution() {
          COMMIT;"
     ))
     .unwrap();
-    let deadline = Utc::now() + Duration::hours(1);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
     let (fresh, created) = store
-        .accept_job("overflow", "{}", deadline, deadline + Duration::days(1))
+        .accept_job(
+            "overflow",
+            "{}",
+            deadline,
+            deadline + jiff::SignedDuration::from_hours(24),
+        )
         .unwrap();
     assert!(created);
     assert_eq!(fresh.state, JobState::Accepted);
@@ -940,10 +959,15 @@ fn tombstones_past_their_deadline_free_receipt_capacity_without_reexecution() {
         "only the tombstone whose deadline is ahead remains"
     );
     assert!(matches!(
-        store.accept_job("receipt-1", "{}", deadline, deadline + Duration::days(1)),
+        store.accept_job(
+            "receipt-1",
+            "{}",
+            deadline,
+            deadline + jiff::SignedDuration::from_hours(24)
+        ),
         Err(JournalError::Conflict(_))
     ));
-    let expired = chrono::DateTime::from_timestamp(past, 0).unwrap();
+    let expired = jiff::Timestamp::from_second(past).unwrap();
     assert!(matches!(
         store.accept_job("receipt-0", "{}", expired, deadline),
         Err(JournalError::Invalid(_))
@@ -970,7 +994,7 @@ fn cleanup_ownership_survives_retention_expiry_and_two_jobs_cannot_share_one_vm(
         .unwrap();
     assert_eq!(
         store
-            .expire_job_evidence(Utc::now() + Duration::days(2))
+            .expire_job_evidence(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(48))
             .unwrap(),
         0
     );
@@ -983,7 +1007,7 @@ fn cleanup_ownership_survives_retention_expiry_and_two_jobs_cannot_share_one_vm(
         .unwrap();
     assert_eq!(
         store
-            .expire_job_evidence(Utc::now() + Duration::days(2))
+            .expire_job_evidence(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(48))
             .unwrap(),
         1
     );
@@ -1016,7 +1040,7 @@ fn migration_16_upgrades_existing_database_and_identity_cannot_be_rewritten() {
     )
     .unwrap();
     let vm_id = Uuid::new_v4();
-    conn.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'migration-survivor','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![vm_id.to_string(), Utc::now().to_rfc3339()]).unwrap();
+    conn.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'migration-survivor','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![vm_id.to_string(), husker_state::format_timestamp(jiff::Timestamp::now())]).unwrap();
     let store = StateStore::open(&path).unwrap();
     assert_eq!(store.get_vm(vm_id).unwrap().name, "migration-survivor");
     let job = running(&store, "immutable");
@@ -1083,7 +1107,7 @@ fn binary_artifacts_survive_terminal_vm_deletion_and_reopen_until_explicit_evide
     );
     let generation = job.vm_id.unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'disposable','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![generation.to_string(), Utc::now().to_rfc3339()]).unwrap();
+    conn.execute("INSERT INTO vms(id,name,state,vcpu_count,mem_size_mib,vsock_cid,kernel_path,rootfs_path,created_at,updated_at) VALUES (?1,'disposable','stopped',1,128,3,'kernel','disk',?2,?2)", rusqlite::params![generation.to_string(), husker_state::format_timestamp(jiff::Timestamp::now())]).unwrap();
     store.delete_vm(generation).unwrap();
     store.record_job_vm_destruction(job.vm_id.unwrap()).unwrap();
     store
@@ -1405,8 +1429,8 @@ fn filesystem_pressure_is_atomic_and_replay_never_observes_storage() {
         store.accept_job_with_budget(
             key,
             budget_spec(),
-            Utc::now() + Duration::hours(1),
-            Utc::now() + Duration::days(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
             &budget,
             || Ok(storage),
         )
@@ -1452,8 +1476,8 @@ fn filesystem_pressure_is_atomic_and_replay_never_observes_storage() {
             .accept_job_with_budget(
                 "observation-error",
                 budget_spec(),
-                Utc::now() + Duration::hours(1),
-                Utc::now() + Duration::days(1),
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
                 &budget,
                 || Err(JournalError::Capacity("observation failed"))
             )
@@ -1497,8 +1521,8 @@ fn filesystem_pressure_is_atomic_and_replay_never_observes_storage() {
             .accept_job_with_budget(
                 "accepted",
                 &first.specification,
-                chrono::DateTime::from_timestamp(first.deadline, 0).unwrap(),
-                chrono::DateTime::from_timestamp(first.retention_until, 0).unwrap(),
+                jiff::Timestamp::from_second(first.deadline).unwrap(),
+                jiff::Timestamp::from_second(first.retention_until).unwrap(),
                 &budget,
                 || panic!("replay must not observe storage")
             )
@@ -1523,8 +1547,8 @@ fn concurrent_free_space_claims_cannot_overbook() {
                 store.accept_job_with_budget(
                     &format!("space-{i}"),
                     budget_spec(),
-                    Utc::now() + Duration::hours(1),
-                    Utc::now() + Duration::days(1),
+                    jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+                    jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
                     &budget,
                     || {
                         Ok(FactoryAvailableStorage {

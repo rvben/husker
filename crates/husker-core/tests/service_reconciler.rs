@@ -185,7 +185,7 @@ fn make_service_record(
     kernel: &Path,
     rootfs: &Path,
 ) -> ServiceRecord {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     ServiceRecord {
         id,
         name: name.into(),
@@ -612,7 +612,7 @@ async fn reconcile_empty_rootfs_returns_failed() {
         &runtime_dir,
     );
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let svc = ServiceRecord {
         id: Uuid::new_v4(),
         name: "empty-svc".into(),

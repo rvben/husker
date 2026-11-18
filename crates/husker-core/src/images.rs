@@ -55,7 +55,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             content_digest: Some(content_digest),
             parent_image: None,
             size_bytes: metadata.len(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
 
         if let Err(err) = self.state.insert_image(&record).map_err(|e| match e {
@@ -132,7 +132,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             content_digest: Some(content_digest),
             parent_image: None,
             size_bytes: artifact.size_bytes,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         if let Err(err) = self.state.insert_image(&record).map_err(|e| match e {
             husker_state::StateError::ImageAlreadyExists(n) => CoreError::ImageAlreadyExists(n),
@@ -258,7 +258,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             content_digest: Some(content_digest),
             parent_image: Some(parent.name),
             size_bytes: metadata.len(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         if let Err(error) = self.state.insert_image(&record) {
             if created_catalog_file {

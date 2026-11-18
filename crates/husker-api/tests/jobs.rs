@@ -51,7 +51,7 @@ fn spec(bundle: &FrozenBundle) -> JobSpec {
         "commands":[{"argv":["true"],"timeout_secs":20}],"working_directory":"/workspace",
         "writable_directories":[],"environment":{},"uid":1000,"gid":1000,
         "resources":{"vcpu_count":1,"mem_size_mib":512,"disk_size_bytes":1073741824_u64,"pids_limit":32},
-        "network":{"mode":"none"},"deadline":chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp()+60,0),"artifacts":[],
+        "network":{"mode":"none"},"deadline":jiff::Timestamp::from_second(jiff::Timestamp::now().as_second()+60).unwrap(),"artifacts":[],
         "correlation":{"job":"http-fixture","stage":"baseline","round":1}
     })).unwrap()
 }
@@ -104,7 +104,7 @@ async fn retained_evidence_auth_replay_cancel_and_deletion_contract() {
             &submission.idempotency_key,
             &spec.canonical_json().unwrap(),
             spec.deadline,
-            spec.deadline + chrono::Duration::hours(1),
+            spec.deadline + jiff::SignedDuration::from_hours(1),
         )
         .unwrap();
     let vm = Uuid::new_v4();
@@ -149,7 +149,7 @@ async fn retained_evidence_auth_replay_cancel_and_deletion_contract() {
             "active",
             &spec.canonical_json().unwrap(),
             spec.deadline,
-            spec.deadline + chrono::Duration::hours(1),
+            spec.deadline + jiff::SignedDuration::from_hours(1),
         )
         .unwrap();
     store
@@ -214,7 +214,7 @@ async fn retained_evidence_auth_replay_cancel_and_deletion_contract() {
         }
     }
 
-    let payload = json!({"submission":submission,"source_bundle":base64_encode(bundle.bytes()),"acceptance_bundle":base64_encode(bundle.bytes()),"retention_until":spec.deadline+chrono::Duration::hours(1)});
+    let payload = json!({"submission":submission,"source_bundle":base64_encode(bundle.bytes()),"acceptance_bundle":base64_encode(bundle.bytes()),"retention_until":spec.deadline+jiff::SignedDuration::from_hours(1)});
     for endpoint in [
         path.clone(),
         format!("{path}/events"),
@@ -485,7 +485,7 @@ async fn retained_evidence_auth_replay_cancel_and_deletion_contract() {
             "shutdown-unstarted",
             &spec.canonical_json().unwrap(),
             spec.deadline,
-            spec.deadline + chrono::Duration::hours(1),
+            spec.deadline + jiff::SignedDuration::from_hours(1),
         )
         .unwrap()
         .0;
@@ -508,7 +508,7 @@ async fn retained_evidence_auth_replay_cancel_and_deletion_contract() {
     assert_eq!(interrupted["job"]["vm_id"], Value::Null);
     assert_eq!(shutdown.cleanup_pending, 1); // Previously cancelled owner is still unconfirmed.
     let mut fresh = json!({"submission":submission,"source_bundle":base64_encode(bundle.bytes()),
-        "acceptance_bundle":base64_encode(bundle.bytes()),"retention_until":spec.deadline+chrono::Duration::hours(1)});
+        "acceptance_bundle":base64_encode(bundle.bytes()),"retention_until":spec.deadline+jiff::SignedDuration::from_hours(1)});
     fresh["submission"]["idempotency_key"] = json!("after-shutdown");
     assert_eq!(
         request(&app, "POST", "/v1/jobs", fresh, true).await.0,

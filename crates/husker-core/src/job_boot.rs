@@ -495,7 +495,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         let canonical = spec
             .canonical_json()
             .map_err(|error| invalid(error.to_string()))?;
-        if canonical != job.specification || spec.deadline.timestamp() != job.deadline {
+        if canonical != job.specification || spec.deadline.as_second() != job.deadline {
             return Err(invalid("job specification is not canonical"));
         }
         // Filtered egress stays unsupported here until its pinned policy and
@@ -597,7 +597,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             std::fs::File::open(&parent)
                 .and_then(|file| file.sync_all())
                 .map_err(|error| invalid(error.to_string()))?;
-            if chrono::Utc::now().timestamp() >= job.deadline {
+            if jiff::Timestamp::now().as_second() >= job.deadline {
                 return Err(invalid("job deadline elapsed during boot preparation"));
             }
             // Creation sets the fence once it adopts the lease. Any error
@@ -631,7 +631,8 @@ impl<B: VmmBackend> HuskerCore<B> {
                 .state
                 .bind_job_vm(id, record.id, &record.name)
                 .map_err(|error| invalid(error.to_string()))?;
-            if bound.state != JobState::Preparing || chrono::Utc::now().timestamp() >= job.deadline
+            if bound.state != JobState::Preparing
+                || jiff::Timestamp::now().as_second() >= job.deadline
             {
                 return Err(invalid(
                     "job stopped or deadline elapsed during VM allocation; cleanup remains pending",
@@ -651,7 +652,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                         invalid(format!("record pre-allocation abort: {journal}"))
                     })?;
             }
-            let state = if chrono::Utc::now().timestamp() >= job.deadline {
+            let state = if jiff::Timestamp::now().as_second() >= job.deadline {
                 JobState::TimedOut
             } else {
                 JobState::InfrastructureFailed
@@ -922,13 +923,13 @@ mod allocation_recovery_tests {
         husker_state::HostResourceLease,
     ) {
         let state = husker_state::StateStore::open(&path.join("journal.sqlite")).unwrap();
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = state
             .accept_job(
                 "entered-recovery",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -1071,8 +1072,8 @@ mod allocation_recovery_tests {
             .accept_job(
                 "entered-recovery",
                 "{}",
-                chrono::DateTime::from_timestamp(job.deadline, 0).unwrap(),
-                chrono::DateTime::from_timestamp(job.retention_until, 0).unwrap(),
+                jiff::Timestamp::from_second(job.deadline).unwrap(),
+                jiff::Timestamp::from_second(job.retention_until).unwrap(),
             )
             .unwrap();
         assert!(!replay.1);
@@ -1183,7 +1184,7 @@ mod allocation_recovery_tests {
         for transferred in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let (core, job, lease) = fixture(tmp.path(), "owned");
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let record = husker_state::VmRecord {
                 id: lease.vm_id.unwrap(),
                 name: lease.vm_name.clone(),

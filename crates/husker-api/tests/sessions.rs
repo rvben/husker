@@ -73,7 +73,7 @@ impl VmmBackend for AgentBackend {
     }
 }
 fn vm_record(name: &str) -> VmRecord {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     VmRecord {
         id: uuid::Uuid::new_v4(),
         name: name.into(),

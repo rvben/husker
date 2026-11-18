@@ -187,7 +187,7 @@ mod linux {
     fn require_deadline(spec: &JobSpec) -> Result<()> {
         ensure!(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
-                < spec.deadline.timestamp() as u64,
+                < spec.deadline.as_second() as u64,
             "job hard deadline expired"
         );
         Ok(())

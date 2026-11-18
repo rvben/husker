@@ -997,7 +997,7 @@ pub(crate) async fn reveal_secret<B: VmmBackend + 'static>(
     Ok(Json(RevealedSecretResponse {
         name: revealed.name,
         value: revealed.value,
-        updated_at: revealed.updated_at.to_rfc3339(),
+        updated_at: husker_core::format_timestamp(revealed.updated_at),
     }))
 }
 
@@ -2449,7 +2449,7 @@ pub(crate) async fn add_port_forward_handler<B: VmmBackend + 'static>(
             guest_port: rec.guest_port,
             protocol: rec.protocol,
             bind_addr: rec.bind_addr,
-            created_at: rec.created_at.to_rfc3339(),
+            created_at: husker_core::format_timestamp(rec.created_at),
         }),
     ))
 }
@@ -2477,7 +2477,7 @@ pub(crate) async fn list_port_forwards_handler<B: VmmBackend + 'static>(
                 guest_port: pf.guest_port,
                 protocol: pf.protocol,
                 bind_addr: pf.bind_addr,
-                created_at: pf.created_at.to_rfc3339(),
+                created_at: husker_core::format_timestamp(pf.created_at),
             })
             .collect(),
     ))
@@ -2614,8 +2614,8 @@ fn pool_to_response(r: PoolRecord) -> PoolResponse {
         initrd_path: r.initrd_path,
         vcpu_count: r.vcpu_count,
         mem_size_mib: r.mem_size_mib,
-        created_at: r.created_at.to_rfc3339(),
-        updated_at: r.updated_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
+        updated_at: husker_core::format_timestamp(r.updated_at),
     }
 }
 
@@ -2624,8 +2624,8 @@ fn host_group_to_response(r: HostGroupRecord) -> HostGroupResponse {
         id: r.id.to_string(),
         name: r.name,
         description: r.description,
-        created_at: r.created_at.to_rfc3339(),
-        updated_at: r.updated_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
+        updated_at: husker_core::format_timestamp(r.updated_at),
     }
 }
 
@@ -2663,8 +2663,8 @@ fn service_to_response<B: VmmBackend + 'static>(
         image: r.image,
         rootfs_path: r.rootfs_path,
         kernel_path: r.kernel_path,
-        created_at: r.created_at.to_rfc3339(),
-        updated_at: r.updated_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
+        updated_at: husker_core::format_timestamp(r.updated_at),
         cloud_image: r.cloud_image,
         disk_size: r.disk_size,
         balloon: r.balloon,
@@ -2684,7 +2684,7 @@ fn image_to_response(r: ImageRecord) -> ImageResponse {
         content_digest: r.content_digest,
         parent_image: r.parent_image,
         size_bytes: r.size_bytes,
-        created_at: r.created_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
     }
 }
 
@@ -2700,8 +2700,8 @@ fn secret_to_response(r: SecretMetadata) -> SecretResponse {
     SecretResponse {
         id: r.id.to_string(),
         name: r.name,
-        created_at: r.created_at.to_rfc3339(),
-        updated_at: r.updated_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
+        updated_at: husker_core::format_timestamp(r.updated_at),
     }
 }
 
@@ -2711,7 +2711,7 @@ fn snapshot_to_response(r: SnapshotRecord) -> SnapshotResponse {
         name: r.name,
         source_vm_name: r.source_vm_name,
         file_path: r.file_path,
-        created_at: r.created_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
     }
 }
 
@@ -2729,8 +2729,8 @@ pub(crate) fn record_to_response(
         vsock_cid: r.vsock_cid,
         host_ip: r.host_ip,
         guest_ip: r.guest_ip,
-        created_at: r.created_at.to_rfc3339(),
-        updated_at: r.updated_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
+        updated_at: husker_core::format_timestamp(r.updated_at),
         userdata_status: r.userdata_status,
         vmm: r.vmm.to_string(),
         boot_mode: r.boot_mode,
@@ -2743,10 +2743,10 @@ pub(crate) fn record_to_response(
         // Only surface auto_resume for VMs that opted into the policy, so the payload
         // stays tidy for the common (no-policy) case.
         auto_resume: r.idle_timeout_secs.is_some().then_some(r.auto_resume),
-        suspended_at: r.suspended_at.map(|d| d.to_rfc3339()),
+        suspended_at: r.suspended_at.map(husker_core::format_timestamp),
         expires_at: expiration
             .as_ref()
-            .map(|value| value.expires_at.to_rfc3339()),
+            .map(|value| husker_core::format_timestamp(value.expires_at)),
         owner: expiration.and_then(|value| value.owner),
     }
 }
@@ -2757,6 +2757,6 @@ fn volume_to_response(r: VolumeRecord) -> VolumeResponse {
         name: r.name,
         file_path: r.file_path,
         size_bytes: r.size_bytes,
-        created_at: r.created_at.to_rfc3339(),
+        created_at: husker_core::format_timestamp(r.created_at),
     }
 }

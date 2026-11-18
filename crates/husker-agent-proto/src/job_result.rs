@@ -221,7 +221,7 @@ mod tests {
                 pids_limit: 64,
             },
             network: JobNetwork::None {},
-            deadline: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            deadline: jiff::Timestamp::from_second(1_800_000_000).unwrap(),
             artifacts: vec![
                 JobArtifact {
                     path: "out/a.bin".into(),

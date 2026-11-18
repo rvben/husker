@@ -62,10 +62,10 @@ tar-codec = "=0.0.15"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 
 # FAT filesystem
-fatfs = "0.3"
+fatfs = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 
 # Utilities
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2", default-features = false, features = ["serde", "std"] }
 hex = "0.4"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -87,7 +87,7 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
 # OpenAPI documentation
-utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
+utoipa = { version = "6", features = ["axum_extras", "jiff_0_2", "uuid"] }
 # Keep builds reproducible and offline-capable. Without `vendored`, this crate's
 # build script downloads Swagger UI from GitHub during every fresh profile.
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }

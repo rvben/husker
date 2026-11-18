@@ -39,7 +39,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             name: req.name.clone(),
             source_vm_name: req.vm,
             file_path: snapshot_path.to_string_lossy().into_owned(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
 
         if let Err(err) = self.state.insert_snapshot(&record).map_err(|e| match e {

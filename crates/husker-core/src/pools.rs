@@ -58,7 +58,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             return Err(e);
         }
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let record = PoolRecord {
             id: Uuid::new_v4(),
             name: req.name.clone(),

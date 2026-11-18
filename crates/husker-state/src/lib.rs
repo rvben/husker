@@ -9,7 +9,6 @@ pub mod jobs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -236,8 +235,8 @@ pub struct VmRecord {
     pub guest_ip: Option<String>,
     pub kernel_path: String,
     pub rootfs_path: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
     pub userdata: Option<String>,
     pub userdata_status: Option<UserdataStatus>,
     /// JSON-serialized environment variables for userdata script.
@@ -261,10 +260,10 @@ pub struct VmRecord {
     pub egress_policy: Option<String>,
     /// Last control-plane interaction, debounced observability mirror of the
     /// in-memory activity signal used by the idle policy.
-    pub last_activity_at: DateTime<Utc>,
+    pub last_activity_at: jiff::Timestamp,
     /// When the VM entered `suspended` (drives the reap timer). None = never
     /// suspended or suspended without stamping; treated as not-reapable.
-    pub suspended_at: Option<DateTime<Utc>>,
+    pub suspended_at: Option<jiff::Timestamp>,
     /// Idle policy: seconds of idle before suspend. None = policy disabled.
     pub idle_timeout_secs: Option<u64>,
     /// Idle policy: seconds suspended before reap. None/0 = never reap.
@@ -284,7 +283,7 @@ pub struct VmRecord {
 pub struct VmExpirationRecord {
     pub vm_id: Uuid,
     pub owner: Option<String>,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: jiff::Timestamp,
 }
 
 /// Persistent port forward record.
@@ -298,7 +297,7 @@ pub struct PortForwardRecord {
     /// Host bind address for the userspace proxy (macOS). `None` means the
     /// platform default (127.0.0.1 on macOS; all-interfaces on Linux nftables).
     pub bind_addr: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// Fleet size as counted in the store, without loading any record.
@@ -320,7 +319,7 @@ pub struct HostResourceLease {
     pub vsock_cid: u32,
     pub tap_device: Option<String>,
     pub guest_ip: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
     pub vm_id: Option<Uuid>,
     pub backend_entered: bool,
     pub vm_destroyed: bool,
@@ -333,8 +332,8 @@ pub struct HostGroupRecord {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Persistent service record.
@@ -355,8 +354,8 @@ pub struct ServiceRecord {
     pub userdata: Option<String>,
     /// JSON-encoded Vec<(String,String)>.
     pub userdata_env: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
     /// Cloud image name for UEFI-booted services (mutually exclusive with
     /// rootfs+kernel direct-boot). None for direct-kernel services.
     pub cloud_image: Option<String>,
@@ -384,8 +383,8 @@ pub struct PoolRecord {
     pub initrd_path: Option<String>,
     pub vcpu_count: Option<u32>,
     pub mem_size_mib: Option<u32>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Persistent snapshot record.
@@ -395,7 +394,7 @@ pub struct SnapshotRecord {
     pub name: String,
     pub source_vm_name: String,
     pub file_path: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// Persistent image catalog record.
@@ -418,7 +417,7 @@ pub struct ImageRecord {
     /// images and legacy records leave this unset.
     pub parent_image: Option<String>,
     pub size_bytes: u64,
-    pub created_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// Persistent secret record (ciphertext only; plaintext never stored).
@@ -428,8 +427,8 @@ pub struct SecretRecord {
     pub name: String,
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Persistent volume catalog record.
@@ -439,7 +438,7 @@ pub struct VolumeRecord {
     pub name: String,
     pub file_path: String,
     pub size_bytes: u64,
-    pub created_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// SQLite-backed state store. Thread-safe via an internal connection pool: a
@@ -977,8 +976,8 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.guest_ip,
             record.kernel_path,
             record.rootfs_path,
-            record.created_at.to_rfc3339(),
-            record.updated_at.to_rfc3339(),
+            format_timestamp(record.created_at),
+            format_timestamp(record.updated_at),
             record.userdata,
             record.userdata_status.map(UserdataStatus::as_str),
             record.userdata_env,
@@ -989,8 +988,8 @@ fn insert_vm_on(conn: &Connection, record: &VmRecord) -> Result<(), StateError> 
             record.balloon as i64,
             record.volume,
             record.network.as_str(),
-            record.last_activity_at.to_rfc3339(),
-            record.suspended_at.map(|d| d.to_rfc3339()),
+            format_timestamp(record.last_activity_at),
+            record.suspended_at.map(format_timestamp),
             record.idle_timeout_secs.map(|v| v as i64),
             record.suspend_ttl_secs.map(|v| v as i64),
             record.auto_resume as i64,
@@ -1041,7 +1040,7 @@ fn insert_vm_expiration_on(
         params![
             expiration.vm_id.to_string(),
             expiration.owner,
-            expiration.expires_at.timestamp(),
+            expiration.expires_at.as_second(),
         ],
     )?;
     Ok(())
@@ -1402,13 +1401,13 @@ impl StateStore {
     }
 
     /// List VM generations whose hard lifetime has elapsed.
-    pub fn list_expired_vm_ids(&self, now: DateTime<Utc>) -> Result<Vec<Uuid>, StateError> {
+    pub fn list_expired_vm_ids(&self, now: jiff::Timestamp) -> Result<Vec<Uuid>, StateError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT vm_id FROM vm_expirations WHERE expires_at <= ?1 ORDER BY expires_at",
         )?;
         Ok(stmt
-            .query_map(params![now.timestamp()], |row| {
+            .query_map(params![now.as_second()], |row| {
                 let id: String = row.get(0)?;
                 parse_uuid(&id)
             })?
@@ -1514,7 +1513,11 @@ impl StateStore {
         let conn = self.lock()?;
         let updated = conn.execute(
             "UPDATE vms SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            params![state, Utc::now().to_rfc3339(), id.to_string()],
+            params![
+                state,
+                format_timestamp(jiff::Timestamp::now()),
+                id.to_string()
+            ],
         )?;
         if updated == 0 {
             return Err(StateError::VmNotFound(id));
@@ -1536,7 +1539,12 @@ impl StateStore {
         let conn = self.lock()?;
         let updated = conn.execute(
             "UPDATE vms SET state = ?1, pid = ?2, updated_at = ?3 WHERE id = ?4",
-            params![state, pid, Utc::now().to_rfc3339(), id.to_string()],
+            params![
+                state,
+                pid,
+                format_timestamp(jiff::Timestamp::now()),
+                id.to_string()
+            ],
         )?;
         if updated == 0 {
             return Err(StateError::VmNotFound(id));
@@ -1556,7 +1564,7 @@ impl StateStore {
             "UPDATE vms
              SET state = 'stopped', pid = NULL, suspended_at = NULL, updated_at = ?1
              WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), id.to_string()],
+            params![format_timestamp(jiff::Timestamp::now()), id.to_string()],
         )?;
         if updated == 0 {
             return Err(StateError::VmNotFound(id));
@@ -1573,7 +1581,7 @@ impl StateStore {
         let updated = conn.execute(
             "UPDATE vms SET tap_device = NULL, host_ip = NULL, guest_ip = NULL, updated_at = ?2 \
              WHERE id = ?1",
-            params![id.to_string(), Utc::now().to_rfc3339()],
+            params![id.to_string(), format_timestamp(jiff::Timestamp::now())],
         )?;
         if updated == 0 {
             return Err(StateError::VmNotFound(id));
@@ -1582,11 +1590,11 @@ impl StateStore {
     }
 
     /// Update the debounced last-activity mirror.
-    pub fn touch_last_activity(&self, id: Uuid, at: DateTime<Utc>) -> Result<(), StateError> {
+    pub fn touch_last_activity(&self, id: Uuid, at: jiff::Timestamp) -> Result<(), StateError> {
         let conn = self.lock()?;
         let n = conn.execute(
             "UPDATE vms SET last_activity_at = ?1 WHERE id = ?2",
-            params![at.to_rfc3339(), id.to_string()],
+            params![format_timestamp(at), id.to_string()],
         )?;
         if n == 0 {
             return Err(StateError::VmNotFound(id));
@@ -1595,11 +1603,15 @@ impl StateStore {
     }
 
     /// Set or clear the reap timer anchor.
-    pub fn set_suspended_at(&self, id: Uuid, at: Option<DateTime<Utc>>) -> Result<(), StateError> {
+    pub fn set_suspended_at(
+        &self,
+        id: Uuid,
+        at: Option<jiff::Timestamp>,
+    ) -> Result<(), StateError> {
         let conn = self.lock()?;
         let n = conn.execute(
             "UPDATE vms SET suspended_at = ?1 WHERE id = ?2",
-            params![at.map(|d| d.to_rfc3339()), id.to_string()],
+            params![at.map(format_timestamp), id.to_string()],
         )?;
         if n == 0 {
             return Err(StateError::VmNotFound(id));
@@ -1656,7 +1668,7 @@ impl StateStore {
         let conn = self.lock()?;
         let updated = conn.execute(
             "UPDATE vms SET guest_ip = ?1, updated_at = ?2 WHERE id = ?3",
-            params![ip, Utc::now().to_rfc3339(), id.to_string()],
+            params![ip, format_timestamp(jiff::Timestamp::now()), id.to_string()],
         )?;
         if updated == 0 {
             return Err(StateError::VmNotFound(id));
@@ -1719,8 +1731,8 @@ impl StateStore {
                 record.id.to_string(),
                 record.name,
                 record.description,
-                record.created_at.to_rfc3339(),
-                record.updated_at.to_rfc3339(),
+                format_timestamp(record.created_at),
+                format_timestamp(record.updated_at),
             ],
         )
         .map_err(|e| match &e {
@@ -1829,8 +1841,8 @@ impl StateStore {
                 record.mem_size_mib,
                 record.userdata,
                 record.userdata_env,
-                record.created_at.to_rfc3339(),
-                record.updated_at.to_rfc3339(),
+                format_timestamp(record.created_at),
+                format_timestamp(record.updated_at),
                 record.cloud_image,
                 disk_size_i64,
                 record.balloon as i64,
@@ -1910,7 +1922,11 @@ impl StateStore {
             "UPDATE services
              SET desired_instances = ?2, updated_at = ?3
              WHERE id = ?1",
-            params![id.to_string(), desired_instances, Utc::now().to_rfc3339()],
+            params![
+                id.to_string(),
+                desired_instances,
+                format_timestamp(jiff::Timestamp::now())
+            ],
         )?;
         if updated == 0 {
             return Err(StateError::ServiceNotFound(id));
@@ -1983,8 +1999,8 @@ impl StateStore {
                 record.initrd_path,
                 record.vcpu_count,
                 record.mem_size_mib,
-                record.created_at.to_rfc3339(),
-                record.updated_at.to_rfc3339(),
+                format_timestamp(record.created_at),
+                format_timestamp(record.updated_at),
             ],
         );
         if let Err(error) = insert_result {
@@ -2142,7 +2158,7 @@ impl StateStore {
                 record.name,
                 record.source_vm_name,
                 record.file_path,
-                record.created_at.to_rfc3339(),
+                format_timestamp(record.created_at),
             ],
         )
         .map_err(|e| match &e {
@@ -2234,7 +2250,7 @@ impl StateStore {
                 record.format,
                 record.kind.as_str(),
                 size_bytes_i64,
-                record.created_at.to_rfc3339(),
+                format_timestamp(record.created_at),
                 record.boot_init,
                 record.content_digest,
                 record.parent_image,
@@ -2317,8 +2333,8 @@ impl StateStore {
                 record.name,
                 record.ciphertext,
                 record.nonce,
-                record.created_at.to_rfc3339(),
-                record.updated_at.to_rfc3339(),
+                format_timestamp(record.created_at),
+                format_timestamp(record.updated_at),
             ],
         )
         .map_err(|e| match &e {
@@ -2387,7 +2403,12 @@ impl StateStore {
             "UPDATE secrets
              SET ciphertext = ?2, nonce = ?3, updated_at = ?4
              WHERE id = ?1",
-            params![id.to_string(), ciphertext, nonce, Utc::now().to_rfc3339()],
+            params![
+                id.to_string(),
+                ciphertext,
+                nonce,
+                format_timestamp(jiff::Timestamp::now())
+            ],
         )?;
         if updated == 0 {
             return Err(StateError::SecretNotFound(id));
@@ -2728,7 +2749,7 @@ impl StateStore {
                 record.guest_port,
                 record.protocol,
                 record.bind_addr,
-                record.created_at.to_rfc3339(),
+                format_timestamp(record.created_at),
             ],
         )
         .map_err(|e| match &e {
@@ -2798,7 +2819,7 @@ impl StateStore {
              WHERE id = ?3 AND userdata_status = ?4",
             params![
                 next.as_str(),
-                Utc::now().to_rfc3339(),
+                format_timestamp(jiff::Timestamp::now()),
                 id.to_string(),
                 expected.as_str()
             ],
@@ -2833,7 +2854,7 @@ impl StateStore {
         use VmLifecycleState as S;
         let conn = self.lock()?;
         let tx = conn.unchecked_transaction()?;
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(jiff::Timestamp::now());
         let count = tx.execute(
             &format!(
                 "UPDATE vms
@@ -2921,7 +2942,7 @@ impl StateStore {
                 record.name,
                 record.file_path,
                 size_bytes_i64,
-                record.created_at.to_rfc3339(),
+                format_timestamp(record.created_at),
             ],
         )
         .map_err(|e| match &e {
@@ -3044,8 +3065,32 @@ fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     })
 }
 
-fn parse_datetime(s: &str) -> rusqlite::Result<DateTime<Utc>> {
-    s.parse::<DateTime<Utc>>().map_err(|e| {
+/// Keep the numeric UTC offset and fractional precision used by existing
+/// database rows and API fields. The offset also keeps whole-second values
+/// sorted before fractional values of the same second in SQLite.
+pub fn format_timestamp(timestamp: jiff::Timestamp) -> String {
+    use jiff::{fmt::temporal::DateTimePrinter, tz::Offset};
+
+    let nanos = timestamp.subsec_nanosecond();
+    let precision = if nanos == 0 {
+        0
+    } else if nanos % 1_000_000 == 0 {
+        3
+    } else if nanos % 1_000 == 0 {
+        6
+    } else {
+        9
+    };
+    let mut formatted = String::with_capacity(35);
+    DateTimePrinter::new()
+        .precision(Some(precision))
+        .print_timestamp_with_offset(&timestamp, Offset::UTC, &mut formatted)
+        .expect("writing a timestamp to String cannot fail");
+    formatted
+}
+
+fn parse_datetime(s: &str) -> rusqlite::Result<jiff::Timestamp> {
+    s.parse::<jiff::Timestamp>().map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
@@ -3178,7 +3223,7 @@ fn row_to_vm_expiration_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmEx
     Ok(VmExpirationRecord {
         vm_id: parse_uuid(&vm_id)?,
         owner: row.get(1)?,
-        expires_at: DateTime::from_timestamp(expires_at, 0).ok_or_else(|| {
+        expires_at: jiff::Timestamp::from_second(expires_at).map_err(|_| {
             rusqlite::Error::FromSqlConversionFailure(
                 2,
                 rusqlite::types::Type::Integer,
@@ -3379,7 +3424,7 @@ pub(crate) fn insert_host_resource_lease(
         vsock_cid,
         tap_device: None,
         guest_ip: None,
-        created_at: Utc::now(),
+        created_at: jiff::Timestamp::now(),
         vm_id,
         backend_entered: false,
         vm_destroyed: false,
@@ -3393,7 +3438,7 @@ pub(crate) fn insert_host_resource_lease(
             lease.id.to_string(),
             lease.vm_name,
             lease.vsock_cid,
-            lease.created_at.to_rfc3339(),
+            format_timestamp(lease.created_at),
             lease.vm_id.map(|id| id.to_string()),
         ],
     );
@@ -3419,6 +3464,20 @@ mod tests {
     use std::sync::{Mutex, Once};
 
     use super::*;
+
+    #[test]
+    fn legacy_timestamp_text_round_trips_in_sqlite_order() {
+        let values = [
+            "2026-01-02T03:04:05+00:00",
+            "2026-01-02T03:04:05.100+00:00",
+            "2026-01-02T03:04:05.100100+00:00",
+            "2026-01-02T03:04:05.100100100+00:00",
+        ];
+        for value in values {
+            assert_eq!(format_timestamp(parse_datetime(value).unwrap()), value);
+        }
+        assert!(values.is_sorted());
+    }
 
     #[test]
     fn vm_lifecycle_state_has_a_stable_round_trip_for_every_value() {
@@ -3480,8 +3539,8 @@ mod tests {
             guest_ip: Some("172.20.0.2".into()),
             kernel_path: "/boot/vmlinux".into(),
             rootfs_path: "/images/rootfs.ext4".into(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             userdata: None,
             userdata_status: None,
             userdata_env: None,
@@ -3492,7 +3551,7 @@ mod tests {
             balloon: false,
             volume: None,
             network: NetworkMode::Nat,
-            last_activity_at: Utc::now(),
+            last_activity_at: jiff::Timestamp::now(),
             suspended_at: None,
             idle_timeout_secs: None,
             suspend_ttl_secs: None,
@@ -3507,8 +3566,8 @@ mod tests {
             id: Uuid::new_v4(),
             name: name.into(),
             description: Some(format!("{name} group")),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
         }
     }
 
@@ -3526,8 +3585,8 @@ mod tests {
             mem_size_mib: None,
             userdata: None,
             userdata_env: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             cloud_image: None,
             disk_size: None,
             balloon: false,
@@ -3541,7 +3600,7 @@ mod tests {
             name: name.into(),
             source_vm_name: source_vm_name.into(),
             file_path: format!("/tmp/husker-snapshots/{name}.ext4"),
-            created_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
     }
 
@@ -3557,7 +3616,7 @@ mod tests {
             content_digest: None,
             parent_image: None,
             size_bytes: 1024,
-            created_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
     }
 
@@ -3580,8 +3639,8 @@ mod tests {
             name: name.into(),
             ciphertext: payload.to_vec(),
             nonce: vec![7; 12],
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
         }
     }
 
@@ -3646,7 +3705,8 @@ mod tests {
         let expiration = VmExpirationRecord {
             vm_id: rec.id,
             owner: Some("werkt/run-123".into()),
-            expires_at: DateTime::from_timestamp(Utc::now().timestamp() - 1, 0).unwrap(),
+            expires_at: jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() - 1)
+                .unwrap(),
         };
 
         store
@@ -3655,7 +3715,10 @@ mod tests {
 
         assert_eq!(store.get_vm_expiration(rec.id).unwrap(), Some(expiration));
         assert_eq!(store.list_vm_expirations().unwrap().len(), 1);
-        assert_eq!(store.list_expired_vm_ids(Utc::now()).unwrap(), vec![rec.id]);
+        assert_eq!(
+            store.list_expired_vm_ids(jiff::Timestamp::now()).unwrap(),
+            vec![rec.id]
+        );
 
         store.retire_vm(rec.id).unwrap();
         assert_eq!(store.get_vm_expiration(rec.id).unwrap(), None);
@@ -3668,7 +3731,7 @@ mod tests {
         let expiration = VmExpirationRecord {
             vm_id: Uuid::new_v4(),
             owner: Some("werkt/run-123".into()),
-            expires_at: Utc::now(),
+            expires_at: jiff::Timestamp::now(),
         };
 
         assert!(matches!(
@@ -3812,7 +3875,7 @@ mod tests {
         let mut rec = make_record("retired-runtime");
         rec.state = VmLifecycleState::Suspended;
         rec.pid = Some(4242);
-        rec.suspended_at = Some(Utc::now());
+        rec.suspended_at = Some(jiff::Timestamp::now());
         store.insert_vm(&rec).unwrap();
 
         store.mark_vm_stopped(rec.id).unwrap();
@@ -3883,14 +3946,14 @@ mod tests {
         let store = StateStore::open_memory().unwrap();
         let rec = make_record("s1");
         store.insert_vm(&rec).unwrap();
-        let t = Utc::now();
+        let t = jiff::Timestamp::now();
         store.touch_last_activity(rec.id, t).unwrap();
         store.set_suspended_at(rec.id, Some(t)).unwrap();
         store
             .set_idle_policy(rec.id, Some(60), Some(120), true)
             .unwrap();
         let got = store.get_vm(rec.id).unwrap();
-        assert_eq!(got.suspended_at.map(|d| d.timestamp()), Some(t.timestamp()));
+        assert_eq!(got.suspended_at.map(|d| d.as_second()), Some(t.as_second()));
         assert_eq!(got.idle_timeout_secs, Some(60));
         store.set_suspended_at(rec.id, None).unwrap();
         assert_eq!(store.get_vm(rec.id).unwrap().suspended_at, None);
@@ -4278,7 +4341,7 @@ mod tests {
 
         let fetched = store.get_vm(rec.id).unwrap();
         // RFC3339 roundtrip loses sub-nanosecond precision, compare seconds
-        assert_eq!(fetched.created_at.timestamp(), original_created.timestamp());
+        assert_eq!(fetched.created_at.as_second(), original_created.as_second());
     }
 
     #[test]
@@ -4422,7 +4485,7 @@ mod tests {
             guest_port,
             protocol: "tcp".into(),
             bind_addr: None,
-            created_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
     }
 
@@ -5445,7 +5508,7 @@ mod tests {
             name: name.into(),
             file_path: format!("/var/lib/husker/volumes/{name}.img"),
             size_bytes,
-            created_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
     }
 
@@ -5757,8 +5820,8 @@ mod tests {
             initrd_path: Some("/img/initrd.gz".into()),
             vcpu_count: Some(2),
             mem_size_mib: Some(512),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
         };
         store.insert_pool(&rec).unwrap();
 
@@ -5792,7 +5855,7 @@ mod tests {
     fn pool_requires_an_existing_suspended_template() {
         let store = StateStore::open_memory().unwrap();
         let template_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         let pool = PoolRecord {
             id: Uuid::new_v4(),
             name: "orphan".into(),
@@ -5829,7 +5892,7 @@ mod tests {
         template.state = VmLifecycleState::Suspended;
         template.pid = None;
         store.insert_vm(&template).unwrap();
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         let first = PoolRecord {
             id: Uuid::new_v4(),
             name: "first".into(),
@@ -5868,7 +5931,7 @@ mod tests {
         template.state = VmLifecycleState::Suspended;
         template.pid = None;
         store.insert_vm(&template).unwrap();
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         let pool = PoolRecord {
             id: Uuid::new_v4(),
             name: "aggregate".into(),
@@ -6007,7 +6070,7 @@ mod tests {
                 "INSERT INTO vms (id, name, state, vcpu_count, mem_size_mib, vsock_cid,
                                   guest_ip, kernel_path, rootfs_path, created_at, updated_at)
                  VALUES (?1, 'legacy-vm', 'running', 2, 256, 7, '192.0.2.50', '/k', '/r', ?2, ?2)",
-                params![vm_id.to_string(), Utc::now().to_rfc3339()],
+                params![vm_id.to_string(), format_timestamp(jiff::Timestamp::now())],
             )
             .unwrap();
         } // drop the raw connection so StateStore can reopen the file
@@ -6754,8 +6817,8 @@ mod job_database_durability_tests {
                 .unwrap();
             drop(seed);
             let store = StateStore::open(&path).unwrap();
-            let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
-            let retention = deadline + chrono::Duration::hours(1);
+            let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
+            let retention = deadline + jiff::SignedDuration::from_hours(1);
             let (job, fresh) = store
                 .accept_job("owned", "{}", deadline, retention)
                 .unwrap();

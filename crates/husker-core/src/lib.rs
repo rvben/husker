@@ -50,7 +50,7 @@ use uuid::Uuid;
 
 pub use husker_state::{
     HostGroupRecord, ImageRecord, PoolRecord, SecretRecord, ServiceRecord, SnapshotRecord,
-    StateError, VmExpirationRecord, VmLifecycleState, VmRecord, VolumeRecord,
+    StateError, VmExpirationRecord, VmLifecycleState, VmRecord, VolumeRecord, format_timestamp,
 };
 pub use husker_types::{BackendKind, BootKind, ImageKind, NetworkMode, UserdataStatus};
 pub use husker_vmm::{VmInfo, VmState};
@@ -327,7 +327,7 @@ pub struct CreateVmRequest {
 #[derive(Debug, Clone)]
 struct PendingVmExpiration {
     owner: Option<String>,
-    expires_at: chrono::DateTime<chrono::Utc>,
+    expires_at: jiff::Timestamp,
 }
 
 /// Parameters for creating a host group.
@@ -501,8 +501,8 @@ pub struct RotateSecretRequest {
 pub struct SecretMetadata {
     pub id: Uuid,
     pub name: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Decrypted secret payload returned by reveal operations.
@@ -511,7 +511,7 @@ pub struct SecretMetadata {
 pub struct RevealedSecret {
     pub name: String,
     pub value: String,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Maximum length of a user-supplied resource name (VM, snapshot, image, …).
@@ -2664,7 +2664,7 @@ pub enum PolicyAction {
 /// caller so this function reads no clock and touches no I/O.
 pub fn evaluate_policy(
     record: &VmRecord,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     idle_for: Option<std::time::Duration>,
     has_active_session: bool,
     has_live_fork: bool,
@@ -2700,7 +2700,7 @@ pub fn evaluate_policy(
             let Some(since) = record.suspended_at else {
                 return PolicyAction::None;
             };
-            if (now - since).num_seconds() >= ttl as i64 {
+            if now.duration_since(since).as_secs() >= ttl as i64 {
                 PolicyAction::Reap
             } else {
                 PolicyAction::None
@@ -3148,7 +3148,7 @@ mod tests {
     /// service/fork/volume attachments, no idle policy set by default.
     #[cfg(feature = "linux-net")]
     fn sample_vm_record(name: &str) -> VmRecord {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         VmRecord {
             id: Uuid::new_v4(),
             name: name.into(),
@@ -3204,7 +3204,7 @@ mod tests {
         let expired_policy = VmExpirationRecord {
             vm_id: expired.id,
             owner: Some("werkt/expired".into()),
-            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            expires_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
         };
         core.state
             .insert_vm_with_expiration(&expired, Some(&expired_policy))
@@ -3215,11 +3215,8 @@ mod tests {
         let live_policy = VmExpirationRecord {
             vm_id: live.id,
             owner: Some("werkt/live".into()),
-            expires_at: chrono::DateTime::from_timestamp(
-                chrono::Utc::now().timestamp() + 5 * 60,
-                0,
-            )
-            .unwrap(),
+            expires_at: jiff::Timestamp::new(jiff::Timestamp::now().as_second() + 5 * 60, 0)
+                .unwrap(),
         };
         core.state
             .insert_vm_with_expiration(&live, Some(&live_policy))
@@ -3244,7 +3241,7 @@ mod tests {
         rec.tap_device = Some(format!("tap-{name}"));
         rec.host_ip = Some("172.20.0.1".into());
         rec.guest_ip = Some("172.20.0.2".into());
-        rec.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        rec.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
         rec
     }
 
@@ -3265,7 +3262,7 @@ mod tests {
                 guest_port: 80,
                 protocol: "tcp".into(),
                 bind_addr: None,
-                created_at: chrono::Utc::now(),
+                created_at: jiff::Timestamp::now(),
             })
             .unwrap();
 
@@ -3294,7 +3291,7 @@ mod tests {
         let core = test_core().await;
         let mut rec = abandoned_crashed_vm("recent");
         // Stopped only 5s ago: within the 60s grace, so not reclaimed.
-        rec.updated_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        rec.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5);
         core.state.insert_vm(&rec).unwrap();
 
         assert_eq!(core.reclaim_abandoned_vms(60).await, 0);
@@ -3310,7 +3307,7 @@ mod tests {
     async fn shutdown_reclaim_clears_recent_service_vm_network_resources() {
         let core = test_core().await;
         let mut rec = abandoned_crashed_vm("shutdown-service");
-        rec.updated_at = chrono::Utc::now();
+        rec.updated_at = jiff::Timestamp::now();
         rec.service_id = Some(Uuid::new_v4());
         core.ip_allocator
             .reserve(rec.guest_ip.as_deref().unwrap().parse().unwrap())
@@ -3349,7 +3346,7 @@ mod tests {
                 guest_port: 80,
                 protocol: "tcp".into(),
                 bind_addr: None,
-                created_at: chrono::Utc::now(),
+                created_at: jiff::Timestamp::now(),
             })
             .unwrap();
         rec
@@ -3979,7 +3976,7 @@ mod tests {
         // does). Force it here anyway: if the arm-gating regresses and the
         // "suspended" cleanup runs for "paused" too, this field flipping to
         // `None` is what catches it.
-        rec.suspended_at = Some(chrono::Utc::now());
+        rec.suspended_at = Some(jiff::Timestamp::now());
         core.state.insert_vm(&rec).unwrap();
 
         let transitioned = core.resume_vm("p1").await.unwrap();
@@ -4018,7 +4015,7 @@ mod tests {
         core.state()
             .set_suspended_at(
                 rec.id,
-                Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+                Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5)),
             )
             .unwrap();
         core.idle_policy_tick().await;
@@ -4320,14 +4317,14 @@ mod tests {
         let rec = sample_vm_record("factory-boot-wait");
         core.state.insert_vm(&rec).unwrap();
         let deadline =
-            chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 4, 0).unwrap();
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 4).unwrap();
         let job = core
             .state
             .accept_job(
                 "factory-boot-wait",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -4653,7 +4650,7 @@ mod tests {
                 content_digest: None,
                 parent_image: None,
                 size_bytes: 1,
-                created_at: chrono::Utc::now(),
+                created_at: jiff::Timestamp::now(),
             })
             .unwrap();
         assert_eq!(
@@ -5263,8 +5260,8 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             guest_ip: None,
             kernel_path: "/boot/vmlinux".into(),
             rootfs_path: "/images/rootfs.ext4".into(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             userdata: None,
             userdata_status: None,
             userdata_env: None,
@@ -5276,7 +5273,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             volume: None,
             network: NetworkMode::Nat,
             egress_policy: None,
-            last_activity_at: chrono::Utc::now(),
+            last_activity_at: jiff::Timestamp::now(),
             suspended_at: None,
             idle_timeout_secs: None,
             suspend_ttl_secs: None,
@@ -5350,7 +5347,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[test]
     fn instance_request_direct_sets_kernel_and_rootfs() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let svc = husker_state::ServiceRecord {
             id: uuid::Uuid::new_v4(),
             name: "svc".into(),
@@ -5392,7 +5389,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[test]
     fn instance_request_direct_balloon_propagates() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let svc = husker_state::ServiceRecord {
             id: uuid::Uuid::new_v4(),
             name: "svc".into(),
@@ -5422,7 +5419,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[test]
     fn instance_request_cloud_sets_image_fields() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let svc = husker_state::ServiceRecord {
             id: uuid::Uuid::new_v4(),
             name: "cloudsvc".into(),
@@ -5508,7 +5505,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             name: "data".into(),
             file_path: "/volumes/data.img".into(),
             size_bytes: 1024 * 1024 * 1024,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         state.insert_volume(&vol).unwrap();
 
@@ -5518,7 +5515,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             name: "data".into(),
             file_path: "/volumes/data2.img".into(),
             size_bytes: 512 * 1024 * 1024,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         let err = state.insert_volume(&dup).unwrap_err();
         assert!(
@@ -5539,7 +5536,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             name: "mydata".into(),
             file_path: "/volumes/mydata.img".into(),
             size_bytes: 1024 * 1024 * 1024,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         state.insert_volume(&vol).unwrap();
 
@@ -5557,8 +5554,8 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             guest_ip: None,
             kernel_path: "/boot/vmlinux".into(),
             rootfs_path: "/images/rootfs.ext4".into(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             userdata: None,
             userdata_status: None,
             userdata_env: None,
@@ -5570,7 +5567,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             volume: Some("mydata".into()),
             network: NetworkMode::Nat,
             egress_policy: None,
-            last_activity_at: chrono::Utc::now(),
+            last_activity_at: jiff::Timestamp::now(),
             suspended_at: None,
             idle_timeout_secs: None,
             suspend_ttl_secs: None,
@@ -5595,7 +5592,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             name: "free-vol".into(),
             file_path: "/volumes/free.img".into(),
             size_bytes: 512 * 1024 * 1024,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         state.insert_volume(&vol).unwrap();
 
@@ -5610,7 +5607,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     /// for both cloud and direct boot paths.
     #[test]
     fn instance_request_threads_volume_cloud() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let svc = husker_state::ServiceRecord {
             id: uuid::Uuid::new_v4(),
             name: "svc".into(),
@@ -5641,7 +5638,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 
     #[test]
     fn instance_request_threads_volume_direct() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let svc = husker_state::ServiceRecord {
             id: uuid::Uuid::new_v4(),
             name: "svc".into(),
@@ -5988,7 +5985,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
                 name: "data".into(),
                 file_path: tmp.path().join("data.img").to_string_lossy().into_owned(),
                 size_bytes: 1024 * 1024,
-                created_at: chrono::Utc::now(),
+                created_at: jiff::Timestamp::now(),
             })
             .unwrap();
         let storage = husker_storage::StorageConfig {
@@ -6249,8 +6246,8 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             guest_ip: None,
             kernel_path: String::new(),
             rootfs_path: "/images/ubuntu.qcow2".into(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             userdata: None,
             userdata_status: None,
             userdata_env: None,
@@ -6262,7 +6259,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             volume: None,
             network: NetworkMode::Bridged,
             egress_policy: None,
-            last_activity_at: chrono::Utc::now(),
+            last_activity_at: jiff::Timestamp::now(),
             suspended_at: None,
             idle_timeout_secs: None,
             suspend_ttl_secs: None,
@@ -6525,13 +6522,13 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("restart.sqlite");
             let store = husker_state::StateStore::open(&path).unwrap();
-            let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+            let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
             let job = store
                 .accept_job(
                     scenario,
                     "{}",
                     deadline,
-                    deadline + chrono::Duration::hours(1),
+                    deadline + jiff::SignedDuration::from_hours(1),
                 )
                 .unwrap()
                 .0;
@@ -6635,14 +6632,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("claimed.sqlite");
         let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = core
             .state
             .accept_job(
                 "claimed-unbound",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -6664,14 +6661,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("foreign.sqlite");
         let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = core
             .state
             .accept_job(
                 "claimed-foreign",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -6690,14 +6687,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("copying.sqlite");
         let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = core
             .state
             .accept_job(
                 "bound-copying",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -6733,14 +6730,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("restart.sqlite");
         let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = core
             .state
             .accept_job(
                 "retry",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -6782,14 +6779,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
     async fn restart_recovery_refuses_to_fence_while_a_worker_is_owned() {
         let tmp = tempfile::tempdir().unwrap();
         let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = core
             .state
             .accept_job(
                 "live-owner",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -6833,14 +6830,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("worker-publication.sqlite");
         let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = core
             .state
             .accept_job(
                 "unpublished",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -6894,14 +6891,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
         let path = tmp.path().join("abort-retry.sqlite");
         // Backend object only: no VM or guest is created in this fixture.
         let core = make_vz_core(husker_state::StateStore::open(&path).unwrap(), tmp.path());
-        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = core
             .state
             .accept_job(
                 "abort-cleanup",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -6974,7 +6971,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
                 "abort-cleanup",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap();
         assert!(!replay.1);
@@ -7158,14 +7155,14 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             let core = make_vz_core(husker_state::StateStore::open_memory().unwrap(), tmp.path());
             #[cfg(feature = "linux-net")]
             let core = test_core().await;
-            let deadline = chrono::Utc::now() + chrono::Duration::minutes(5);
+            let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5);
             let job = core
                 .state
                 .accept_job(
                     "lease-recovery",
                     "{\"version\":1}",
                     deadline,
-                    deadline + chrono::Duration::days(1),
+                    deadline + jiff::SignedDuration::from_hours(24),
                 )
                 .unwrap()
                 .0;
@@ -7253,8 +7250,8 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             guest_ip: Some("127.0.0.1".into()),
             kernel_path: String::new(),
             rootfs_path: "/images/ubuntu.qcow2".into(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             userdata: None,
             userdata_status: None,
             userdata_env: None,
@@ -7266,7 +7263,7 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
             volume: None,
             network: NetworkMode::Nat,
             egress_policy: None,
-            last_activity_at: chrono::Utc::now(),
+            last_activity_at: jiff::Timestamp::now(),
             suspended_at: None,
             idle_timeout_secs: None,
             suspend_ttl_secs: None,
@@ -8314,13 +8311,12 @@ exit "${HUSKER_FAKE_UMOUNT_EXIT:-0}"
 #[cfg(test)]
 mod idle_policy_tests {
     use super::*;
-    use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
 
     /// A minimal, policy-eligible `VmRecord`: `running`, `firecracker`, no
     /// service/fork/volume attachments, no idle policy set by default.
     fn sample_vm_record(name: &str) -> VmRecord {
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         VmRecord {
             id: Uuid::new_v4(),
             name: name.into(),
@@ -8367,7 +8363,13 @@ mod idle_policy_tests {
     #[test]
     fn running_idle_past_threshold_suspends() {
         let r = running(Some(60));
-        let a = evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(61)), false, false);
+        let a = evaluate_policy(
+            &r,
+            jiff::Timestamp::now(),
+            Some(Duration::from_secs(61)),
+            false,
+            false,
+        );
         assert!(matches!(a, PolicyAction::Suspend));
     }
 
@@ -8377,7 +8379,13 @@ mod idle_policy_tests {
         // --idle-timeout help text), not "policy disabled" - guard against a
         // future refactor reintroducing a `> 0` sentinel that would break this.
         let r = running(Some(0));
-        let a = evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(0)), false, false);
+        let a = evaluate_policy(
+            &r,
+            jiff::Timestamp::now(),
+            Some(Duration::from_secs(0)),
+            false,
+            false,
+        );
         assert!(matches!(a, PolicyAction::Suspend));
     }
 
@@ -8385,7 +8393,13 @@ mod idle_policy_tests {
     fn running_below_threshold_does_nothing() {
         let r = running(Some(60));
         assert!(matches!(
-            evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(10)), false, false),
+            evaluate_policy(
+                &r,
+                jiff::Timestamp::now(),
+                Some(Duration::from_secs(10)),
+                false,
+                false
+            ),
             PolicyAction::None
         ));
     }
@@ -8394,7 +8408,7 @@ mod idle_policy_tests {
     fn active_session_shields_from_suspend() {
         let r = running(Some(60));
         assert!(matches!(
-            evaluate_policy(&r, Utc::now(), None, true, false),
+            evaluate_policy(&r, jiff::Timestamp::now(), None, true, false),
             PolicyAction::None
         ));
     }
@@ -8403,7 +8417,13 @@ mod idle_policy_tests {
     fn no_policy_never_acts() {
         let r = running(None);
         assert!(matches!(
-            evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(999)), false, false),
+            evaluate_policy(
+                &r,
+                jiff::Timestamp::now(),
+                Some(Duration::from_secs(999)),
+                false,
+                false
+            ),
             PolicyAction::None
         ));
     }
@@ -8413,7 +8433,13 @@ mod idle_policy_tests {
         let mut r = running(Some(1));
         r.vmm = BackendKind::Qemu;
         assert!(matches!(
-            evaluate_policy(&r, Utc::now(), Some(Duration::from_secs(99)), false, false),
+            evaluate_policy(
+                &r,
+                jiff::Timestamp::now(),
+                Some(Duration::from_secs(99)),
+                false,
+                false
+            ),
             PolicyAction::None
         ));
     }
@@ -8425,7 +8451,7 @@ mod idle_policy_tests {
         assert!(matches!(
             evaluate_policy(
                 &svc,
-                Utc::now(),
+                jiff::Timestamp::now(),
                 Some(Duration::from_secs(99)),
                 false,
                 false
@@ -8437,7 +8463,7 @@ mod idle_policy_tests {
         assert!(matches!(
             evaluate_policy(
                 &fork,
-                Utc::now(),
+                jiff::Timestamp::now(),
                 Some(Duration::from_secs(99)),
                 false,
                 false
@@ -8451,9 +8477,9 @@ mod idle_policy_tests {
         let mut r = running(Some(60));
         r.state = VmLifecycleState::Suspended;
         r.suspend_ttl_secs = Some(100);
-        r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(101));
+        r.suspended_at = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(101));
         assert!(matches!(
-            evaluate_policy(&r, Utc::now(), None, false, false),
+            evaluate_policy(&r, jiff::Timestamp::now(), None, false, false),
             PolicyAction::Reap
         ));
     }
@@ -8464,32 +8490,32 @@ mod idle_policy_tests {
             let mut r = running(Some(60));
             r.state = VmLifecycleState::Suspended;
             r.suspend_ttl_secs = Some(100);
-            r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(101));
+            r.suspended_at = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(101));
             r
         };
         // live fork
         assert!(matches!(
-            evaluate_policy(&base(), Utc::now(), None, false, true),
+            evaluate_policy(&base(), jiff::Timestamp::now(), None, false, true),
             PolicyAction::None
         ));
         // volume
         let mut vol = base();
         vol.volume = Some("data".into());
         assert!(matches!(
-            evaluate_policy(&vol, Utc::now(), None, false, false),
+            evaluate_policy(&vol, jiff::Timestamp::now(), None, false, false),
             PolicyAction::None
         ));
         // null timestamp
         let mut nots = base();
         nots.suspended_at = None;
         assert!(matches!(
-            evaluate_policy(&nots, Utc::now(), None, false, false),
+            evaluate_policy(&nots, jiff::Timestamp::now(), None, false, false),
             PolicyAction::None
         ));
         // active session
         let active = base();
         assert!(matches!(
-            evaluate_policy(&active, Utc::now(), None, true, false),
+            evaluate_policy(&active, jiff::Timestamp::now(), None, true, false),
             PolicyAction::None
         ));
     }
@@ -8502,19 +8528,19 @@ mod idle_policy_tests {
         let base = || {
             let mut r = running(Some(60));
             r.state = VmLifecycleState::Suspended;
-            r.suspended_at = Some(Utc::now() - ChronoDuration::seconds(999));
+            r.suspended_at = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(999));
             r
         };
         let mut unset = base();
         unset.suspend_ttl_secs = None;
         assert!(matches!(
-            evaluate_policy(&unset, Utc::now(), None, false, false),
+            evaluate_policy(&unset, jiff::Timestamp::now(), None, false, false),
             PolicyAction::None
         ));
         let mut zero = base();
         zero.suspend_ttl_secs = Some(0);
         assert!(matches!(
-            evaluate_policy(&zero, Utc::now(), None, false, false),
+            evaluate_policy(&zero, jiff::Timestamp::now(), None, false, false),
             PolicyAction::None
         ));
     }

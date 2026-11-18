@@ -191,14 +191,14 @@ impl<B: VmmBackend> HuskerCore<B> {
         // Pin the VM active and record the touch before dialing the guest,
         // so a connection attempt in progress can never be suspended out
         // from under itself.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         self.note_activity(record.id);
         // Debounce the SQLite mirror: `note_activity`'s in-memory timestamp
         // is the authoritative signal the idle-policy poll reads, so only
         // flush to the DB when the persisted value has drifted more than
         // ~30s. This keeps a hot exec/shell loop from writing to the DB on
         // every call.
-        if (now - record.last_activity_at).num_seconds() >= 30 {
+        if now.duration_since(record.last_activity_at).as_secs() >= 30 {
             let _ = self.state.touch_last_activity(record.id, now);
         }
         let guard = self.begin_session(record.id);

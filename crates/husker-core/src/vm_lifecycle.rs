@@ -82,9 +82,9 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
         let seconds = i64::try_from(expires_after_secs)
             .map_err(|_| CoreError::InvalidArgument("expires_after_secs is too large".into()))?;
-        let expires_at = chrono::Utc::now()
-            .checked_add_signed(chrono::Duration::seconds(seconds))
-            .ok_or_else(|| CoreError::InvalidArgument("expiration deadline overflows".into()))?;
+        let expires_at = jiff::Timestamp::now()
+            .checked_add(jiff::SignedDuration::from_secs(seconds))
+            .map_err(|_| CoreError::InvalidArgument("expiration deadline overflows".into()))?;
         self.create_to_completion(
             req,
             None,
@@ -753,7 +753,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         // NAT: persist the allocated IP and gateway; bridged: both stay None (DHCP-assigned).
         let (record_guest_ip, record_host_ip) = if network_mode == NetworkMode::Nat {
@@ -1054,7 +1054,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             }
 
             let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let record = VmRecord {
                 id: info.id,
                 name: req.name,
@@ -1197,7 +1197,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         }
 
         let userdata_status = req.userdata.as_ref().map(|_| UserdataStatus::Pending);
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let record = VmRecord {
             id: info.id,
             name: req.name,
@@ -1773,7 +1773,7 @@ impl<B: VmmBackend> HuskerCore<B> {
     where
         B: 'static,
     {
-        let expired = match self.state.list_expired_vm_ids(chrono::Utc::now()) {
+        let expired = match self.state.list_expired_vm_ids(jiff::Timestamp::now()) {
             Ok(ids) => ids,
             Err(error) => {
                 warn!(%error, "expiration tick: list expired VMs failed");
@@ -1794,7 +1794,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                 continue;
             };
             let still_expired = match self.state.get_vm_expiration(id) {
-                Ok(Some(value)) => value.expires_at <= chrono::Utc::now(),
+                Ok(Some(value)) => value.expires_at <= jiff::Timestamp::now(),
                 Ok(None) => false,
                 Err(error) => {
                     warn!(vm = %fresh.name, %id, %error, "expiration tick: reload policy failed");

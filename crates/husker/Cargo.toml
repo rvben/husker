@@ -60,6 +60,7 @@ tempfile = "3"
 
 [dev-dependencies]
 assert_cmd = "2"
+jiff = { workspace = true }
 jsonschema = { version = "0.47", default-features = false }
 # Stub daemon for the `job` behavioural tests (already a workspace dep via husker-api).
 axum = { workspace = true }

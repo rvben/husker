@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use chrono::Utc;
 use husker_agent_proto::{
     AgentRequest, AgentResponse, GuestPowerAction, read_message, write_message,
 };
@@ -370,7 +369,7 @@ fn vm_record(
     guest_ip: Option<String>,
     tap_device: Option<String>,
 ) -> VmRecord {
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     VmRecord {
         id,
         name: name.to_string(),
@@ -2474,7 +2473,7 @@ async fn reconcile_port_forwards_skips_invalid_guest_ip() {
             guest_port: 9000,
             protocol: "tcp".into(),
             bind_addr: None,
-            created_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
         })
         .unwrap();
 
@@ -2791,7 +2790,7 @@ async fn commit_fixture() -> CommitFixture {
             content_digest: Some("sha256:base".into()),
             parent_image: None,
             size_bytes: std::fs::metadata(&parent_path).unwrap().len(),
-            created_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
         })
         .unwrap();
     let mut vm = vm_record(
@@ -3052,7 +3051,7 @@ async fn commit_vm_image_refuses_a_parent_replaced_after_the_vm_was_created() {
             content_digest: Some("sha256:reimported".into()),
             parent_image: None,
             size_bytes: 15,
-            created_at: vm.created_at + chrono::Duration::minutes(5),
+            created_at: vm.created_at + jiff::SignedDuration::from_mins(5),
         })
         .unwrap();
 
@@ -4064,7 +4063,7 @@ fn volume_race_core(
             name: "exclusive".into(),
             file_path: volume_path.to_string_lossy().into_owned(),
             size_bytes: 6,
-            created_at: Utc::now(),
+            created_at: jiff::Timestamp::now(),
         })
         .unwrap();
     (
@@ -4794,10 +4793,11 @@ mod kernel_args_composition {
                 content_digest: Some(sha(b"prepared rootfs")),
                 parent_image: None,
                 size_bytes: 15,
-                created_at: Utc::now(),
+                created_at: jiff::Timestamp::now(),
             })
             .unwrap();
-        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+        let deadline =
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 60).unwrap();
         let spec: JobSpec = serde_json::from_value(serde_json::json!({
             "version":1, "image":{"catalog_id":image_id,"rootfs_digest":sha(b"prepared rootfs"),
                 "kernel_digest":sha(&compressed),"initrd_digest":null},
@@ -4815,7 +4815,7 @@ mod kernel_args_composition {
                 "rejected-kernel",
                 &spec.canonical_json().unwrap(),
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap();
         let mock = MockVmm::new();
@@ -4878,10 +4878,11 @@ mod kernel_args_composition {
                 content_digest: Some(sha(b"prepared rootfs")),
                 parent_image: None,
                 size_bytes: 15,
-                created_at: Utc::now(),
+                created_at: jiff::Timestamp::now(),
             })
             .unwrap();
-        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+        let deadline =
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 60).unwrap();
         let spec: JobSpec = serde_json::from_value(serde_json::json!({
             "version":1, "image":{"catalog_id":image_id,"rootfs_digest":sha(b"prepared rootfs"),
                 "kernel_digest":sha(&kernel_bytes),"initrd_digest":null},
@@ -4899,7 +4900,7 @@ mod kernel_args_composition {
                 "lease-failure",
                 &spec.canonical_json().unwrap(),
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap();
         let mock = MockVmm::new();
@@ -4973,11 +4974,11 @@ mod kernel_args_composition {
                 content_digest: Some(sha(b"prepared rootfs")),
                 parent_image: None,
                 size_bytes: 15,
-                created_at: Utc::now(),
+                created_at: jiff::Timestamp::now(),
             };
             state.insert_image(&image).unwrap();
             let deadline =
-                chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+                jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 60).unwrap();
             let spec: JobSpec = serde_json::from_value(serde_json::json!({
                 "version":1, "image":{"catalog_id":image_id,"rootfs_digest":sha(b"prepared rootfs"),
                     "kernel_digest":sha(&kernel_stub_bytes()),"initrd_digest":null},
@@ -4994,7 +4995,7 @@ mod kernel_args_composition {
                     "prepared",
                     &spec.canonical_json().unwrap(),
                     deadline,
-                    deadline + chrono::Duration::hours(1),
+                    deadline + jiff::SignedDuration::from_hours(1),
                 )
                 .unwrap();
             if corrupt_kernel {

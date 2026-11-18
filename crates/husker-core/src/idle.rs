@@ -136,9 +136,10 @@ impl<B: VmmBackend> HuskerCore<B> {
         // control-plane touch. `last_activity_at` is set to `created_at` at
         // creation, so an untouched-but-old VM is immediately eligible while a
         // freshly-created one waits out a full window.
-        let db_elapsed = (chrono::Utc::now() - record.last_activity_at)
-            .to_std()
-            .unwrap_or(std::time::Duration::ZERO);
+        let db_elapsed = std::time::Duration::try_from(
+            jiff::Timestamp::now().duration_since(record.last_activity_at),
+        )
+        .unwrap_or_default();
         let control_plane = self
             .control_plane_last_active
             .lock()
@@ -260,7 +261,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             let idle_for = self.idle_for(&vm);
             let has_active = self.active_session_count(vm.id) > 0;
             let has_fork = self.state.count_live_forks_of(vm.id).unwrap_or(0) > 0;
-            match evaluate_policy(&vm, chrono::Utc::now(), idle_for, has_active, has_fork) {
+            match evaluate_policy(&vm, jiff::Timestamp::now(), idle_for, has_active, has_fork) {
                 PolicyAction::None => {}
                 PolicyAction::Suspend => {
                     // In-lock re-check: see the doc comment above for why the
@@ -274,7 +275,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                         }
                         let re = evaluate_policy(
                             &fresh,
-                            chrono::Utc::now(),
+                            jiff::Timestamp::now(),
                             self.idle_for(&fresh),
                             self.active_session_count(fresh.id) > 0,
                             self.state.count_live_forks_of(fresh.id).unwrap_or(0) > 0,
@@ -298,7 +299,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                     if let Ok(fresh) = self.state.get_vm(vm.id) {
                         let re = evaluate_policy(
                             &fresh,
-                            chrono::Utc::now(),
+                            jiff::Timestamp::now(),
                             None,
                             self.active_session_count(fresh.id) > 0,
                             self.state.count_live_forks_of(fresh.id).unwrap_or(0) > 0,

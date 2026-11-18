@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
 use husker_core::HuskerCore;
 use husker_state::{BackendKind, BootKind, NetworkMode, StateStore, VmRecord};
 use husker_storage::StorageConfig;
@@ -119,7 +118,7 @@ fn make_vm_record(
     boot_mode: BootKind,
     guest_ip: Option<String>,
 ) -> VmRecord {
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     VmRecord {
         id,
         name: name.into(),

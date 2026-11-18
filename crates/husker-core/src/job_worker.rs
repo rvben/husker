@@ -1,7 +1,6 @@
 //! Client-independent factory execution. Replays never create another worker.
 use std::{future::Future, sync::Arc, time::Duration};
 
-use chrono::{DateTime, Utc};
 use husker_agent_proto::{SessionState, frozen_bundle::FrozenBundle, job_spec::JobSubmission};
 pub use husker_state::jobs::{
     CollectionState, JobArtifactRecord, JobEventPage, JobRecord, JobState, JournalError,
@@ -431,7 +430,7 @@ impl<B: VmmBackend + 'static> HuskerCore<B> {
             .filter(|job| job.cleanup_pending)
             .count();
         // Only cleanup-confirmed terminal evidence is eligible for expiry.
-        report.expired_evidence = self.state.expire_job_evidence(Utc::now())?;
+        report.expired_evidence = self.state.expire_job_evidence(jiff::Timestamp::now())?;
         Ok(report)
     }
 
@@ -468,7 +467,7 @@ impl<B: VmmBackend + 'static> HuskerCore<B> {
         submission: &JobSubmission,
         source: FrozenBundle,
         acceptance: FrozenBundle,
-        retention_until: DateTime<Utc>,
+        retention_until: jiff::Timestamp,
     ) -> Result<(JobRecord, bool), JournalError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| JournalError::Invalid("factory worker requires a daemon runtime"))?;
@@ -726,13 +725,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("jobs.db");
         let store = husker_state::StateStore::open(&path).unwrap();
-        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 1, 0).unwrap();
+        let deadline =
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 1).unwrap();
         let (job, _) = store
             .accept_job(
                 "deadline",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), monitor_stop(&store, job.id))
@@ -758,13 +758,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("restart.db");
         let store = husker_state::StateStore::open(&path).unwrap();
-        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+        let deadline =
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 60).unwrap();
         let accepted = store
             .accept_job(
                 "accepted",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -773,7 +774,7 @@ mod tests {
                 "preparing",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -783,7 +784,7 @@ mod tests {
                 "running",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -810,7 +811,7 @@ mod tests {
                 "completed",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -862,7 +863,7 @@ mod tests {
                 "running",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap();
         assert!(!fresh);
@@ -873,13 +874,14 @@ mod tests {
     #[test]
     fn failure_envelope_explicitly_hashes_a_staged_manifest_that_exceeds_its_bound() {
         let store = husker_state::StateStore::open_memory().unwrap();
-        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 60, 0).unwrap();
+        let deadline =
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 60).unwrap();
         let job = store
             .accept_job(
                 "large-stage",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -915,13 +917,14 @@ mod tests {
     #[tokio::test]
     async fn restart_after_deadline_records_timeout_without_claiming_destruction() {
         let store = husker_state::StateStore::open_memory().unwrap();
-        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 1, 0).unwrap();
+        let deadline =
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 1).unwrap();
         let job = store
             .accept_job(
                 "expired-restart",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -947,13 +950,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("publication.sqlite");
         let store = husker_state::StateStore::open(&path).unwrap();
-        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = store
             .accept_job(
                 "publication",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -981,7 +984,7 @@ mod tests {
                 "independent-publication",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -1037,7 +1040,7 @@ mod tests {
                 "publication",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap();
         assert!(!fresh);
@@ -1048,13 +1051,13 @@ mod tests {
     #[tokio::test]
     async fn worker_reconciliation_never_infers_stopped_from_missing_or_live_handles() {
         let store = husker_state::StateStore::open_memory().unwrap();
-        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let missing = store
             .accept_job(
                 "missing-handle",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -1063,7 +1066,7 @@ mod tests {
                 "live-handle",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -1091,13 +1094,14 @@ mod tests {
     #[tokio::test]
     async fn finished_worker_reconciliation_after_deadline_records_timeout_without_death_proof() {
         let store = husker_state::StateStore::open_memory().unwrap();
-        let deadline = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 1, 0).unwrap();
+        let deadline =
+            jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 1).unwrap();
         let job = store
             .accept_job(
                 "late-publication",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -1119,13 +1123,13 @@ mod tests {
     #[tokio::test]
     async fn a_finished_worker_whose_evidence_was_deleted_is_released() {
         let store = husker_state::StateStore::open_memory().unwrap();
-        let deadline = Utc::now() + chrono::Duration::minutes(10);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10);
         let job = store
             .accept_job(
                 "deleted-evidence",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -1148,13 +1152,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("finished-abort.sqlite");
         let store = husker_state::StateStore::open(&path).unwrap();
-        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let job = store
             .accept_job(
                 "abort-retry",
                 "{}",
                 deadline,
-                deadline + chrono::Duration::hours(1),
+                deadline + jiff::SignedDuration::from_hours(1),
             )
             .unwrap()
             .0;
@@ -1231,13 +1235,13 @@ mod tests {
     async fn finished_worker_abort_reconciliation_preserves_entered_foreign_and_live_allocations() {
         for profile in ["entered", "foreign", "unbound", "live"] {
             let store = husker_state::StateStore::open_memory().unwrap();
-            let deadline = Utc::now() + chrono::Duration::hours(1);
+            let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
             let job = store
                 .accept_job(
                     profile,
                     "{}",
                     deadline,
-                    deadline + chrono::Duration::hours(1),
+                    deadline + jiff::SignedDuration::from_hours(1),
                 )
                 .unwrap()
                 .0;

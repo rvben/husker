@@ -2,7 +2,6 @@
 //! requests; it does not establish that a backend enforces the requested policy.
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -107,9 +106,34 @@ pub struct JobSpec {
     pub resources: JobResources,
     pub network: JobNetwork,
     /// Covers preparation, boot, transfers, execution and evidence collection.
-    pub deadline: DateTime<Utc>,
+    #[serde(deserialize_with = "deserialize_deadline")]
+    pub deadline: jiff::Timestamp,
     pub artifacts: Vec<JobArtifact>,
     pub correlation: JobCorrelation,
+}
+
+fn deserialize_deadline<'de, D>(deserializer: D) -> Result<jiff::Timestamp, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let time = value
+        .split_once(['T', 't', ' '])
+        .map(|(_, time)| time)
+        .unwrap_or_default();
+    if time.get(2..3) != Some(":") || time.get(5..6) != Some(":") {
+        return Err(serde::de::Error::custom(
+            "deadline must include hours, minutes and seconds",
+        ));
+    }
+    // Jiff clamps leap seconds to :59. Reject them before they can become a
+    // valid whole-second deadline or change the canonical job digest.
+    if time.get(6..8) == Some("60") {
+        return Err(serde::de::Error::custom(
+            "deadline must be a nonnegative whole UTC second",
+        ));
+    }
+    value.parse().map_err(serde::de::Error::custom)
 }
 
 pub(crate) fn digest_valid(value: &str) -> bool {
@@ -285,7 +309,7 @@ impl JobSpec {
                 "filtered network requires 1–32 bounded explicit egress rules",
             ));
         }
-        if self.deadline.timestamp() < 0 || self.deadline.timestamp_subsec_nanos() != 0 {
+        if self.deadline.as_second() < 0 || self.deadline.subsec_nanosecond() != 0 {
             return Err(JobSpecError(
                 "deadline must be a nonnegative whole UTC second",
             ));
@@ -384,7 +408,7 @@ mod tests {
                 pids_limit: 64,
             },
             network: JobNetwork::None {},
-            deadline: DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            deadline: jiff::Timestamp::from_second(1_800_000_000).unwrap(),
             artifacts: vec![],
             correlation: JobCorrelation {
                 job: "job-1".into(),
@@ -721,16 +745,16 @@ mod tests {
     #[test]
     fn deadline_must_be_a_nonnegative_whole_second() {
         const MSG: &str = "deadline must be a nonnegative whole UTC second";
-        accepts(|s| s.deadline = DateTime::from_timestamp(0, 0).unwrap());
-        accepts(|s| s.deadline = DateTime::from_timestamp(1, 0).unwrap());
+        accepts(|s| s.deadline = jiff::Timestamp::from_second(0).unwrap());
+        accepts(|s| s.deadline = jiff::Timestamp::from_second(1).unwrap());
         rejects(MSG, |s| {
-            s.deadline = DateTime::from_timestamp(-1, 0).unwrap()
+            s.deadline = jiff::Timestamp::from_second(-1).unwrap()
         });
         rejects(MSG, |s| {
-            s.deadline = DateTime::from_timestamp(1_800_000_000, 1).unwrap()
+            s.deadline = jiff::Timestamp::new(1_800_000_000, 1).unwrap()
         });
         rejects(MSG, |s| {
-            s.deadline = DateTime::from_timestamp(1_800_000_000, 999_999_999).unwrap()
+            s.deadline = jiff::Timestamp::new(1_800_000_000, 999_999_999).unwrap()
         });
     }
 
@@ -814,7 +838,7 @@ mod tests {
             BTreeMap::from([("PATH".into(), "/p".into()), ("HOME".into(), "/h".into())]);
         spec.gid = 1001;
         spec.network = filtered(vec![rule("example.test", 443, "tcp")]);
-        spec.deadline = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        spec.deadline = jiff::Timestamp::from_second(1_800_000_000).unwrap();
         spec.artifacts = vec![artifact("out/r.txt", 5)];
         spec
     }
@@ -822,6 +846,17 @@ mod tests {
     #[test]
     fn canonical_json_is_sorted_compact_utf8() {
         assert_eq!(canonical_fixture().canonical_json().unwrap(), CANONICAL);
+    }
+
+    #[test]
+    fn deadline_offsets_normalize_without_accepting_leap_seconds() {
+        let mut json: serde_json::Value = serde_json::from_str(CANONICAL).unwrap();
+        json["deadline"] = "2027-01-15T09:00:00+01:00".into();
+        let spec: JobSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(spec.canonical_json().unwrap(), CANONICAL);
+
+        json["deadline"] = "2027-01-15T08:00:60Z".into();
+        assert!(serde_json::from_value::<JobSpec>(json).is_err());
     }
 
     #[test]

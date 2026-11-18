@@ -492,7 +492,7 @@ mod tests {
 
     fn seeded_core_for_metrics() -> Arc<HuskerCore<husker_vmm::firecracker::FirecrackerBackend>> {
         let state = husker_state::StateStore::open_memory().unwrap();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         // Insert a service named "svc" with desired_instances = 2.
         let svc_id = uuid::Uuid::new_v4();
@@ -891,7 +891,7 @@ mod tests {
         std::fs::write(data_dir.join("vms/snap-vm/rootfs.ext4"), b"snapshot-source").unwrap();
 
         let state = husker_state::StateStore::open_memory().unwrap();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         state
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
@@ -1271,7 +1271,7 @@ mod tests {
         // One VM already exists and the limit is 1, so a create is rejected with
         // 429 at admission - before it reaches kernel validation (which would 500).
         let state = husker_state::StateStore::open_memory().unwrap();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         state
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
@@ -1394,7 +1394,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
 
         let state = husker_state::StateStore::open_memory().unwrap();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         state
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
@@ -1528,7 +1528,7 @@ mod tests {
         // Insert a VM with balloon=false (the default); the endpoint must
         // return 400 before ever calling the VMM backend.
         let state = husker_state::StateStore::open_memory().unwrap();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         state
             .insert_vm(&husker_state::VmRecord {
                 id: uuid::Uuid::new_v4(),
@@ -1762,7 +1762,7 @@ mod tests {
     /// A minimal `VmRecord`: `running`, `firecracker`, no idle policy set by
     /// default, no service/fork/volume attachments.
     fn sample_vm_record(name: &str) -> VmRecord {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         VmRecord {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
@@ -1806,14 +1806,17 @@ mod tests {
         let expiration = VmExpirationRecord {
             vm_id: r.id,
             owner: Some("werkt/run-123".into()),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5),
         };
         let resp = record_to_response(r, Some(expiration.clone()));
         assert_eq!(resp.vmm, "firecracker");
         assert_eq!(resp.idle_timeout_secs, Some(120));
         assert_eq!(resp.suspend_ttl_secs, None);
         assert_eq!(resp.auto_resume, Some(false));
-        assert_eq!(resp.expires_at, Some(expiration.expires_at.to_rfc3339()));
+        assert_eq!(
+            resp.expires_at,
+            Some(husker_state::format_timestamp(expiration.expires_at))
+        );
         assert_eq!(resp.owner.as_deref(), Some("werkt/run-123"));
 
         // A VM that never opted into the idle policy must not surface
@@ -2986,7 +2989,7 @@ mod tests {
         // Insert a volume record and a VM record that references it directly into
         // state, bypassing mkfs, so this test runs everywhere.
         let state = husker_state::StateStore::open_memory().unwrap();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let vol_id = uuid::Uuid::new_v4();
 
         state

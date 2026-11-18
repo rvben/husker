@@ -70,7 +70,7 @@ mod linux {
             .commands
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("command index out of range"))?;
-        let remaining = Duration::from_secs(u64::try_from(spec.deadline.timestamp())?)
+        let remaining = Duration::from_secs(u64::try_from(spec.deadline.as_second())?)
             .checked_sub(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?)
             .filter(|duration| !duration.is_zero())
             .ok_or_else(|| anyhow::anyhow!("job deadline expired"))?;

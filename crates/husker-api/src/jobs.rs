@@ -5,7 +5,6 @@ use crate::{
     errors::{Failure, error_response_with_hint},
 };
 use axum::{extract::State, http::StatusCode};
-use chrono::{DateTime, Utc};
 use husker_agent_proto::{
     base64_decode, base64_encode,
     frozen_bundle::{FrozenBundle, MAX_BUNDLE_BYTES},
@@ -72,7 +71,7 @@ pub(crate) struct FactorySubmission {
     /// Canonical frozen tar bytes in standard padded base64, up to 32 MiB decoded.
     source_bundle: String,
     acceptance_bundle: String,
-    retention_until: DateTime<Utc>,
+    retention_until: jiff::Timestamp,
 }
 #[derive(Serialize, ToSchema)]
 pub(crate) struct JobReferences {

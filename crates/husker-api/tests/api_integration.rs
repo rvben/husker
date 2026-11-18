@@ -118,7 +118,7 @@ async fn health_returns_json_with_version_and_vm_counts() {
 #[tokio::test]
 async fn health_counts_vms_correctly() {
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
 
     // Insert 3 VMs: 2 running, 1 stopped
     for (i, vm_state) in ["running", "running", "stopped"].iter().enumerate() {
@@ -468,7 +468,7 @@ async fn snapshot_endpoints_roundtrip() {
     std::fs::write(data_dir.join("vms/snap-vm/rootfs.ext4"), b"snapshot-source").unwrap();
 
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     state
         .insert_vm(&husker_state::VmRecord {
             id: uuid::Uuid::new_v4(),
@@ -1114,7 +1114,7 @@ async fn exec_on_nonexistent_vm_returns_404() {
 #[tokio::test]
 async fn exec_running_vm_with_unavailable_agent_returns_503() {
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let vm_name = "agent-unavailable";
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
@@ -1365,7 +1365,7 @@ async fn vm_response_json_structure() {
     // Insert a VM record directly into state and verify the GET response
     // matches the expected VmResponse structure
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "shape-test".into(),
@@ -1460,7 +1460,7 @@ async fn vm_response_json_structure() {
 // ── List with Pre-populated State ────────────────────────────────────
 
 /// A running VM named `vm-{i}` created at `created_at`, for the list tests.
-fn fleet_record(i: u32, created_at: chrono::DateTime<chrono::Utc>) -> husker_state::VmRecord {
+fn fleet_record(i: u32, created_at: jiff::Timestamp) -> husker_state::VmRecord {
     husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: format!("vm-{i}"),
@@ -1499,7 +1499,7 @@ fn fleet_record(i: u32, created_at: chrono::DateTime<chrono::Utc>) -> husker_sta
 #[tokio::test]
 async fn list_vms_returns_all_records() {
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     for i in 0..3 {
         state.insert_vm(&fleet_record(i, now)).unwrap();
     }
@@ -1532,9 +1532,9 @@ async fn list_vms_returns_all_records() {
 #[tokio::test]
 async fn list_vms_pages_in_creation_order_and_reports_the_fleet_size() {
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     for i in 0..3 {
-        let created_at = now + chrono::Duration::seconds(i64::from(i));
+        let created_at = now + jiff::SignedDuration::from_secs(i64::from(i));
         state.insert_vm(&fleet_record(i, created_at)).unwrap();
     }
 
@@ -1822,7 +1822,7 @@ async fn add_port_forward_invalid_json_returns_400() {
 #[tokio::test]
 async fn list_port_forwards_empty_for_existing_vm() {
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "pf-test".into(),
@@ -1886,7 +1886,7 @@ async fn list_port_forwards_empty_for_existing_vm() {
 #[tokio::test]
 async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "pf-ok".into(),
@@ -1950,7 +1950,7 @@ async fn add_port_forward_succeeds_on_macos_with_bind_addr() {
 #[tokio::test]
 async fn vm_response_with_null_optional_fields() {
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let record = husker_state::VmRecord {
         id: uuid::Uuid::new_v4(),
         name: "null-fields".into(),
@@ -2032,7 +2032,7 @@ async fn logs_nonexistent_vm_returns_404() {
 async fn logs_returns_serial_output() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let vm_id = uuid::Uuid::new_v4();
     let record = husker_state::VmRecord {
         id: vm_id,
@@ -2099,7 +2099,7 @@ async fn logs_returns_serial_output() {
 async fn logs_tail_returns_last_n_lines() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let vm_id = uuid::Uuid::new_v4();
     let record = husker_state::VmRecord {
         id: vm_id,
@@ -2166,7 +2166,7 @@ async fn logs_tail_returns_last_n_lines() {
 async fn logs_no_serial_file_returns_404() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let vm_id = uuid::Uuid::new_v4();
     let record = husker_state::VmRecord {
         id: vm_id,
@@ -2235,7 +2235,7 @@ fn logs_test_core(
 ) {
     let runtime_dir = tempfile::tempdir().unwrap();
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let vm_id = uuid::Uuid::new_v4();
     let record = husker_state::VmRecord {
         id: vm_id,
@@ -2485,7 +2485,7 @@ async fn logs_tail_one_from_multiline() {
 async fn logs_large_file_is_truncated() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let state = husker_state::StateStore::open_memory().unwrap();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let vm_id = uuid::Uuid::new_v4();
     let record = husker_state::VmRecord {
         id: vm_id,

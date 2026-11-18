@@ -1,4 +1,3 @@
-use chrono::{TimeZone, Utc};
 use husker_core::job_spec::*;
 use serde_json::json;
 use uuid::Uuid;
@@ -43,7 +42,7 @@ fn spec() -> JobSpec {
             pids_limit: 128,
         },
         network: JobNetwork::None {},
-        deadline: Utc.timestamp_opt(2_000_000_000, 0).unwrap(),
+        deadline: jiff::Timestamp::from_second(2_000_000_000).unwrap(),
         artifacts: vec![JobArtifact {
             path: "results/check.json".into(),
             max_bytes: 4096,
@@ -141,7 +140,10 @@ fn identity_binds_every_execution_input_and_environment_order_is_canonical() {
             }]
         }
     );
-    changed!(deadline, original.deadline + chrono::Duration::seconds(1));
+    changed!(
+        deadline,
+        original.deadline + jiff::SignedDuration::from_secs(1)
+    );
     changed!(artifacts, vec![]);
     changed!(
         correlation,
@@ -283,7 +285,7 @@ fn unsafe_paths_privileged_users_secrets_and_unbounded_commands_are_rejected() {
     s.artifacts.push(s.artifacts[0].clone());
     assert!(s.validate().is_err());
     let mut s = spec();
-    s.deadline += chrono::Duration::nanoseconds(1);
+    s.deadline += jiff::SignedDuration::from_nanos(1);
     assert!(s.validate().is_err());
 }
 

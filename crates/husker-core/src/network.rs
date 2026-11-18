@@ -258,7 +258,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             guest_port,
             protocol: "tcp".into(),
             bind_addr: None,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         if let Err(e) = self
             .state
@@ -388,7 +388,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             guest_port,
             protocol: "tcp".into(),
             bind_addr: Some(bind_str),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
         if let Err(e) = self
             .state

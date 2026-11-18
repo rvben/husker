@@ -74,8 +74,8 @@ mod tests {
             .accept_job(
                 "durable",
                 "{}",
-                chrono::Utc::now() + chrono::Duration::hours(1),
-                chrono::Utc::now() + chrono::Duration::days(1),
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
             )
             .unwrap();
         let mut held = Vec::new();

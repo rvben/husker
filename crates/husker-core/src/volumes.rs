@@ -81,7 +81,7 @@ impl<B: VmmBackend> HuskerCore<B> {
             name: req.name.clone(),
             file_path: image_path.to_string_lossy().into_owned(),
             size_bytes: req.size_bytes,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         };
 
         if let Err(err) = self.state.insert_volume(&record).map_err(|e| match e {

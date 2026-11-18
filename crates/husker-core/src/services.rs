@@ -15,8 +15,8 @@ impl<B: VmmBackend> HuskerCore<B> {
             id: Uuid::new_v4(),
             name: req.name,
             description: req.description,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
         };
         self.state.insert_host_group(&record).map_err(|e| match e {
             husker_state::StateError::HostGroupAlreadyExists(name) => {
@@ -137,7 +137,7 @@ impl<B: VmmBackend> HuskerCore<B> {
         // immediately rather than at instance spawn time.
         self.resolve_volume_attachment(&req.volume)?;
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let record = ServiceRecord {
             id: Uuid::new_v4(),
             name: req.name,

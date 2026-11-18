@@ -311,7 +311,7 @@ fn core_with_running_vm_backend(
         state_dir: tmp.path().to_path_buf(),
     };
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let id = Uuid::new_v4();
     let record = husker_state::VmRecord {
         id,
@@ -409,7 +409,7 @@ fn core_store_with_vm_on(
         data_dir: tmp.path().to_path_buf(),
         state_dir: tmp.path().to_path_buf(),
     };
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let id = Uuid::new_v4();
     let record = husker_state::VmRecord {
         id,
@@ -935,7 +935,7 @@ fn core_with_named_pool_template(
         data_dir: tmp.path().to_path_buf(),
         state_dir: tmp.path().to_path_buf(),
     };
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let template_id = Uuid::new_v4();
     let template = husker_state::VmRecord {
         id: template_id,

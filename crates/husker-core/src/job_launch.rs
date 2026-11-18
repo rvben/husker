@@ -23,8 +23,14 @@ pub enum JobLaunchError {
     Deadline,
 }
 pub(crate) fn remaining_deadline(deadline: i64) -> std::time::Duration {
-    chrono::DateTime::from_timestamp(deadline, 0)
-        .and_then(|deadline| (deadline - chrono::Utc::now()).to_std().ok())
+    jiff::Timestamp::from_second(deadline)
+        .ok()
+        .and_then(|deadline| {
+            deadline
+                .duration_since(jiff::Timestamp::now())
+                .try_into()
+                .ok()
+        })
         .unwrap_or_default()
 }
 
@@ -43,7 +49,7 @@ fn validated_spec(
         .canonical_json()
         .map_err(|error| invalid(error.to_string()))?
         != job.specification
-        || spec.deadline.timestamp() != job.deadline
+        || spec.deadline.as_second() != job.deadline
         || spec.digest().map_err(|error| invalid(error.to_string()))? != job.specification_digest
         || source.digest() != spec.source.digest
         || source.bytes().len() as u64 != spec.source.size_bytes

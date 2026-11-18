@@ -1,5 +1,4 @@
 //! Recovery uses owned mock handles and private databases; no hypervisor runs.
-use chrono::{Duration, Utc};
 use husker_core::{CoreError, HuskerCore};
 use husker_state::{
     HostResourceLease, StateStore,
@@ -187,13 +186,13 @@ async fn terminal_factory_lease_recovers_with_the_exact_backend_generation() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.db");
     let store = StateStore::open(&path).unwrap();
-    let deadline = Utc::now() + Duration::minutes(10);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10);
     let job = store
         .accept_job(
             "failed-launch",
             "{}",
             deadline,
-            deadline + Duration::hours(1),
+            deadline + jiff::SignedDuration::from_hours(1),
         )
         .unwrap()
         .0;
@@ -226,9 +225,14 @@ async fn terminal_factory_lease_recovers_with_the_exact_backend_generation() {
 async fn a_factory_ownership_mismatch_preserves_its_lease_without_failing_startup() {
     let temp = tempfile::tempdir().unwrap();
     let store = StateStore::open_memory().unwrap();
-    let deadline = Utc::now() + Duration::minutes(10);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10);
     let job = store
-        .accept_job("mismatch", "{}", deadline, deadline + Duration::hours(1))
+        .accept_job(
+            "mismatch",
+            "{}",
+            deadline,
+            deadline + jiff::SignedDuration::from_hours(1),
+        )
         .unwrap()
         .0;
     let id = Uuid::new_v4();
@@ -312,13 +316,13 @@ async fn factory_recovery_persists_job_proof_before_retiring_a_destroyed_lease()
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.db");
     let store = StateStore::open(&path).unwrap();
-    let deadline = Utc::now() + Duration::minutes(10);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10);
     let job = store
         .accept_job(
             "retry-job-receipt",
             "{}",
             deadline,
-            deadline + Duration::hours(1),
+            deadline + jiff::SignedDuration::from_hours(1),
         )
         .unwrap()
         .0;
@@ -373,9 +377,14 @@ async fn a_durable_job_receipt_can_finish_a_matching_entered_lease_without_backe
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.db");
     let store = StateStore::open(&path).unwrap();
-    let deadline = Utc::now() + Duration::minutes(10);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10);
     let job = store
-        .accept_job("job-proof", "{}", deadline, deadline + Duration::hours(1))
+        .accept_job(
+            "job-proof",
+            "{}",
+            deadline,
+            deadline + jiff::SignedDuration::from_hours(1),
+        )
         .unwrap()
         .0;
     let id = Uuid::new_v4();

@@ -29,7 +29,6 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use chrono::Utc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -51,7 +50,7 @@ const PAGE_OFFSET: usize = 150;
 /// probe, so the listing cost is the store and serialization path alone,
 /// which is what this gate bounds.
 fn stopped_vm(ordinal: u32) -> VmRecord {
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     VmRecord {
         id: Uuid::new_v4(),
         name: format!("perf-vm-{ordinal:04}"),
