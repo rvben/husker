@@ -67,7 +67,7 @@ jobs:
       - name: Install kernel configuration dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev
+          sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev patch
       - run: make test-kernel-config
 
   contracts:

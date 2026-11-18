@@ -3,7 +3,7 @@
 # driver compiled in. No loadable modules means kernel/initramfs version
 # pairing cannot break, and guests need no insmod step at boot.
 #
-# Build deps (Debian/Ubuntu): build-essential bc bison flex libelf-dev libssl-dev
+# Build deps (Debian/Ubuntu): build-essential bc bison flex libelf-dev libssl-dev patch
 # Cross-compiling aarch64 on x86_64: export CROSS_COMPILE=aarch64-linux-gnu-
 set -euo pipefail
 
@@ -48,8 +48,27 @@ if [ "$KERNEL_SHA256" != "skip" ]; then
   echo "$KERNEL_SHA256  linux-${KERNEL_VERSION}.tar.xz" | sha256sum -c
 fi
 
-[ -d "linux-${KERNEL_VERSION}" ] || tar xf "linux-${KERNEL_VERSION}.tar.xz"
-cd "linux-${KERNEL_VERSION}"
+SOURCE_DIR="linux-${KERNEL_VERSION}"
+RESET_PATCH=
+if [[ "$KARCH" == arm64 && "$KERNEL_VERSION" == 6.12.93 ]]; then
+  # Use short sleeps when polling virtio PCI resets on ARM64 microVMs.
+  # Keep patched ARM64 sources separate when WORK_DIR is reused for x86_64.
+  SOURCE_DIR+=".husker-arm64"
+  RESET_PATCH="$SCRIPT_DIR/patches/linux-6.12.93-virtio-pci-reset-polling.patch"
+fi
+if [ ! -d "$SOURCE_DIR" ]; then
+  mkdir "$SOURCE_DIR"
+  tar xf "linux-${KERNEL_VERSION}.tar.xz" -C "$SOURCE_DIR" --strip-components=1
+fi
+cd "$SOURCE_DIR"
+
+if [ -n "$RESET_PATCH" ]; then
+  # Match the pinned source exactly and allow repeated builds in the same tree.
+  if ! patch --dry-run --reverse --force --fuzz=0 -p1 < "$RESET_PATCH" >/dev/null 2>&1; then
+    patch --dry-run --forward --batch --fuzz=0 -p1 < "$RESET_PATCH"
+    patch --forward --batch --fuzz=0 -p1 < "$RESET_PATCH"
+  fi
+fi
 
 make ARCH="$KARCH" ${CROSS_COMPILE:+CROSS_COMPILE="$CROSS_COMPILE"} defconfig
 

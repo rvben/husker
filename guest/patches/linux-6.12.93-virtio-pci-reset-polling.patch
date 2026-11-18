@@ -1,0 +1,28 @@
+diff --git a/drivers/virtio/virtio_pci_modern.c b/drivers/virtio/virtio_pci_modern.c
+--- a/drivers/virtio/virtio_pci_modern.c
++++ b/drivers/virtio/virtio_pci_modern.c
+@@ -437,7 +437,7 @@
+ 	 * including MSI-X interrupts, if any.
+ 	 */
+ 	while (vp_modern_get_status(mdev))
+-		msleep(1);
++		usleep_range(10, 50);
+
+ 	vp_modern_avq_cleanup(vdev);
+
+diff --git a/drivers/virtio/virtio_pci_modern_dev.c b/drivers/virtio/virtio_pci_modern_dev.c
+--- a/drivers/virtio/virtio_pci_modern_dev.c
++++ b/drivers/virtio/virtio_pci_modern_dev.c
+@@ -524,10 +524,10 @@
+ 	vp_iowrite16(1, &cfg->queue_reset);
+
+ 	while (vp_ioread16(&cfg->queue_reset))
+-		msleep(1);
++		usleep_range(10, 50);
+
+ 	while (vp_ioread16(&cfg->cfg.queue_enable))
+-		msleep(1);
++		usleep_range(10, 50);
+ }
+ EXPORT_SYMBOL_GPL(vp_modern_set_queue_reset);
+

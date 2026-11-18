@@ -71,9 +71,9 @@ jobs:
           sudo apt-get update
           # e2fsprogs: debugfs for rootfs baking
           # musl-tools: x86_64-linux-musl-gcc for x86_64 agent cross
-          # build-essential bc bison flex libelf-dev libssl-dev: kernel build
+          # build-essential bc bison flex libelf-dev libssl-dev patch: kernel build
           sudo apt-get install -y e2fsprogs musl-tools \
-            build-essential bc bison flex libelf-dev libssl-dev
+            build-essential bc bison flex libelf-dev libssl-dev patch
           if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
             # Set the musl linker to the apt gcc cross/native wrapper.
             # musl-tools alone does not ship aarch64-linux-musl-gcc (the
