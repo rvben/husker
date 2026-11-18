@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.57](https://github.com/rvben/husker/compare/v0.4.56...v0.4.57) - 2026-11-18
+
+### Fixed
+
+- **vmm**: release Apple VZ guests in terminal error state ([1f49d7d](https://github.com/rvben/husker/commit/1f49d7d9acbe035760f52cc28573e47b10bf1f5e))
+- **deps**: replace chrono with jiff ([f03212f](https://github.com/rvben/husker/commit/f03212fb2e421236a461e79dd5676b5e4ad0c268))
+- **deps**: patch bundled SQLite and rustix advisories ([6ca7464](https://github.com/rvben/husker/commit/6ca746407b50b1dc34be9c000b3891c1c86c6669))
+- **isolation**: bind guest sources and support ARM64 QEMU workers ([43d815d](https://github.com/rvben/husker/commit/43d815d9c5d90f8ff11c03baa850d951185e13e3))
+- **deps**: refresh compatible nix and zip security fixes ([27b75f3](https://github.com/rvben/husker/commit/27b75f343220db9e69e68ecddee53bc728828361))
+- support anonymous OCI pulls and verify lifecycle retries ([535744a](https://github.com/rvben/husker/commit/535744a3a63be79d2fc7beb62a64f79a0d6428f9))
+- **factory**: encode canonical lifecycle payload archives ([79efef8](https://github.com/rvben/husker/commit/79efef8223734c4ff754b36adb18bbd30f05127d))
+
+### Performance
+
+- **vz**: detect direct-kernel guest readiness sooner ([ad65090](https://github.com/rvben/husker/commit/ad65090f69b53b14efe89e2571d10fd03245863a))
+
 ## [0.4.56](https://github.com/rvben/husker/compare/v0.4.55...v0.4.56) - 2026-10-29
 
 ### Added
