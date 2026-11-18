@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.58](https://github.com/rvben/husker/compare/v0.4.57...v0.4.58) - 2026-11-18
+
+### Performance
+
+- **kernel**: shorten ARM64 virtio PCI reset waits ([f1ad0f8](https://github.com/rvben/husker/commit/f1ad0f8d51ce8b71a216360ebfdd37cd20140954))
+
 ## [0.4.57](https://github.com/rvben/husker/compare/v0.4.56...v0.4.57) - 2026-11-18
 
 ### Fixed
