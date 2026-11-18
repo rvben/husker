@@ -238,13 +238,18 @@ impl<B: VmmBackend> HuskerCore<B> {
         self.note_activity(record.id);
         let _hold_guard = self.begin_session(record.id);
 
+        let started = tokio::time::Instant::now();
+        // VZ returns from starting a direct-kernel VM before the guest agent
+        // binds. Probe more frequently during that short startup window.
+        let fast_retry_until = (record.vmm == husker_vmm::BackendKind::AppleVz
+            && record.boot_mode == BootKind::DirectKernel)
+            .then_some(started + std::time::Duration::from_millis(400));
         let mut backoff = std::time::Duration::from_millis(200);
         let max_backoff = std::time::Duration::from_secs(2);
         // Shrink the deadline by one attempt window so a final attempt that
         // starts just under the deadline cannot push total wall-clock beyond
         // approximately `timeout`.
-        let deadline =
-            tokio::time::Instant::now() + timeout.saturating_sub(AGENT_PING_ATTEMPT_TIMEOUT);
+        let deadline = started + timeout.saturating_sub(AGENT_PING_ATTEMPT_TIMEOUT);
         loop {
             // Each attempt (connect + ping) is bounded so a guest that accepts
             // the vsock but never replies cannot exceed the overall deadline.
@@ -265,7 +270,15 @@ impl<B: VmmBackend> HuskerCore<B> {
                 // A timed-out attempt is transient.
                 Err(_) => debug!(%name, "agent ping attempt timed out, retrying"),
             }
-            if tokio::time::Instant::now() + backoff >= deadline {
+            let now = tokio::time::Instant::now();
+            let delay = if fast_retry_until.is_some_and(|until| now < until) {
+                std::time::Duration::from_millis(25)
+            } else {
+                let delay = backoff;
+                backoff = (backoff * 2).min(max_backoff);
+                delay
+            };
+            if now + delay >= deadline {
                 return Err(CoreError::Agent(
                     crate::agent_client::AgentError::NotReady {
                         timeout,
@@ -273,8 +286,7 @@ impl<B: VmmBackend> HuskerCore<B> {
                     },
                 ));
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(max_backoff);
+            tokio::time::sleep(delay).await;
         }
     }
 
