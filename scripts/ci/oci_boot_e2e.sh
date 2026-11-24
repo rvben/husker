@@ -64,11 +64,9 @@ trap cleanup EXIT
 # 1. Resolve a built-in-driver kernel.
 KERNEL="${HUSKER_E2E_KERNEL:-}"
 if [[ -z "${KERNEL}" ]]; then
-  log "resolving the latest images-* release kernel"
-  url="$(bash "$(dirname "${BASH_SOURCE[0]}")/resolve-images-tag.sh" --url)"
-  KERNEL="${WORK}/kernel"
-  curl -fsSL "${url}/kernel-x86_64" -o "${KERNEL}"
-  log "using kernel from ${url##*/}"
+  log "fetching the pinned guest images (sha256-verified)"
+  bash "$(dirname "${BASH_SOURCE[0]}")/fetch-guest-images.sh" "${WORK}/images"
+  KERNEL="${WORK}/images/kernel-x86_64"
 fi
 
 # 2. Build the x86_64-musl agent and the daemon embedding it.

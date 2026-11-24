@@ -23,9 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Resolve kernel + rootfs from the latest images-* release (the standard
-      # Firecracker/MMIO kernel boots here, unlike the QEMU gate). Written to a
-      # temp dir the daemon can read; the rootfs is cloned CoW per VM.
+      # Fetch the pinned, sha256-verified kernel + rootfs (scripts/ci/
+      # fetch-guest-images.sh). The standard Firecracker/MMIO kernel boots here,
+      # unlike the QEMU gate. Written to a temp dir the daemon can read; the
+      # rootfs is cloned CoW per VM.
       #
       # The images live under RUNNER_TEMP, which the runner clears between jobs,
       # and the job removes them itself in its final step. A bare `mktemp -d`
@@ -35,22 +36,14 @@ jobs:
       # disk. Keep both bounds - they fail independently.
       - name: Fetch guest images
         id: images
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           work="${RUNNER_TEMP}/guest-images"
-          rm -rf "$work"
-          mkdir -p "$work"
-          url="$(bash scripts/ci/resolve-images-tag.sh --url)"
-          echo "using images from ${url##*/}"
-          curl -fsSL "${url}/kernel-x86_64"     -o "${work}/kernel"
-          curl -fsSL "${url}/rootfs-x86_64.ext4" -o "${work}/rootfs.ext4"
-          curl -fsSL "${url}/initramfs-x86_64.gz" -o "${work}/initramfs.gz"
+          make fetch-guest-images GUEST_IMAGES_DIR="${work}"
           {
-            echo "kernel=${work}/kernel"
-            echo "rootfs=${work}/rootfs.ext4"
-            echo "initrd=${work}/initramfs.gz"
+            echo "kernel=${work}/kernel-x86_64"
+            echo "rootfs=${work}/rootfs-x86_64.ext4"
+            echo "initrd=${work}/initramfs-x86_64.gz"
           } >> "$GITHUB_OUTPUT"
 
       # The gated target uses cargo-nextest; ensure it exists for root.

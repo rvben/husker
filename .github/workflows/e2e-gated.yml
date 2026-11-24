@@ -33,8 +33,9 @@ jobs:
             HUSKER_RUN_NET_E2E=1 \
             make test-net-e2e-gated
 
-      # Resolve kernel + rootfs + initrd from the latest images-* release for the
-      # general daemon e2e, which boots real Firecracker VMs.
+      # Fetch the pinned, sha256-verified kernel + rootfs + initrd (scripts/ci/
+      # fetch-guest-images.sh) for the general daemon e2e, which boots real
+      # Firecracker VMs.
       #
       # The images live under RUNNER_TEMP, which the runner clears between jobs,
       # and the job removes them itself in its final step. A bare `mktemp -d`
@@ -44,22 +45,14 @@ jobs:
       # disk. Keep both bounds - they fail independently.
       - name: Fetch guest images
         id: images
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           work="${RUNNER_TEMP}/guest-images"
-          rm -rf "$work"
-          mkdir -p "$work"
-          url="$(bash scripts/ci/resolve-images-tag.sh --url)"
-          echo "using images from ${url##*/}"
-          curl -fsSL "${url}/kernel-x86_64"      -o "${work}/kernel"
-          curl -fsSL "${url}/rootfs-x86_64.ext4" -o "${work}/rootfs.ext4"
-          curl -fsSL "${url}/initramfs-x86_64.gz" -o "${work}/initramfs.gz"
+          make fetch-guest-images GUEST_IMAGES_DIR="${work}"
           {
-            echo "kernel=${work}/kernel"
-            echo "rootfs=${work}/rootfs.ext4"
-            echo "initrd=${work}/initramfs.gz"
+            echo "kernel=${work}/kernel-x86_64"
+            echo "rootfs=${work}/rootfs-x86_64.ext4"
+            echo "initrd=${work}/initramfs-x86_64.gz"
           } >> "$GITHUB_OUTPUT"
 
       # Exercise daemon-owned worker shutdown and host-network cleanup after an

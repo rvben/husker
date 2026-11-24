@@ -66,17 +66,16 @@ trap cleanup EXIT
 json_str() { grep -oE "\"$1\":\"[^\"]*\"" | head -1 | cut -d'"' -f4; }
 json_num() { grep -oE "\"$1\":[0-9]+" | head -1 | grep -oE '[0-9]+'; }
 
-# 1. Resolve kernel + rootfs + initramfs (latest images-* release unless overridden).
+# 1. Resolve kernel + rootfs + initramfs (pinned, sha256-verified images unless overridden).
 KERNEL="${HUSKER_E2E_KERNEL:-}"
 ROOTFS="${HUSKER_E2E_ROOTFS:-}"
 INITRD="${HUSKER_E2E_INITRD:-}"
 if [[ -z "${KERNEL}" || -z "${ROOTFS}" || -z "${INITRD}" ]]; then
-  log "resolving the latest images-* release"
-  url="$(bash "$(dirname "${BASH_SOURCE[0]}")/resolve-images-tag.sh" --url)"
-  log "using images from ${url##*/}"
-  [[ -n "${KERNEL}" ]] || { KERNEL="${WORK}/kernel"; curl -fsSL "${url}/kernel-x86_64" -o "${KERNEL}"; }
-  [[ -n "${ROOTFS}" ]] || { ROOTFS="${WORK}/rootfs.ext4"; curl -fsSL "${url}/rootfs-x86_64.ext4" -o "${ROOTFS}"; }
-  [[ -n "${INITRD}" ]] || { INITRD="${WORK}/initramfs.gz"; curl -fsSL "${url}/initramfs-x86_64.gz" -o "${INITRD}"; }
+  log "fetching the pinned guest images (sha256-verified)"
+  bash "$(dirname "${BASH_SOURCE[0]}")/fetch-guest-images.sh" "${WORK}/images"
+  [[ -n "${KERNEL}" ]] || KERNEL="${WORK}/images/kernel-x86_64"
+  [[ -n "${ROOTFS}" ]] || ROOTFS="${WORK}/images/rootfs-x86_64.ext4"
+  [[ -n "${INITRD}" ]] || INITRD="${WORK}/images/initramfs-x86_64.gz"
 fi
 
 # 2. Build the daemon.
