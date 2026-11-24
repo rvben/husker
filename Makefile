@@ -86,7 +86,7 @@ sign-macos:
 
 # Check compilation without linux-net (macOS path)
 check-macos:
-	cargo check --workspace --no-default-features
+	cargo check --locked --workspace --no-default-features
 
 # Test targets run nextest (one process per test, the isolation CI relies on)
 # and then `cargo test --doc`, because nextest does not run doctests. There is
@@ -161,7 +161,7 @@ deploy-husker-dev:
 
 # Type check without building
 check:
-	cargo check --workspace --all-targets
+	cargo check --locked --workspace --all-targets
 
 # Clean build artifacts
 clean:
