@@ -12,12 +12,17 @@ on:
     # Nightly; staggered after the idle-policy gate (one runner, runs serially).
     - cron: "30 6 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   qemu-e2e:
     name: QEMU E2E (self-hosted, KVM)
     runs-on: [self-hosted, husker, linux]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The gated targets use cargo-nextest; ensure it exists for root (which
       # runs the e2e via sudo). Idempotent, survives a runner wipe.

@@ -1,0 +1,8 @@
+rules:
+  dangerous-triggers:
+    ignore:
+      # Republishes the default images after this repository's own Release
+      # workflow succeeds. The trigger only fires for runs of Release, which
+      # starts from tags pushed to this repository, and the jobs check out the
+      # commit that Release ran on, never a pull request head.
+      - build-images.yml

@@ -19,12 +19,17 @@ on:
     # Nightly; staggered an hour before suspend-fork-e2e (one runner, serial).
     - cron: "30 3 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   oci-boot-e2e:
     name: OCI Boot E2E (self-hosted, KVM)
     runs-on: [self-hosted, husker, linux]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       # The gate runs entirely as root (HOME=/root) on the runner's root

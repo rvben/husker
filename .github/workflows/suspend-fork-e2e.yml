@@ -20,12 +20,17 @@ on:
     # Nightly; staggered an hour after oci-boot-e2e (one runner, runs serially).
     - cron: "30 4 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   suspend-fork-e2e:
     name: Suspend/Fork E2E (self-hosted, KVM)
     runs-on: [self-hosted, husker, linux]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The gate runs entirely as root (HOME=/root) on the runner's root
       # toolchain, with an out-of-tree CARGO_TARGET_DIR so the ubuntu-owned
       # checkout stays free of root-owned build artifacts (next run's `git clean`

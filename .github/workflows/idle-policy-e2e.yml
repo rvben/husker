@@ -16,12 +16,17 @@ on:
     # Nightly; staggered after the suspend-fork gate (one runner, runs serially).
     - cron: "30 5 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   idle-policy-e2e:
     name: Idle Policy E2E (self-hosted, KVM)
     runs-on: [self-hosted, husker, linux]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Fetch the pinned, sha256-verified kernel + rootfs (scripts/ci/
       # fetch-guest-images.sh). The standard Firecracker/MMIO kernel boots here,
