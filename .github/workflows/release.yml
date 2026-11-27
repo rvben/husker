@@ -400,7 +400,7 @@ jobs:
 
           cat > /tmp/husker.rb << 'FORMULA'
           class Husker < Formula
-            desc "MicroVM manager built on Firecracker (Linux) and Apple Virtualization.framework (macOS)"
+            desc "MicroVM manager for Firecracker (Linux) and Virtualization.framework (macOS)"
             homepage "https://github.com/rvben/husker"
             version "VERSION_NUM"
             license "MIT"
